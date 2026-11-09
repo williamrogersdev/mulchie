@@ -2,7 +2,10 @@ pub mod api;
 pub mod config;
 pub mod diskmap;
 pub mod engine;
+pub mod git;
 pub mod monitor;
+pub mod paths;
+pub mod process;
 pub mod reclaim;
 
 pub use config::Config;
