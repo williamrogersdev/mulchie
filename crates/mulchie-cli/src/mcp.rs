@@ -29,8 +29,8 @@ fn tools() -> Value {
           "inputSchema": obj(json!({ "path": { "type": "string" }, "action": { "type": "string", "enum": ["pause", "resume", "deprioritize", "stop_builds", "kill_all"] } }), &["path", "action"]) },
         { "name": "process_action", "description": "Signal or renice one process owned by the current user.",
           "inputSchema": obj(json!({ "pid": { "type": "integer" }, "action": { "type": "string", "enum": ["term", "kill", "stop", "cont", "renice"] }, "nice": { "type": "integer" } }), &["pid", "action"]) },
-        { "name": "acquire_build_slot", "description": "Join the machine-wide build queue. Poll with the returned ticket until granted, then run with the returned job count. Always release afterwards.",
-          "inputSchema": obj(json!({ "label": { "type": "string" }, "ticket": { "type": "integer" } }), &[]) },
+        { "name": "acquire_build_slot", "description": "Join the machine-wide build queue. Poll with the returned ticket until granted, then run with the returned job count. A granted slot lasts ttl_secs (default 900); call again with the ticket to renew it during a long build. Always release afterwards.",
+          "inputSchema": obj(json!({ "label": { "type": "string" }, "ticket": { "type": "integer" }, "ttl_secs": { "type": "integer" } }), &[]) },
         { "name": "release_build_slot", "description": "Release a build slot ticket.", "inputSchema": obj(json!({ "ticket": { "type": "integer" } }), &["ticket"]) },
     ])
 }
@@ -161,9 +161,11 @@ fn call_tool(name: &str, a: &Value) -> Result<Value, String> {
             }
             post("/v1/process", b)
         }
+        // A TTL, not this server's pid: `mulchie mcp` lives as long as the agent
+        // session, so a forgotten release would hold the slot until then.
         "acquire_build_slot" => post(
             "/v1/lease",
-            json!({ "label": a["label"].as_str().unwrap_or("mcp agent"), "pid": std::process::id(), "ticket": a["ticket"] }),
+            json!({ "label": a["label"].as_str().unwrap_or("mcp agent"), "ticket": a["ticket"], "ttl_secs": a["ttl_secs"].as_u64().unwrap_or(900).clamp(1, 86_400) }),
         ),
         "release_build_slot" => post("/v1/release", json!({ "ticket": a["ticket"] })),
         other => Err(format!("unknown tool {other}")),
