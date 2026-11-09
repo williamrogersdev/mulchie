@@ -1,0 +1,10 @@
+{
+  "identifier": "default",
+  "windows": [
+    "panel",
+    "dashboard"
+  ],
+  "permissions": [
+    "core:default"
+  ]
+}

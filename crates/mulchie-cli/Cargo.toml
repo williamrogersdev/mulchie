@@ -1,0 +1,9 @@
+[package]
+name = "mulchie"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+mulchie-core = { path = "../mulchie-core" }
+serde_json = "1"
+libc = "0.2"

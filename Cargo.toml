@@ -1,0 +1,14 @@
+[workspace]
+resolver = "2"
+members = ["crates/mulchie-core", "crates/mulchie-cli", "crates/mulchie-app"]
+
+[workspace.package]
+version = "0.2.0"
+edition = "2021"
+license = "MIT"
+
+[profile.release]
+strip = "none"
+
+[profile.release.build-override]
+strip = "none"
