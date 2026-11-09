@@ -5,13 +5,14 @@ use serde::Serialize;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::Mutex;
-use std::time::SystemTime;
+use std::time::{Duration, SystemTime};
 
 use crate::config::Config;
-use crate::git::{self, git};
+use crate::git::{self, git, run_with_timeout, GitError};
 use crate::paths::Paths;
+use crate::process::{is_tool, ProcessSource};
 use crate::reclaim::dir_size;
-use crate::safety::{any_cwd_in, is_agent_worktree};
+use crate::safety::{any_cwd_in, is_agent_worktree, SkipReason};
 
 /// Repositories scanned at once.
 const REPO_WORKERS: usize = 8;
@@ -67,12 +68,40 @@ struct CatDef {
     name: &'static str,
     path: PathBuf,
     hint: &'static str,
-    prune: Option<(&'static str, &'static [&'static str])>,
+    prune: Option<Prune>,
 }
 
+/// A package manager's own prune command, and the processes that must not be
+/// running while it runs.
+#[derive(Clone, Copy)]
+struct Prune {
+    bin: &'static str,
+    args: &'static [&'static str],
+    busy: &'static [&'static str],
+}
+
+const fn prune(
+    bin: &'static str,
+    args: &'static [&'static str],
+    busy: &'static [&'static str],
+) -> Option<Prune> {
+    Some(Prune { bin, args, busy })
+}
+
+/// Longest a package-manager prune may run before its process group is killed.
+pub const PRUNE_TIMEOUT: Duration = Duration::from_secs(600);
+
+/// The cache categories for this platform.
 fn categories_for(paths: &Paths) -> Vec<CatDef> {
+    categories_for_os(paths, cfg!(target_os = "macos"))
+}
+
+/// The cache categories for macOS (`macos`) or Linux and other Unixes.
+fn categories_for_os(paths: &Paths, macos: bool) -> Vec<CatDef> {
     let home = &paths.home;
     let lib = home.join("Library");
+    let cache = home.join(".cache");
+    let share = home.join(".local/share");
     let c = |key, name, path, hint, prune| CatDef {
         key,
         name,
@@ -80,7 +109,8 @@ fn categories_for(paths: &Paths) -> Vec<CatDef> {
         hint,
         prune,
     };
-    vec![
+    // Shared by both platforms.
+    let mut v = vec![
         c(
             "cargo_registry",
             "Cargo registry",
@@ -107,103 +137,42 @@ fn categories_for(paths: &Paths) -> Vec<CatDef> {
             "npm cache",
             home.join(".npm"),
             "npm cache clean --force",
-            Some(("npm", &["cache", "clean", "--force"])),
+            prune(
+                "npm",
+                &["cache", "clean", "--force"],
+                &["npm", "npx", "npm-cli"],
+            ),
         ),
         c(
             "bun",
             "bun install cache",
             home.join(".bun/install/cache"),
             "bun pm cache rm",
-            Some(("bun", &["pm", "cache", "rm"])),
-        ),
-        c(
-            "pnpm",
-            "pnpm store",
-            lib.join("pnpm/store"),
-            "pnpm store prune",
-            Some(("pnpm", &["store", "prune"])),
-        ),
-        c(
-            "yarn",
-            "Yarn cache",
-            lib.join("Caches/Yarn"),
-            "yarn cache clean",
-            Some(("yarn", &["cache", "clean"])),
+            prune("bun", &["pm", "cache", "rm"], &["bun", "bunx"]),
         ),
         c(
             "uv",
             "uv cache",
-            home.join(".cache/uv"),
+            cache.join("uv"),
             "uv cache prune",
-            Some(("uv", &["cache", "prune"])),
-        ),
-        c(
-            "pip",
-            "pip cache",
-            lib.join("Caches/pip"),
-            "pip cache purge",
-            Some(("pip3", &["cache", "purge"])),
-        ),
-        c(
-            "homebrew",
-            "Homebrew downloads",
-            lib.join("Caches/Homebrew"),
-            "brew cleanup --prune=7",
-            Some(("brew", &["cleanup", "--prune=7"])),
+            prune("uv", &["cache", "prune"], &["uv", "uvx"]),
         ),
         c(
             "go",
             "Go module cache",
             home.join("go/pkg/mod"),
             "go clean -modcache",
-            Some(("go", &["clean", "-modcache"])),
-        ),
-        c(
-            "xcode_dd",
-            "Xcode DerivedData",
-            lib.join("Developer/Xcode/DerivedData"),
-            "reclaimable as a build cache",
-            None,
-        ),
-        c(
-            "simulators",
-            "iOS Simulators",
-            lib.join("Developer/CoreSimulator"),
-            "xcrun simctl delete unavailable",
-            Some(("xcrun", &["simctl", "delete", "unavailable"])),
-        ),
-        c(
-            "docker",
-            "Docker disk image",
-            lib.join("Containers/com.docker.docker"),
-            "docker system prune",
-            None,
-        ),
-        c(
-            "lib_caches",
-            "~/Library/Caches",
-            lib.join("Caches"),
-            "app caches; most apps rebuild them",
-            None,
-        ),
-        c(
-            "logs",
-            "~/Library/Logs",
-            lib.join("Logs"),
-            "old logs are safe to delete",
-            None,
-        ),
-        c(
-            "trash",
-            "Trash",
-            home.join(".Trash"),
-            "empty the Trash",
-            None,
+            // `go build` runs compile, link and asm from the toolchain.
+            prune(
+                "go",
+                &["clean", "-modcache"],
+                &["go", "compile", "link", "asm", "cgo"],
+            ),
         ),
         c(
             "hf",
             "Hugging Face models",
-            home.join(".cache/huggingface"),
+            cache.join("huggingface"),
             "large model weights",
             None,
         ),
@@ -228,7 +197,135 @@ fn categories_for(paths: &Paths) -> Vec<CatDef> {
             "patches and ignored-file archives saved before worktree removal",
             None,
         ),
-    ]
+    ];
+    let pnpm = prune("pnpm", &["store", "prune"], &["pnpm", "pnpx"]);
+    let yarn = prune("yarn", &["cache", "clean"], &["yarn"]);
+    let pip = prune("pip3", &["cache", "purge"], &["pip", "pip3"]);
+    let brew = prune("brew", &["cleanup", "--prune=7"], &["brew"]);
+    if macos {
+        v.extend([
+            c(
+                "pnpm",
+                "pnpm store",
+                lib.join("pnpm/store"),
+                "pnpm store prune",
+                pnpm,
+            ),
+            c(
+                "yarn",
+                "Yarn cache",
+                lib.join("Caches/Yarn"),
+                "yarn cache clean",
+                yarn,
+            ),
+            c(
+                "pip",
+                "pip cache",
+                lib.join("Caches/pip"),
+                "pip cache purge",
+                pip,
+            ),
+            c(
+                "homebrew",
+                "Homebrew downloads",
+                lib.join("Caches/Homebrew"),
+                "brew cleanup --prune=7",
+                brew,
+            ),
+            c(
+                "xcode_dd",
+                "Xcode DerivedData",
+                lib.join("Developer/Xcode/DerivedData"),
+                "reclaimable as a build cache",
+                None,
+            ),
+            c(
+                "simulators",
+                "iOS Simulators",
+                lib.join("Developer/CoreSimulator"),
+                "xcrun simctl delete unavailable",
+                prune(
+                    "xcrun",
+                    &["simctl", "delete", "unavailable"],
+                    &["simulator", "simctl", "launchd_sim"],
+                ),
+            ),
+            c(
+                "docker",
+                "Docker disk image",
+                lib.join("Containers/com.docker.docker"),
+                "docker system prune",
+                None,
+            ),
+            c(
+                "lib_caches",
+                "~/Library/Caches",
+                lib.join("Caches"),
+                "app caches; most apps rebuild them",
+                None,
+            ),
+            c(
+                "logs",
+                "~/Library/Logs",
+                lib.join("Logs"),
+                "old logs are safe to delete",
+                None,
+            ),
+            c(
+                "trash",
+                "Trash",
+                home.join(".Trash"),
+                "empty the Trash",
+                None,
+            ),
+        ]);
+    } else {
+        v.extend([
+            c(
+                "pnpm",
+                "pnpm store",
+                share.join("pnpm/store"),
+                "pnpm store prune",
+                pnpm,
+            ),
+            c(
+                "yarn",
+                "Yarn cache",
+                cache.join("yarn"),
+                "yarn cache clean",
+                yarn,
+            ),
+            c(
+                "pip",
+                "pip cache",
+                cache.join("pip"),
+                "pip cache purge",
+                pip,
+            ),
+            c(
+                "homebrew",
+                "Homebrew downloads",
+                cache.join("Homebrew"),
+                "brew cleanup --prune=7",
+                brew,
+            ),
+            c(
+                "xdg_cache",
+                "~/.cache",
+                cache.clone(),
+                "app caches; most apps rebuild them",
+                None,
+            ),
+            c(
+                "trash",
+                "Trash",
+                share.join("Trash"),
+                "empty the Trash",
+                None,
+            ),
+        ]);
+    }
+    v
 }
 
 /// Scan package caches and every git worktree under the scan roots. `busy_cwds`
@@ -515,87 +612,147 @@ pub struct PruneResult {
     pub ok: bool,
     pub freed: u64,
     pub output: String,
+    /// Why the prune did not run or did not succeed.
+    pub reason: Option<SkipReason>,
 }
 
-fn find_bin(paths: &Paths, name: &str) -> Option<PathBuf> {
+impl PruneResult {
+    fn refused(key: &str, reason: SkipReason, output: impl Into<String>) -> Self {
+        Self {
+            key: key.into(),
+            ok: false,
+            freed: 0,
+            output: output.into(),
+            reason: Some(reason),
+        }
+    }
+}
+
+/// Directories searched for tools after `$PATH`: the platform's package-manager
+/// prefixes, then per-user tool directories.
+pub fn tool_dirs(paths: &Paths) -> Vec<PathBuf> {
     let home = &paths.home;
+    let mut dirs: Vec<PathBuf> = Vec::new();
+    if cfg!(target_os = "macos") {
+        dirs.push("/opt/homebrew/bin".into());
+    } else {
+        dirs.push("/home/linuxbrew/.linuxbrew/bin".into());
+        dirs.push(home.join(".linuxbrew/bin"));
+        dirs.push("/snap/bin".into());
+    }
+    dirs.push("/usr/local/bin".into());
+    dirs.push("/usr/bin".into());
+    dirs.push("/bin".into());
+    for d in [
+        ".bun/bin",
+        ".cargo/bin",
+        ".local/bin",
+        "go/bin",
+        ".volta/bin",
+    ] {
+        dirs.push(home.join(d));
+    }
+    dirs
+}
+
+/// An executable named `name` on `$PATH` or in [`tool_dirs`].
+pub fn find_bin(paths: &Paths, name: &str) -> Option<PathBuf> {
+    use std::os::unix::fs::PermissionsExt;
     let mut dirs: Vec<PathBuf> = std::env::var_os("PATH")
         .map(|p| std::env::split_paths(&p).collect())
         .unwrap_or_default();
-    for d in ["/opt/homebrew/bin", "/usr/local/bin", "/usr/bin"] {
-        dirs.push(PathBuf::from(d));
-    }
-    for d in [".bun/bin", ".cargo/bin", ".local/bin", "go/bin"] {
-        dirs.push(home.join(d));
-    }
-    dirs.into_iter().map(|d| d.join(name)).find(|p| p.is_file())
+    dirs.extend(tool_dirs(paths));
+    dirs.into_iter()
+        .filter(|d| d.is_absolute())
+        .map(|d| d.join(name))
+        .find(|p| {
+            std::fs::metadata(p)
+                .map(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
+                .unwrap_or(false)
+        })
 }
 
-/// Run a package manager's own prune command for one cache category.
-pub fn prune_cache(paths: &Paths, key: &str) -> PruneResult {
+/// Run a package manager's own prune command for one cache category. Refused
+/// while the tool itself (or, for Go, a build it drives) is running; killed
+/// with its whole process group after [`PRUNE_TIMEOUT`].
+pub fn prune_cache(paths: &Paths, procs: &dyn ProcessSource, key: &str) -> PruneResult {
+    prune_cache_with(paths, procs, key, PRUNE_TIMEOUT)
+}
+
+fn prune_cache_with(
+    paths: &Paths,
+    procs: &dyn ProcessSource,
+    key: &str,
+    timeout: Duration,
+) -> PruneResult {
     let Some(def) = categories_for(paths).into_iter().find(|c| c.key == key) else {
-        return PruneResult {
-            key: key.into(),
-            ok: false,
-            freed: 0,
-            output: "unknown cache".into(),
-        };
+        return PruneResult::refused(key, SkipReason::UnknownTarget, "unknown cache");
     };
-    let Some((bin, args)) = def.prune else {
-        return PruneResult {
-            key: key.into(),
-            ok: false,
-            freed: 0,
-            output: format!("no safe prune command; {}", def.hint),
-        };
+    let Some(pr) = def.prune else {
+        return PruneResult::refused(
+            key,
+            SkipReason::NoPruneCommand,
+            format!("no safe prune command; {}", def.hint),
+        );
     };
-    let Some(exe) = find_bin(paths, bin) else {
-        return PruneResult {
-            key: key.into(),
-            ok: false,
-            freed: 0,
-            output: format!("{bin} not found"),
-        };
+    let Some(exe) = find_bin(paths, pr.bin) else {
+        return PruneResult::refused(
+            key,
+            SkipReason::ToolNotFound,
+            format!("{} not found", pr.bin),
+        );
     };
+    let uid = procs.current_uid();
+    let me = procs.self_pid();
+    if let Some(p) = procs
+        .list()
+        .into_iter()
+        .find(|p| p.uid == Some(uid) && p.pid != me && is_tool(p, pr.busy))
+    {
+        return PruneResult::refused(
+            key,
+            SkipReason::Busy,
+            format!(
+                "{} (pid {}) is running; try again when it finishes",
+                p.name, p.pid
+            ),
+        );
+    }
     let before = dir_size(&def.path);
     let mut cmd = Command::new(exe);
-    cmd.args(args);
-    if let Some(path) = std::env::var_os("PATH") {
-        let mut parts: Vec<PathBuf> = std::env::split_paths(&path).collect();
-        parts.push("/opt/homebrew/bin".into());
-        parts.push("/usr/local/bin".into());
-        if let Ok(joined) = std::env::join_paths(parts) {
-            cmd.env("PATH", joined);
-        }
+    cmd.args(pr.args);
+    let mut parts: Vec<PathBuf> = std::env::var_os("PATH")
+        .map(|p| std::env::split_paths(&p).collect())
+        .unwrap_or_default();
+    parts.extend(tool_dirs(paths));
+    if let Ok(joined) = std::env::join_paths(parts) {
+        cmd.env("PATH", joined);
     }
-    let out = cmd.output();
+    cmd.env("HOME", &paths.home);
+    let out = run_with_timeout(cmd, timeout);
     let after = dir_size(&def.path);
     match out {
         Ok(o) => {
             let mut text = String::from_utf8_lossy(&o.stdout).to_string();
-            text.push_str(&String::from_utf8_lossy(&o.stderr));
-            let text: String = text
-                .lines()
-                .rev()
-                .take(6)
-                .collect::<Vec<_>>()
-                .into_iter()
-                .rev()
-                .collect::<Vec<_>>()
-                .join("\n");
+            text.push_str(&o.stderr);
+            let lines: Vec<&str> = text.lines().collect();
+            let text = lines[lines.len().saturating_sub(6)..].join("\n");
             PruneResult {
                 key: key.into(),
-                ok: o.status.success(),
+                ok: o.success,
                 freed: before.saturating_sub(after),
                 output: text,
+                reason: (!o.success).then_some(SkipReason::CommandFailed),
             }
         }
-        Err(e) => PruneResult {
+        Err(GitError::Timeout(_)) => PruneResult {
             key: key.into(),
             ok: false,
-            freed: 0,
-            output: e.to_string(),
+            freed: before.saturating_sub(after),
+            output: format!("{} ran past {}s and was stopped", pr.bin, timeout.as_secs()),
+            reason: Some(SkipReason::TimedOut),
         },
+        Err(e) => PruneResult::refused(key, SkipReason::CommandFailed, e.to_string()),
     }
 }
 

@@ -1,0 +1,623 @@
+//! API tests: parsing limits on any reader, the auth matrix over every route,
+//! Host and Origin, connection limits, token file permissions, the client's
+//! listener check, and plan-then-execute exactness. Everything runs against an
+//! engine whose paths are under a tempdir, on a free loopback port.
+
+use super::*;
+use crate::config::LoadedConfig;
+use crate::lock::EngineLock;
+use crate::process::FakeProcesses;
+use crate::safety::CACHEDIR_TAG_SIGNATURE;
+use serde_json::{json, Value};
+use std::io::Cursor;
+use std::os::unix::fs::PermissionsExt;
+
+// ------------------------------------------------------------ read_req
+
+fn parse(raw: &[u8]) -> Result<Req, ReqError> {
+    parse_with(raw, &Limits::default())
+}
+
+fn parse_with(raw: &[u8], limits: &Limits) -> Result<Req, ReqError> {
+    let mut r = Cursor::new(raw.to_vec());
+    read_req(&mut r, limits, Instant::now() + Duration::from_secs(5))
+}
+
+fn status(r: Result<Req, ReqError>) -> (u16, String) {
+    match r {
+        Ok(_) => (200, String::new()),
+        Err(ReqError::Http(e)) => (e.status, e.code),
+        Err(ReqError::Closed) => (0, "closed".into()),
+    }
+}
+
+#[test]
+fn parses_a_well_formed_request() {
+    let r = parse(b"POST /v1/clean?x=1 HTTP/1.1\r\nHost: 127.0.0.1:7\r\nAuthorization: Bearer abc\r\nContent-Length: 2\r\n\r\n{}")
+        .unwrap();
+    assert_eq!(r.method, "POST");
+    assert_eq!(r.path, "/v1/clean");
+    assert_eq!(r.query, "x=1");
+    assert_eq!(r.host.as_deref(), Some("127.0.0.1:7"));
+    assert_eq!(r.auth.as_deref(), Some("Bearer abc"));
+    assert_eq!(r.body, b"{}");
+    // Bare LF line ends are accepted too.
+    assert!(parse(b"GET /v1/health HTTP/1.0\nHost: x\n\n").is_ok());
+}
+
+#[test]
+fn malformed_requests_are_400() {
+    for raw in [
+        &b"GARBAGE\r\n\r\n"[..],
+        b"GET /v1/health\r\n\r\n",
+        b"get /v1/health HTTP/1.1\r\n\r\n",
+        b"GET v1/health HTTP/1.1\r\n\r\n",
+        b"GET /v1/health HTTP/2\r\n\r\n",
+        b"GET /a HTTP/1.1\r\nNoColonHere\r\n\r\n",
+        b"GET /a HTTP/1.1\r\nBad Name: x\r\n\r\n",
+        b"GET /a HTTP/1.1\r\nContent-Length: -1\r\n\r\n",
+        b"GET /a HTTP/1.1\r\nContent-Length: 1\r\nContent-Length: 2\r\n\r\nxx",
+        b"GET /a HTTP/1.1\r\nHost: a\r\nHost: b\r\n\r\n",
+        b"POST /a HTTP/1.1\r\nContent-Length: 10\r\n\r\nshort",
+        b"GET /a HTTP/1.1\r\nHost: a\r\n",
+        b"GET /a HTTP/1.1\r\n\xff\xfe: x\r\n\r\n",
+    ] {
+        assert_eq!(
+            status(parse(raw)).0,
+            400,
+            "{:?}",
+            String::from_utf8_lossy(raw)
+        );
+    }
+    assert_eq!(status(parse(b"")).1, "closed");
+}
+
+#[test]
+fn oversized_requests_are_refused_with_their_own_codes() {
+    let long_line = format!("GET /{} HTTP/1.1\r\n\r\n", "a".repeat(9000));
+    assert_eq!(
+        status(parse(long_line.as_bytes())),
+        (414, "request_line_too_long".into())
+    );
+    let no_newline = "G".repeat(100_000);
+    assert_eq!(
+        status(parse(no_newline.as_bytes())).0,
+        414,
+        "stops reading early"
+    );
+
+    let long_header = format!("GET / HTTP/1.1\r\nX-A: {}\r\n\r\n", "b".repeat(9000));
+    assert_eq!(
+        status(parse(long_header.as_bytes())),
+        (431, "headers_too_large".into())
+    );
+    let mut many = String::from("GET / HTTP/1.1\r\n");
+    for i in 0..20 {
+        many.push_str(&format!("X-{i}: {}\r\n", "c".repeat(4000)));
+    }
+    many.push_str("\r\n");
+    assert_eq!(
+        status(parse(many.as_bytes())).0,
+        431,
+        "64 KB of headers in all"
+    );
+
+    let big = format!(
+        "POST / HTTP/1.1\r\nContent-Length: {}\r\n\r\n",
+        1024 * 1024 + 1
+    );
+    assert_eq!(
+        status(parse(big.as_bytes())),
+        (413, "body_too_large".into())
+    );
+    let chunked = b"POST / HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n0\r\n\r\n";
+    assert_eq!(
+        status(parse(chunked)),
+        (501, "unsupported_transfer_encoding".into())
+    );
+}
+
+/// Hands out one byte per read, slowly.
+struct Slow {
+    data: Vec<u8>,
+    at: usize,
+    delay: Duration,
+}
+
+impl Read for Slow {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        std::thread::sleep(self.delay);
+        if self.at >= self.data.len() || buf.is_empty() {
+            return Ok(0);
+        }
+        buf[0] = self.data[self.at];
+        self.at += 1;
+        Ok(1)
+    }
+}
+
+#[test]
+fn slow_input_hits_the_deadline() {
+    let slow = Slow {
+        data: b"GET /v1/state HTTP/1.1\r\nHost: 127.0.0.1:1\r\n\r\n".to_vec(),
+        at: 0,
+        delay: Duration::from_millis(20),
+    };
+    let mut r = BufReader::with_capacity(1, slow);
+    let t = Instant::now();
+    let res = read_req(
+        &mut r,
+        &Limits::default(),
+        Instant::now() + Duration::from_millis(150),
+    );
+    assert_eq!(status(res), (408, "request_timeout".into()));
+    assert!(t.elapsed() < Duration::from_secs(1));
+}
+
+#[test]
+fn tokens_compare_in_constant_time_shape() {
+    assert!(constant_time_eq(b"abc", b"abc"));
+    assert!(!constant_time_eq(b"abc", b"abd"));
+    assert!(!constant_time_eq(b"abc", b"abcd"));
+    assert!(!constant_time_eq(b"", b"a"));
+    assert!(constant_time_eq(b"", b""));
+}
+
+#[test]
+fn timeouts_per_route() {
+    assert_eq!(timeout_for("GET", "/v1/health"), HEALTH_TIMEOUT);
+    assert_eq!(timeout_for("GET", "/v1/state"), DEFAULT_TIMEOUT);
+    assert_eq!(timeout_for("POST", "/v1/sweep"), LONG_TIMEOUT);
+    assert_eq!(
+        timeout_for("GET", "/v1/clean/plan?want_bytes=1"),
+        LONG_TIMEOUT
+    );
+    assert_eq!(timeout_for("POST", "/v1/lease"), DEFAULT_TIMEOUT);
+}
+
+// --------------------------------------------------------- token files
+
+#[test]
+fn token_is_created_private_and_loose_files_are_refused() {
+    let t = tempfile::tempdir().unwrap();
+    let paths = Paths::under(t.path());
+    let tok = load_or_create_token_in(&paths).unwrap();
+    assert_eq!(tok.len(), 64);
+    let path = token_path_in(&paths);
+    let mode = |p: &Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
+    assert_eq!(mode(&path), 0o600);
+    assert_eq!(mode(&paths.config_dir), 0o700);
+    assert_eq!(load_or_create_token_in(&paths).unwrap(), tok, "stable");
+    assert_eq!(read_token(&paths).unwrap(), tok);
+
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+    let e = load_or_create_token_in(&paths).unwrap_err();
+    assert_eq!(e.kind(), std::io::ErrorKind::PermissionDenied);
+    assert!(e.to_string().contains("chmod 600"), "{e}");
+    assert!(read_token(&paths).is_err());
+    assert_eq!(mode(&path), 0o644, "never silently changed or replaced");
+
+    // A symlink is not followed.
+    std::fs::remove_file(&path).unwrap();
+    let elsewhere = t.path().join("elsewhere");
+    std::fs::write(&elsewhere, "f".repeat(64)).unwrap();
+    std::os::unix::fs::symlink(&elsewhere, &path).unwrap();
+    assert!(load_or_create_token_in(&paths).is_err());
+    assert!(read_token(&paths).is_err());
+
+    // Ours and private but truncated: replaced.
+    std::fs::remove_file(&path).unwrap();
+    let f = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(&path)
+        .unwrap();
+    drop(f);
+    let fresh = load_or_create_token_in(&paths).unwrap();
+    assert_eq!(fresh.len(), 64);
+}
+
+#[test]
+fn a_loose_token_stops_the_server_from_starting() {
+    let (_t, e) = engine();
+    let path = token_path_in(e.paths());
+    load_or_create_token_in(e.paths()).unwrap();
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o640)).unwrap();
+    assert!(serve_with(e, 0, Limits::default()).is_err());
+}
+
+// ------------------------------------------------------------- server
+
+fn engine() -> (tempfile::TempDir, Engine) {
+    let t = tempfile::tempdir().unwrap();
+    let paths = Paths::under(t.path());
+    std::fs::create_dir_all(&paths.home).unwrap();
+    let root = t.path().join("code");
+    std::fs::create_dir_all(&root).unwrap();
+    let cfg = Config {
+        scan_roots: vec![root.canonicalize().unwrap()],
+        ..Config::default()
+    };
+    let e = Engine::with_processes(
+        paths,
+        LoadedConfig {
+            config: cfg,
+            error: None,
+        },
+        Arc::new(FakeProcesses::empty()),
+    );
+    (t, e)
+}
+
+struct Running {
+    t: tempfile::TempDir,
+    engine: Engine,
+    server: Option<Server>,
+    _lock: EngineLock,
+    token: String,
+    port: u16,
+}
+
+impl Drop for Running {
+    fn drop(&mut self) {
+        if let Some(s) = self.server.take() {
+            s.stop();
+        }
+    }
+}
+
+fn running(limits: Limits) -> Running {
+    let (t, engine) = engine();
+    let mut lk = engine.acquire_lock().unwrap();
+    let server = serve_with(engine.clone(), 0, limits).unwrap();
+    let port = server.port();
+    lk.set_port(Some(port)).unwrap();
+    let token = read_token(engine.paths()).unwrap();
+    Running {
+        t,
+        engine,
+        server: Some(server),
+        _lock: lk,
+        token,
+        port,
+    }
+}
+
+impl Running {
+    fn code_root(&self) -> PathBuf {
+        self.t.path().join("code").canonicalize().unwrap()
+    }
+}
+
+/// Send raw bytes, return status code and JSON body.
+fn raw(port: u16, req: &str) -> (u16, Value) {
+    let mut s = TcpStream::connect(("127.0.0.1", port)).unwrap();
+    s.set_read_timeout(Some(Duration::from_secs(30))).unwrap();
+    s.write_all(req.as_bytes()).unwrap();
+    let mut out = String::new();
+    let _ = s.read_to_string(&mut out);
+    let (head, body) = out.split_once("\r\n\r\n").unwrap_or((&out, ""));
+    let code = head
+        .split_whitespace()
+        .nth(1)
+        .and_then(|c| c.parse().ok())
+        .unwrap_or(0);
+    (code, serde_json::from_str(body).unwrap_or(Value::Null))
+}
+
+fn send(port: u16, method: &str, path: &str, auth: Option<&str>, body: &str) -> (u16, Value) {
+    let auth = auth
+        .map(|a| format!("Authorization: {a}\r\n"))
+        .unwrap_or_default();
+    raw(
+        port,
+        &format!(
+            "{method} {path} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\n{auth}Content-Length: {}\r\n\r\n{body}",
+            body.len()
+        ),
+    )
+}
+
+#[test]
+fn every_route_but_health_needs_the_token() {
+    let r = running(Limits::default());
+    let good = format!("Bearer {}", r.token);
+    let bad = format!("Bearer {}", "0".repeat(64));
+    for (method, path) in ROUTES {
+        for (label, auth) in [
+            ("none", None),
+            ("bad", Some(bad.as_str())),
+            ("good", Some(good.as_str())),
+        ] {
+            let (code, v) = send(r.port, method, path, auth, "{}");
+            if *path == "/v1/health" {
+                assert_eq!(code, 200, "{method} {path} {label}");
+                assert_eq!(v["name"], "mulchie");
+            } else if label == "good" {
+                assert!(
+                    code == 200 || code == 400,
+                    "{method} {path} {label}: {code} {v}"
+                );
+                assert_ne!(v["code"], "unauthorized");
+            } else {
+                assert_eq!(code, 401, "{method} {path} {label}");
+                assert_eq!(v["code"], "unauthorized");
+            }
+        }
+    }
+    // Deny by default: unknown routes and wrong methods are 401 without a token.
+    assert_eq!(send(r.port, "GET", "/v1/nope", None, "").0, 401);
+    assert_eq!(send(r.port, "DELETE", "/v1/state", None, "").0, 401);
+    assert_eq!(
+        send(r.port, "GET", "/v1/nope", Some(&good), "").1["code"],
+        "not_found"
+    );
+    let (code, v) = send(r.port, "DELETE", "/v1/state", Some(&good), "");
+    assert_eq!(
+        (code, v["code"].as_str()),
+        (405, Some("method_not_allowed"))
+    );
+    // A malformed scheme is no token.
+    assert_eq!(send(r.port, "GET", "/v1/state", Some(&r.token), "").0, 401);
+    // Nothing destructive happened in the good-token pass: bare POSTs were refused.
+    assert!(r
+        .engine
+        .snapshot_state()
+        .actions
+        .iter()
+        .all(|a| a.status.as_deref() != Some("done")));
+}
+
+#[test]
+fn host_and_origin_are_checked_before_anything_else() {
+    let r = running(Limits::default());
+    let p = r.port;
+    let get = |extra: &str| raw(p, &format!("GET /v1/health HTTP/1.1\r\n{extra}\r\n"));
+    assert_eq!(get(&format!("Host: 127.0.0.1:{p}\r\n")).0, 200);
+    assert_eq!(get(&format!("Host: LOCALHOST:{p}\r\n")).0, 200);
+    for bad in [
+        String::new(),
+        "Host: 127.0.0.1\r\n".into(),
+        format!("Host: evil.example:{p}\r\n"),
+        format!("Host: 127.0.0.1:{}\r\n", p.wrapping_add(1)),
+    ] {
+        let (code, v) = get(&bad);
+        assert_eq!(
+            (code, v["code"].as_str()),
+            (403, Some("bad_host")),
+            "{bad:?}"
+        );
+    }
+    let (code, v) = get(&format!(
+        "Host: 127.0.0.1:{p}\r\nOrigin: http://evil.example\r\n"
+    ));
+    assert_eq!((code, v["code"].as_str()), (403, Some("origin_refused")));
+    let (code, _) = get(&format!(
+        "Host: 127.0.0.1:{p}\r\nSec-Fetch-Site: cross-site\r\n"
+    ));
+    assert_eq!(code, 403);
+    // Even with the token, a rebinding page is refused.
+    let (code, _) = raw(
+        p,
+        &format!(
+            "GET /v1/state HTTP/1.1\r\nHost: rebind.example:{p}\r\nAuthorization: Bearer {}\r\n\r\n",
+            r.token
+        ),
+    );
+    assert_eq!(code, 403);
+}
+
+#[test]
+fn health_reports_staleness() {
+    let r = running(Limits::default());
+    let (code, v) = send(r.port, "GET", "/v1/health", None, "");
+    assert_eq!(code, 200);
+    assert_eq!(v["stale"], true, "no sample yet: {v}");
+    assert_eq!(v["health"], "stale");
+    assert!(v["sample_age_secs"].is_null());
+}
+
+#[test]
+fn connections_beyond_the_limit_get_503() {
+    let r = running(Limits {
+        max_connections: 1,
+        deadline: Duration::from_secs(2),
+        ..Limits::default()
+    });
+    // Hold the only slot with a request that never finishes.
+    let mut hold = TcpStream::connect(("127.0.0.1", r.port)).unwrap();
+    hold.write_all(b"GET /v1/health HTTP/1.1\r\n").unwrap();
+    std::thread::sleep(Duration::from_millis(100));
+    let (code, v) = send(r.port, "GET", "/v1/health", None, "");
+    assert_eq!(
+        (code, v["code"].as_str()),
+        (503, Some("too_many_connections"))
+    );
+    // The slow one times out with 408 and frees the slot.
+    let mut out = String::new();
+    hold.set_read_timeout(Some(Duration::from_secs(10)))
+        .unwrap();
+    let _ = hold.read_to_string(&mut out);
+    assert!(out.starts_with("HTTP/1.1 408"), "{out}");
+    std::thread::sleep(Duration::from_millis(100));
+    assert_eq!(send(r.port, "GET", "/v1/health", None, "").0, 200);
+}
+
+#[test]
+fn oversized_bodies_are_refused_over_the_socket() {
+    let r = running(Limits::default());
+    let (code, v) = raw(
+        r.port,
+        &format!(
+            "POST /v1/clean HTTP/1.1\r\nHost: 127.0.0.1:{}\r\nContent-Length: 5000000\r\n\r\n",
+            r.port
+        ),
+    );
+    assert_eq!((code, v["code"].as_str()), (413, Some("body_too_large")));
+}
+
+// ------------------------------------------------------------- client
+
+#[test]
+fn the_client_only_talks_to_the_engine_holding_the_lock() {
+    let (_t, e) = engine();
+    // Nobody holds the lock: the client refuses before sending anything.
+    let server = serve_with(e.clone(), 0, Limits::default()).unwrap();
+    let port = server.port();
+    let err = Client::connect_in(e.paths(), port).unwrap_err();
+    assert!(err.contains("no Mulchie engine"), "{err}");
+    let mut lk = e.acquire_lock().unwrap();
+    assert!(
+        Client::connect_in(e.paths(), port).is_err(),
+        "no port announced yet"
+    );
+    lk.set_port(Some(port.wrapping_add(1))).unwrap();
+    assert!(Client::connect_in(e.paths(), port)
+        .unwrap_err()
+        .contains("listens on port"));
+    lk.set_port(Some(port)).unwrap();
+    let c = Client::connect_in(e.paths(), port).unwrap();
+    let st = c.call("GET", "/v1/state", None).unwrap();
+    assert_eq!(st["version"], VERSION);
+    let err = c
+        .request("POST", "/v1/sweep", Some(&json!({})), DEFAULT_TIMEOUT)
+        .unwrap_err();
+    assert_eq!((err.status, err.code.as_str()), (400, "items_required"));
+    server.stop();
+    drop(lk);
+}
+
+// -------------------------------------------------- plan then execute
+
+fn cache(root: &Path, rel: &str) -> PathBuf {
+    let dir = root.join(rel);
+    std::fs::create_dir_all(dir.join("target/debug")).unwrap();
+    std::fs::write(dir.join("Cargo.toml"), "[package]").unwrap();
+    std::fs::write(dir.join("target/CACHEDIR.TAG"), CACHEDIR_TAG_SIGNATURE).unwrap();
+    std::fs::write(dir.join("target/debug/blob"), vec![1u8; 10_000]).unwrap();
+    dir.join("target")
+}
+
+#[test]
+fn only_the_posted_items_are_executed() {
+    let r = running(Limits::default());
+    let c = Client::connect_in(r.engine.paths(), r.port).unwrap();
+    let root = r.code_root();
+    let a = cache(&root, "a");
+    let b = cache(&root, "b");
+    let plan = c
+        .call("POST", "/v1/clean/plan", Some(&json!({ "paths": [a, b] })))
+        .unwrap();
+    let items = plan["items"].as_array().unwrap();
+    assert!(items.iter().all(|i| i["ready"] == true), "{plan}");
+    let only_a = vec![items[0]["request"].clone()];
+    assert_eq!(only_a[0]["path"], a.display().to_string());
+    let res = c
+        .call("POST", "/v1/clean", Some(&json!({ "items": only_a })))
+        .unwrap();
+    assert_eq!(res.as_array().unwrap().len(), 1);
+    assert_eq!(res[0]["status"], "done");
+    assert!(!a.exists());
+    assert!(b.exists(), "planned and deletable, but not approved");
+
+    // An empty approval executes nothing.
+    let res = c
+        .call("POST", "/v1/clean", Some(&json!({ "items": [] })))
+        .unwrap();
+    assert_eq!(res, json!([]));
+    assert!(b.exists());
+}
+
+#[test]
+fn one_step_forms_are_refused_without_auto() {
+    let r = running(Limits::default());
+    let c = Client::connect_in(r.engine.paths(), r.port).unwrap();
+    let err = |m: &str, p: &str, b: Value| {
+        let e = c.request(m, p, Some(&b), DEFAULT_TIMEOUT).unwrap_err();
+        (e.status, e.code)
+    };
+    assert_eq!(
+        err("POST", "/v1/sweep", json!({})),
+        (400, "items_required".into())
+    );
+    assert_eq!(
+        err("POST", "/v1/clean", json!({ "stale": true })),
+        (400, "plan_required".into())
+    );
+    assert_eq!(
+        err(
+            "POST",
+            "/v1/worktree/remove",
+            json!({ "paths": ["/x"], "backup": true })
+        ),
+        (400, "expected_head_required".into())
+    );
+    assert_eq!(
+        err("POST", "/v1/worktree/remove", json!({})),
+        (400, "items_required".into())
+    );
+    let cache_item = json!({ "action": "delete_cache", "path": "/x", "require_stale": false });
+    assert_eq!(
+        err("POST", "/v1/sweep", json!({ "items": [cache_item] })),
+        (400, "invalid_item".into())
+    );
+    let wt_item = json!({ "action": "prune_worktree", "repo": "/r", "path": "/x" });
+    assert_eq!(
+        err("POST", "/v1/clean", json!({ "items": [wt_item] })),
+        (400, "invalid_item".into())
+    );
+    assert_eq!(
+        err("POST", "/v1/clean", json!({ "items": "x" })).1,
+        "invalid_body"
+    );
+    assert_eq!(
+        err("GET", "/v1/clean/plan?want_bytes=lots", Value::Null).1,
+        "invalid_query"
+    );
+    // The explicit one-step form exists for scripts and runs a fresh plan.
+    let res = c
+        .call("POST", "/v1/sweep", Some(&json!({ "auto": true })))
+        .unwrap();
+    assert_eq!(res, json!([]), "nothing sweepable in an empty tree");
+}
+
+#[test]
+fn leases_over_the_api() {
+    let r = running(Limits::default());
+    let c = Client::connect_in(r.engine.paths(), r.port).unwrap();
+    let e = c
+        .request(
+            "POST",
+            "/v1/lease",
+            Some(&json!({ "label": "x" })),
+            DEFAULT_TIMEOUT,
+        )
+        .unwrap_err();
+    assert_eq!((e.status, e.code.as_str()), (400, "lease_needs_pid_or_ttl"));
+    let e = c
+        .request(
+            "POST",
+            "/v1/lease",
+            Some(&json!({ "ttl_secs": 0 })),
+            DEFAULT_TIMEOUT,
+        )
+        .unwrap_err();
+    assert_eq!(e.code, "ttl_out_of_range");
+    let g = c
+        .call(
+            "POST",
+            "/v1/lease",
+            Some(&json!({ "label": "x", "ttl_secs": 60 })),
+        )
+        .unwrap();
+    assert!(g["ticket"].as_u64().is_some());
+    let rel = c
+        .call(
+            "POST",
+            "/v1/release",
+            Some(&json!({ "ticket": g["ticket"] })),
+        )
+        .unwrap();
+    assert_eq!(rel["released"], true);
+}

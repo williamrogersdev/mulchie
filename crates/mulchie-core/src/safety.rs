@@ -11,8 +11,9 @@
 use serde::{Deserialize, Serialize};
 use std::io::Write;
 use std::path::{Component, Path, PathBuf};
-use std::sync::Mutex;
-use std::time::Duration;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use crate::config::{create_private_dir, Config};
 use crate::diskmap::{self, last_activity};
@@ -61,6 +62,15 @@ const BACKUP_TIMEOUT: Duration = Duration::from_secs(120);
 /// an automatic sweep) never back up and remove the same worktree at once.
 static EXEC_LOCK: Mutex<()> = Mutex::new(());
 
+/// How long one gate reuses a read of the process table. A plan or execute call
+/// over many items reads the table once per window instead of once per item;
+/// the recheck just before a worktree is removed always reads it fresh.
+pub const PROC_VIEW_MAX_AGE: Duration = Duration::from_secs(2);
+
+/// Every process other than Mulchie itself; own processes carry their
+/// canonical working directory (others `None`, so they never make a path busy).
+type ProcView = Arc<Vec<(ProcFacts, Option<PathBuf>)>>;
+
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
 #[serde(rename_all = "snake_case")]
 pub enum SkipReason {
@@ -96,6 +106,14 @@ pub enum SkipReason {
     StartTimeMismatch,
     SignalFailed,
     UnknownTarget,
+    /// A package-manager prune: the category has no safe prune command.
+    NoPruneCommand,
+    /// A package-manager prune: the tool is not installed.
+    ToolNotFound,
+    /// A command ran past its deadline and was killed.
+    TimedOut,
+    /// A command ran and failed.
+    CommandFailed,
 }
 
 impl SkipReason {
@@ -380,6 +398,8 @@ pub struct Gate<'a> {
     pub procs: &'a dyn ProcessSource,
     pub journal: Option<&'a Journal>,
     pub now: u64,
+    proc_view: Mutex<Option<(Instant, ProcView)>>,
+    proc_reads: AtomicUsize,
 }
 
 struct CacheFacts {
@@ -422,7 +442,47 @@ impl<'a> Gate<'a> {
             procs,
             journal: None,
             now,
+            proc_view: Mutex::new(None),
+            proc_reads: AtomicUsize::new(0),
         }
+    }
+
+    /// How many times this gate has read the whole process table.
+    pub fn process_table_reads(&self) -> usize {
+        self.proc_reads.load(Ordering::SeqCst)
+    }
+
+    /// The process table as of at most [`PROC_VIEW_MAX_AGE`] ago, or read now
+    /// with `fresh`.
+    fn procs_view(&self, fresh: bool) -> ProcView {
+        let mut g = self.proc_view.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some((at, v)) = g.as_ref() {
+            if !fresh && at.elapsed() < PROC_VIEW_MAX_AGE {
+                return v.clone();
+            }
+        }
+        self.proc_reads.fetch_add(1, Ordering::SeqCst);
+        let uid = self.procs.current_uid();
+        let me = self.procs.self_pid();
+        let v: ProcView = Arc::new(
+            self.procs
+                .list()
+                .into_iter()
+                .filter(|p| p.pid != me)
+                .map(|p| {
+                    let c = if p.uid == Some(uid) {
+                        p.cwd
+                            .as_ref()
+                            .map(|c| c.canonicalize().unwrap_or_else(|_| c.clone()))
+                    } else {
+                        None
+                    };
+                    (p, c)
+                })
+                .collect(),
+        );
+        *g = Some((Instant::now(), v.clone()));
+        v
     }
 
     pub fn with_journal(mut self, journal: &'a Journal) -> Self {
@@ -710,11 +770,9 @@ impl<'a> Gate<'a> {
             if !self.config.include_xcode {
                 return skip(SkipReason::XcodeDisabled, "include_xcode is off");
             }
-            if let Some(p) =
-                self.procs.list().into_iter().find(|p| {
-                    matches!(p.name.to_ascii_lowercase().as_str(), "xcode" | "xcodebuild")
-                })
-            {
+            if let Some((p, _)) = self.procs_view(false).iter().find(|(p, _)| {
+                matches!(p.name.to_ascii_lowercase().as_str(), "xcode" | "xcodebuild")
+            }) {
                 return skip(
                     SkipReason::Busy,
                     format!("{} (pid {}) is running", p.name, p.pid),
@@ -761,14 +819,23 @@ impl<'a> Gate<'a> {
     /// `root`. With `nested`, directories inside another git checkout below `root`
     /// (a worktree inside the repo) belong to that checkout, not to `root`.
     fn busy_check(&self, root: &Path, nested: bool) -> Result<(), Skip> {
-        if let Some(p) = busy_process(self.procs, root, nested) {
+        self.busy_check_with(root, nested, false)
+    }
+
+    fn busy_check_with(&self, root: &Path, nested: bool, fresh: bool) -> Result<(), Skip> {
+        let root = root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
+        let view = self.procs_view(fresh);
+        let found = view
+            .iter()
+            .find(|(_, c)| c.as_deref().is_some_and(|c| cwd_in(c, &root, nested)));
+        if let Some((p, _)) = found {
             return skip(
                 SkipReason::Busy,
                 format!(
                     "{} (pid {}) is working in {}",
                     p.name,
                     p.pid,
-                    p.cwd.as_deref().unwrap_or(root).display()
+                    p.cwd.as_deref().unwrap_or(&root).display()
                 ),
             );
         }
@@ -1037,7 +1104,7 @@ impl<'a> Gate<'a> {
                 "files changed while backing up; nothing was removed",
             );
         }
-        self.busy_check(&f.path, false)?;
+        self.busy_check_with(&f.path, false, true)?;
 
         let mut g = Git::new(self.paths, &f.repo).args(["worktree", "remove"]);
         if f.dirty_files > 0 {
@@ -1309,10 +1376,10 @@ impl<'a> Gate<'a> {
     // ----------------------------------------------------------------- signal
 
     fn check_signal(&self, pid: u32, expected_start_time: u64) -> Result<ProcFacts, Skip> {
-        if pid <= 1 {
+        if pid <= 1 || pid > i32::MAX as u32 {
             return skip(
                 SkipReason::ProtectedProcess,
-                "pid 0 and 1 are never signalled",
+                "pid 0, pid 1 and pids that are not positive i32 values are never signalled",
             );
         }
         if pid == self.procs.self_pid() {
@@ -1494,9 +1561,17 @@ pub fn is_mulchie_process(p: &ProcFacts) -> bool {
             .unwrap_or(false)
 }
 
-/// Whether `pid` exists (signal 0).
+/// Whether `pid` exists (signal 0). `EPERM` means it exists but belongs to
+/// someone else, so it counts as alive. Values that would be negative as a
+/// `pid_t` (process groups, or "every process" for -1) are never alive.
 pub fn pid_alive(pid: u32) -> bool {
-    pid > 0 && unsafe { libc::kill(pid as i32, 0) == 0 }
+    if pid == 0 || pid > i32::MAX as u32 {
+        return false;
+    }
+    if unsafe { libc::kill(pid as i32, 0) } == 0 {
+        return true;
+    }
+    std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
 }
 
 /// `backup/<name>-<12-char sha>`.

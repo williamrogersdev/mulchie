@@ -116,20 +116,38 @@ fn call_tool(name: &str, a: &Value) -> Result<Value, String> {
             )
         }
         "reclaim_candidates" => Ok(get("/v1/state")?["scan"].clone()),
-        "clean_caches" => post(
-            "/v1/clean",
-            json!({ "paths": a["paths"], "stale": a["stale"].as_bool().unwrap_or(false) }),
-        ),
-        "prune_cache" => post("/v1/prune", json!({ "key": a["key"] })),
-        "remove_worktrees" => post(
-            "/v1/worktree/remove",
-            json!({ "paths": a["paths"], "backup": a["backup"].as_bool().unwrap_or(false) }),
-        ),
-        "sweep_worktrees" => {
-            if a["dry_run"].as_bool().unwrap_or(false) {
-                get("/v1/sweep")
+        "clean_caches" => {
+            if a["stale"].as_bool().unwrap_or(false) {
+                // Plan, then execute exactly the ready items of that plan.
+                let plan = get("/v1/clean/plan")?;
+                post("/v1/clean", json!({ "items": ready_requests(&plan) }))
             } else {
-                post("/v1/sweep", json!({}))
+                post("/v1/clean", json!({ "paths": a["paths"] }))
+            }
+        }
+        "prune_cache" => post("/v1/prune", json!({ "key": a["key"] })),
+        "remove_worktrees" => {
+            // The plan reads each HEAD now; removal fails if it moves after.
+            let plan = post(
+                "/v1/worktree/plan",
+                json!({ "paths": a["paths"], "allow_dirty": a["backup"].as_bool().unwrap_or(false) }),
+            )?;
+            let skipped: Vec<Value> = plan["items"]
+                .as_array()
+                .map(|v| v.iter().filter(|i| i["ready"] != true).cloned().collect())
+                .unwrap_or_default();
+            let done = post(
+                "/v1/worktree/remove",
+                json!({ "items": ready_requests(&plan) }),
+            )?;
+            Ok(json!({ "results": done, "not_ready": skipped }))
+        }
+        "sweep_worktrees" => {
+            let plan = get("/v1/sweep")?;
+            if a["dry_run"].as_bool().unwrap_or(false) {
+                Ok(plan)
+            } else {
+                post("/v1/sweep", json!({ "items": ready_requests(&plan) }))
             }
         }
         "workspace_action" => post(
@@ -150,6 +168,19 @@ fn call_tool(name: &str, a: &Value) -> Result<Value, String> {
         "release_build_slot" => post("/v1/release", json!({ "ticket": a["ticket"] })),
         other => Err(format!("unknown tool {other}")),
     }
+}
+
+/// The requests of a plan's ready items.
+fn ready_requests(plan: &Value) -> Vec<Value> {
+    plan["items"]
+        .as_array()
+        .map(|v| {
+            v.iter()
+                .filter(|i| i["ready"] == true)
+                .map(|i| i["request"].clone())
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 pub fn serve() -> i32 {

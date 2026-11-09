@@ -1,10 +1,11 @@
 use serde::Serialize;
 use std::collections::HashMap;
+use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 use sysinfo::{
-    CpuRefreshKind, Disks, MemoryRefreshKind, Pid, ProcessRefreshKind, ProcessStatus,
-    ProcessesToUpdate, System, UpdateKind,
+    CpuRefreshKind, MemoryRefreshKind, ProcessRefreshKind, ProcessStatus, ProcessesToUpdate,
+    System, UpdateKind,
 };
 
 use crate::paths::home_dir;
@@ -177,6 +178,55 @@ const BUILDS: &[&str] = &[
 ];
 const RUNTIMES: &[&str] = &["node", "bun", "deno", "python", "python3", "ruby", "java"];
 
+/// What the engine needs to throttle a process.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct KindInfo {
+    pub pid: u32,
+    pub kind: ProcKind,
+    /// Owned by the current user.
+    pub own: bool,
+    pub start_time: u64,
+}
+
+/// Classify by every name the process goes by: its kernel name (cut to 15
+/// characters on Linux), its executable's file name and `argv[0]`; for an
+/// interpreter (`node`, `python3`, …) also the script it runs, so `node …/tsc`
+/// is a build and `node …/claude` an agent. The most specific kind wins.
+pub fn classify_names(name: &str, exe: Option<&Path>, cmd: &[OsString]) -> ProcKind {
+    let base = |s: &str| -> String {
+        let b = s.rsplit('/').next().unwrap_or(s);
+        let b = [".js", ".cjs", ".mjs", ".py"]
+            .iter()
+            .find_map(|e| b.strip_suffix(e))
+            .unwrap_or(b);
+        b.to_string()
+    };
+    let pick = |best: ProcKind, n: &str| {
+        let k = classify(&base(n));
+        if (k as u8) < (best as u8) {
+            k
+        } else {
+            best
+        }
+    };
+    let mut best = classify(name);
+    if let Some(e) = exe {
+        best = pick(best, &e.to_string_lossy());
+    }
+    if let Some(a) = cmd.first() {
+        best = pick(best, &a.to_string_lossy());
+    }
+    if best == ProcKind::Runtime {
+        if let Some(a) = cmd.get(1) {
+            let a = a.to_string_lossy();
+            if !a.starts_with('-') {
+                best = pick(best, &a);
+            }
+        }
+    }
+    best
+}
+
 pub fn classify(name: &str) -> ProcKind {
     let n = name.to_ascii_lowercase();
     let base = n.split(['.', ' ']).next().unwrap_or(&n);
@@ -194,7 +244,11 @@ pub fn classify(name: &str) -> ProcKind {
 pub struct Monitor {
     sys: System,
     home: PathBuf,
+    /// Home and the scan roots: processes working under any of them are
+    /// attributed to a checkout.
+    bases: Vec<PathBuf>,
     root_cache: RootCache,
+    disk_mount: Option<PathBuf>,
     branch_cache: HashMap<PathBuf, (Instant, Option<String>)>,
     last: Instant,
     me: u32,
@@ -212,12 +266,29 @@ impl Monitor {
         sys.refresh_cpu_specifics(CpuRefreshKind::nothing().with_usage());
         Self {
             sys,
+            bases: vec![home.clone()],
             home,
             root_cache: HashMap::new(),
+            disk_mount: None,
             branch_cache: HashMap::new(),
             last: Instant::now(),
             me: std::process::id(),
             samples: 0,
+        }
+    }
+
+    /// Attribute processes working under these roots too, not only under home.
+    pub fn set_roots(&mut self, roots: &[PathBuf]) {
+        let mut bases = vec![self.home.clone()];
+        for r in roots {
+            let r = r.canonicalize().unwrap_or_else(|_| r.clone());
+            if !bases.iter().any(|b| r.starts_with(b)) {
+                bases.push(r);
+            }
+        }
+        if bases != self.bases {
+            self.bases = bases;
+            self.root_cache.clear();
         }
     }
 
@@ -267,7 +338,7 @@ impl Monitor {
                 start_time: p.start_time(),
             })
             .collect();
-        let roots = attribute(&facts, my_uid, &self.home, &mut self.root_cache);
+        let roots = attribute(&facts, my_uid, &self.bases, &mut self.root_cache);
         let bcache = &mut self.branch_cache;
         let home = self.home.clone();
         for (pid, p) in self.sys.processes() {
@@ -276,7 +347,7 @@ impl Monitor {
             }
             let own = p.user_id().map(|u| **u == my_uid).unwrap_or(false);
             let name = p.name().to_string_lossy().to_string();
-            let kind = classify(&name);
+            let kind = classify_names(&name, p.exe(), p.cmd());
             let du = p.disk_usage();
             let (read_bps, write_bps) = if io_valid {
                 (
@@ -381,6 +452,8 @@ impl Monitor {
             all.push(info);
         }
 
+        // Forget branches of checkouts nobody works in any more.
+        bcache.retain(|root, _| groups.contains_key(root));
         let mut workspaces: Vec<Workspace> = groups.into_values().collect();
         for w in &mut workspaces {
             w.procs.sort_by(|a, b| {
@@ -417,7 +490,11 @@ impl Monitor {
             .collect();
         top.sort_by(|a, b| b.cpu_pct.total_cmp(&a.cpu_pct));
 
-        let (disk_mount, disk_total, disk_free) = home_disk(&self.home);
+        let (disk_total, disk_free) = disk_space(&self.home).unwrap_or((0, 0));
+        let disk_mount = self
+            .disk_mount
+            .get_or_insert_with(|| mount_point(&self.home))
+            .clone();
         let load = System::load_average()
             .map(|l| [l.one, l.five, l.fifteen])
             .unwrap_or_default();
@@ -445,11 +522,19 @@ impl Monitor {
         }
     }
 
-    pub fn process_kinds(&self) -> Vec<(Pid, ProcKind)> {
+    /// Every process in the last sample with its kind, owner and start time.
+    pub fn process_kinds(&self) -> Vec<KindInfo> {
+        let uid = unsafe { libc::getuid() };
         self.sys
             .processes()
             .iter()
-            .map(|(pid, p)| (*pid, classify(&p.name().to_string_lossy())))
+            .filter(|(_, p)| p.thread_kind().is_none())
+            .map(|(pid, p)| KindInfo {
+                pid: pid.as_u32(),
+                kind: classify_names(&p.name().to_string_lossy(), p.exe(), p.cmd()),
+                own: p.user_id().map(|u| **u == uid).unwrap_or(false),
+                start_time: p.start_time(),
+            })
             .collect()
     }
 }
@@ -501,18 +586,19 @@ fn app_group(exe: Option<&Path>, name: &str) -> String {
 
 /// Attribute each process to the git checkout it works in: its own working
 /// directory's checkout, else the nearest own ancestor's (up to 8 levels). Only
-/// processes owned by `uid` with a working directory under `home` are attributed.
+/// processes owned by `uid` with a working directory under one of `bases` (home
+/// and the scan roots) are attributed.
 pub fn attribute(
     procs: &[ProcFacts],
     uid: u32,
-    home: &Path,
+    bases: &[PathBuf],
     cache: &mut RootCache,
 ) -> HashMap<u32, (PathBuf, bool)> {
     let mut direct: HashMap<u32, (u32, bool, DirectEntry)> = HashMap::with_capacity(procs.len());
     for p in procs {
         let own = p.uid == Some(uid);
         let root = if own {
-            p.cwd.as_deref().and_then(|c| cached_root(cache, c, home))
+            p.cwd.as_deref().and_then(|c| cached_root(cache, c, bases))
         } else {
             None
         };
@@ -541,11 +627,11 @@ pub fn attribute(
         .collect()
 }
 
-fn cached_root(cache: &mut RootCache, cwd: &Path, home: &Path) -> Option<(PathBuf, bool)> {
+fn cached_root(cache: &mut RootCache, cwd: &Path, bases: &[PathBuf]) -> Option<(PathBuf, bool)> {
     if let Some(hit) = cache.get(cwd) {
         return hit.clone();
     }
-    let found = find_root(cwd, home);
+    let found = find_root(cwd, bases);
     if cache.len() > 20_000 {
         cache.clear();
     }
@@ -567,8 +653,13 @@ fn cached_branch(
     b
 }
 
-fn find_root(cwd: &Path, home: &Path) -> Option<(PathBuf, bool)> {
-    if !cwd.starts_with(home) || cwd == home {
+fn find_root(cwd: &Path, bases: &[PathBuf]) -> Option<(PathBuf, bool)> {
+    // The deepest base containing `cwd`; the base itself is no workspace.
+    let home = bases
+        .iter()
+        .filter(|b| cwd.starts_with(b))
+        .max_by_key(|b| b.components().count())?;
+    if cwd == home {
         return None;
     }
     let mut cur = Some(cwd);
@@ -671,30 +762,57 @@ fn label_for(root: &Path, is_worktree: bool) -> String {
     format!("{} › {name}", repo_name(root, true))
 }
 
-fn home_disk(home: &Path) -> (PathBuf, u64, u64) {
-    let Ok(disks) = Disks::new_with_refreshed_list() else {
-        return (PathBuf::from("/"), 0, 0);
-    };
-    let mut best: Option<&sysinfo::Disk> = None;
-    for d in disks.iter() {
-        let mp = d.mount_point();
-        if home.starts_with(mp) {
-            let longer = best
-                .map(|b| mp.as_os_str().len() > b.mount_point().as_os_str().len())
-                .unwrap_or(true);
-            if longer {
-                best = Some(d);
-            }
+/// Total and available bytes on the filesystem holding `path`, from one
+/// `statfs`/`statvfs` call (no listing of every mounted disk). Available is what
+/// an unprivileged user can write (`f_bavail`); on APFS it does not count
+/// purgeable space, so it can be lower than what Finder shows.
+pub fn disk_space(path: &Path) -> Option<(u64, u64)> {
+    use std::os::unix::ffi::OsStrExt;
+    let c = std::ffi::CString::new(path.as_os_str().as_bytes()).ok()?;
+    #[cfg(target_os = "macos")]
+    unsafe {
+        // statfs has 64-bit block counts on macOS; statvfs's are 32-bit.
+        let mut st: libc::statfs = std::mem::zeroed();
+        if libc::statfs(c.as_ptr(), &mut st) != 0 {
+            return None;
         }
+        let bs = st.f_bsize as u64;
+        Some((
+            st.f_blocks.saturating_mul(bs),
+            st.f_bavail.saturating_mul(bs),
+        ))
     }
-    match best {
-        Some(d) => (
-            d.mount_point().to_path_buf(),
-            d.total_space(),
-            d.available_space(),
-        ),
-        None => (PathBuf::from("/"), 0, 0),
+    #[cfg(not(target_os = "macos"))]
+    unsafe {
+        let mut st: libc::statvfs = std::mem::zeroed();
+        if libc::statvfs(c.as_ptr(), &mut st) != 0 {
+            return None;
+        }
+        let fr = st.f_frsize as u64;
+        Some((
+            (st.f_blocks as u64).saturating_mul(fr),
+            (st.f_bavail as u64).saturating_mul(fr),
+        ))
     }
+}
+
+/// The mount point of the filesystem holding `path`: the highest ancestor on
+/// the same device. Computed once per monitor.
+fn mount_point(path: &Path) -> PathBuf {
+    use std::os::unix::fs::MetadataExt;
+    let Ok(dev) = std::fs::metadata(path).map(|m| m.dev()) else {
+        return PathBuf::from("/");
+    };
+    let mut best = path.to_path_buf();
+    let mut cur = path.parent();
+    while let Some(d) = cur {
+        match std::fs::metadata(d) {
+            Ok(m) if m.dev() == dev => best = d.to_path_buf(),
+            _ => break,
+        }
+        cur = d.parent();
+    }
+    best
 }
 
 pub fn now_unix() -> u64 {
@@ -729,11 +847,88 @@ mod tests {
         foreign.uid = Some(table.uid + 1);
         table.procs.push(foreign);
         let mut cache = RootCache::new();
-        let roots = attribute(&table.list(), table.current_uid(), &home, &mut cache);
+        let roots = attribute(
+            &table.list(),
+            table.current_uid(),
+            std::slice::from_ref(&home),
+            &mut cache,
+        );
         assert_eq!(roots.get(&10), Some(&(wt.clone(), true)));
         assert_eq!(roots.get(&11), Some(&(wt.clone(), true)), "child inherits");
         assert_eq!(roots.get(&12), Some(&(repo.clone(), false)));
         assert!(!roots.contains_key(&13), "home itself is no workspace");
         assert!(!roots.contains_key(&14), "other users are not attributed");
+    }
+
+    #[test]
+    fn scan_roots_outside_home_are_attributed() {
+        let t = tempfile::tempdir().unwrap();
+        let base = t.path().canonicalize().unwrap();
+        let home = base.join("home");
+        let srv = base.join("srv/code");
+        let repo = srv.join("repo");
+        std::fs::create_dir_all(&home).unwrap();
+        std::fs::create_dir_all(repo.join(".git")).unwrap();
+        let table = FakeProcesses::empty()
+            .with(20, "cargo", Some(repo.join("src")), 1)
+            .with(21, "zsh", Some(srv.clone()), 1);
+        let mut cache = RootCache::new();
+        let only_home = attribute(
+            &table.list(),
+            table.uid,
+            std::slice::from_ref(&home),
+            &mut cache,
+        );
+        assert!(only_home.is_empty());
+        let mut cache = RootCache::new();
+        let roots = attribute(&table.list(), table.uid, &[home, srv], &mut cache);
+        assert_eq!(roots.get(&20), Some(&(repo, false)));
+        assert!(
+            !roots.contains_key(&21),
+            "a scan root itself is no workspace"
+        );
+    }
+
+    #[test]
+    fn truncated_linux_names_classify_by_exe_and_argv() {
+        let os = |v: &[&str]| v.iter().map(OsString::from).collect::<Vec<_>>();
+        // comm is cut to 15 characters: "build-script-build" -> "build-script-bu".
+        assert_eq!(classify("build-script-bu"), ProcKind::Other);
+        assert_eq!(
+            classify_names(
+                "build-script-bu",
+                Some(Path::new("/t/build/x/build-script-build")),
+                &[]
+            ),
+            ProcKind::Build
+        );
+        assert_eq!(
+            classify_names(
+                "node",
+                None,
+                &os(&["node", "/usr/lib/node_modules/typescript/bin/tsc"])
+            ),
+            ProcKind::Build
+        );
+        assert_eq!(
+            classify_names("node", None, &os(&["node", "/home/u/.local/bin/claude"])),
+            ProcKind::Agent
+        );
+        assert_eq!(
+            classify_names("node", None, &os(&["node", "--inspect"])),
+            ProcKind::Runtime
+        );
+        assert_eq!(
+            classify_names("zsh", None, &os(&["zsh", "cargo"])),
+            ProcKind::Other
+        );
+    }
+
+    #[test]
+    fn disk_space_reads_the_filesystem_of_a_path() {
+        let t = tempfile::tempdir().unwrap();
+        let (total, free) = disk_space(t.path()).unwrap();
+        assert!(total > 0 && free <= total);
+        assert!(mount_point(t.path()).is_absolute());
     }
 }

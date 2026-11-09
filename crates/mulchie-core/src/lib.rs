@@ -14,7 +14,7 @@ pub mod safety;
 pub mod shutdown;
 
 pub use config::{Config, ConfigError, LoadedConfig};
-pub use engine::{Engine, Health, State, WorkspaceAction};
+pub use engine::{Engine, Health, LeaseRequest, State, WorkspaceAction};
 pub use monitor::{Monitor, Snapshot};
 pub use paths::Paths;
 pub use reclaim::ScanReport;

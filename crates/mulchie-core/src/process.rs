@@ -170,3 +170,102 @@ pub fn own_cwds(src: &dyn ProcessSource) -> Vec<PathBuf> {
     out.dedup();
     out
 }
+
+/// Names a process goes by, lowercased: its kernel name (15 characters at most
+/// on Linux), the file names of its executable and of its first two arguments
+/// (an interpreter runs `npm` as `node …/npm`), each also without a `.js`,
+/// `.cjs`, `.mjs`, `.rb` or `.py` extension.
+pub fn names_of(p: &ProcFacts) -> Vec<String> {
+    let base = |s: &str| s.rsplit('/').next().unwrap_or(s).to_ascii_lowercase();
+    let mut out = vec![p.name.to_ascii_lowercase()];
+    if let Some(e) = &p.exe {
+        out.push(base(&e.to_string_lossy()));
+    }
+    for a in p.cmd.iter().take(2) {
+        if !a.starts_with('-') {
+            out.push(base(a));
+        }
+    }
+    for n in out.clone() {
+        for ext in [".js", ".cjs", ".mjs", ".rb", ".py"] {
+            if let Some(stem) = n.strip_suffix(ext) {
+                out.push(stem.to_string());
+            }
+        }
+    }
+    out.retain(|n| !n.is_empty());
+    out.sort();
+    out.dedup();
+    out
+}
+
+/// Whether the process is one of `tools` (lowercase names), by any of
+/// [`names_of`]. A 15-character Linux `comm` that is a prefix of a longer tool
+/// name also matches.
+pub fn is_tool(p: &ProcFacts, tools: &[&str]) -> bool {
+    let names = names_of(p);
+    tools.iter().any(|t| {
+        names.iter().any(|n| {
+            n == t
+                || (n.len() == LINUX_COMM_LEN
+                    && t.len() > LINUX_COMM_LEN
+                    && t.starts_with(n.as_str()))
+        })
+    })
+}
+
+/// The kernel truncates a Linux process name (`comm`) to 15 bytes.
+pub const LINUX_COMM_LEN: usize = 15;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn p(name: &str, exe: Option<&str>, cmd: &[&str]) -> ProcFacts {
+        ProcFacts {
+            pid: 10,
+            ppid: 1,
+            uid: Some(0),
+            name: name.into(),
+            exe: exe.map(PathBuf::from),
+            cmd: cmd.iter().map(|s| s.to_string()).collect(),
+            cwd: None,
+            start_time: 0,
+        }
+    }
+
+    #[test]
+    fn tools_match_through_interpreters_and_truncated_names() {
+        assert!(is_tool(
+            &p(
+                "node",
+                Some("/usr/bin/node"),
+                &["node", "/usr/lib/node_modules/npm/bin/npm-cli.js"]
+            ),
+            &["npm-cli"]
+        ));
+        assert!(is_tool(
+            &p("node", None, &["node", "/opt/homebrew/bin/npm"]),
+            &["npm"]
+        ));
+        assert!(is_tool(
+            &p(
+                "ruby",
+                None,
+                &["ruby", "/opt/homebrew/Library/Homebrew/brew.rb"]
+            ),
+            &["brew"]
+        ));
+        // Linux comm is cut to 15 characters; the exe or the prefix still matches.
+        assert!(is_tool(
+            &p("rust-analyzer-p", None, &[]),
+            &["rust-analyzer-proc-macro-srv"]
+        ));
+        assert!(is_tool(&p("x", Some("/usr/bin/go"), &[]), &["go"]));
+        assert!(!is_tool(
+            &p("gopls", Some("/usr/bin/gopls"), &["gopls"]),
+            &["go"]
+        ));
+        assert!(!is_tool(&p("cargo", None, &["cargo", "--go"]), &["go"]));
+    }
+}

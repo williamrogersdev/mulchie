@@ -1,7 +1,8 @@
 mod mcp;
 
 use mulchie_core::api::Client;
-use mulchie_core::{human_bytes, Config, Engine, Monitor, Paths};
+use mulchie_core::process::SystemProcesses;
+use mulchie_core::{human_bytes, Config, Engine, Monitor, Paths, Request};
 use serde_json::{json, Value};
 use std::path::PathBuf;
 use std::time::Duration;
@@ -157,10 +158,7 @@ fn clean(args: &[String]) -> i32 {
     let dry = args.iter().any(|a| a == "--dry-run");
     let stale = args.iter().any(|a| a == "--stale");
     let engine = Engine::from_env();
-    {
-        let snap = sample();
-        engine.state.lock().unwrap().snapshot = snap;
-    }
+    engine.set_snapshot(sample());
     let paths: Vec<PathBuf> = if stale {
         let r = engine.run_scan();
         r.items
@@ -207,15 +205,32 @@ fn clean(args: &[String]) -> i32 {
 fn serve() -> i32 {
     let engine = Engine::from_env();
     let port = mulchie_core::config::effective_port(&engine.config());
+    let mut lock = match engine.acquire_lock() {
+        Ok(l) => l,
+        Err(e) => {
+            eprintln!("mulchie: {e}; not starting a second one");
+            return 1;
+        }
+    };
+    if let Err(e) = mulchie_core::shutdown::install_termination_handler() {
+        eprintln!("mulchie: cannot handle SIGTERM/SIGINT: {e}");
+    }
+    engine.enable_notifications();
     engine.start();
-    match mulchie_core::api::serve(engine, port) {
-        Ok(h) => {
+    match mulchie_core::api::serve(engine.clone(), port) {
+        Ok(server) => {
+            let _ = lock.set_port(Some(server.port()));
             println!("mulchie serving on http://127.0.0.1:{port}");
-            let _ = h.join();
+            mulchie_core::shutdown::wait_for_termination();
+            eprintln!("mulchie: stopping");
+            server.stop();
+            engine.shutdown(Duration::from_secs(10));
+            drop(lock);
             0
         }
         Err(e) => {
             eprintln!("could not start API on port {port}: {e}");
+            engine.shutdown(Duration::from_secs(10));
             1
         }
     }
@@ -240,7 +255,7 @@ fn flag<'a>(args: &'a [String], name: &str) -> Option<&'a str> {
 
 fn local_engine(scan: bool) -> Engine {
     let engine = Engine::from_env();
-    engine.state.lock().unwrap().snapshot = sample();
+    engine.set_snapshot(sample());
     if scan {
         engine.run_scan();
     }
@@ -346,18 +361,24 @@ fn worktrees(json_out: bool) -> i32 {
 fn sweep(args: &[String]) -> i32 {
     let dry = args.iter().any(|a| a == "--dry-run");
     let client = Client::connect();
-    let plan: Vec<Value> = match &client {
-        Some(c) => c
+    let local = if client.is_none() {
+        Some(local_engine(true))
+    } else {
+        None
+    };
+    let plan: Vec<Value> = match (&client, &local) {
+        (Some(c), _) => c
             .call("GET", "/v1/sweep", None)
             .ok()
             .and_then(|v| v["items"].as_array().cloned())
             .unwrap_or_default(),
-        None => local_engine(true)
+        (None, Some(e)) => e
             .sweep_plan()
             .items
             .into_iter()
             .filter_map(|w| serde_json::to_value(w).ok())
             .collect(),
+        (None, None) => Vec::new(),
     };
     let plan: Vec<Value> = plan
         .into_iter()
@@ -380,17 +401,25 @@ fn sweep(args: &[String]) -> i32 {
     if dry {
         return 0;
     }
-    let results: Vec<Value> = match &client {
-        Some(c) => c
-            .call("POST", "/v1/sweep", Some(&json!({})))
-            .ok()
-            .and_then(|v| v.as_array().cloned())
-            .unwrap_or_default(),
-        None => local_engine(true)
-            .sweep_worktrees("cli")
-            .into_iter()
-            .filter_map(|r| serde_json::to_value(r).ok())
-            .collect(),
+    // Execute exactly the items listed above, each re-checked by the gate.
+    let items: Vec<Value> = plan.iter().map(|w| w["request"].clone()).collect();
+    let results: Vec<Value> = match (&client, &local) {
+        (Some(c), _) => match c.call("POST", "/v1/sweep", Some(&json!({ "items": items }))) {
+            Ok(v) => v.as_array().cloned().unwrap_or_default(),
+            Err(e) => {
+                eprintln!("{e}");
+                return 1;
+            }
+        },
+        (None, Some(e)) => {
+            let reqs: Vec<Request> =
+                serde_json::from_value(Value::Array(items)).unwrap_or_default();
+            e.execute(&reqs, "cli")
+                .into_iter()
+                .filter_map(|r| serde_json::to_value(r).ok())
+                .collect()
+        }
+        (None, None) => Vec::new(),
     };
     report_removals(&results)
 }
@@ -420,8 +449,12 @@ fn prune(args: &[String]) -> i32 {
         Some(c) => c
             .call("POST", "/v1/prune", Some(&json!({ "key": key })))
             .unwrap_or(Value::Null),
-        None => serde_json::to_value(mulchie_core::diskmap::prune_cache(&Paths::from_env(), key))
-            .unwrap_or(Value::Null),
+        None => serde_json::to_value(mulchie_core::diskmap::prune_cache(
+            &Paths::from_env(),
+            &SystemProcesses::new(),
+            key,
+        ))
+        .unwrap_or(Value::Null),
     };
     println!("{}", s(&r, "output"));
     println!("freed {}", human_bytes(f(&r, "freed") as u64));

@@ -2,8 +2,9 @@
 
 use mulchie_core::diskmap::PruneResult;
 use mulchie_core::engine::{Advice, ProcAction, Sample};
+use mulchie_core::lock::EngineLock;
 use mulchie_core::{
-    human_bytes, ActionResult, Config, Engine, Health, Plan, State, WorkspaceAction,
+    human_bytes, ActionResult, Config, Engine, Health, Plan, Request, State, WorkspaceAction,
 };
 use serde::Serialize;
 use std::path::PathBuf;
@@ -40,7 +41,8 @@ fn clean(engine: tauri::State<Engine>, paths: Vec<String>) -> Vec<ActionResult> 
 
 #[tauri::command]
 fn clean_stale(engine: tauri::State<Engine>) -> Vec<ActionResult> {
-    engine.reclaim_stale(None, "manual")
+    // P6: the UI should show reclaim_plan and send back the approved items.
+    engine.reclaim_now(None, "manual")
 }
 
 #[tauri::command]
@@ -72,8 +74,26 @@ fn remove_worktrees(
     paths: Vec<String>,
     backup: bool,
 ) -> Vec<ActionResult> {
-    let paths: Vec<PathBuf> = paths.into_iter().map(PathBuf::from).collect();
-    engine.remove_worktrees(&paths, backup, "manual")
+    // The expected HEAD is the one in the scan this window displayed. P6: the
+    // UI should send it (or the items of a worktree plan) explicitly.
+    let map = engine.snapshot_state().diskmap.unwrap_or_default();
+    let reqs: Vec<Request> = paths
+        .into_iter()
+        .map(PathBuf::from)
+        .map(|p| match map.worktrees.iter().find(|w| w.path == p) {
+            Some(w) if w.missing => Request::PruneWorktree {
+                repo: w.repo.clone(),
+                path: p,
+            },
+            w => Request::RemoveWorktree {
+                expected_head: w.and_then(|w| w.head.clone()).unwrap_or_default(),
+                path: p,
+                allow_dirty: backup,
+                require_idle: false,
+            },
+        })
+        .collect();
+    engine.execute(&reqs, "manual")
 }
 
 #[tauri::command]
@@ -83,7 +103,8 @@ fn sweep_plan(engine: tauri::State<Engine>) -> Plan {
 
 #[tauri::command]
 fn sweep(engine: tauri::State<Engine>) -> Vec<ActionResult> {
-    engine.sweep_worktrees("manual")
+    // P6: the UI should send back the approved items of sweep_plan.
+    engine.sweep_now("manual")
 }
 
 #[tauri::command]
@@ -248,9 +269,22 @@ fn notify(title: &str, body: &str) {
     }
 }
 
+/// The engine lock, held for the app's lifetime.
+struct AppLock(#[allow(dead_code)] std::sync::Mutex<Option<EngineLock>>);
+
 fn main() {
     let engine = Engine::from_env();
     let port = mulchie_core::config::effective_port(&engine.config());
+    // One engine per user. When `mulchie serve` already runs, this window still
+    // shows the machine but leaves automatic actions and the API to it.
+    let engine_lock = match engine.acquire_lock() {
+        Ok(l) => Some(l),
+        Err(e) => {
+            eprintln!("mulchie: {e}; automatic actions and the API stay with it");
+            engine.set_automation_enabled(false);
+            None
+        }
+    };
     engine.start();
     let api_engine = engine.clone();
 
@@ -280,9 +314,16 @@ fn main() {
             #[cfg(target_os = "macos")]
             app.set_activation_policy(tauri::ActivationPolicy::Accessory);
 
-            if let Err(e) = mulchie_core::api::serve(api_engine.clone(), port) {
-                eprintln!("mulchie api not started on {port}: {e}");
+            let mut engine_lock = engine_lock;
+            if let Some(lk) = engine_lock.as_mut() {
+                match mulchie_core::api::serve(api_engine.clone(), port) {
+                    Ok(server) => {
+                        let _ = lk.set_port(Some(server.port()));
+                    }
+                    Err(e) => eprintln!("mulchie api not started on {port}: {e}"),
+                }
             }
+            app.manage(AppLock(std::sync::Mutex::new(engine_lock)));
 
             let icon = Image::from_bytes(include_bytes!("../icons/tray.png"))?;
             let tray = TrayIconBuilder::with_id("mulchie")

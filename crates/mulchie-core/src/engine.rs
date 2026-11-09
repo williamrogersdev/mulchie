@@ -1,26 +1,50 @@
+//! The engine: a sample loop (every 3 s: machine snapshot, throttling, leases,
+//! alerts) and a scan loop (caches and worktrees, plus every destructive job),
+//! both supervised, sharing one [`State`].
+//!
+//! Destructive work never runs on the sample loop. The sample loop asks for it
+//! over a job channel ([`Job`]) and the scan loop carries it out through the
+//! safety gate.
+
 use serde::{Deserialize, Serialize};
-use std::collections::{BTreeMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
+use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Condvar, Mutex};
+use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 use crate::config::{Config, ConfigError, LoadedConfig};
 use crate::diskmap::{self, DiskMap, PruneResult};
 pub use crate::journal::Action;
 use crate::journal::Journal;
-use crate::monitor::{now_unix, Monitor, ProcKind, Snapshot};
+use crate::lock;
+use crate::monitor::{now_unix, KindInfo, Monitor, ProcKind, Snapshot};
 use crate::paths::Paths;
 use crate::process::{own_cwds, ProcessSource, SystemProcesses};
 use crate::reclaim::{self, ScanReport};
-use crate::safety::{
-    pid_alive, ActionKind, ActionResult, Gate, Outcome, Plan, Request, Signal, SkipReason,
-};
+use crate::safety::{pid_alive, ActionResult, Gate, Outcome, Plan, Request, Signal};
 
 const HISTORY_LEN: usize = 600;
-const SAMPLE_SECS: u64 = 3;
+pub const SAMPLE_SECS: u64 = 3;
+/// Health reads `stale` when the last sample is older than this.
+pub const STALE_AFTER_SECS: u64 = 15;
 /// Activity entries kept in memory and loaded from the journal on start.
 const ACTIONS_KEPT: usize = 500;
+/// Automatic reclaim runs at most this often.
+const RECLAIM_COOLDOWN: Duration = Duration::from_secs(600);
+/// The scan loop wakes at least this often to check whether a scan is due.
+const SCAN_POLL: Duration = Duration::from_secs(2);
+/// Longest lease TTL a caller may ask for.
+pub const MAX_LEASE_TTL_SECS: u64 = 86_400;
+/// A waiter that has not polled for this long (or its TTL, if longer) leaves
+/// the queue.
+pub const WAITER_POLL_SECS: u64 = 30;
+/// A supervised loop that ran this long before panicking restarts without
+/// backoff.
+const HEALTHY_RUN: Duration = Duration::from_secs(60);
+const MAX_BACKOFF: Duration = Duration::from_secs(60);
 
 #[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -42,13 +66,15 @@ pub enum ProcAction {
     Renice { nice: i32 },
 }
 
-#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum Health {
     Good,
     Busy,
     Strained,
     Critical,
+    /// No sample in the last [`STALE_AFTER_SECS`]: the figures are old.
+    Stale,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -75,18 +101,23 @@ pub struct Forecast {
 pub struct Lease {
     pub id: u64,
     pub label: String,
-    pub pid: u32,
+    /// The process the lease belongs to; it ends when that process exits.
+    pub pid: Option<u32>,
     pub since_unix: u64,
     pub jobs: usize,
+    /// The lease ends unless renewed (the same ticket sent again) within this.
+    pub ttl_secs: Option<u64>,
+    pub expires_unix: Option<u64>,
 }
 
 #[derive(Debug, Clone, Serialize)]
 pub struct Waiter {
     pub id: u64,
     pub label: String,
-    pub pid: u32,
+    pub pid: Option<u32>,
     pub since_unix: u64,
     pub last_poll: u64,
+    pub ttl_secs: Option<u64>,
 }
 
 #[derive(Debug, Clone, Serialize, Default)]
@@ -104,6 +135,52 @@ pub struct LeaseReply {
     pub jobs: usize,
     pub position: usize,
     pub reason: String,
+    pub expires_unix: Option<u64>,
+}
+
+/// A build-slot request. A lease needs a live `pid`, a `ttl_secs`, or both.
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct LeaseRequest {
+    #[serde(default)]
+    pub label: String,
+    #[serde(default)]
+    pub pid: Option<u32>,
+    #[serde(default)]
+    pub ticket: Option<u64>,
+    #[serde(default)]
+    pub ttl_secs: Option<u64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LeaseError {
+    NeedsPidOrTtl,
+    PidNotAlive(u32),
+    TtlOutOfRange(u64),
+}
+
+impl LeaseError {
+    pub fn code(&self) -> &'static str {
+        match self {
+            LeaseError::NeedsPidOrTtl => "lease_needs_pid_or_ttl",
+            LeaseError::PidNotAlive(_) => "pid_not_alive",
+            LeaseError::TtlOutOfRange(_) => "ttl_out_of_range",
+        }
+    }
+}
+
+impl std::fmt::Display for LeaseError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            LeaseError::NeedsPidOrTtl => write!(
+                f,
+                "a lease needs the pid of a live process or a ttl_secs (renew by sending the ticket again)"
+            ),
+            LeaseError::PidNotAlive(p) => write!(f, "process {p} is not running"),
+            LeaseError::TtlOutOfRange(t) => {
+                write!(f, "ttl_secs {t} is out of range 1..={MAX_LEASE_TTL_SECS}")
+            }
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -115,6 +192,47 @@ pub struct Advice {
     pub reasons: Vec<String>,
 }
 
+/// One supervised loop's restarts.
+#[derive(Debug, Clone, Serialize, Default)]
+pub struct LoopStatus {
+    pub restarts: u32,
+    pub last_panic: Option<String>,
+    pub last_panic_unix: Option<u64>,
+}
+
+#[derive(Debug, Clone, Serialize, Default)]
+pub struct Loops {
+    pub sample: LoopStatus,
+    pub scan: LoopStatus,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LoopName {
+    Sample,
+    Scan,
+}
+
+/// What `/v1/health` reports, read without cloning the whole state.
+#[derive(Debug, Clone, Serialize)]
+pub struct HealthSummary {
+    pub name: &'static str,
+    pub version: String,
+    pub health: Health,
+    pub stale: bool,
+    pub sample_age_secs: Option<u64>,
+    pub disk_free: u64,
+    pub disk_total: u64,
+    pub cpu_pct: f32,
+    pub load: [f64; 3],
+    pub mem_free_pct: f32,
+    pub agents: usize,
+    pub builds: usize,
+    pub free_slots: usize,
+    pub ok_to_start_heavy_work: bool,
+    pub reclaimable_stale: u64,
+    pub restarts: u32,
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct State {
     pub version: String,
@@ -122,9 +240,12 @@ pub struct State {
     /// Why the config file was not used, if it was not. While set, the engine runs
     /// on defaults with every automatic destructive behaviour off.
     pub config_error: Option<String>,
-    pub snapshot: Snapshot,
-    pub scan: Option<ScanReport>,
-    pub diskmap: Option<DiskMap>,
+    /// Shared with readers; a poll clones a pointer, not the process list.
+    pub snapshot: Arc<Snapshot>,
+    /// Seconds since the last sample; `None` before the first one.
+    pub sample_age_secs: Option<u64>,
+    pub scan: Option<Arc<ScanReport>>,
+    pub diskmap: Option<Arc<DiskMap>>,
     pub scanning: bool,
     pub health: Health,
     pub forecast: Forecast,
@@ -132,6 +253,10 @@ pub struct State {
     pub actions: VecDeque<Action>,
     pub throttled: usize,
     pub low_disk: bool,
+    pub loops: Loops,
+    /// Automatic reclaim, sweeping and throttling run only when true: the config
+    /// loaded cleanly and this engine holds the engine lock.
+    pub automation: bool,
 }
 
 impl State {
@@ -151,11 +276,13 @@ impl State {
             return;
         }
         if let Some(scan) = self.scan.as_mut() {
+            let scan = Arc::make_mut(scan);
             scan.items.retain(|i| !done.contains(&i.path));
             scan.total_bytes = scan.items.iter().map(|i| i.bytes).sum();
             scan.stale_bytes = scan.items.iter().filter(|i| i.stale).map(|i| i.bytes).sum();
         }
         if let Some(m) = self.diskmap.as_mut() {
+            let m = Arc::make_mut(m);
             m.worktrees.retain(|w| !done.contains(&w.path));
             m.worktree_bytes = m.worktrees.iter().map(|w| w.bytes).sum();
             m.sweepable_bytes = m
@@ -164,6 +291,18 @@ impl State {
                 .filter(|w| w.sweepable)
                 .map(|w| w.bytes)
                 .sum();
+        }
+    }
+
+    fn sample_age(&self, now: u64) -> Option<u64> {
+        (self.snapshot.at_unix > 0).then(|| now.saturating_sub(self.snapshot.at_unix))
+    }
+
+    /// Health as of `now`: stale when no sample is recent.
+    fn health_at(&self, now: u64) -> Health {
+        match self.sample_age(now) {
+            Some(a) if a <= STALE_AFTER_SECS => self.health,
+            _ => Health::Stale,
         }
     }
 }
@@ -199,15 +338,100 @@ pub fn auto_reclaim_need(cfg: &Config, disk_free: u64) -> Option<u64> {
     (need > 0).then_some(need)
 }
 
+/// Lock a mutex, recovering the data if a panicking thread poisoned it. Every
+/// update the engine makes leaves the state consistent between statements, so
+/// a panic elsewhere never makes it unusable.
+pub(crate) fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    m.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// Work the scan loop does on request.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Job {
+    Scan,
+    /// Delete stale caches until about `want_bytes` are free.
+    Reclaim {
+        want_bytes: u64,
+        source: String,
+    },
+    /// Remove idle agent worktrees.
+    Sweep {
+        source: String,
+    },
+}
+
+#[derive(Default)]
+struct Jobs {
+    queue: Mutex<VecDeque<Job>>,
+    ready: Condvar,
+}
+
+impl Jobs {
+    /// Queue `job` unless one of the same kind is already waiting.
+    fn push(&self, job: Job) -> bool {
+        let mut q = lock(&self.queue);
+        let same = |j: &Job| std::mem::discriminant(j) == std::mem::discriminant(&job);
+        if q.iter().any(same) {
+            return false;
+        }
+        q.push_back(job);
+        self.ready.notify_all();
+        true
+    }
+
+    fn pop_wait(&self, wait: Duration) -> Option<Job> {
+        let mut q = lock(&self.queue);
+        if q.is_empty() && !wait.is_zero() {
+            q = self
+                .ready
+                .wait_timeout(q, wait)
+                .map(|(g, _)| g)
+                .unwrap_or_else(|e| e.into_inner().0);
+        }
+        q.pop_front()
+    }
+
+    fn pending(&self) -> Vec<Job> {
+        lock(&self.queue).iter().cloned().collect()
+    }
+}
+
+/// A build process Mulchie lowered the priority of, and what it was before.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Reniced {
+    start_time: u64,
+    original: i32,
+    restore_failed: bool,
+}
+
+/// What the sample loop keeps between ticks.
+#[derive(Default)]
+pub struct SampleCtx {
+    monitor: Option<Monitor>,
+    last_reclaim: Option<Instant>,
+}
+
+/// What the scan loop keeps between ticks.
+#[derive(Default)]
+pub struct ScanCtx {
+    last_scan: Option<Instant>,
+}
+
 #[derive(Clone)]
 pub struct Engine {
-    pub state: Arc<Mutex<State>>,
+    state: Arc<Mutex<State>>,
     history: Arc<Mutex<VecDeque<Sample>>>,
-    scan_requested: Arc<AtomicBool>,
+    jobs: Arc<Jobs>,
     next_id: Arc<AtomicU64>,
     paths: Arc<Paths>,
     journal: Arc<Journal>,
     procs: Arc<dyn ProcessSource>,
+    shutdown: Arc<AtomicBool>,
+    automation_enabled: Arc<AtomicBool>,
+    notify: Arc<AtomicBool>,
+    reniced: Arc<Mutex<HashMap<u32, Reniced>>>,
+    threads: Arc<Mutex<Vec<JoinHandle<()>>>>,
+    backoff_ms: Arc<AtomicU64>,
 }
 
 impl Engine {
@@ -230,11 +454,14 @@ impl Engine {
     ) -> Self {
         let journal = Journal::new(&paths);
         let actions: VecDeque<Action> = journal.tail(ACTIONS_KEPT).into_iter().rev().collect();
+        let config_error = loaded.error.map(|e| e.to_string());
         let state = State {
             version: env!("CARGO_PKG_VERSION").into(),
             config: loaded.config,
-            config_error: loaded.error.map(|e| e.to_string()),
-            snapshot: Snapshot::default(),
+            automation: config_error.is_none(),
+            config_error,
+            snapshot: Arc::new(Snapshot::default()),
+            sample_age_secs: None,
             scan: None,
             diskmap: None,
             scanning: false,
@@ -244,15 +471,22 @@ impl Engine {
             actions,
             throttled: 0,
             low_disk: false,
+            loops: Loops::default(),
         };
         Self {
             state: Arc::new(Mutex::new(state)),
             history: Arc::new(Mutex::new(VecDeque::with_capacity(HISTORY_LEN))),
-            scan_requested: Arc::new(AtomicBool::new(true)),
+            jobs: Arc::new(Jobs::default()),
             next_id: Arc::new(AtomicU64::new(1)),
             paths: Arc::new(paths),
             journal: Arc::new(journal),
             procs,
+            shutdown: Arc::new(AtomicBool::new(false)),
+            automation_enabled: Arc::new(AtomicBool::new(true)),
+            notify: Arc::new(AtomicBool::new(false)),
+            reniced: Arc::new(Mutex::new(HashMap::new())),
+            threads: Arc::new(Mutex::new(Vec::new())),
+            backoff_ms: Arc::new(AtomicU64::new(1000)),
         }
     }
 
@@ -260,20 +494,69 @@ impl Engine {
         &self.paths
     }
 
+    /// Take the per-user engine lock. On [`lock::LockError::Held`] another
+    /// engine runs; the caller should act as its client (see
+    /// [`crate::api::Client`]) or call [`Engine::set_automation_enabled`] with
+    /// `false` before starting.
+    pub fn acquire_lock(&self) -> Result<lock::EngineLock, lock::LockError> {
+        lock::EngineLock::acquire(&self.paths, now_unix())
+    }
+
+    /// The whole state with `sample_age_secs` and a stale health filled in.
     pub fn snapshot_state(&self) -> State {
-        self.state.lock().unwrap().clone()
+        let now = now_unix();
+        let mut st = lock(&self.state).clone();
+        st.sample_age_secs = st.sample_age(now);
+        st.health = st.health_at(now);
+        st.automation = st.automation && self.automation_allowed();
+        st
+    }
+
+    /// The figures `/v1/health` reports, without cloning scans or processes.
+    pub fn health_summary(&self) -> HealthSummary {
+        let now = now_unix();
+        let adv = self.advice();
+        let st = lock(&self.state);
+        let s = &st.snapshot;
+        let health = st.health_at(now);
+        HealthSummary {
+            name: "mulchie",
+            version: st.version.clone(),
+            stale: health == Health::Stale,
+            health,
+            sample_age_secs: st.sample_age(now),
+            disk_free: s.disk_free,
+            disk_total: s.disk_total,
+            cpu_pct: s.cpu_pct,
+            load: s.load,
+            mem_free_pct: s.mem_free_pct(),
+            agents: s.agent_count,
+            builds: s.build_count,
+            free_slots: adv.free_slots,
+            ok_to_start_heavy_work: adv.ok_to_start_heavy_work,
+            reclaimable_stale: st.scan.as_ref().map(|s| s.stale_bytes).unwrap_or(0),
+            restarts: st.loops.sample.restarts + st.loops.scan.restarts,
+        }
+    }
+
+    /// Replace the machine snapshot (the CLI samples once without loops).
+    pub fn set_snapshot(&self, snap: Snapshot) {
+        let cfg = self.config();
+        let mut st = lock(&self.state);
+        st.health = health_of(&snap, &cfg);
+        st.snapshot = Arc::new(snap);
     }
 
     pub fn history(&self) -> Vec<Sample> {
-        self.history.lock().unwrap().iter().cloned().collect()
+        lock(&self.history).iter().cloned().collect()
     }
 
     pub fn config(&self) -> Config {
-        self.state.lock().unwrap().config.clone()
+        lock(&self.state).config.clone()
     }
 
     pub fn config_error(&self) -> Option<String> {
-        self.state.lock().unwrap().config_error.clone()
+        lock(&self.state).config_error.clone()
     }
 
     /// Validate, save atomically, then apply. A file that failed to load is moved
@@ -281,16 +564,36 @@ impl Engine {
     pub fn set_config(&self, cfg: Config) -> Result<(), ConfigError> {
         cfg.save_to(&self.paths, now_unix())?;
         {
-            let mut st = self.state.lock().unwrap();
+            let mut st = lock(&self.state);
             st.config = cfg;
             st.config_error = None;
+            st.automation = true;
         }
         self.request_scan();
         Ok(())
     }
 
-    pub fn request_scan(&self) {
-        self.scan_requested.store(true, Ordering::SeqCst);
+    /// Queue a scan on the scan loop. False when one is already queued.
+    pub fn request_scan(&self) -> bool {
+        self.jobs.push(Job::Scan)
+    }
+
+    /// Jobs waiting for the scan loop.
+    pub fn pending_jobs(&self) -> Vec<Job> {
+        self.jobs.pending()
+    }
+
+    /// Turn automatic reclaim, sweeping and throttling on or off for this
+    /// engine. A second engine (the app while `mulchie serve` holds the lock)
+    /// runs with it off.
+    pub fn set_automation_enabled(&self, on: bool) {
+        self.automation_enabled.store(on, Ordering::SeqCst);
+    }
+
+    /// Show desktop notifications for alerts and automatic actions (headless
+    /// `serve`; the app shows its own).
+    pub fn enable_notifications(&self) {
+        self.notify.store(true, Ordering::SeqCst);
     }
 
     /// Record an activity entry in memory and in the journal.
@@ -313,201 +616,402 @@ impl Engine {
     }
 
     fn record(&self, a: Action) {
+        if a.kind == "alert" && self.notify.load(Ordering::SeqCst) {
+            crate::notify::notify("Mulchie", &a.detail);
+        }
         let _ = self.journal.append(&a);
-        self.state.lock().unwrap().push(a);
+        lock(&self.state).push(a);
     }
 
+    // ------------------------------------------------------------- lifecycle
+
+    /// Start the supervised sample and scan loops.
     pub fn start(&self) {
+        let mut threads = lock(&self.threads);
         let me = self.clone();
-        std::thread::Builder::new()
-            .name("mulchie-monitor".into())
-            .spawn(move || me.monitor_loop())
-            .ok();
+        if let Ok(h) = std::thread::Builder::new()
+            .name("mulchie-sample".into())
+            .spawn(move || me.supervise(LoopName::Sample, SampleCtx::default, Engine::sample_tick))
+        {
+            threads.push(h);
+        }
         let me = self.clone();
-        std::thread::Builder::new()
+        if let Ok(h) = std::thread::Builder::new()
             .name("mulchie-scan".into())
-            .spawn(move || me.scan_loop())
-            .ok();
-    }
-
-    /// Automatic destructive behaviour is allowed only with a config that loaded
-    /// cleanly.
-    fn automation_allowed(&self) -> bool {
-        self.state.lock().unwrap().config_error.is_none()
-    }
-
-    fn monitor_loop(&self) {
-        let mut mon = Monitor::with_home(self.paths.home.clone());
-        let mut reniced: HashSet<u32> = HashSet::new();
-        let mut last_reclaim = Instant::now() - Duration::from_secs(3600);
-        loop {
-            let tick = Instant::now();
-            let snap = mon.sample();
-            let cfg = self.config();
-            let health = health_of(&snap, &cfg);
-
-            let mut ws_top: Vec<(String, f32, u64)> = snap
-                .workspaces
-                .iter()
-                .map(|w| (w.label.clone(), w.cpu_pct, w.mem_bytes))
-                .collect();
-            ws_top.sort_by(|a, b| b.1.total_cmp(&a.1));
-            ws_top.truncate(10);
-            let forecast = {
-                let mut h = self.history.lock().unwrap();
-                h.push_back(Sample {
-                    t: snap.at_unix,
-                    cpu: snap.cpu_pct,
-                    load1: snap.load[0],
-                    mem_used: snap.mem_used(),
-                    swap: snap.swap_used,
-                    disk_free: snap.disk_free,
-                    read_bps: snap.read_bps,
-                    write_bps: snap.write_bps,
-                    ws: ws_top,
-                });
-                while h.len() > HISTORY_LEN {
-                    h.pop_front();
-                }
-                forecast(&h, &cfg)
-            };
-
-            let pressured = snap.mem_free_pct() < cfg.throttle_mem_free_pct
-                || snap.cpu_pct > cfg.throttle_cpu_pct;
-            let kinds = mon.process_kinds();
-            let mut newly = Vec::new();
-            if cfg.throttle_builds && pressured {
-                for (pid, kind) in &kinds {
-                    let pid = pid.as_u32();
-                    if *kind != ProcKind::Build || reniced.contains(&pid) {
-                        continue;
-                    }
-                    if renice(pid, cfg.build_nice) {
-                        reniced.insert(pid);
-                        newly.push(pid);
-                    }
-                }
-            }
-            let alive: HashSet<u32> = kinds.iter().map(|(p, _)| p.as_u32()).collect();
-            reniced.retain(|p| alive.contains(p));
-
-            let mut notes = Vec::new();
-            {
-                let mut st = self.state.lock().unwrap();
-                st.snapshot = snap.clone();
-                st.health = health;
-                st.forecast = forecast;
-                st.throttled = reniced.len();
-                let low = snap.disk_total > 0 && snap.disk_free_gb() < cfg.alert_below_gb as f64;
-                if low && !st.low_disk {
-                    notes.push(Action::note(
-                        now_unix(),
-                        "alert",
-                        format!("Free space below {} GB", cfg.alert_below_gb),
-                        snap.disk_free,
-                        None,
-                        "monitor",
-                    ));
-                }
-                st.low_disk = low;
-                let cap = capacity(&cfg, snap.cpu_count);
-                st.slots.capacity = cap;
-                st.slots.jobs_per_slot = (snap.cpu_count / cap).max(1);
-                st.slots.active.retain(|l| pid_alive(l.pid));
-                let now = now_unix();
-                st.slots
-                    .waiting
-                    .retain(|w| pid_alive(w.pid) && now.saturating_sub(w.last_poll) < 30);
-                if !newly.is_empty() {
-                    let mut by_ws: BTreeMap<String, usize> = BTreeMap::new();
-                    let mut seen = HashSet::new();
-                    for p in snap
-                        .workspaces
-                        .iter()
-                        .flat_map(|w| w.procs.iter())
-                        .chain(snap.top.iter())
-                    {
-                        if newly.contains(&p.pid) && seen.insert(p.pid) {
-                            *by_ws.entry(p.group.clone()).or_default() += 1;
-                        }
-                    }
-                    let named: usize = by_ws.values().sum();
-                    for (label, n) in by_ws {
-                        notes.push(Action::note(
-                            now,
-                            "throttle",
-                            format!("Lowered priority of {n} build process(es) under pressure"),
-                            0,
-                            Some(label),
-                            "optimizer",
-                        ));
-                    }
-                    if newly.len() > named {
-                        notes.push(Action::note(
-                            now,
-                            "throttle",
-                            format!(
-                                "Lowered priority of {} build process(es)",
-                                newly.len() - named
-                            ),
-                            0,
-                            None,
-                            "optimizer",
-                        ));
-                    }
-                }
-            }
-            for n in notes {
-                self.record(n);
-            }
-
-            if cfg.auto_reclaim
-                && self.automation_allowed()
-                && snap.disk_free_gb() < cfg.low_disk_gb as f64
-                && last_reclaim.elapsed() > Duration::from_secs(600)
-            {
-                last_reclaim = Instant::now();
-                if let Some(need) = auto_reclaim_need(&cfg, snap.disk_free) {
-                    self.reclaim_stale(Some(need), "optimizer");
-                }
-            }
-
-            std::thread::sleep(Duration::from_secs(SAMPLE_SECS).saturating_sub(tick.elapsed()));
+            .spawn(move || {
+                me.supervise(LoopName::Scan, ScanCtx::default, |e, c| {
+                    e.scan_tick(c, SCAN_POLL)
+                })
+            })
+        {
+            threads.push(h);
         }
     }
 
-    fn scan_loop(&self) {
-        let mut last = Instant::now() - Duration::from_secs(86_400);
-        loop {
-            let cfg = self.config();
-            let due = last.elapsed() > Duration::from_secs(cfg.scan_interval_mins.max(1) * 60);
-            if self.scan_requested.swap(false, Ordering::SeqCst) || due {
-                self.run_scan();
-                if cfg.auto_sweep_worktrees && due && self.automation_allowed() {
-                    self.sweep_worktrees("optimizer");
-                }
-                last = Instant::now();
+    pub fn is_shut_down(&self) -> bool {
+        self.shutdown.load(Ordering::SeqCst)
+    }
+
+    /// Stop both loops, wait up to `wait` for them (a scan in progress finishes
+    /// its current step first), and restore build priorities Mulchie lowered.
+    pub fn shutdown(&self, wait: Duration) {
+        self.shutdown.store(true, Ordering::SeqCst);
+        self.jobs.ready.notify_all();
+        let handles: Vec<JoinHandle<()>> = lock(&self.threads).drain(..).collect();
+        let deadline = Instant::now() + wait;
+        for h in handles {
+            while !h.is_finished() && Instant::now() < deadline {
+                std::thread::sleep(Duration::from_millis(20));
             }
-            std::thread::sleep(Duration::from_secs(2));
+            if h.is_finished() {
+                let _ = h.join();
+            }
+        }
+        self.restore_priorities("shutdown");
+    }
+
+    /// Sleep up to `d`, returning early on shutdown.
+    fn nap(&self, d: Duration) {
+        let end = Instant::now() + d;
+        while !self.is_shut_down() {
+            let left = end.saturating_duration_since(Instant::now());
+            if left.is_zero() {
+                break;
+            }
+            std::thread::sleep(left.min(Duration::from_millis(100)));
+        }
+    }
+
+    /// Run `tick` until shutdown. A panic is caught, logged and counted in
+    /// `state.loops`, and the loop restarts with fresh context after a backoff
+    /// that doubles per consecutive failure (up to a minute) and resets after a
+    /// minute of healthy running.
+    pub(crate) fn supervise<C>(
+        &self,
+        name: LoopName,
+        make: impl Fn() -> C,
+        mut tick: impl FnMut(&Engine, &mut C),
+    ) {
+        let mut failures: u32 = 0;
+        while !self.is_shut_down() {
+            let started = Instant::now();
+            let r = catch_unwind(AssertUnwindSafe(|| {
+                let mut ctx = make();
+                while !self.is_shut_down() {
+                    tick(self, &mut ctx);
+                }
+            }));
+            let Err(panic) = r else { break };
+            let msg = panic
+                .downcast_ref::<&str>()
+                .map(|s| s.to_string())
+                .or_else(|| panic.downcast_ref::<String>().cloned())
+                .unwrap_or_else(|| "panic".into());
+            if started.elapsed() >= HEALTHY_RUN {
+                failures = 0;
+            }
+            failures = failures.saturating_add(1);
+            let label = match name {
+                LoopName::Sample => "sample",
+                LoopName::Scan => "scan",
+            };
+            {
+                let mut st = lock(&self.state);
+                let ls = match name {
+                    LoopName::Sample => &mut st.loops.sample,
+                    LoopName::Scan => &mut st.loops.scan,
+                };
+                ls.restarts += 1;
+                ls.last_panic = Some(msg.clone());
+                ls.last_panic_unix = Some(now_unix());
+            }
+            self.log(
+                "error",
+                format!("{label} loop failed ({msg}); restarting"),
+                0,
+                None,
+                "engine",
+            );
+            let base = self.backoff_ms.load(Ordering::SeqCst);
+            let ms = base.saturating_mul(1u64 << (failures - 1).min(16));
+            self.nap(Duration::from_millis(ms).min(MAX_BACKOFF));
+        }
+    }
+
+    /// Automatic destructive behaviour is allowed only with a config that loaded
+    /// cleanly, on the engine that holds the lock.
+    fn automation_allowed(&self) -> bool {
+        self.automation_enabled.load(Ordering::SeqCst) && lock(&self.state).config_error.is_none()
+    }
+
+    // ----------------------------------------------------------- sample loop
+
+    /// One sample-loop iteration: sample, update state, sleep out the period.
+    pub fn sample_tick(&self, ctx: &mut SampleCtx) {
+        let tick = Instant::now();
+        let cfg = self.config();
+        let mon = ctx
+            .monitor
+            .get_or_insert_with(|| Monitor::with_home(self.paths.home.clone()));
+        mon.set_roots(&cfg.roots(&self.paths));
+        let snap = mon.sample();
+        let kinds = mon.process_kinds();
+        self.apply_sample(snap, &kinds, ctx);
+        self.nap(Duration::from_secs(SAMPLE_SECS).saturating_sub(tick.elapsed()));
+    }
+
+    /// Everything a sample changes: history, health, forecast, throttling,
+    /// leases, alerts, and a reclaim request when the disk is low.
+    pub fn apply_sample(&self, snap: Snapshot, kinds: &[KindInfo], ctx: &mut SampleCtx) {
+        let cfg = self.config();
+        let now = now_unix();
+        let health = health_of(&snap, &cfg);
+        let mut ws_top: Vec<(String, f32, u64)> = snap
+            .workspaces
+            .iter()
+            .map(|w| (w.label.clone(), w.cpu_pct, w.mem_bytes))
+            .collect();
+        ws_top.sort_by(|a, b| b.1.total_cmp(&a.1));
+        ws_top.truncate(10);
+        let forecast = {
+            let mut h = lock(&self.history);
+            h.push_back(Sample {
+                t: snap.at_unix,
+                cpu: snap.cpu_pct,
+                load1: snap.load[0],
+                mem_used: snap.mem_used(),
+                swap: snap.swap_used,
+                disk_free: snap.disk_free,
+                read_bps: snap.read_bps,
+                write_bps: snap.write_bps,
+                ws: ws_top,
+            });
+            while h.len() > HISTORY_LEN {
+                h.pop_front();
+            }
+            forecast(&h, &cfg)
+        };
+
+        let pressured =
+            snap.mem_free_pct() < cfg.throttle_mem_free_pct || snap.cpu_pct > cfg.throttle_cpu_pct;
+        let automation = self.automation_allowed();
+        let newly = if automation && cfg.throttle_builds && pressured {
+            self.throttle(kinds, cfg.build_nice)
+        } else {
+            // Pressure cleared, throttling turned off, or this engine is not
+            // the one that throttles: put priorities back.
+            self.forget_exited(kinds);
+            self.restore_priorities("optimizer");
+            Vec::new()
+        };
+        let throttled = lock(&self.reniced).len();
+
+        let mut notes = Vec::new();
+        {
+            let mut st = lock(&self.state);
+            st.health = health;
+            st.forecast = forecast;
+            st.throttled = throttled;
+            let low = snap.disk_total > 0 && snap.disk_free_gb() < cfg.alert_below_gb as f64;
+            if low && !st.low_disk {
+                notes.push(Action::note(
+                    now,
+                    "alert",
+                    format!("Free space below {} GB", cfg.alert_below_gb),
+                    snap.disk_free,
+                    None,
+                    "monitor",
+                ));
+            }
+            st.low_disk = low;
+            let cap = capacity(&cfg, snap.cpu_count);
+            st.slots.capacity = cap;
+            st.slots.jobs_per_slot = (snap.cpu_count / cap).max(1);
+            expire_leases(&mut st.slots, now);
+            if !newly.is_empty() {
+                notes.extend(throttle_notes(&snap, &newly, now));
+            }
+            st.snapshot = Arc::new(snap);
+        }
+        for n in notes {
+            self.record(n);
+        }
+
+        let st_snapshot = lock(&self.state).snapshot.clone();
+        if cfg.auto_reclaim
+            && automation
+            && st_snapshot.disk_total > 0
+            && st_snapshot.disk_free_gb() < cfg.low_disk_gb as f64
+            && ctx
+                .last_reclaim
+                .map(|t| t.elapsed() > RECLAIM_COOLDOWN)
+                .unwrap_or(true)
+        {
+            if let Some(need) = auto_reclaim_need(&cfg, st_snapshot.disk_free) {
+                ctx.last_reclaim = Some(Instant::now());
+                self.jobs.push(Job::Reclaim {
+                    want_bytes: need,
+                    source: "optimizer".into(),
+                });
+            }
+        }
+    }
+
+    /// Lower the priority of the user's own build processes. Returns the pids
+    /// newly lowered; each is remembered with its previous priority.
+    fn throttle(&self, kinds: &[KindInfo], nice: i32) -> Vec<u32> {
+        self.forget_exited(kinds);
+        let me = std::process::id();
+        let mut rn = lock(&self.reniced);
+        let mut newly = Vec::new();
+        for k in kinds {
+            if !k.own || k.kind != ProcKind::Build || k.pid == me || k.pid <= 1 {
+                continue;
+            }
+            if rn.contains_key(&k.pid) {
+                continue;
+            }
+            if let Some(original) = lower_priority(k.pid, nice) {
+                rn.insert(
+                    k.pid,
+                    Reniced {
+                        start_time: k.start_time,
+                        original,
+                        restore_failed: false,
+                    },
+                );
+                newly.push(k.pid);
+            }
+        }
+        newly
+    }
+
+    /// Stop tracking processes that exited (or whose pid was reused).
+    fn forget_exited(&self, kinds: &[KindInfo]) {
+        let alive: HashMap<u32, u64> = kinds.iter().map(|k| (k.pid, k.start_time)).collect();
+        lock(&self.reniced).retain(|pid, r| alive.get(pid) == Some(&r.start_time));
+    }
+
+    /// Put back the priorities Mulchie lowered. Raising priority again usually
+    /// needs privilege: a failure is journaled once and the process stays
+    /// counted as throttled until it exits.
+    fn restore_priorities(&self, source: &str) {
+        let (mut restored, mut failed) = (0usize, 0usize);
+        {
+            let mut rn = lock(&self.reniced);
+            rn.retain(|pid, r| {
+                if r.restore_failed {
+                    return true;
+                }
+                if set_nice(*pid, r.original).is_ok() {
+                    restored += 1;
+                    false
+                } else {
+                    failed += 1;
+                    r.restore_failed = true;
+                    true
+                }
+            });
+        }
+        if restored > 0 {
+            self.log(
+                "throttle",
+                format!("Restored the priority of {restored} build process(es)"),
+                0,
+                None,
+                source,
+            );
+        }
+        if failed > 0 {
+            self.log(
+                "throttle",
+                format!(
+                    "Could not restore the priority of {failed} build process(es); raising priority needs privilege, so they keep the lower priority until they exit"
+                ),
+                0,
+                None,
+                source,
+            );
+        }
+    }
+
+    // ------------------------------------------------------------- scan loop
+
+    /// One scan-loop iteration: a periodic scan when due, else the next job
+    /// (waiting up to `wait` for one).
+    pub fn scan_tick(&self, ctx: &mut ScanCtx, wait: Duration) {
+        let cfg = self.config();
+        let interval = Duration::from_secs(cfg.scan_interval_mins.max(1) * 60);
+        let due = ctx
+            .last_scan
+            .map(|t| t.elapsed() >= interval)
+            .unwrap_or(true);
+        if due {
+            let first = ctx.last_scan.is_none();
+            self.run_scan();
+            ctx.last_scan = Some(Instant::now());
+            if !first && cfg.auto_sweep_worktrees && self.automation_allowed() {
+                self.jobs.push(Job::Sweep {
+                    source: "optimizer".into(),
+                });
+            }
+            return;
+        }
+        let Some(job) = self.jobs.pop_wait(wait) else {
+            return;
+        };
+        self.run_job(job, ctx);
+    }
+
+    fn run_job(&self, job: Job, ctx: &mut ScanCtx) {
+        match job {
+            Job::Scan => {
+                self.run_scan();
+                ctx.last_scan = Some(Instant::now());
+            }
+            Job::Reclaim { want_bytes, source } => {
+                if self.automation_allowed() {
+                    let r = self.reclaim_now(Some(want_bytes), &source);
+                    self.announce(&r, "reclaimed");
+                }
+            }
+            Job::Sweep { source } => {
+                if self.automation_allowed() {
+                    let r = self.sweep_now(&source);
+                    self.announce(&r, "swept");
+                }
+            }
+        }
+    }
+
+    fn announce(&self, results: &[ActionResult], verb: &str) {
+        let freed: u64 = results.iter().map(|r| r.freed_bytes()).sum();
+        if freed > 0 && self.notify.load(Ordering::SeqCst) {
+            crate::notify::notify(
+                "Mulchie",
+                &format!("Automatically {verb} {}", crate::human_bytes(freed)),
+            );
         }
     }
 
     pub fn run_scan(&self) -> ScanReport {
         let cfg = {
-            let mut st = self.state.lock().unwrap();
+            let mut st = lock(&self.state);
             st.scanning = true;
             st.config.clone()
         };
         let cwds = own_cwds(&*self.procs);
         let now = now_unix();
         let report = reclaim::scan(&cfg, &self.paths, &cwds, now);
-        self.state.lock().unwrap().scan = Some(report.clone());
+        lock(&self.state).scan = Some(Arc::new(report.clone()));
         let map = diskmap::scan(&cfg, &self.paths, &cwds, now);
-        let mut st = self.state.lock().unwrap();
-        st.diskmap = Some(map);
+        let mut st = lock(&self.state);
+        st.diskmap = Some(Arc::new(map));
         st.scanning = false;
         report
     }
+
+    // ------------------------------------------------------- plan and execute
 
     fn gate_run<R>(&self, f: impl FnOnce(&Gate) -> R) -> R {
         let cfg = self.config();
@@ -521,11 +1025,12 @@ impl Engine {
         self.gate_run(|g| g.plan(requests))
     }
 
-    /// Execute approved requests through the safety gate. Each is re-checked now.
+    /// Execute exactly these requests through the safety gate; each is
+    /// re-checked now. Nothing else is touched.
     pub fn execute(&self, requests: &[Request], source: &str) -> Vec<ActionResult> {
         let now = now_unix();
         let results = self.gate_run(|g| g.execute(requests, source));
-        let mut st = self.state.lock().unwrap();
+        let mut st = lock(&self.state);
         for (r, req) in results.iter().zip(requests) {
             let sig = match req {
                 Request::Signal { signal, .. } => Some(*signal),
@@ -537,88 +1042,123 @@ impl Engine {
         results
     }
 
-    fn reject(
-        &self,
-        action: ActionKind,
-        target: String,
-        detail: &str,
-        source: &str,
-    ) -> ActionResult {
-        let r = ActionResult {
-            action,
-            target,
-            outcome: Outcome::Skipped {
-                reason: SkipReason::UnknownTarget,
-                detail: detail.into(),
-            },
-        };
-        self.record(r.to_action(now_unix(), source, None));
-        r
-    }
-
-    /// Delete specific caches (no staleness requirement).
-    pub fn clean_paths(&self, paths: &[PathBuf], source: &str) -> Vec<ActionResult> {
-        let reqs: Vec<Request> = paths
+    fn cache_requests(paths: &[PathBuf]) -> Vec<Request> {
+        paths
             .iter()
             .map(|p| Request::DeleteCache {
                 path: p.clone(),
                 require_stale: false,
             })
-            .collect();
-        self.execute(&reqs, source)
+            .collect()
+    }
+
+    /// Delete exactly these caches (no staleness requirement).
+    pub fn clean_paths(&self, paths: &[PathBuf], source: &str) -> Vec<ActionResult> {
+        self.execute(&Self::cache_requests(paths), source)
+    }
+
+    /// What deleting these caches would do, checked now.
+    pub fn clean_plan(&self, paths: &[PathBuf]) -> Plan {
+        self.plan(&Self::cache_requests(paths))
+    }
+
+    fn cached_scan(&self) -> Arc<ScanReport> {
+        let existing = lock(&self.state).scan.clone();
+        match existing {
+            Some(s) => s,
+            None => Arc::new(self.run_scan()),
+        }
+    }
+
+    fn cached_diskmap(&self) -> Arc<DiskMap> {
+        if let Some(m) = lock(&self.state).diskmap.clone() {
+            return m;
+        }
+        self.run_scan();
+        lock(&self.state).diskmap.clone().unwrap_or_default()
     }
 
     /// Stale caches to delete, re-checked now. `None` means every stale cache.
     pub fn reclaim_plan(&self, want_bytes: Option<u64>) -> Plan {
-        let existing = self.state.lock().unwrap().scan.clone();
-        let scan = match existing {
-            Some(s) => s,
-            None => self.run_scan(),
-        };
+        let scan = self.cached_scan();
         self.gate_run(|g| g.plan_reclaim(&scan.items, want_bytes))
     }
 
-    /// Build a reclaim plan and execute its ready items.
-    pub fn reclaim_stale(&self, want_bytes: Option<u64>, source: &str) -> Vec<ActionResult> {
+    /// Plan and execute in one step. For the engine's automatic reclaim and an
+    /// explicit `{"auto": true}`; interactive callers plan, show, then execute
+    /// the approved items.
+    pub fn reclaim_now(&self, want_bytes: Option<u64>, source: &str) -> Vec<ActionResult> {
         let plan = self.reclaim_plan(want_bytes);
         self.execute(&plan.approved(), source)
     }
 
-    /// Idle agent worktrees a sweep would remove, re-checked now.
+    /// Idle agent worktrees a sweep would remove, re-checked now. Ready items
+    /// carry the HEAD read now as their expected HEAD.
     pub fn sweep_plan(&self) -> Plan {
-        let existing = self.state.lock().unwrap().diskmap.clone();
-        let map = match existing {
-            Some(m) => m,
-            None => {
-                self.run_scan();
-                self.state
-                    .lock()
-                    .unwrap()
-                    .diskmap
-                    .clone()
-                    .unwrap_or_default()
-            }
-        };
+        let map = self.cached_diskmap();
         self.gate_run(|g| g.plan_sweep(&map.worktrees))
     }
 
-    /// Build a sweep plan and execute its ready items.
-    pub fn sweep_worktrees(&self, source: &str) -> Vec<ActionResult> {
+    /// Plan and execute a sweep in one step (automatic sweep, `{"auto": true}`).
+    pub fn sweep_now(&self, source: &str) -> Vec<ActionResult> {
         let plan = self.sweep_plan();
         self.execute(&plan.approved(), source)
     }
 
+    /// What removing these worktrees would do, checked now. A ready removal
+    /// carries the HEAD read now; executing it later fails if HEAD moves. A
+    /// path whose directory is gone and that the last scan saw as a missing
+    /// worktree becomes a prune.
+    pub fn worktree_plan(&self, paths: &[PathBuf], allow_dirty: bool) -> Plan {
+        let map = lock(&self.state).diskmap.clone();
+        let reqs: Vec<Request> = paths
+            .iter()
+            .map(|p| {
+                let missing = map
+                    .as_ref()
+                    .and_then(|m| m.worktrees.iter().find(|w| &w.path == p && w.missing));
+                match missing {
+                    Some(w) if !p.exists() => Request::PruneWorktree {
+                        repo: w.repo.clone(),
+                        path: w.path.clone(),
+                    },
+                    _ => Request::RemoveWorktree {
+                        path: p.clone(),
+                        expected_head: String::new(),
+                        allow_dirty,
+                        require_idle: false,
+                    },
+                }
+            })
+            .collect();
+        self.plan(&reqs)
+    }
+
+    /// Run a package manager's prune command, refused while that tool runs.
     pub fn prune_cache(&self, key: &str, source: &str) -> PruneResult {
-        let r = diskmap::prune_cache(&self.paths, key);
-        if r.ok {
-            self.log(
-                "reclaim",
-                format!("Pruned {key} cache"),
-                r.freed,
-                None,
-                source,
-            );
-            if let Some(m) = self.state.lock().unwrap().diskmap.as_mut() {
+        let r = diskmap::prune_cache(&self.paths, &*self.procs, key);
+        let mut a = Action::note(
+            now_unix(),
+            "reclaim",
+            if r.ok {
+                format!("Pruned {key} cache")
+            } else {
+                format!(
+                    "Did not prune {key} cache: {}",
+                    r.output.lines().last().unwrap_or("")
+                )
+            },
+            r.freed,
+            None,
+            source,
+        );
+        a.target = Some(key.to_string());
+        a.status = Some(if r.ok { "done" } else { "skipped" }.into());
+        a.reason = r.reason;
+        self.record(a);
+        if r.freed > 0 {
+            if let Some(m) = lock(&self.state).diskmap.as_mut() {
+                let m = Arc::make_mut(m);
                 if let Some(c) = m.categories.iter_mut().find(|c| c.key == key) {
                     c.bytes = c.bytes.saturating_sub(r.freed);
                 }
@@ -627,49 +1167,7 @@ impl Engine {
         r
     }
 
-    /// Remove worktrees by path. The expected HEAD is the one in the last scan
-    /// (what the caller saw); a worktree whose directory is gone is pruned instead.
-    pub fn remove_worktrees(
-        &self,
-        paths: &[PathBuf],
-        allow_dirty: bool,
-        source: &str,
-    ) -> Vec<ActionResult> {
-        let map = self
-            .state
-            .lock()
-            .unwrap()
-            .diskmap
-            .clone()
-            .unwrap_or_default();
-        let mut out = Vec::new();
-        for p in paths {
-            let Some(wt) = map.worktrees.iter().find(|w| &w.path == p) else {
-                out.push(self.reject(
-                    ActionKind::RemoveWorktree,
-                    p.display().to_string(),
-                    "not a known worktree; rescan first",
-                    source,
-                ));
-                continue;
-            };
-            let req = if wt.missing {
-                Request::PruneWorktree {
-                    repo: wt.repo.clone(),
-                    path: wt.path.clone(),
-                }
-            } else {
-                Request::RemoveWorktree {
-                    path: wt.path.clone(),
-                    expected_head: wt.head.clone().unwrap_or_default(),
-                    allow_dirty,
-                    require_idle: false,
-                }
-            };
-            out.extend(self.execute(std::slice::from_ref(&req), source));
-        }
-        out
-    }
+    // -------------------------------------------------------------- processes
 
     pub fn workspace_action(
         &self,
@@ -678,7 +1176,7 @@ impl Engine {
         source: &str,
     ) -> Result<usize, String> {
         let (ws, nice) = {
-            let st = self.state.lock().unwrap();
+            let st = lock(&self.state);
             let ws = st
                 .snapshot
                 .workspaces
@@ -697,7 +1195,7 @@ impl Engine {
         if action == WorkspaceAction::Deprioritize {
             let done = targets
                 .iter()
-                .filter(|p| renice(p.pid, nice.max(10)))
+                .filter(|p| lower_priority(p.pid, nice.max(10)).is_some())
                 .count();
             self.log(
                 "throttle",
@@ -746,10 +1244,7 @@ impl Engine {
         if pid <= 1 || pid == std::process::id() {
             return Err("refusing to signal this process".into());
         }
-        let info = self
-            .state
-            .lock()
-            .unwrap()
+        let info = lock(&self.state)
             .snapshot
             .find_proc(pid)
             .cloned()
@@ -763,19 +1258,19 @@ impl Engine {
             ProcAction::Stop => Signal::Stop,
             ProcAction::Cont => Signal::Cont,
             ProcAction::Renice { nice } => {
-                let ok = unsafe {
-                    libc::setpriority(
-                        libc::PRIO_PROCESS as _,
-                        pid as libc::id_t,
-                        nice.clamp(0, 20),
-                    ) == 0
-                };
-                if !ok {
-                    return Err(std::io::Error::last_os_error().to_string());
+                // Only our own process (checked above) whose start time still
+                // matches, so a reused pid is never touched.
+                match self.procs.get(pid) {
+                    Some(p)
+                        if p.uid == Some(self.procs.current_uid())
+                            && p.start_time == info.start_time => {}
+                    _ => return Err("the pid now belongs to a different process".into()),
                 }
+                let nice = nice.clamp(0, 20);
+                set_nice(pid, nice).map_err(|e| e.to_string())?;
                 self.log(
                     "throttle",
-                    format!("renice {} → {} ({pid})", nice.clamp(0, 20), info.name),
+                    format!("renice {nice} → {} ({pid})", info.name),
                     0,
                     Some(info.group),
                     source,
@@ -797,11 +1292,16 @@ impl Engine {
     }
 
     pub fn advice(&self) -> Advice {
-        let st = self.state.lock().unwrap();
+        let now = now_unix();
+        let st = lock(&self.state);
         let s = &st.snapshot;
         let cfg = &st.config;
+        let health = st.health_at(now);
         let free = st.slots.capacity.saturating_sub(st.slots.active.len());
         let mut reasons = Vec::new();
+        if health == Health::Stale {
+            reasons.push("the engine has no recent sample of this machine".to_string());
+        }
         if free == 0 {
             reasons.push(format!("all {} build slots are taken", st.slots.capacity));
         }
@@ -814,11 +1314,11 @@ impl Engine {
                 s.load[0], s.cpu_count
             ));
         }
-        if s.disk_free_gb() < cfg.low_disk_gb as f64 {
+        if s.disk_total > 0 && s.disk_free_gb() < cfg.low_disk_gb as f64 {
             reasons.push(format!("only {:.0} GB disk free", s.disk_free_gb()));
         }
         Advice {
-            health: st.health.clone(),
+            health,
             ok_to_start_heavy_work: reasons.is_empty(),
             free_slots: free,
             suggested_jobs: st.slots.jobs_per_slot.max(1),
@@ -826,35 +1326,79 @@ impl Engine {
         }
     }
 
-    pub fn acquire(&self, label: &str, pid: u32, ticket: Option<u64>) -> LeaseReply {
-        let mut st = self.state.lock().unwrap();
-        let now = now_unix();
-        let jobs = st.slots.jobs_per_slot.max(1);
-        let id = match ticket {
-            Some(t) if st.slots.active.iter().any(|l| l.id == t) => {
-                return LeaseReply {
-                    granted: true,
-                    ticket: t,
-                    jobs,
-                    position: 0,
-                    reason: "already granted".into(),
-                };
+    // ------------------------------------------------------------ build queue
+
+    pub fn acquire(&self, req: &LeaseRequest) -> Result<LeaseReply, LeaseError> {
+        self.acquire_at(req, now_unix())
+    }
+
+    /// Join the queue, poll a ticket, or renew a granted lease (send its ticket
+    /// again). A lease needs a live pid or a TTL; with a TTL it ends unless
+    /// renewed in time, with a pid when that process exits.
+    pub fn acquire_at(&self, req: &LeaseRequest, now: u64) -> Result<LeaseReply, LeaseError> {
+        let pid = req.pid.filter(|p| *p > 0);
+        if let Some(t) = req.ttl_secs {
+            if t == 0 || t > MAX_LEASE_TTL_SECS {
+                return Err(LeaseError::TtlOutOfRange(t));
             }
-            Some(t) if st.slots.waiting.iter().any(|w| w.id == t) => t,
-            _ => {
+        }
+        if let Some(p) = pid {
+            if !pid_alive(p) {
+                return Err(LeaseError::PidNotAlive(p));
+            }
+        }
+        let label = if req.label.is_empty() {
+            pid.map(|p| format!("pid {p}"))
+                .unwrap_or_else(|| "lease".into())
+        } else {
+            req.label.clone()
+        };
+        let mut st = lock(&self.state);
+        expire_leases(&mut st.slots, now);
+        // A known ticket (renewal or poll) keeps what it was granted with; a
+        // new request must say how it ends.
+        let known = req.ticket.is_some_and(|t| {
+            st.slots.active.iter().any(|l| l.id == t) || st.slots.waiting.iter().any(|w| w.id == t)
+        });
+        if !known && pid.is_none() && req.ttl_secs.is_none() {
+            return Err(LeaseError::NeedsPidOrTtl);
+        }
+        let jobs = st.slots.jobs_per_slot.max(1);
+        let ticket = req.ticket;
+        if let Some(l) = ticket.and_then(|t| st.slots.active.iter_mut().find(|l| l.id == t)) {
+            if let Some(ttl) = req.ttl_secs.or(l.ttl_secs) {
+                l.ttl_secs = Some(ttl);
+                l.expires_unix = Some(now + ttl);
+            }
+            return Ok(LeaseReply {
+                granted: true,
+                ticket: l.id,
+                jobs: l.jobs,
+                position: 0,
+                reason: "renewed".into(),
+                expires_unix: l.expires_unix,
+            });
+        }
+        let id = match ticket.filter(|t| st.slots.waiting.iter().any(|w| w.id == *t)) {
+            Some(t) => t,
+            None => {
                 let id = self.next_id.fetch_add(1, Ordering::SeqCst);
                 st.slots.waiting.push(Waiter {
                     id,
-                    label: label.into(),
+                    label,
                     pid,
                     since_unix: now,
                     last_poll: now,
+                    ttl_secs: req.ttl_secs,
                 });
                 id
             }
         };
         if let Some(w) = st.slots.waiting.iter_mut().find(|w| w.id == id) {
             w.last_poll = now;
+            if req.ttl_secs.is_some() {
+                w.ttl_secs = req.ttl_secs;
+            }
         }
         let position = st
             .slots
@@ -868,21 +1412,25 @@ impl Engine {
             || st.slots.active.is_empty();
         if position == 0 && st.slots.active.len() < cap && mem_ok {
             let w = st.slots.waiting.remove(0);
+            let expires_unix = w.ttl_secs.map(|t| now + t);
             st.slots.active.push(Lease {
                 id,
                 label: w.label,
                 pid: w.pid,
                 since_unix: now,
                 jobs,
+                ttl_secs: w.ttl_secs,
+                expires_unix,
             });
             let reason = format!("slot {}/{}", st.slots.active.len(), cap);
-            return LeaseReply {
+            return Ok(LeaseReply {
                 granted: true,
                 ticket: id,
                 jobs,
                 position: 0,
                 reason,
-            };
+                expires_unix,
+            });
         }
         let reason = if !mem_ok {
             "waiting for memory pressure to drop".to_string()
@@ -891,22 +1439,96 @@ impl Engine {
         } else {
             format!("all {cap} build slots are busy")
         };
-        LeaseReply {
+        Ok(LeaseReply {
             granted: false,
             ticket: id,
             jobs,
             position,
             reason,
-        }
+            expires_unix: None,
+        })
     }
 
     pub fn release(&self, ticket: u64) -> bool {
-        let mut st = self.state.lock().unwrap();
+        let mut st = lock(&self.state);
         let before = st.slots.active.len() + st.slots.waiting.len();
         st.slots.active.retain(|l| l.id != ticket);
         st.slots.waiting.retain(|w| w.id != ticket);
         before != st.slots.active.len() + st.slots.waiting.len()
     }
+
+    /// Drop leases whose process exited or whose TTL passed, and waiters that
+    /// stopped polling.
+    pub fn expire_leases_at(&self, now: u64) {
+        expire_leases(&mut lock(&self.state).slots, now);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn state_mut(&self) -> std::sync::MutexGuard<'_, State> {
+        lock(&self.state)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_restart_backoff(&self, d: Duration) {
+        self.backoff_ms
+            .store(d.as_millis() as u64, Ordering::SeqCst);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn begin_shutdown(&self) {
+        self.shutdown.store(true, Ordering::SeqCst);
+    }
+}
+
+fn expire_leases(slots: &mut Slots, now: u64) {
+    slots.active.retain(|l| {
+        l.pid.map(pid_alive).unwrap_or(true) && l.expires_unix.map(|e| now < e).unwrap_or(true)
+    });
+    slots.waiting.retain(|w| {
+        let window = w.ttl_secs.unwrap_or(0).max(WAITER_POLL_SECS);
+        w.pid.map(pid_alive).unwrap_or(true) && now.saturating_sub(w.last_poll) < window
+    });
+}
+
+fn throttle_notes(snap: &Snapshot, newly: &[u32], now: u64) -> Vec<Action> {
+    let mut notes = Vec::new();
+    let mut by_ws: BTreeMap<String, usize> = BTreeMap::new();
+    let mut seen = HashSet::new();
+    for p in snap
+        .workspaces
+        .iter()
+        .flat_map(|w| w.procs.iter())
+        .chain(snap.top.iter())
+    {
+        if newly.contains(&p.pid) && seen.insert(p.pid) {
+            *by_ws.entry(p.group.clone()).or_default() += 1;
+        }
+    }
+    let named: usize = by_ws.values().sum();
+    for (label, n) in by_ws {
+        notes.push(Action::note(
+            now,
+            "throttle",
+            format!("Lowered priority of {n} build process(es) under pressure"),
+            0,
+            Some(label),
+            "optimizer",
+        ));
+    }
+    if newly.len() > named {
+        notes.push(Action::note(
+            now,
+            "throttle",
+            format!(
+                "Lowered priority of {} build process(es)",
+                newly.len() - named
+            ),
+            0,
+            None,
+            "optimizer",
+        ));
+    }
+    notes
 }
 
 fn forecast(h: &VecDeque<Sample>, cfg: &Config) -> Forecast {
@@ -940,15 +1562,61 @@ fn forecast(h: &VecDeque<Sample>, cfg: &Config) -> Forecast {
     }
 }
 
-fn renice(pid: u32, nice: i32) -> bool {
+/// The current nice value of `pid`, if readable.
+pub fn nice_of(pid: u32) -> Option<i32> {
     unsafe {
         *errno() = 0;
         let cur = libc::getpriority(libc::PRIO_PROCESS as _, pid as libc::id_t);
-        if *errno() != 0 || cur >= nice {
-            return false;
-        }
-        libc::setpriority(libc::PRIO_PROCESS as _, pid as libc::id_t, nice) == 0
+        (*errno() == 0).then_some(cur)
     }
+}
+
+/// Raise `pid`'s nice value to `nice` when it is lower. Returns the previous
+/// value when it changed.
+fn lower_priority(pid: u32, nice: i32) -> Option<i32> {
+    let cur = nice_of(pid)?;
+    if cur >= nice {
+        return None;
+    }
+    set_nice(pid, nice).ok().map(|_| cur)
+}
+
+/// Set the nice value of `pid`. On Linux nice is per thread, so every thread
+/// in `/proc/<pid>/task` is set (threads started later inherit from the thread
+/// that creates them, not from this call).
+pub fn set_nice(pid: u32, nice: i32) -> std::io::Result<()> {
+    let set = |id: u32| -> std::io::Result<()> {
+        if unsafe { libc::setpriority(libc::PRIO_PROCESS as _, id as libc::id_t, nice) } == 0 {
+            Ok(())
+        } else {
+            Err(std::io::Error::last_os_error())
+        }
+    };
+    if cfg!(target_os = "linux") {
+        if let Ok(rd) = std::fs::read_dir(format!("/proc/{pid}/task")) {
+            let tids: Vec<u32> = rd
+                .flatten()
+                .filter_map(|e| e.file_name().to_str().and_then(|s| s.parse().ok()))
+                .collect();
+            if !tids.is_empty() {
+                let mut first_err = None;
+                let mut any = false;
+                for t in tids {
+                    match set(t) {
+                        Ok(()) => any = true,
+                        Err(e) => {
+                            first_err.get_or_insert(e);
+                        }
+                    }
+                }
+                return match (any, first_err) {
+                    (true, _) | (false, None) => Ok(()),
+                    (false, Some(e)) => Err(e),
+                };
+            }
+        }
+    }
+    set(pid)
 }
 
 #[cfg(target_os = "macos")]
@@ -962,108 +1630,5 @@ unsafe fn errno() -> *mut libc::c_int {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::process::FakeProcesses;
-
-    fn engine(cfg: Config) -> (tempfile::TempDir, Engine) {
-        let t = tempfile::tempdir().unwrap();
-        let paths = Paths::under(t.path());
-        let e = Engine::with_processes(
-            paths,
-            LoadedConfig {
-                config: cfg,
-                error: None,
-            },
-            Arc::new(FakeProcesses::empty()),
-        );
-        (t, e)
-    }
-
-    #[test]
-    fn slots_queue_in_order_and_release() {
-        let (_t, e) = engine(Config {
-            max_heavy_jobs: 1,
-            ..Config::default()
-        });
-        {
-            let mut st = e.state.lock().unwrap();
-            st.slots.capacity = 1;
-            st.slots.jobs_per_slot = 4;
-            st.snapshot.mem_total = 100;
-            st.snapshot.mem_available = 90;
-        }
-        let me = std::process::id();
-        let a = e.acquire("a", me, None);
-        assert!(a.granted);
-        let b = e.acquire("b", me, None);
-        assert!(!b.granted);
-        let c = e.acquire("c", me, None);
-        assert_eq!(c.position, 1);
-        assert!(e.release(a.ticket));
-        let c2 = e.acquire("c", me, Some(c.ticket));
-        assert!(!c2.granted);
-        let b2 = e.acquire("b", me, Some(b.ticket));
-        assert!(b2.granted);
-        assert_eq!(b2.jobs, 4);
-    }
-
-    #[test]
-    fn auto_reclaim_never_means_everything() {
-        let cfg = Config {
-            low_disk_gb: 100,
-            auto_reclaim_target_gb: 60,
-            ..Config::default()
-        };
-        // The audit's case: free space already above the target.
-        assert_eq!(auto_reclaim_need(&cfg, 80_000_000_000), None);
-        assert_eq!(auto_reclaim_need(&cfg, 60_000_000_000), None);
-        assert_eq!(
-            auto_reclaim_need(&cfg, 50_000_000_000),
-            Some(10_000_000_000)
-        );
-        // And such a config does not validate in the first place.
-        assert!(cfg.validate().is_err());
-    }
-
-    #[test]
-    fn config_error_turns_automation_off_and_is_in_state() {
-        let t = tempfile::tempdir().unwrap();
-        let paths = Paths::under(t.path());
-        std::fs::create_dir_all(&paths.config_dir).unwrap();
-        std::fs::write(paths.config_file(), b"{ broken").unwrap();
-        let loaded = Config::load_from(&paths);
-        let e = Engine::with_processes(paths.clone(), loaded, Arc::new(FakeProcesses::empty()));
-        let st = e.snapshot_state();
-        assert!(st.config_error.is_some());
-        assert!(!st.config.auto_reclaim && !st.config.auto_sweep_worktrees);
-        assert!(!e.automation_allowed());
-        e.set_config(Config::default()).unwrap();
-        assert!(e.config_error().is_none() && e.automation_allowed());
-    }
-
-    #[test]
-    fn activity_survives_a_restart() {
-        let t = tempfile::tempdir().unwrap();
-        let paths = Paths::under(t.path());
-        let mk = || {
-            Engine::with_processes(
-                paths.clone(),
-                LoadedConfig {
-                    config: Config::default(),
-                    error: None,
-                },
-                Arc::new(FakeProcesses::empty()),
-            )
-        };
-        let e = mk();
-        e.log("alert", "one".into(), 0, None, "test");
-        let r = e.clean_paths(&[PathBuf::from("relative/target")], "test");
-        assert_eq!(r[0].reason(), Some(SkipReason::NotAbsolute));
-        let e2 = mk();
-        let st = e2.snapshot_state();
-        assert_eq!(st.actions.len(), 2);
-        assert_eq!(st.actions[0].status.as_deref(), Some("skipped"));
-        assert_eq!(st.actions[1].detail, "one");
-    }
-}
+#[path = "engine_tests.rs"]
+mod tests;
