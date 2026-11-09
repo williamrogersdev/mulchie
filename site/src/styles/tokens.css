@@ -1,0 +1,53 @@
+@import '@fontsource-variable/bricolage-grotesque/wght.css';
+@import '@fontsource-variable/jetbrains-mono/wght.css';
+
+/* Shared by the landing pages and the Starlight docs. */
+:root {
+  --font-sans: 'Bricolage Grotesque Variable', ui-sans-serif, system-ui, -apple-system, 'Segoe UI', sans-serif;
+  --font-mono: 'JetBrains Mono Variable', ui-monospace, 'SF Mono', Menlo, Consolas, monospace;
+
+  /* Light: lichen paper, leaf green ink */
+  --bg: #f3f5ef;
+  --bg-sunk: #e8ede2;
+  --ink: #15201a;
+  --muted: #465048;
+  --line: #c9d2c3;
+  --accent: #2a6427;       /* 6.3:1 on --bg */
+  --accent-ink: #ffffff;
+  --brand: #4a7c3f;        /* the icon green; decoration only */
+
+  /* Terminal panels stay dark in both schemes */
+  --term-bg: #151915;
+  --term-line: #2c342c;
+  --term-text: #e4e9df;
+  --term-dim: #98a395;
+  --term-green: #8fd17e;
+  --term-amber: #e3b95c;
+  --term-red: #ee8d78;
+  --term-blue: #86b9e0;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme='light']) {
+    --bg: #101410;
+    --bg-sunk: #181e18;
+    --ink: #e9eee4;
+    --muted: #a5b0a1;
+    --line: #2c352b;
+    --accent: #8fd17e;
+    --accent-ink: #0d140d;
+    --term-bg: #0a0d0a;
+    --term-line: #2c352b;
+  }
+}
+:root[data-theme='dark'] {
+  --bg: #101410;
+  --bg-sunk: #181e18;
+  --ink: #e9eee4;
+  --muted: #a5b0a1;
+  --line: #2c352b;
+  --accent: #8fd17e;
+  --accent-ink: #0d140d;
+  --term-bg: #0a0d0a;
+  --term-line: #2c352b;
+}

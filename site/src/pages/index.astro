@@ -1,0 +1,198 @@
+---
+import Base from '../layouts/Base.astro';
+import { SITE, REPO, RELEASES, VERSION } from '../lib/meta';
+
+const title = 'Mulchie: keep your machine usable while AI agents build';
+const description =
+  'Open source monitor, build queue and safe cleaner for machines running many AI coding agents. macOS menu bar app, CLI, local API and MCP server.';
+
+const jsonLd = {
+  '@context': 'https://schema.org',
+  '@type': 'SoftwareApplication',
+  name: 'Mulchie',
+  description:
+    'A macOS menu bar app, CLI, local HTTP API and MCP server that keeps one machine healthy while many AI coding agents run on it.',
+  url: `${SITE}/`,
+  applicationCategory: 'DeveloperApplication',
+  operatingSystem: 'macOS, Linux',
+  softwareVersion: VERSION,
+  license: 'https://opensource.org/licenses/MIT',
+  offers: { '@type': 'Offer', price: '0', priceCurrency: 'USD' },
+  downloadUrl: RELEASES,
+  codeRepository: REPO,
+  sameAs: [REPO],
+};
+
+const mcp = `{
+  "mcpServers": {
+    "mulchie": { "command": "mulchie", "args": ["mcp"] }
+  }
+}`;
+---
+<Base title={title} description={description} jsonLd={jsonLd} ogImage="home">
+  <div class="wrap hero">
+    <div>
+      <h1>Keep your machine usable while AI agents build on it.</h1>
+      <p class="lede">Mulchie watches CPU, memory and disk per repo and worktree, queues heavy builds, and cleans up what agents leave behind.</p>
+      <p class="who">For developers who run Claude Code, Codex, Cursor agents and similar tools side by side on one Mac or Linux box.</p>
+      <div class="cta">
+        <a class="btn primary" href="/install/">Install Mulchie</a>
+        <a class="btn ghost" href={REPO}>View on GitHub</a>
+      </div>
+    </div>
+    {/* TODO: replace this rendering with a real dashboard screenshot once one exists.
+         Use an <img> with explicit width and height to avoid layout shift. */}
+    {/* VERIFY: sample output below is illustrative; match column names and formatting to real `mulchie status` output. */}
+    <figure class="term-fig" style="margin:0">
+      <div class="term" role="group" aria-label="Example output of mulchie status">
+        <div class="term-bar"><i></i><i></i><i></i><span>illustrative output</span></div>
+        <pre tabindex="0"><code><span class="p">$</span> <span class="k">mulchie status</span>
+<span class="d">disk  </span> 142 GB free of 460 GB   <span class="a">full in about 6 h</span>
+<span class="d">memory</span> 11.2 of 16 GB used     <span class="a">swap 3.1 GB</span>
+<span class="d">cpu   </span> load 14.2 on 10 cores  <span class="r">builds throttled</span>
+
+<span class="d">WORKSPACE         CPU    MEM   AGENT   BUILD</span>
+api/wt-auth       <span class="a">310%</span>   2.1G  claude  cargo
+api/wt-billing    <span class="a">280%</span>   1.8G  codex   cargo
+web/wt-search     190%   1.4G  cursor  next
+api/wt-old-spike   <span class="g">0%</span>   0.0G  none    none
+
+<span class="p">$</span> <span class="caret"></span></code></pre>
+      </div>
+    </figure>
+  </div>
+
+  <section class="sec wrap split" aria-labelledby="problem">
+    <div>
+      <h2 id="problem">Ten agents, one machine</h2>
+      <p>Each agent gets its own git worktree and starts its own build. The CPU pins, memory goes to swap, and the disk fills with <code>target/</code> directories nobody is using.</p>
+    </div>
+    <ul class="facts">
+      <li><strong>Every worktree has its own caches.</strong>Rust <code>target/</code>, <code>.next</code> and <code>node_modules</code> are often gigabytes each, and they stay after the agent finishes.</li>
+      <li><strong>Agents do not know about each other.</strong>They start heavy builds at the same time because nothing tells them the machine is busy.</li>
+      <li><strong>Activity Monitor shows processes, not projects.</strong>You see <code>rustc</code> at 300%, not which repo or which agent started it.</li>
+    </ul>
+  </section>
+
+  <section class="sec wrap" aria-labelledby="does">
+    <h2 id="does">What it does</h2>
+    <div class="rows">
+      <div class="row">
+        <div>
+          <h3>Monitor</h3>
+          <p>Samples every 3 seconds and keeps 30 minutes of history. Every process is attributed to its repo or worktree from its working directory, then classified as an agent, a build or a runtime. It forecasts when the disk will fill.</p>
+        </div>
+        <div class="term" role="group" aria-label="Example output of mulchie top">
+          <pre tabindex="0"><code><span class="p">$</span> <span class="k">mulchie top --sort cpu -n 3</span>
+<span class="d"> PID    CPU   MEM   WORKSPACE       KIND</span>
+ 48211  <span class="a">212%</span>  1.4G  api/wt-auth     build
+ 48907  <span class="a">188%</span>  1.1G  api/wt-billing  build
+ 39120   41%  0.9G  web/wt-search   agent</code></pre>
+        </div>
+      </div>
+      <div class="row">
+        <div>
+          <h3>Optimize</h3>
+          <p>Lowers the priority of build processes when CPU or memory is under pressure. Runs a machine-wide build queue: <code>mulchie run</code> waits for a free slot and sets a fair <code>CARGO_BUILD_JOBS</code>. Ask it whether now is a good time for heavy work and get reasons back.</p>
+        </div>
+        <div class="term" role="group" aria-label="Example output of mulchie run and mulchie advice">
+          <pre tabindex="0"><code><span class="p">$</span> <span class="k">mulchie advice</span>
+<span class="a">not now</span>: 3 heavy jobs running, memory free 6%
+<span class="p">$</span> <span class="k">mulchie run -- cargo build</span>
+<span class="d">waiting for a build slot (position 2)</span>
+<span class="g">slot granted</span>, running with 4 jobs</code></pre>
+        </div>
+      </div>
+      <div class="row">
+        <div>
+          <h3>Reclaim</h3>
+          <p>Finds stale build caches and idle git worktrees, and shows size, idle days, uncommitted files and merged state for each. "Idle" means no file changes outside <code>target/</code>, <code>node_modules/</code> and <code>.git/</code> and no recent commit, not the folder timestamp. It also prunes npm, bun, pnpm, uv, Homebrew, Go and simulator stores with each tool's own command.</p>
+        </div>
+        {/* VERIFY: sample worktrees table is illustrative; match columns and verdict wording to real `mulchie worktrees` output. */}
+        <div class="term" role="group" aria-label="Example output of mulchie worktrees">
+          <pre tabindex="0"><code><span class="p">$</span> <span class="k">mulchie worktrees</span>
+<span class="d">WORKTREE             SIZE    IDLE  DIRTY  MERGED  VERDICT</span>
+api/wt-auth         6.4 GB    0d      3  no      <span class="g">in use</span>
+api/wt-old-spike    4.1 GB   21d      0  yes     <span class="a">remove</span>
+web/wt-checkout     2.2 GB   14d      4  no      <span class="a">back up, remove</span></code></pre>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <section class="sec wrap split flip" aria-labelledby="safety">
+    <div>
+      <h2 id="safety">It deletes things, so it checks first</h2>
+      <p>Cleaning up after agents only works if you can trust it with your repos. Every delete is decided from facts read at the moment it runs, not from an earlier scan.</p>
+      {/* VERIFY: backup details (tar.gz of ignored files, backup/ branch for detached HEAD, actions.jsonl) come from docs/ARCHITECTURE.md and must match the shipped behaviour. */}
+      <ul class="facts">
+        <li><strong>Backups before removal.</strong>Uncommitted changes are saved as a patch. Ignored files such as <code>.env</code> are archived. A detached <code>HEAD</code> gets a <code>backup/</code> branch. Branches are never deleted.</li>
+        <li><strong>Projects in use are left alone.</strong>If a process runs anywhere in a project, nothing in it is cleaned or removed.</li>
+        <li><strong>Narrow deletes.</strong>Only recognised build caches under your scan roots, by canonical paths, never through symlinks.</li>
+        <li><strong>Careful signals.</strong>Only your own processes. Never pid 1, never Mulchie itself.</li>
+        <li><strong>Localhost only.</strong>The API listens on <code>127.0.0.1</code>, needs a bearer token with mode <code>0600</code>, and refuses requests that carry a browser <code>Origin</code> header.</li>
+      </ul>
+      <p class="note"><a href="/docs/safety/">Read the full safety model</a></p>
+    </div>
+    <div>
+      <div class="term" role="group" aria-label="Example output of mulchie sweep --dry-run">
+        <div class="term-bar"><i></i><i></i><i></i><span>illustrative output</span></div>
+        <pre tabindex="0"><code><span class="p">$</span> <span class="k">mulchie sweep --dry-run</span>
+would remove 2 worktrees, 6.3 GB
+  api/wt-old-spike   idle 21d  merged, clean
+  web/wt-checkout    idle 14d  <span class="a">4 dirty files, patch first</span>
+skipped 1
+  api/wt-auth        <span class="g">a process is running in it</span>
+
+<span class="d">dry run: nothing was changed</span></code></pre>
+      </div>
+    </div>
+  </section>
+
+  <section class="sec wrap split" aria-labelledby="agents">
+    <div>
+      <h2 id="agents">Agents use it too</h2>
+      <p>Agents talk to the same engine you do. Add the MCP server so they can ask whether to start a build, request a slot and see what is reclaimable. Or wrap a heavy command and skip the setup.</p>
+      <p>The dashboard has a ready-made snippet for your <code>AGENTS.md</code>. There is also a local HTTP API for scripts and <code>curl</code>.</p>
+      <p class="note"><a href="/docs/mcp/">MCP tools</a> and <a href="/docs/http-api/">HTTP API</a></p>
+    </div>
+    <div class="stack" style="display:grid;gap:1.5rem">
+      <div class="term" role="group" aria-label="MCP server configuration">
+        <div class="term-bar"><i></i><i></i><i></i><span>mcp config</span></div>
+        <pre tabindex="0"><code>{mcp}</code></pre>
+      </div>
+      <div class="term" role="group" aria-label="Queue a build">
+        <pre tabindex="0"><code><span class="p">$</span> <span class="k">mulchie run -- cargo build</span>
+<span class="p">$</span> <span class="k">mulchie run --label web -- bun run build</span></code></pre>
+      </div>
+    </div>
+  </section>
+
+  <section class="sec wrap" aria-labelledby="install">
+    <h2 id="install">Install</h2>
+    <p class="muted">The app needs macOS 12 or later. The CLI, engine and API run on macOS and Linux.</p>
+    <ul class="cmds">
+      <li>
+        <div class="label">Menu bar app<span>Homebrew cask</span></div>
+        <pre tabindex="0"><code>brew install --cask williamrogersdev/tap/mulchie</code></pre>
+      </li>
+      <li>
+        <div class="label">CLI only<span>Homebrew</span></div>
+        <pre tabindex="0"><code>brew install williamrogersdev/tap/mulchie-cli</code></pre>
+      </li>
+      <li>
+        <div class="label">CLI on macOS or Linux<span>Install script</span></div>
+        <pre tabindex="0"><code>curl -fsSL https://mulchie.com/install.sh | sh</code></pre>
+      </li>
+      <li>
+        <div class="label">CLI from source<span>Cargo</span></div>
+        <pre tabindex="0"><code>cargo install mulchie</code></pre>
+      </li>
+    </ul>
+    <p class="cta" style="margin-top:2rem">
+      <a class="btn primary" href="/install/">All install options</a>
+      <a class="btn ghost" href={RELEASES}>Download the DMG</a>
+      <a class="btn ghost" href={REPO}>GitHub</a>
+    </p>
+  </section>
+</Base>

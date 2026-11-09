@@ -1,0 +1,95 @@
+---
+import Base from '../layouts/Base.astro';
+import { REPO, RELEASES } from '../lib/meta';
+
+const title = 'Install Mulchie on macOS or Linux';
+const description =
+  'Install the Mulchie menu bar app or CLI with a DMG, Homebrew, an install script, Cargo or from source. Includes checksums, updating and uninstalling.';
+---
+<Base title={title} description={description} ogImage="default" current="install">
+  <div class="wrap prose">
+    <h1>Install Mulchie</h1>
+    <p class="lede">Pick the path that matches how you work. The menu bar app bundles the CLI, so you only need one.</p>
+
+    <h2 id="requirements">Requirements</h2>
+    <ul>
+      <li>Menu bar app: macOS 12 or later, Apple silicon or Intel.</li>
+      <li>CLI, engine, local API and MCP server: macOS or Linux (x86_64 or aarch64). Windows is not supported.</li>
+    </ul>
+
+    <h2 id="paths">Choose an install path</h2>
+    <table>
+      <thead><tr><th scope="col">You want</th><th scope="col">Use</th></tr></thead>
+      <tbody>
+        <tr><td>The menu bar app and dashboard</td><td><a href="#dmg">DMG</a> or <a href="#cask">Homebrew cask</a></td></tr>
+        <tr><td>Only the CLI on a Mac</td><td><a href="#brew-cli">Homebrew formula</a>, <a href="#script">install script</a> or <a href="#cargo">Cargo</a></td></tr>
+        <tr><td>The CLI on Linux or a server</td><td><a href="#script">Install script</a> or <a href="#cargo">Cargo</a></td></tr>
+        <tr><td>To read or change the code first</td><td><a href="#source">Build from source</a></td></tr>
+      </tbody>
+    </table>
+
+    <h2 id="dmg">DMG (macOS app)</h2>
+    <p>Download <code>Mulchie_X.Y.Z_universal.dmg</code> from the <a href={RELEASES}>latest release</a>. Open it and drag Mulchie to Applications. The DMG is signed and notarized, so it opens without a Gatekeeper warning.</p>
+    {/* VERIFY: confirm the DMG is published with a checksum file; the architecture doc only lists .sha256 files for the CLI tarballs. */}
+
+    <h2 id="cask">Homebrew cask (macOS app)</h2>
+    <pre><code>brew install --cask williamrogersdev/tap/mulchie</code></pre>
+
+    <h2 id="brew-cli">Homebrew formula (CLI)</h2>
+    <pre><code>brew install williamrogersdev/tap/mulchie-cli</code></pre>
+
+    <h2 id="script">Install script (CLI)</h2>
+    <pre><code>curl -fsSL https://mulchie.com/install.sh | sh</code></pre>
+    <p>The script picks the release tarball for your OS and CPU. To read it first, run <code>curl -fsSL https://mulchie.com/install.sh | less</code>, or open <a href="/install.sh">/install.sh</a>.</p>
+    {/* VERIFY: install location, whether it verifies the .sha256, and supported env vars or flags, once scripts/install.sh is final. */}
+
+    <h2 id="cargo">Cargo (CLI)</h2>
+    <pre><code>cargo install mulchie</code></pre>
+    <p>This compiles the CLI from the published crate. It needs a current stable Rust toolchain.</p>
+
+    <h2 id="source">Build from source</h2>
+    <p>Building the app needs Rust and Bun.</p>
+    <pre><code>git clone {REPO}.git
+cd mulchie
+./scripts/bundle.sh
+open target/release/bundle/macos/Mulchie.app</code></pre>
+    <p>To build only the CLI:</p>
+    <pre><code>cargo install --path crates/mulchie-cli</code></pre>
+
+    <h2 id="first-run">First run</h2>
+    <ol>
+      <li>Open Mulchie. It adds an icon to the menu bar and starts the engine.</li>
+      <li>Click the icon for the panel, then open the dashboard for per-worktree detail.</li>
+      <li>In the dashboard, open <strong>Agent API → Link mulchie</strong> to put the CLI on your <code>PATH</code> at <code>~/.local/bin/mulchie</code>. Make sure that directory is on your <code>PATH</code>.</li>
+      <li>Run <code>mulchie status</code> in a terminal. It uses the running app and says so if it falls back to a local scan.</li>
+      <li>Check the setup with <code>mulchie doctor</code>.</li>
+    </ol>
+    {/* VERIFY: `mulchie doctor` is described in docs/ARCHITECTURE.md but not in the README; confirm it ships. */}
+    <p>Mulchie scans folders such as <code>~/Developer</code>, <code>~/Projects</code> and <code>~/code</code> by default. Change them in Settings or in <a href="/docs/configuration/">the config file</a>. For a machine without a menu bar, see <a href="/docs/headless/">running headless</a>.</p>
+
+    <h2 id="verify">Verify a download</h2>
+    <p>Each CLI tarball on the release page has a matching <code>.sha256</code> file. Download both into one folder and check:</p>
+    <pre><code>shasum -a 256 -c mulchie-aarch64-apple-darwin.tar.gz.sha256</code></pre>
+    <p>On Linux, use <code>sha256sum -c</code> with the same file. For the app, check that macOS accepts the signature:</p>
+    <pre><code>spctl --assess --verbose /Applications/Mulchie.app</code></pre>
+    <p>The expected output ends with <code>accepted</code> and <code>source=Notarized Developer ID</code>.</p>
+    {/* VERIFY: exact tarball names and spctl output against a real release. */}
+
+    <h2 id="update">Update</h2>
+    <ul>
+      <li>App: it checks the latest GitHub release and offers updates itself.</li>
+      <li>Cask: <code>brew upgrade --cask williamrogersdev/tap/mulchie</code></li>
+      <li>Formula: <code>brew upgrade williamrogersdev/tap/mulchie-cli</code></li>
+      <li>Install script: run it again.</li>
+      <li>Cargo: <code>cargo install mulchie --force</code></li>
+    </ul>
+
+    <h2 id="uninstall">Uninstall</h2>
+    <ol>
+      <li>Quit Mulchie from the menu bar. If you set up a background service, remove it first (see <a href="/docs/headless/">running headless</a>).</li>
+      <li>Remove the program: <code>brew uninstall --cask mulchie</code>, <code>brew uninstall mulchie-cli</code>, <code>cargo uninstall mulchie</code>, or delete <code>/Applications/Mulchie.app</code> and <code>~/.local/bin/mulchie</code>.</li>
+      <li>Optional: delete <code>~/.config/mulchie</code>. It holds your config, API token, action log and <strong>worktree backups</strong>. Keep the <code>backups</code> folder until you are sure you do not need any patch in it.</li>
+    </ol>
+    <p>Source and issues live on <a href={REPO}>GitHub</a>.</p>
+  </div>
+</Base>
