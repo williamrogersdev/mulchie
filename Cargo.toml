@@ -6,6 +6,8 @@ members = ["crates/mulchie-core", "crates/mulchie-cli", "crates/mulchie-app"]
 version = "0.2.0"
 edition = "2021"
 license = "MIT"
+repository = "https://github.com/williamrogersdev/mulchie"
+homepage = "https://mulchie.com"
 
 [profile.release]
 strip = "none"
