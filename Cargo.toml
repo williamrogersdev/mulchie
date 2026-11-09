@@ -27,3 +27,7 @@ sysinfo = "0.40.1"
 strip = "symbols"
 lto = "thin"
 codegen-units = 1
+
+# Stripping proc-macro dylibs makes dlopen reject them on recent macOS.
+[profile.release.build-override]
+strip = "none"
