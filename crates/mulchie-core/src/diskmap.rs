@@ -1,12 +1,20 @@
+//! Disk map: package and toolchain caches, and every git worktree under the scan
+//! roots. Read-only; removal goes through the safety gate.
+
 use serde::Serialize;
-use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::Mutex;
 use std::time::SystemTime;
 
-use crate::config::{config_dir, home_dir, Config};
-use crate::monitor::now_unix;
+use crate::config::Config;
+use crate::git::{self, git};
+use crate::paths::Paths;
 use crate::reclaim::dir_size;
+use crate::safety::{any_cwd_in, is_agent_worktree};
+
+/// Repositories scanned at once.
+const REPO_WORKERS: usize = 8;
 
 #[derive(Debug, Clone, Serialize)]
 pub struct Category {
@@ -33,6 +41,9 @@ pub struct Worktree {
     pub idle_days: u64,
     pub dirty_files: usize,
     pub merged: bool,
+    /// HEAD commit at scan time. Removal requests carry it as the expected HEAD.
+    pub head: Option<String>,
+    /// git marks the entry prunable (its directory is gone).
     pub missing: bool,
     pub locked: bool,
     pub in_use: bool,
@@ -59,7 +70,8 @@ struct CatDef {
     prune: Option<(&'static str, &'static [&'static str])>,
 }
 
-fn categories_for(home: &Path) -> Vec<CatDef> {
+fn categories_for(paths: &Paths) -> Vec<CatDef> {
+    let home = &paths.home;
     let lib = home.join("Library");
     let c = |key, name, path, hint, prune| CatDef {
         key,
@@ -212,21 +224,24 @@ fn categories_for(home: &Path) -> Vec<CatDef> {
         c(
             "mulchie_backups",
             "Mulchie backups",
-            config_dir().join("backups"),
-            "patches saved before worktree removal",
+            paths.backups_dir.clone(),
+            "patches and ignored-file archives saved before worktree removal",
             None,
         ),
     ]
 }
 
-pub fn scan(cfg: &Config, busy: &[PathBuf]) -> DiskMap {
+/// Scan package caches and every git worktree under the scan roots. `busy_cwds`
+/// are the working directories of the user's processes, read now.
+pub fn scan(cfg: &Config, paths: &Paths, busy_cwds: &[PathBuf], now: u64) -> DiskMap {
     let start = std::time::Instant::now();
-    let home = home_dir();
-    let cats: Vec<CatDef> = categories_for(&home)
+    let cats: Vec<CatDef> = categories_for(paths)
         .into_iter()
         .filter(|c| c.path.exists())
         .collect();
-    let repos = find_repos(cfg);
+    let repos = find_repos(cfg, paths);
+    // A bounded pool: at most REPO_WORKERS repositories at once.
+    let queue = Mutex::new(repos.iter());
 
     let (mut categories, mut worktrees) = std::thread::scope(|s| {
         let ch: Vec<_> = cats
@@ -242,9 +257,19 @@ pub fn scan(cfg: &Config, busy: &[PathBuf]) -> DiskMap {
                 })
             })
             .collect();
-        let wh: Vec<_> = repos
-            .iter()
-            .map(|r| s.spawn(move || repo_worktrees(r, busy, cfg)))
+        let wh: Vec<_> = (0..REPO_WORKERS.min(repos.len()))
+            .map(|_| {
+                let queue = &queue;
+                s.spawn(move || {
+                    let mut out = Vec::new();
+                    loop {
+                        let next = queue.lock().unwrap_or_else(|e| e.into_inner()).next();
+                        let Some(r) = next else { break };
+                        out.extend(repo_worktrees(r, busy_cwds, cfg, paths, now));
+                    }
+                    out
+                })
+            })
             .collect();
         let cats: Vec<Category> = ch.into_iter().filter_map(|h| h.join().ok()).collect();
         let wts: Vec<Worktree> = wh
@@ -265,7 +290,7 @@ pub fn scan(cfg: &Config, busy: &[PathBuf]) -> DiskMap {
         .map(|w| w.bytes)
         .sum();
     DiskMap {
-        at_unix: now_unix(),
+        at_unix: now,
         took_ms: start.elapsed().as_millis() as u64,
         categories,
         worktrees,
@@ -274,10 +299,12 @@ pub fn scan(cfg: &Config, busy: &[PathBuf]) -> DiskMap {
     }
 }
 
-fn find_repos(cfg: &Config) -> Vec<PathBuf> {
+fn find_repos(cfg: &Config, paths: &Paths) -> Vec<PathBuf> {
     let mut out = Vec::new();
-    for root in &cfg.scan_roots {
-        walk_repos(root, 0, &mut out);
+    for root in cfg.roots(paths) {
+        if let Ok(root) = root.canonicalize() {
+            walk_repos(&root, 0, &mut out);
+        }
     }
     out.sort();
     out.dedup();
@@ -314,98 +341,94 @@ fn walk_repos(dir: &Path, depth: usize, out: &mut Vec<PathBuf>) {
     }
 }
 
-fn git(dir: &Path, args: &[&str]) -> Option<String> {
-    let out = Command::new("git")
-        .arg("-C")
-        .arg(dir)
-        .args(args)
-        .env("GIT_OPTIONAL_LOCKS", "0")
-        .output()
-        .ok()?;
-    if !out.status.success() {
-        return None;
-    }
-    Some(String::from_utf8_lossy(&out.stdout).to_string())
-}
-
-fn repo_worktrees(repo: &Path, busy: &[PathBuf], cfg: &Config) -> Vec<Worktree> {
-    let Some(list) = git(repo, &["worktree", "list", "--porcelain"]) else {
+fn repo_worktrees(
+    repo: &Path,
+    busy_cwds: &[PathBuf],
+    cfg: &Config,
+    paths: &Paths,
+    now: u64,
+) -> Vec<Worktree> {
+    let Ok(entries) = git::worktree_list(paths, repo) else {
         return Vec::new();
     };
-    let main_branch = git(repo, &["symbolic-ref", "--short", "HEAD"]).map(|s| s.trim().to_string());
+    let main_branch = git(paths, repo, &["symbolic-ref", "--short", "HEAD"])
+        .ok()
+        .map(|s| s.trim().to_string());
     let merged: Vec<String> = main_branch
         .as_ref()
         .and_then(|b| {
             git(
+                paths,
                 repo,
                 &["branch", "--merged", b, "--format=%(refname:short)"],
             )
+            .ok()
         })
         .map(|s| s.lines().map(|l| l.trim().to_string()).collect())
         .unwrap_or_default();
-
-    let mut entries: Vec<HashMap<&str, String>> = Vec::new();
-    let mut cur: HashMap<&str, String> = HashMap::new();
-    for line in list.lines() {
-        if line.is_empty() {
-            if !cur.is_empty() {
-                entries.push(std::mem::take(&mut cur));
-            }
-            continue;
-        }
-        let (k, v) = line.split_once(' ').unwrap_or((line, ""));
-        let key: &str = match k {
-            "worktree" => "worktree",
-            "branch" => "branch",
-            "HEAD" => "head",
-            "detached" => "detached",
-            "locked" => "locked",
-            "prunable" => "prunable",
-            "bare" => "bare",
-            _ => continue,
-        };
-        cur.insert(key, v.to_string());
-    }
-    if !cur.is_empty() {
-        entries.push(cur);
-    }
 
     let repo_name = repo
         .file_name()
         .map(|n| n.to_string_lossy().to_string())
         .unwrap_or_default();
-    let now = now_unix();
     entries
         .into_iter()
         .skip(1)
-        .filter(|e| !e.contains_key("bare"))
-        .filter_map(|e| {
-            let path = PathBuf::from(e.get("worktree")?);
-            let name = path.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
-            let branch = e.get("branch").map(|b| b.trim_start_matches("refs/heads/").to_string());
-            let detached = e.contains_key("detached");
-            let missing = !path.exists() || e.contains_key("prunable");
-            let locked = e.contains_key("locked");
-            let in_use = busy.contains(&path);
-            let agent = name.starts_with("agent-") || path.to_string_lossy().contains("/.claude/worktrees/");
-            let bytes = if missing { 0 } else { dir_size(&path) };
-            let dirty_files = if missing {
-                0
+        .filter(|e| !e.bare)
+        .map(|e| {
+            let path = e.path.clone();
+            let name = path
+                .file_name()
+                .map(|n| n.to_string_lossy().to_string())
+                .unwrap_or_default();
+            let missing = e.prunable;
+            let exists = !missing && path.is_dir();
+            let canon = path.canonicalize().unwrap_or_else(|_| path.clone());
+            let in_use = exists && any_cwd_in(busy_cwds, &canon, false);
+            let agent = is_agent_worktree(&path);
+            let bytes = if exists { dir_size(&path) } else { 0 };
+            let dirty_files = if exists {
+                git(
+                    paths,
+                    &path,
+                    &[
+                        "status",
+                        "--porcelain=v1",
+                        "--untracked-files=all",
+                        "--ignore-submodules=all",
+                    ],
+                )
+                .map(|s| s.lines().filter(|l| !l.is_empty()).count())
+                .unwrap_or(0)
             } else {
-                git(&path, &["status", "--porcelain"]).map(|s| s.lines().count()).unwrap_or(0)
-            };
-            let last_commit_unix = if missing {
                 0
-            } else {
-                git(&path, &["log", "-1", "--format=%ct", "HEAD"]).and_then(|s| s.trim().parse().ok()).unwrap_or(0)
             };
-            let last_activity_unix = if missing { 0 } else { last_activity(&path).max(last_commit_unix) };
+            let last_commit_unix = if exists {
+                git(paths, &path, &["log", "-1", "--format=%ct", "HEAD"])
+                    .ok()
+                    .and_then(|s| s.trim().parse().ok())
+                    .unwrap_or(0)
+            } else {
+                0
+            };
+            let last_activity_unix = if exists {
+                last_activity(&path).max(last_commit_unix)
+            } else {
+                0
+            };
             let idle_days = now.saturating_sub(last_activity_unix) / 86_400;
-            let is_merged = branch.as_ref().map(|b| merged.contains(b)).unwrap_or(false);
-            let removable = missing || (!in_use && !locked && dirty_files == 0);
-            let sweepable = missing || (agent && !in_use && !locked && idle_days >= cfg.worktree_idle_days);
-            let verdict = if missing {
-                "directory is gone; prune the stale git entry".to_string()
+            let is_merged = e.branch.as_ref().map(|b| merged.contains(b)).unwrap_or(false);
+            let locked = e.locked;
+            let removable = (missing && agent) || (exists && !in_use && !locked && dirty_files == 0);
+            let sweepable = agent
+                && !locked
+                && (missing || (exists && !in_use && idle_days >= cfg.worktree_idle_days));
+            let verdict = if missing && !agent {
+                "directory is gone; not an agent worktree, so it is left for you".to_string()
+            } else if missing {
+                "directory is gone; git marks the entry prunable".to_string()
+            } else if !exists {
+                "directory is missing but git does not mark it prunable".to_string()
             } else if in_use {
                 "agent or process running here".to_string()
             } else if locked {
@@ -421,13 +444,13 @@ fn repo_worktrees(repo: &Path, busy: &[PathBuf], cfg: &Config) -> Vec<Worktree> 
             } else {
                 format!("clean; active {idle_days}d ago")
             };
-            Some(Worktree {
+            Worktree {
                 name,
                 path,
                 repo: repo.to_path_buf(),
                 repo_name: repo_name.clone(),
-                branch,
-                detached,
+                branch: e.branch.clone(),
+                detached: e.detached,
                 agent,
                 bytes,
                 last_activity_unix,
@@ -435,13 +458,14 @@ fn repo_worktrees(repo: &Path, busy: &[PathBuf], cfg: &Config) -> Vec<Worktree> 
                 idle_days,
                 dirty_files,
                 merged: is_merged,
+                head: e.head.clone(),
                 missing,
                 locked,
                 in_use,
                 removable,
                 sweepable,
                 verdict,
-            })
+            }
         })
         .collect()
 }
@@ -455,6 +479,8 @@ fn mtime(p: &Path) -> u64 {
         .unwrap_or(0)
 }
 
+/// Newest file modification under `root`, skipping caches and `.git`, within a
+/// budget of 20,000 entries.
 pub fn last_activity(root: &Path) -> u64 {
     let mut newest = 0u64;
     let mut budget = 20_000usize;
@@ -484,161 +510,6 @@ pub fn last_activity(root: &Path) -> u64 {
 }
 
 #[derive(Debug, Clone, Serialize)]
-pub struct RemoveResult {
-    pub path: PathBuf,
-    pub ok: bool,
-    pub freed: u64,
-    pub message: String,
-    pub backup: Option<PathBuf>,
-}
-
-impl RemoveResult {
-    fn fail(path: &Path, message: impl Into<String>) -> Self {
-        Self {
-            path: path.to_path_buf(),
-            ok: false,
-            freed: 0,
-            message: message.into(),
-            backup: None,
-        }
-    }
-}
-
-fn save_patch(wt: &Worktree) -> Result<PathBuf, String> {
-    let dir = config_dir().join("backups");
-    std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
-    let file = dir.join(format!("{}-{}-{}.patch", wt.repo_name, wt.name, now_unix()));
-    let index = std::env::temp_dir().join(format!(
-        "mulchie-index-{}-{}",
-        std::process::id(),
-        now_unix()
-    ));
-    let real_index =
-        git(&wt.path, &["rev-parse", "--git-path", "index"]).map(|s| s.trim().to_string());
-    if let Some(ri) = real_index {
-        let ri = if Path::new(&ri).is_absolute() {
-            PathBuf::from(ri)
-        } else {
-            wt.path.join(ri)
-        };
-        std::fs::copy(&ri, &index).ok();
-    }
-    let run = |args: &[&str]| {
-        Command::new("git")
-            .arg("-C")
-            .arg(&wt.path)
-            .args(args)
-            .env("GIT_INDEX_FILE", &index)
-            .env("GIT_OPTIONAL_LOCKS", "0")
-            .output()
-    };
-    let added = run(&["add", "-A"]).map_err(|e| e.to_string())?;
-    if !added.status.success() {
-        std::fs::remove_file(&index).ok();
-        return Err(format!(
-            "could not stage a backup: {}",
-            String::from_utf8_lossy(&added.stderr).trim()
-        ));
-    }
-    let diff = run(&["diff", "--cached", "--binary", "HEAD"]).map_err(|e| e.to_string())?;
-    std::fs::remove_file(&index).ok();
-    if !diff.status.success() {
-        return Err("git diff failed while saving a backup".into());
-    }
-    std::fs::write(&file, &diff.stdout).map_err(|e| e.to_string())?;
-    Ok(file)
-}
-
-pub fn remove_worktree(wt: &Worktree, backup_dirty: bool) -> RemoveResult {
-    if wt.missing {
-        let ok = git(&wt.repo, &["worktree", "prune"]).is_some();
-        return RemoveResult {
-            path: wt.path.clone(),
-            ok,
-            freed: 0,
-            message: if ok {
-                "pruned stale entry".into()
-            } else {
-                "git worktree prune failed".into()
-            },
-            backup: None,
-        };
-    }
-    if wt.in_use {
-        return RemoveResult::fail(&wt.path, "agent or process running here");
-    }
-    if wt.locked {
-        return RemoveResult::fail(&wt.path, "locked by git");
-    }
-    let mut backup = None;
-    if wt.dirty_files > 0 {
-        if !backup_dirty {
-            return RemoveResult::fail(
-                &wt.path,
-                format!(
-                    "{} uncommitted file(s); pass backup to save a patch and remove",
-                    wt.dirty_files
-                ),
-            );
-        }
-        match save_patch(wt) {
-            Ok(p) => backup = Some(p),
-            Err(e) => return RemoveResult::fail(&wt.path, e),
-        }
-    }
-    let mut kept = wt.branch.clone();
-    if wt.detached {
-        let name = format!("backup/{}", wt.name);
-        if git(&wt.path, &["branch", "-f", &name, "HEAD"]).is_none() {
-            return RemoveResult::fail(
-                &wt.path,
-                "could not create a backup branch for the detached HEAD",
-            );
-        }
-        kept = Some(name);
-    }
-    let mut args = vec!["worktree", "remove"];
-    if backup.is_some() {
-        args.push("--force");
-    }
-    let out = Command::new("git")
-        .arg("-C")
-        .arg(&wt.repo)
-        .args(&args)
-        .arg(&wt.path)
-        .output();
-    match out {
-        Ok(o) if o.status.success() => {
-            let mut message = match kept {
-                Some(b) => format!("removed; branch {b} kept"),
-                None => "removed".into(),
-            };
-            if let Some(p) = &backup {
-                message.push_str(&format!("; patch saved to {}", p.display()));
-            }
-            RemoveResult {
-                path: wt.path.clone(),
-                ok: true,
-                freed: wt.bytes,
-                message,
-                backup,
-            }
-        }
-        Ok(o) => RemoveResult {
-            backup,
-            ..RemoveResult::fail(
-                &wt.path,
-                String::from_utf8_lossy(&o.stderr).trim().to_string(),
-            )
-        },
-        Err(e) => RemoveResult {
-            backup,
-            ..RemoveResult::fail(&wt.path, e.to_string())
-        },
-    }
-}
-
-#[derive(Debug, Clone, Serialize)]
 pub struct PruneResult {
     pub key: String,
     pub ok: bool,
@@ -646,8 +517,8 @@ pub struct PruneResult {
     pub output: String,
 }
 
-fn find_bin(name: &str) -> Option<PathBuf> {
-    let home = home_dir();
+fn find_bin(paths: &Paths, name: &str) -> Option<PathBuf> {
+    let home = &paths.home;
     let mut dirs: Vec<PathBuf> = std::env::var_os("PATH")
         .map(|p| std::env::split_paths(&p).collect())
         .unwrap_or_default();
@@ -660,9 +531,9 @@ fn find_bin(name: &str) -> Option<PathBuf> {
     dirs.into_iter().map(|d| d.join(name)).find(|p| p.is_file())
 }
 
-pub fn prune_cache(key: &str) -> PruneResult {
-    let home = home_dir();
-    let Some(def) = categories_for(&home).into_iter().find(|c| c.key == key) else {
+/// Run a package manager's own prune command for one cache category.
+pub fn prune_cache(paths: &Paths, key: &str) -> PruneResult {
+    let Some(def) = categories_for(paths).into_iter().find(|c| c.key == key) else {
         return PruneResult {
             key: key.into(),
             ok: false,
@@ -678,7 +549,7 @@ pub fn prune_cache(key: &str) -> PruneResult {
             output: format!("no safe prune command; {}", def.hint),
         };
     };
-    let Some(exe) = find_bin(bin) else {
+    let Some(exe) = find_bin(paths, bin) else {
         return PruneResult {
             key: key.into(),
             ok: false,
@@ -731,79 +602,61 @@ pub fn prune_cache(key: &str) -> PruneResult {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::git::Git;
 
-    fn sh(dir: &Path, args: &[&str]) {
-        let ok = Command::new("git")
-            .arg("-C")
-            .arg(dir)
-            .args(args)
-            .output()
-            .unwrap()
-            .status
-            .success();
-        assert!(ok, "git {args:?}");
+    const DAY: u64 = 86_400;
+
+    fn commit(paths: &Paths, dir: &Path, msg: &str) {
+        Git::new(paths, dir)
+            .args(["-c", "user.name=t", "-c", "user.email=t@t"])
+            .args(["commit", "-q", "--allow-empty", "-m", msg])
+            .run()
+            .unwrap();
     }
 
     #[test]
-    fn dirty_worktree_is_backed_up_then_removed_and_branch_kept() {
-        let root =
-            std::env::temp_dir().join(format!("mulchie-wt-{}-{}", std::process::id(), now_unix()));
+    fn scans_worktrees_without_touching_home() {
+        let t = tempfile::tempdir().unwrap();
+        let paths = Paths::under(t.path());
+        std::fs::create_dir_all(&paths.home).unwrap();
+        std::fs::create_dir_all(t.path().join("code/repo")).unwrap();
+        let root = t.path().join("code").canonicalize().unwrap();
         let repo = root.join("repo");
-        std::fs::create_dir_all(&repo).unwrap();
-        let repo = repo.canonicalize().unwrap();
-        sh(&repo, &["init", "-q", "-b", "main"]);
-        sh(
-            &repo,
-            &[
-                "-c",
-                "user.name=t",
-                "-c",
-                "user.email=t@t",
-                "commit",
-                "-q",
-                "--allow-empty",
-                "-m",
-                "init",
-            ],
-        );
-        let wt_path = repo.join(".claude/worktrees/agent-x");
-        sh(
-            &repo,
-            &[
-                "worktree",
-                "add",
-                "-q",
-                "-b",
-                "feat",
-                wt_path.to_str().unwrap(),
-            ],
-        );
-        std::fs::write(wt_path.join("new.txt"), "hello").unwrap();
+        git(&paths, &repo, &["init", "-q", "-b", "main"]).unwrap();
+        commit(&paths, &repo, "init");
+        let agent = repo.join(".claude/worktrees/agent-x");
+        let human = root.join("human-wt");
+        let gone = repo.join(".claude/worktrees/agent-gone");
+        for (p, b) in [(&agent, "feat"), (&human, "mine"), (&gone, "g")] {
+            git(
+                &paths,
+                &repo,
+                &["worktree", "add", "-q", "-b", b, p.to_str().unwrap()],
+            )
+            .unwrap();
+        }
+        std::fs::write(agent.join("new.txt"), "hello").unwrap();
+        std::fs::rename(&gone, t.path().join("moved-away")).unwrap();
 
         let cfg = Config {
             scan_roots: vec![root.clone()],
-            worktree_idle_days: 0,
+            worktree_idle_days: 1,
             ..Config::default()
         };
-        let map = scan(&cfg, &[]);
-        let wt = map
-            .worktrees
-            .iter()
-            .find(|w| w.name == "agent-x")
-            .unwrap()
-            .clone();
-        assert!(wt.agent && wt.sweepable && wt.dirty_files == 1 && !wt.removable);
+        let later = crate::monitor::now_unix() + 30 * DAY;
+        let map = scan(&cfg, &paths, &[], later);
+        assert!(map.categories.is_empty(), "home is empty");
+        let find = |n: &str| map.worktrees.iter().find(|w| w.name == n).unwrap().clone();
+        let a = find("agent-x");
+        assert!(a.agent && a.sweepable && a.dirty_files == 1 && !a.removable);
+        assert!(a.head.as_deref().map(|h| h.len() == 40).unwrap_or(false));
+        let h = find("human-wt");
+        assert!(!h.agent && !h.sweepable && h.removable);
+        let g = find("agent-gone");
+        assert!(g.missing && g.sweepable);
 
-        let refused = remove_worktree(&wt, false);
-        assert!(!refused.ok && wt_path.exists());
-
-        let r = remove_worktree(&wt, true);
-        assert!(r.ok, "{}", r.message);
-        assert!(!wt_path.exists());
-        let patch = std::fs::read_to_string(r.backup.as_ref().unwrap()).unwrap();
-        assert!(patch.contains("new.txt") && patch.contains("hello"));
-        assert!(git(&repo, &["rev-parse", "--verify", "feat"]).is_some());
-        std::fs::remove_file(r.backup.unwrap()).ok();
-        std::fs::remove_dir_all(root).ok();
+        let busy = scan(&cfg, &paths, std::slice::from_ref(&agent), later);
+        let a = busy.worktrees.iter().find(|w| w.name == "agent-x").unwrap();
+        assert!(a.in_use && !a.sweepable);
     }
 }

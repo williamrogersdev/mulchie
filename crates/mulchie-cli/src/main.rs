@@ -1,7 +1,7 @@
 mod mcp;
 
 use mulchie_core::api::Client;
-use mulchie_core::{human_bytes, Config, Engine, Monitor};
+use mulchie_core::{human_bytes, Config, Engine, Monitor, Paths};
 use serde_json::{json, Value};
 use std::path::PathBuf;
 use std::time::Duration;
@@ -117,7 +117,12 @@ fn status(json: bool) -> i32 {
 fn scan(json: bool) -> i32 {
     let cfg = Config::load();
     let busy = sample().busy_paths();
-    let r = mulchie_core::reclaim::scan(&cfg, &busy);
+    let r = mulchie_core::reclaim::scan(
+        &cfg,
+        &Paths::from_env(),
+        &busy,
+        mulchie_core::monitor::now_unix(),
+    );
     if json {
         println!("{}", serde_json::to_string_pretty(&r).unwrap_or_default());
         return 0;
@@ -151,7 +156,7 @@ fn scan(json: bool) -> i32 {
 fn clean(args: &[String]) -> i32 {
     let dry = args.iter().any(|a| a == "--dry-run");
     let stale = args.iter().any(|a| a == "--stale");
-    let engine = Engine::new(Config::load());
+    let engine = Engine::from_env();
     {
         let snap = sample();
         engine.state.lock().unwrap().snapshot = snap;
@@ -183,15 +188,12 @@ fn clean(args: &[String]) -> i32 {
     let mut freed = 0;
     let mut failed = 0;
     for r in &results {
-        match &r.error {
-            None => {
-                freed += r.freed;
-                println!("cleared {:>9}  {}", human_bytes(r.freed), r.path.display());
-            }
-            Some(e) => {
-                failed += 1;
-                eprintln!("skipped {}: {e}", r.path.display());
-            }
+        if r.is_done() {
+            freed += r.freed_bytes();
+            println!("cleared {:>9}  {}", human_bytes(r.freed_bytes()), r.target);
+        } else {
+            failed += 1;
+            eprintln!("{}", r.summary());
         }
     }
     println!("\nfreed {}", human_bytes(freed));
@@ -203,9 +205,8 @@ fn clean(args: &[String]) -> i32 {
 }
 
 fn serve() -> i32 {
-    let cfg = Config::load();
-    let port = cfg.api_port;
-    let engine = Engine::new(cfg);
+    let engine = Engine::from_env();
+    let port = mulchie_core::config::effective_port(&engine.config());
     engine.start();
     match mulchie_core::api::serve(engine, port) {
         Ok(h) => {
@@ -238,7 +239,7 @@ fn flag<'a>(args: &'a [String], name: &str) -> Option<&'a str> {
 }
 
 fn local_engine(scan: bool) -> Engine {
-    let engine = Engine::new(Config::load());
+    let engine = Engine::from_env();
     engine.state.lock().unwrap().snapshot = sample();
     if scan {
         engine.run_scan();
@@ -349,14 +350,19 @@ fn sweep(args: &[String]) -> i32 {
         Some(c) => c
             .call("GET", "/v1/sweep", None)
             .ok()
-            .and_then(|v| v.as_array().cloned())
+            .and_then(|v| v["items"].as_array().cloned())
             .unwrap_or_default(),
         None => local_engine(true)
             .sweep_plan()
+            .items
             .into_iter()
             .filter_map(|w| serde_json::to_value(w).ok())
             .collect(),
     };
+    let plan: Vec<Value> = plan
+        .into_iter()
+        .filter(|w| w["ready"].as_bool().unwrap_or(false))
+        .collect();
     if plan.is_empty() {
         println!("no idle agent worktrees to sweep");
         return 0;
@@ -393,12 +399,12 @@ fn report_removals(results: &[Value]) -> i32 {
     let mut freed = 0u64;
     let mut failed = 0;
     for r in results {
-        if r["ok"].as_bool().unwrap_or(false) {
-            freed += f(r, "freed") as u64;
-            println!("  ok    {}  {}", s(r, "path"), s(r, "message"));
+        if s(r, "status") == "done" {
+            freed += f(r, "freed_bytes") as u64;
+            println!("  ok    {}", s(r, "target"));
         } else {
             failed += 1;
-            println!("  skip  {}  {}", s(r, "path"), s(r, "message"));
+            println!("  skip  {}  {}", s(r, "target"), s(r, "detail"));
         }
     }
     println!("freed {}", human_bytes(freed));
@@ -414,9 +420,8 @@ fn prune(args: &[String]) -> i32 {
         Some(c) => c
             .call("POST", "/v1/prune", Some(&json!({ "key": key })))
             .unwrap_or(Value::Null),
-        None => {
-            serde_json::to_value(mulchie_core::diskmap::prune_cache(key)).unwrap_or(Value::Null)
-        }
+        None => serde_json::to_value(mulchie_core::diskmap::prune_cache(&Paths::from_env(), key))
+            .unwrap_or(Value::Null),
     };
     println!("{}", s(&r, "output"));
     println!("freed {}", human_bytes(f(&r, "freed") as u64));

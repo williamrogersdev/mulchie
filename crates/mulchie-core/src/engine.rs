@@ -5,23 +5,22 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use crate::config::Config;
-use crate::diskmap::{self, DiskMap, PruneResult, RemoveResult};
+use crate::config::{Config, ConfigError, LoadedConfig};
+use crate::diskmap::{self, DiskMap, PruneResult};
+pub use crate::journal::Action;
+use crate::journal::Journal;
 use crate::monitor::{now_unix, Monitor, ProcKind, Snapshot};
-use crate::reclaim::{self, CleanResult, ScanReport};
+use crate::paths::Paths;
+use crate::process::{own_cwds, ProcessSource, SystemProcesses};
+use crate::reclaim::{self, ScanReport};
+use crate::safety::{
+    pid_alive, ActionKind, ActionResult, Gate, Outcome, Plan, Request, Signal, SkipReason,
+};
 
 const HISTORY_LEN: usize = 600;
 const SAMPLE_SECS: u64 = 3;
-
-#[derive(Debug, Clone, Serialize)]
-pub struct Action {
-    pub at_unix: u64,
-    pub kind: String,
-    pub detail: String,
-    pub bytes: u64,
-    pub workspace: Option<String>,
-    pub source: String,
-}
+/// Activity entries kept in memory and loaded from the journal on start.
+const ACTIONS_KEPT: usize = 500;
 
 #[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -120,6 +119,9 @@ pub struct Advice {
 pub struct State {
     pub version: String,
     pub config: Config,
+    /// Why the config file was not used, if it was not. While set, the engine runs
+    /// on defaults with every automatic destructive behaviour off.
+    pub config_error: Option<String>,
     pub snapshot: Snapshot,
     pub scan: Option<ScanReport>,
     pub diskmap: Option<DiskMap>,
@@ -133,23 +135,36 @@ pub struct State {
 }
 
 impl State {
-    fn log(
-        &mut self,
-        kind: &str,
-        detail: String,
-        bytes: u64,
-        workspace: Option<String>,
-        source: &str,
-    ) {
-        self.actions.push_front(Action {
-            at_unix: now_unix(),
-            kind: kind.into(),
-            detail,
-            bytes,
-            workspace,
-            source: source.into(),
-        });
-        self.actions.truncate(500);
+    fn push(&mut self, a: Action) {
+        self.actions.push_front(a);
+        self.actions.truncate(ACTIONS_KEPT);
+    }
+
+    /// Drop finished items from the cached scans so the UI stops offering them.
+    fn forget(&mut self, results: &[ActionResult]) {
+        let done: HashSet<PathBuf> = results
+            .iter()
+            .filter(|r| r.is_done())
+            .map(|r| PathBuf::from(&r.target))
+            .collect();
+        if done.is_empty() {
+            return;
+        }
+        if let Some(scan) = self.scan.as_mut() {
+            scan.items.retain(|i| !done.contains(&i.path));
+            scan.total_bytes = scan.items.iter().map(|i| i.bytes).sum();
+            scan.stale_bytes = scan.items.iter().filter(|i| i.stale).map(|i| i.bytes).sum();
+        }
+        if let Some(m) = self.diskmap.as_mut() {
+            m.worktrees.retain(|w| !done.contains(&w.path));
+            m.worktree_bytes = m.worktrees.iter().map(|w| w.bytes).sum();
+            m.sweepable_bytes = m
+                .worktrees
+                .iter()
+                .filter(|w| w.sweepable)
+                .map(|w| w.bytes)
+                .sum();
+        }
     }
 }
 
@@ -176,19 +191,49 @@ fn capacity(cfg: &Config, cores: usize) -> usize {
     }
 }
 
+/// Bytes automatic reclaim should free: up to `auto_reclaim_target_gb` of free
+/// space. `None` when nothing is needed. Never "everything".
+pub fn auto_reclaim_need(cfg: &Config, disk_free: u64) -> Option<u64> {
+    let target = cfg.auto_reclaim_target_gb.saturating_mul(1_000_000_000);
+    let need = target.saturating_sub(disk_free);
+    (need > 0).then_some(need)
+}
+
 #[derive(Clone)]
 pub struct Engine {
     pub state: Arc<Mutex<State>>,
     history: Arc<Mutex<VecDeque<Sample>>>,
     scan_requested: Arc<AtomicBool>,
     next_id: Arc<AtomicU64>,
+    paths: Arc<Paths>,
+    journal: Arc<Journal>,
+    procs: Arc<dyn ProcessSource>,
 }
 
 impl Engine {
-    pub fn new(config: Config) -> Self {
+    /// An engine for this user, from the environment's paths and config file.
+    pub fn from_env() -> Self {
+        let paths = Paths::from_env();
+        let loaded = Config::load_from(&paths);
+        Self::new(paths, loaded)
+    }
+
+    pub fn new(paths: Paths, loaded: LoadedConfig) -> Self {
+        Self::with_processes(paths, loaded, Arc::new(SystemProcesses::new()))
+    }
+
+    /// An engine reading the process table from `procs` (tests use a fake).
+    pub fn with_processes(
+        paths: Paths,
+        loaded: LoadedConfig,
+        procs: Arc<dyn ProcessSource>,
+    ) -> Self {
+        let journal = Journal::new(&paths);
+        let actions: VecDeque<Action> = journal.tail(ACTIONS_KEPT).into_iter().rev().collect();
         let state = State {
             version: env!("CARGO_PKG_VERSION").into(),
-            config,
+            config: loaded.config,
+            config_error: loaded.error.map(|e| e.to_string()),
             snapshot: Snapshot::default(),
             scan: None,
             diskmap: None,
@@ -196,7 +241,7 @@ impl Engine {
             health: Health::Good,
             forecast: Forecast::default(),
             slots: Slots::default(),
-            actions: VecDeque::new(),
+            actions,
             throttled: 0,
             low_disk: false,
         };
@@ -205,7 +250,14 @@ impl Engine {
             history: Arc::new(Mutex::new(VecDeque::with_capacity(HISTORY_LEN))),
             scan_requested: Arc::new(AtomicBool::new(true)),
             next_id: Arc::new(AtomicU64::new(1)),
+            paths: Arc::new(paths),
+            journal: Arc::new(journal),
+            procs,
         }
+    }
+
+    pub fn paths(&self) -> &Paths {
+        &self.paths
     }
 
     pub fn snapshot_state(&self) -> State {
@@ -220,9 +272,19 @@ impl Engine {
         self.state.lock().unwrap().config.clone()
     }
 
-    pub fn set_config(&self, cfg: Config) -> std::io::Result<()> {
-        cfg.save()?;
-        self.state.lock().unwrap().config = cfg;
+    pub fn config_error(&self) -> Option<String> {
+        self.state.lock().unwrap().config_error.clone()
+    }
+
+    /// Validate, save atomically, then apply. A file that failed to load is moved
+    /// aside, never overwritten (see [`Config::save_to`]).
+    pub fn set_config(&self, cfg: Config) -> Result<(), ConfigError> {
+        cfg.save_to(&self.paths, now_unix())?;
+        {
+            let mut st = self.state.lock().unwrap();
+            st.config = cfg;
+            st.config_error = None;
+        }
         self.request_scan();
         Ok(())
     }
@@ -231,6 +293,7 @@ impl Engine {
         self.scan_requested.store(true, Ordering::SeqCst);
     }
 
+    /// Record an activity entry in memory and in the journal.
     pub fn log(
         &self,
         kind: &str,
@@ -239,10 +302,19 @@ impl Engine {
         workspace: Option<String>,
         source: &str,
     ) {
-        self.state
-            .lock()
-            .unwrap()
-            .log(kind, detail, bytes, workspace, source);
+        self.record(Action::note(
+            now_unix(),
+            kind,
+            detail,
+            bytes,
+            workspace,
+            source,
+        ));
+    }
+
+    fn record(&self, a: Action) {
+        let _ = self.journal.append(&a);
+        self.state.lock().unwrap().push(a);
     }
 
     pub fn start(&self) {
@@ -258,8 +330,14 @@ impl Engine {
             .ok();
     }
 
+    /// Automatic destructive behaviour is allowed only with a config that loaded
+    /// cleanly.
+    fn automation_allowed(&self) -> bool {
+        self.state.lock().unwrap().config_error.is_none()
+    }
+
     fn monitor_loop(&self) {
-        let mut mon = Monitor::new();
+        let mut mon = Monitor::with_home(self.paths.home.clone());
         let mut reniced: HashSet<u32> = HashSet::new();
         let mut last_reclaim = Instant::now() - Duration::from_secs(3600);
         loop {
@@ -313,6 +391,7 @@ impl Engine {
             let alive: HashSet<u32> = kinds.iter().map(|(p, _)| p.as_u32()).collect();
             reniced.retain(|p| alive.contains(p));
 
+            let mut notes = Vec::new();
             {
                 let mut st = self.state.lock().unwrap();
                 st.snapshot = snap.clone();
@@ -321,13 +400,14 @@ impl Engine {
                 st.throttled = reniced.len();
                 let low = snap.disk_total > 0 && snap.disk_free_gb() < cfg.alert_below_gb as f64;
                 if low && !st.low_disk {
-                    st.log(
+                    notes.push(Action::note(
+                        now_unix(),
                         "alert",
                         format!("Free space below {} GB", cfg.alert_below_gb),
                         snap.disk_free,
                         None,
                         "monitor",
-                    );
+                    ));
                 }
                 st.low_disk = low;
                 let cap = capacity(&cfg, snap.cpu_count);
@@ -353,16 +433,18 @@ impl Engine {
                     }
                     let named: usize = by_ws.values().sum();
                     for (label, n) in by_ws {
-                        st.log(
+                        notes.push(Action::note(
+                            now,
                             "throttle",
                             format!("Lowered priority of {n} build process(es) under pressure"),
                             0,
                             Some(label),
                             "optimizer",
-                        );
+                        ));
                     }
                     if newly.len() > named {
-                        st.log(
+                        notes.push(Action::note(
+                            now,
                             "throttle",
                             format!(
                                 "Lowered priority of {} build process(es)",
@@ -371,19 +453,23 @@ impl Engine {
                             0,
                             None,
                             "optimizer",
-                        );
+                        ));
                     }
                 }
             }
+            for n in notes {
+                self.record(n);
+            }
 
             if cfg.auto_reclaim
+                && self.automation_allowed()
                 && snap.disk_free_gb() < cfg.low_disk_gb as f64
                 && last_reclaim.elapsed() > Duration::from_secs(600)
             {
                 last_reclaim = Instant::now();
-                let need = ((cfg.auto_reclaim_target_gb as f64 * 1e9) as u64)
-                    .saturating_sub(snap.disk_free);
-                self.reclaim_stale(need, "optimizer");
+                if let Some(need) = auto_reclaim_need(&cfg, snap.disk_free) {
+                    self.reclaim_stale(Some(need), "optimizer");
+                }
             }
 
             std::thread::sleep(Duration::from_secs(SAMPLE_SECS).saturating_sub(tick.elapsed()));
@@ -397,21 +483,12 @@ impl Engine {
             let due = last.elapsed() > Duration::from_secs(cfg.scan_interval_mins.max(1) * 60);
             if self.scan_requested.swap(false, Ordering::SeqCst) || due {
                 self.run_scan();
-                if cfg.auto_sweep_worktrees && due {
+                if cfg.auto_sweep_worktrees && due && self.automation_allowed() {
                     self.sweep_worktrees("optimizer");
                 }
                 last = Instant::now();
             }
             std::thread::sleep(Duration::from_secs(2));
-        }
-    }
-
-    fn busy(&self) -> Vec<PathBuf> {
-        let busy = self.state.lock().unwrap().snapshot.busy_paths();
-        if busy.is_empty() {
-            Monitor::new().sample().busy_paths()
-        } else {
-            busy
         }
     }
 
@@ -421,103 +498,118 @@ impl Engine {
             st.scanning = true;
             st.config.clone()
         };
-        let busy = self.busy();
-        let report = reclaim::scan(&cfg, &busy);
+        let cwds = own_cwds(&*self.procs);
+        let now = now_unix();
+        let report = reclaim::scan(&cfg, &self.paths, &cwds, now);
         self.state.lock().unwrap().scan = Some(report.clone());
-        let map = diskmap::scan(&cfg, &busy);
+        let map = diskmap::scan(&cfg, &self.paths, &cwds, now);
         let mut st = self.state.lock().unwrap();
         st.diskmap = Some(map);
         st.scanning = false;
         report
     }
 
-    pub fn clean_paths(&self, paths: &[PathBuf], source: &str) -> Vec<CleanResult> {
+    fn gate_run<R>(&self, f: impl FnOnce(&Gate) -> R) -> R {
         let cfg = self.config();
-        let busy = self.state.lock().unwrap().snapshot.busy_paths();
-        let mut out = Vec::new();
-        for p in paths {
-            if let Err(e) = reclaim::verify_cleanable(p, &cfg) {
-                out.push(CleanResult {
-                    path: p.clone(),
-                    freed: 0,
-                    error: Some(e),
-                });
-                continue;
-            }
-            let proj = p.parent().unwrap_or(p);
-            let root = reclaim::git_root(proj)
-                .map(|r| r.0)
-                .unwrap_or_else(|| proj.to_path_buf());
-            if busy.contains(&root) {
-                out.push(CleanResult {
-                    path: p.clone(),
-                    freed: 0,
-                    error: Some("an agent or build is running in this project".into()),
-                });
-                continue;
-            }
-            out.push(reclaim::clean(p, &cfg));
-        }
-        let freed: u64 = out.iter().map(|r| r.freed).sum();
-        let ok: Vec<&CleanResult> = out.iter().filter(|r| r.error.is_none()).collect();
-        let mut st = self.state.lock().unwrap();
-        if !ok.is_empty() {
-            let what = if ok.len() == 1 {
-                short_path(&ok[0].path)
-            } else {
-                format!("{} build caches", ok.len())
-            };
-            st.log("reclaim", format!("Cleared {what}"), freed, None, source);
-        }
-        let done: HashSet<PathBuf> = ok.iter().map(|r| r.path.clone()).collect();
-        if let Some(scan) = st.scan.as_mut() {
-            scan.items.retain(|i| !done.contains(&i.path));
-            scan.total_bytes = scan.items.iter().map(|i| i.bytes).sum();
-            scan.stale_bytes = scan.items.iter().filter(|i| i.stale).map(|i| i.bytes).sum();
-        }
-        out
+        let gate =
+            Gate::new(&cfg, &self.paths, &*self.procs, now_unix()).with_journal(&self.journal);
+        f(&gate)
     }
 
-    pub fn reclaim_stale(&self, want_bytes: u64, source: &str) -> Vec<CleanResult> {
+    /// Check requests against the facts now, without acting.
+    pub fn plan(&self, requests: &[Request]) -> Plan {
+        self.gate_run(|g| g.plan(requests))
+    }
+
+    /// Execute approved requests through the safety gate. Each is re-checked now.
+    pub fn execute(&self, requests: &[Request], source: &str) -> Vec<ActionResult> {
+        let now = now_unix();
+        let results = self.gate_run(|g| g.execute(requests, source));
+        let mut st = self.state.lock().unwrap();
+        for (r, req) in results.iter().zip(requests) {
+            let sig = match req {
+                Request::Signal { signal, .. } => Some(*signal),
+                _ => None,
+            };
+            st.push(r.to_action(now, source, sig));
+        }
+        st.forget(&results);
+        results
+    }
+
+    fn reject(
+        &self,
+        action: ActionKind,
+        target: String,
+        detail: &str,
+        source: &str,
+    ) -> ActionResult {
+        let r = ActionResult {
+            action,
+            target,
+            outcome: Outcome::Skipped {
+                reason: SkipReason::UnknownTarget,
+                detail: detail.into(),
+            },
+        };
+        self.record(r.to_action(now_unix(), source, None));
+        r
+    }
+
+    /// Delete specific caches (no staleness requirement).
+    pub fn clean_paths(&self, paths: &[PathBuf], source: &str) -> Vec<ActionResult> {
+        let reqs: Vec<Request> = paths
+            .iter()
+            .map(|p| Request::DeleteCache {
+                path: p.clone(),
+                require_stale: false,
+            })
+            .collect();
+        self.execute(&reqs, source)
+    }
+
+    /// Stale caches to delete, re-checked now. `None` means every stale cache.
+    pub fn reclaim_plan(&self, want_bytes: Option<u64>) -> Plan {
         let existing = self.state.lock().unwrap().scan.clone();
         let scan = match existing {
             Some(s) => s,
             None => self.run_scan(),
         };
-        let mut picked = Vec::new();
-        let mut sum = 0u64;
-        for item in scan.items.iter().filter(|i| i.stale) {
-            if want_bytes > 0 && sum >= want_bytes {
-                break;
+        self.gate_run(|g| g.plan_reclaim(&scan.items, want_bytes))
+    }
+
+    /// Build a reclaim plan and execute its ready items.
+    pub fn reclaim_stale(&self, want_bytes: Option<u64>, source: &str) -> Vec<ActionResult> {
+        let plan = self.reclaim_plan(want_bytes);
+        self.execute(&plan.approved(), source)
+    }
+
+    /// Idle agent worktrees a sweep would remove, re-checked now.
+    pub fn sweep_plan(&self) -> Plan {
+        let existing = self.state.lock().unwrap().diskmap.clone();
+        let map = match existing {
+            Some(m) => m,
+            None => {
+                self.run_scan();
+                self.state
+                    .lock()
+                    .unwrap()
+                    .diskmap
+                    .clone()
+                    .unwrap_or_default()
             }
-            sum += item.bytes;
-            picked.push(item.path.clone());
-        }
-        self.clean_paths(&picked, source)
+        };
+        self.gate_run(|g| g.plan_sweep(&map.worktrees))
     }
 
-    pub fn sweep_plan(&self) -> Vec<diskmap::Worktree> {
-        let st = self.state.lock().unwrap();
-        let busy = st.snapshot.busy_paths();
-        st.diskmap
-            .as_ref()
-            .map(|m| {
-                m.worktrees
-                    .iter()
-                    .filter(|w| w.sweepable && !busy.contains(&w.path))
-                    .cloned()
-                    .collect()
-            })
-            .unwrap_or_default()
-    }
-
-    pub fn sweep_worktrees(&self, source: &str) -> Vec<RemoveResult> {
-        let paths: Vec<PathBuf> = self.sweep_plan().into_iter().map(|w| w.path).collect();
-        self.remove_worktrees(&paths, true, source)
+    /// Build a sweep plan and execute its ready items.
+    pub fn sweep_worktrees(&self, source: &str) -> Vec<ActionResult> {
+        let plan = self.sweep_plan();
+        self.execute(&plan.approved(), source)
     }
 
     pub fn prune_cache(&self, key: &str, source: &str) -> PruneResult {
-        let r = diskmap::prune_cache(key);
+        let r = diskmap::prune_cache(&self.paths, key);
         if r.ok {
             self.log(
                 "reclaim",
@@ -535,55 +627,46 @@ impl Engine {
         r
     }
 
+    /// Remove worktrees by path. The expected HEAD is the one in the last scan
+    /// (what the caller saw); a worktree whose directory is gone is pruned instead.
     pub fn remove_worktrees(
         &self,
         paths: &[PathBuf],
-        backup_dirty: bool,
+        allow_dirty: bool,
         source: &str,
-    ) -> Vec<RemoveResult> {
-        let (map, busy) = {
-            let st = self.state.lock().unwrap();
-            (
-                st.diskmap.clone().unwrap_or_default(),
-                st.snapshot.busy_paths(),
-            )
-        };
+    ) -> Vec<ActionResult> {
+        let map = self
+            .state
+            .lock()
+            .unwrap()
+            .diskmap
+            .clone()
+            .unwrap_or_default();
         let mut out = Vec::new();
         for p in paths {
             let Some(wt) = map.worktrees.iter().find(|w| &w.path == p) else {
-                out.push(RemoveResult {
-                    path: p.clone(),
-                    ok: false,
-                    freed: 0,
-                    message: "not a known worktree; rescan first".into(),
-                    backup: None,
-                });
+                out.push(self.reject(
+                    ActionKind::RemoveWorktree,
+                    p.display().to_string(),
+                    "not a known worktree; rescan first",
+                    source,
+                ));
                 continue;
             };
-            let mut wt = wt.clone();
-            if busy.contains(&wt.path) {
-                wt.in_use = true;
-            }
-            let r = diskmap::remove_worktree(&wt, backup_dirty);
-            if r.ok {
-                self.log(
-                    "worktree",
-                    format!("Removed worktree ({})", r.message),
-                    r.freed,
-                    Some(format!("{} › {}", wt.repo_name, wt.name)),
-                    source,
-                );
-            }
-            out.push(r);
-        }
-        let done: HashSet<PathBuf> = out
-            .iter()
-            .filter(|r| r.ok)
-            .map(|r| r.path.clone())
-            .collect();
-        if let Some(m) = self.state.lock().unwrap().diskmap.as_mut() {
-            m.worktrees.retain(|w| !done.contains(&w.path));
-            m.worktree_bytes = m.worktrees.iter().map(|w| w.bytes).sum();
+            let req = if wt.missing {
+                Request::PruneWorktree {
+                    repo: wt.repo.clone(),
+                    path: wt.path.clone(),
+                }
+            } else {
+                Request::RemoveWorktree {
+                    path: wt.path.clone(),
+                    expected_head: wt.head.clone().unwrap_or_default(),
+                    allow_dirty,
+                    require_idle: false,
+                }
+            };
+            out.extend(self.execute(std::slice::from_ref(&req), source));
         }
         out
     }
@@ -606,41 +689,56 @@ impl Engine {
             (ws, st.config.build_nice)
         };
         let me = std::process::id();
-        let mut done = 0;
-        for p in ws
+        let targets: Vec<_> = ws
             .procs
             .iter()
             .filter(|p| p.own && p.pid != me && p.pid > 1)
-        {
-            let ok = match action {
-                WorkspaceAction::Pause => signal(p.pid, libc::SIGSTOP),
-                WorkspaceAction::Resume => signal(p.pid, libc::SIGCONT),
-                WorkspaceAction::Deprioritize => renice(p.pid, nice.max(10)),
-                WorkspaceAction::StopBuilds => {
-                    p.kind == ProcKind::Build && signal(p.pid, libc::SIGTERM)
-                }
-                WorkspaceAction::KillAll => {
-                    signal(p.pid, libc::SIGCONT);
-                    signal(p.pid, libc::SIGTERM)
-                }
-            };
-            if ok {
-                done += 1;
-            }
-        }
-        let (kind, detail) = match action {
-            WorkspaceAction::Pause => ("pause", format!("Paused {done} process(es)")),
-            WorkspaceAction::Resume => ("resume", format!("Resumed {done} process(es)")),
-            WorkspaceAction::Deprioritize => (
+            .collect();
+        if action == WorkspaceAction::Deprioritize {
+            let done = targets
+                .iter()
+                .filter(|p| renice(p.pid, nice.max(10)))
+                .count();
+            self.log(
                 "throttle",
                 format!("Lowered priority of {done} process(es)"),
-            ),
-            WorkspaceAction::StopBuilds => {
-                ("stop", format!("Sent SIGTERM to {done} build process(es)"))
+                0,
+                Some(ws.label.clone()),
+                source,
+            );
+            return Ok(done);
+        }
+        let mut reqs = Vec::new();
+        for p in &targets {
+            let sigs: &[Signal] = match action {
+                WorkspaceAction::Pause => &[Signal::Stop],
+                WorkspaceAction::Resume => &[Signal::Cont],
+                WorkspaceAction::StopBuilds if p.kind == ProcKind::Build => &[Signal::Term],
+                WorkspaceAction::StopBuilds => &[],
+                WorkspaceAction::KillAll => &[Signal::Cont, Signal::Term],
+                WorkspaceAction::Deprioritize => &[],
+            };
+            for s in sigs {
+                reqs.push(Request::Signal {
+                    pid: p.pid,
+                    signal: *s,
+                    expected_start_time: p.start_time,
+                });
             }
-            WorkspaceAction::KillAll => ("stop", format!("Sent SIGTERM to all {done} process(es)")),
+        }
+        let results = self.execute(&reqs, source);
+        let last_sig = match action {
+            WorkspaceAction::Pause => Signal::Stop,
+            WorkspaceAction::Resume => Signal::Cont,
+            _ => Signal::Term,
         };
-        self.log(kind, detail, 0, Some(ws.label.clone()), source);
+        let done = results
+            .iter()
+            .zip(&reqs)
+            .filter(|(r, q)| {
+                r.is_done() && matches!(q, Request::Signal { signal, .. } if *signal == last_sig)
+            })
+            .count();
         Ok(done)
     }
 
@@ -659,34 +757,43 @@ impl Engine {
         if !info.own {
             return Err("process belongs to another user".into());
         }
-        let ok = match action {
-            ProcAction::Term => signal(pid, libc::SIGTERM),
-            ProcAction::Kill => signal(pid, libc::SIGKILL),
-            ProcAction::Stop => signal(pid, libc::SIGSTOP),
-            ProcAction::Cont => signal(pid, libc::SIGCONT),
-            ProcAction::Renice { nice } => unsafe {
-                libc::setpriority(
-                    libc::PRIO_PROCESS as _,
-                    pid as libc::id_t,
-                    nice.clamp(0, 20),
-                ) == 0
-            },
+        let signal = match action {
+            ProcAction::Term => Signal::Term,
+            ProcAction::Kill => Signal::Kill,
+            ProcAction::Stop => Signal::Stop,
+            ProcAction::Cont => Signal::Cont,
+            ProcAction::Renice { nice } => {
+                let ok = unsafe {
+                    libc::setpriority(
+                        libc::PRIO_PROCESS as _,
+                        pid as libc::id_t,
+                        nice.clamp(0, 20),
+                    ) == 0
+                };
+                if !ok {
+                    return Err(std::io::Error::last_os_error().to_string());
+                }
+                self.log(
+                    "throttle",
+                    format!("renice {} → {} ({pid})", nice.clamp(0, 20), info.name),
+                    0,
+                    Some(info.group),
+                    source,
+                );
+                return Ok(());
+            }
         };
-        if !ok {
-            return Err(std::io::Error::last_os_error().to_string());
+        let req = Request::Signal {
+            pid,
+            signal,
+            expected_start_time: info.start_time,
+        };
+        let r = self.execute(std::slice::from_ref(&req), source);
+        match r.first().map(|r| &r.outcome) {
+            Some(Outcome::Done { .. }) => Ok(()),
+            Some(Outcome::Skipped { detail, .. }) => Err(detail.clone()),
+            None => Err("no result".into()),
         }
-        let (kind, detail) = match action {
-            ProcAction::Term => ("stop", format!("SIGTERM → {} ({pid})", info.name)),
-            ProcAction::Kill => ("stop", format!("SIGKILL → {} ({pid})", info.name)),
-            ProcAction::Stop => ("pause", format!("SIGSTOP → {} ({pid})", info.name)),
-            ProcAction::Cont => ("resume", format!("SIGCONT → {} ({pid})", info.name)),
-            ProcAction::Renice { nice } => (
-                "throttle",
-                format!("renice {} → {} ({pid})", nice.clamp(0, 20), info.name),
-            ),
-        };
-        self.log(kind, detail, 0, Some(info.group), source);
-        Ok(())
     }
 
     pub fn advice(&self) -> Advice {
@@ -833,14 +940,6 @@ fn forecast(h: &VecDeque<Sample>, cfg: &Config) -> Forecast {
     }
 }
 
-fn pid_alive(pid: u32) -> bool {
-    pid > 0 && unsafe { libc::kill(pid as i32, 0) == 0 }
-}
-
-fn signal(pid: u32, sig: i32) -> bool {
-    unsafe { libc::kill(pid as i32, sig) == 0 }
-}
-
 fn renice(pid: u32, nice: i32) -> bool {
     unsafe {
         *errno() = 0;
@@ -862,30 +961,28 @@ unsafe fn errno() -> *mut libc::c_int {
     libc::__errno_location()
 }
 
-fn short_path(p: &Path) -> String {
-    let s = p.to_string_lossy();
-    if let Some(i) = s.find("/.claude/worktrees/") {
-        let repo = s[..i].rsplit('/').next().unwrap_or("");
-        let wt = s[i + "/.claude/worktrees/".len()..]
-            .split('/')
-            .next()
-            .unwrap_or("");
-        return format!("{repo} › {wt} cache");
-    }
-    let parts: Vec<&str> = s.split('/').filter(|x| !x.is_empty()).collect();
-    match parts.len() {
-        n if n >= 2 => format!("{} cache", parts[n - 2]),
-        _ => s.to_string(),
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::process::FakeProcesses;
+
+    fn engine(cfg: Config) -> (tempfile::TempDir, Engine) {
+        let t = tempfile::tempdir().unwrap();
+        let paths = Paths::under(t.path());
+        let e = Engine::with_processes(
+            paths,
+            LoadedConfig {
+                config: cfg,
+                error: None,
+            },
+            Arc::new(FakeProcesses::empty()),
+        );
+        (t, e)
+    }
 
     #[test]
     fn slots_queue_in_order_and_release() {
-        let e = Engine::new(Config {
+        let (_t, e) = engine(Config {
             max_heavy_jobs: 1,
             ..Config::default()
         });
@@ -909,5 +1006,64 @@ mod tests {
         let b2 = e.acquire("b", me, Some(b.ticket));
         assert!(b2.granted);
         assert_eq!(b2.jobs, 4);
+    }
+
+    #[test]
+    fn auto_reclaim_never_means_everything() {
+        let cfg = Config {
+            low_disk_gb: 100,
+            auto_reclaim_target_gb: 60,
+            ..Config::default()
+        };
+        // The audit's case: free space already above the target.
+        assert_eq!(auto_reclaim_need(&cfg, 80_000_000_000), None);
+        assert_eq!(auto_reclaim_need(&cfg, 60_000_000_000), None);
+        assert_eq!(
+            auto_reclaim_need(&cfg, 50_000_000_000),
+            Some(10_000_000_000)
+        );
+        // And such a config does not validate in the first place.
+        assert!(cfg.validate().is_err());
+    }
+
+    #[test]
+    fn config_error_turns_automation_off_and_is_in_state() {
+        let t = tempfile::tempdir().unwrap();
+        let paths = Paths::under(t.path());
+        std::fs::create_dir_all(&paths.config_dir).unwrap();
+        std::fs::write(paths.config_file(), b"{ broken").unwrap();
+        let loaded = Config::load_from(&paths);
+        let e = Engine::with_processes(paths.clone(), loaded, Arc::new(FakeProcesses::empty()));
+        let st = e.snapshot_state();
+        assert!(st.config_error.is_some());
+        assert!(!st.config.auto_reclaim && !st.config.auto_sweep_worktrees);
+        assert!(!e.automation_allowed());
+        e.set_config(Config::default()).unwrap();
+        assert!(e.config_error().is_none() && e.automation_allowed());
+    }
+
+    #[test]
+    fn activity_survives_a_restart() {
+        let t = tempfile::tempdir().unwrap();
+        let paths = Paths::under(t.path());
+        let mk = || {
+            Engine::with_processes(
+                paths.clone(),
+                LoadedConfig {
+                    config: Config::default(),
+                    error: None,
+                },
+                Arc::new(FakeProcesses::empty()),
+            )
+        };
+        let e = mk();
+        e.log("alert", "one".into(), 0, None, "test");
+        let r = e.clean_paths(&[PathBuf::from("relative/target")], "test");
+        assert_eq!(r[0].reason(), Some(SkipReason::NotAbsolute));
+        let e2 = mk();
+        let st = e2.snapshot_state();
+        assert_eq!(st.actions.len(), 2);
+        assert_eq!(st.actions[0].status.as_deref(), Some("skipped"));
+        assert_eq!(st.actions[1].detail, "one");
     }
 }

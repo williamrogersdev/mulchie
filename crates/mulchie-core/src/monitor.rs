@@ -7,10 +7,13 @@ use sysinfo::{
     ProcessesToUpdate, System, UpdateKind,
 };
 
-use crate::config::home_dir;
+use crate::paths::home_dir;
+use crate::process::ProcFacts;
 
 /// Per-process git root lookup: `(root, in_worktree)`.
 type DirectEntry = Option<(PathBuf, bool)>;
+/// Working directory → git root, remembered between samples.
+pub type RootCache = HashMap<PathBuf, Option<(PathBuf, bool)>>;
 
 #[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq, Hash)]
 #[serde(rename_all = "snake_case")]
@@ -37,6 +40,9 @@ pub struct ProcInfo {
     pub nice: i32,
     pub stopped: bool,
     pub run_secs: u64,
+    /// Seconds since the epoch; a signal request carries it so a reused pid is
+    /// not hit.
+    pub start_time: u64,
     pub cmd: String,
 }
 
@@ -187,7 +193,8 @@ pub fn classify(name: &str) -> ProcKind {
 
 pub struct Monitor {
     sys: System,
-    root_cache: HashMap<PathBuf, Option<(PathBuf, bool)>>,
+    home: PathBuf,
+    root_cache: RootCache,
     branch_cache: HashMap<PathBuf, (Instant, Option<String>)>,
     last: Instant,
     me: u32,
@@ -195,11 +202,17 @@ pub struct Monitor {
 }
 
 impl Monitor {
+    /// A monitor for the home directory in `$HOME`. Entry points only.
     pub fn new() -> Self {
+        Self::with_home(home_dir())
+    }
+
+    pub fn with_home(home: PathBuf) -> Self {
         let mut sys = System::new().expect("system info unavailable");
         sys.refresh_cpu_specifics(CpuRefreshKind::nothing().with_usage());
         Self {
             sys,
+            home,
             root_cache: HashMap::new(),
             branch_cache: HashMap::new(),
             last: Instant::now(),
@@ -220,7 +233,8 @@ impl Monitor {
                 .with_cpu()
                 .with_memory()
                 .with_disk_usage()
-                .with_cwd(UpdateKind::OnlyIfNotSet)
+                // A shell that `cd`s into a worktree must be seen there.
+                .with_cwd(UpdateKind::Always)
                 .with_user(UpdateKind::OnlyIfNotSet)
                 .with_cmd(UpdateKind::OnlyIfNotSet)
                 .with_exe(UpdateKind::OnlyIfNotSet),
@@ -237,42 +251,25 @@ impl Monitor {
         let (mut agent_count, mut build_count) = (0, 0);
         let (mut read_total, mut write_total) = (0u64, 0u64);
 
-        let cache = &mut self.root_cache;
+        let facts: Vec<ProcFacts> = self
+            .sys
+            .processes()
+            .iter()
+            .filter(|(_, p)| p.thread_kind().is_none())
+            .map(|(pid, p)| ProcFacts {
+                pid: pid.as_u32(),
+                ppid: p.parent().map(|x| x.as_u32()).unwrap_or(0),
+                uid: p.user_id().map(|u| **u),
+                name: String::new(),
+                exe: None,
+                cmd: Vec::new(),
+                cwd: p.cwd().map(|c| c.to_path_buf()),
+                start_time: p.start_time(),
+            })
+            .collect();
+        let roots = attribute(&facts, my_uid, &self.home, &mut self.root_cache);
         let bcache = &mut self.branch_cache;
-        let mut direct: HashMap<u32, (u32, bool, DirectEntry)> =
-            HashMap::with_capacity(self.sys.processes().len());
-        for (pid, p) in self.sys.processes() {
-            if p.thread_kind().is_some() {
-                continue;
-            }
-            let own = p.user_id().map(|u| **u == my_uid).unwrap_or(false);
-            let root = if own {
-                p.cwd().and_then(|c| cached_root(cache, c))
-            } else {
-                None
-            };
-            direct.insert(
-                pid.as_u32(),
-                (p.parent().map(|x| x.as_u32()).unwrap_or(0), own, root),
-            );
-        }
-        let resolve = |pid: u32| -> Option<(PathBuf, bool)> {
-            let (mut parent, own, root) = direct.get(&pid)?.clone();
-            if root.is_some() || !own {
-                return root;
-            }
-            for _ in 0..8 {
-                let (pp, pown, proot) = direct.get(&parent)?;
-                if !pown || *pp == 0 {
-                    return None;
-                }
-                if proot.is_some() {
-                    return proot.clone();
-                }
-                parent = *pp;
-            }
-            None
-        };
+        let home = self.home.clone();
         for (pid, p) in self.sys.processes() {
             if pid.as_u32() == self.me || p.thread_kind().is_some() {
                 continue;
@@ -292,7 +289,7 @@ impl Monitor {
             read_total += read_bps;
             write_total += write_bps;
 
-            let ws_root = resolve(pid.as_u32());
+            let ws_root = roots.get(&pid.as_u32()).cloned();
             let group = match &ws_root {
                 Some((root, wt)) => label_for(root, *wt),
                 None => app_group(p.exe(), &name),
@@ -303,6 +300,7 @@ impl Monitor {
                     .map(|a| a.to_string_lossy())
                     .collect::<Vec<_>>()
                     .join(" "),
+                &home,
             );
             let info = ProcInfo {
                 pid: pid.as_u32(),
@@ -319,6 +317,7 @@ impl Monitor {
                 nice: if own { priority_of(pid.as_u32()) } else { 0 },
                 stopped: matches!(p.status(), ProcessStatus::Stop),
                 run_secs: p.run_time(),
+                start_time: p.start_time(),
                 cmd,
             };
 
@@ -418,7 +417,7 @@ impl Monitor {
             .collect();
         top.sort_by(|a, b| b.cpu_pct.total_cmp(&a.cpu_pct));
 
-        let (disk_mount, disk_total, disk_free) = home_disk();
+        let (disk_mount, disk_total, disk_free) = home_disk(&self.home);
         let load = System::load_average()
             .map(|l| [l.one, l.five, l.fifteen])
             .unwrap_or_default();
@@ -500,14 +499,53 @@ fn app_group(exe: Option<&Path>, name: &str) -> String {
     name.to_string()
 }
 
-fn cached_root(
-    cache: &mut HashMap<PathBuf, Option<(PathBuf, bool)>>,
-    cwd: &Path,
-) -> Option<(PathBuf, bool)> {
+/// Attribute each process to the git checkout it works in: its own working
+/// directory's checkout, else the nearest own ancestor's (up to 8 levels). Only
+/// processes owned by `uid` with a working directory under `home` are attributed.
+pub fn attribute(
+    procs: &[ProcFacts],
+    uid: u32,
+    home: &Path,
+    cache: &mut RootCache,
+) -> HashMap<u32, (PathBuf, bool)> {
+    let mut direct: HashMap<u32, (u32, bool, DirectEntry)> = HashMap::with_capacity(procs.len());
+    for p in procs {
+        let own = p.uid == Some(uid);
+        let root = if own {
+            p.cwd.as_deref().and_then(|c| cached_root(cache, c, home))
+        } else {
+            None
+        };
+        direct.insert(p.pid, (p.ppid, own, root));
+    }
+    let resolve = |pid: u32| -> Option<(PathBuf, bool)> {
+        let (mut parent, own, root) = direct.get(&pid)?.clone();
+        if root.is_some() || !own {
+            return root;
+        }
+        for _ in 0..8 {
+            let (pp, pown, proot) = direct.get(&parent)?;
+            if !pown || *pp == 0 {
+                return None;
+            }
+            if proot.is_some() {
+                return proot.clone();
+            }
+            parent = *pp;
+        }
+        None
+    };
+    procs
+        .iter()
+        .filter_map(|p| resolve(p.pid).map(|r| (p.pid, r)))
+        .collect()
+}
+
+fn cached_root(cache: &mut RootCache, cwd: &Path, home: &Path) -> Option<(PathBuf, bool)> {
     if let Some(hit) = cache.get(cwd) {
         return hit.clone();
     }
-    let found = find_root(cwd);
+    let found = find_root(cwd, home);
     if cache.len() > 20_000 {
         cache.clear();
     }
@@ -529,9 +567,8 @@ fn cached_branch(
     b
 }
 
-fn find_root(cwd: &Path) -> Option<(PathBuf, bool)> {
-    let home = home_dir();
-    if !cwd.starts_with(&home) || cwd == home {
+fn find_root(cwd: &Path, home: &Path) -> Option<(PathBuf, bool)> {
+    if !cwd.starts_with(home) || cwd == home {
         return None;
     }
     let mut cur = Some(cwd);
@@ -600,8 +637,7 @@ pub fn priority_of(pid: u32) -> i32 {
     unsafe { libc::getpriority(libc::PRIO_PROCESS as _, pid as libc::id_t) }
 }
 
-fn shorten_cmd(cmd: &str) -> String {
-    let home = home_dir();
+fn shorten_cmd(cmd: &str, home: &Path) -> String {
     let home = home.to_string_lossy();
     let out: Vec<String> = cmd
         .split_whitespace()
@@ -635,8 +671,7 @@ fn label_for(root: &Path, is_worktree: bool) -> String {
     format!("{} › {name}", repo_name(root, true))
 }
 
-fn home_disk() -> (PathBuf, u64, u64) {
-    let home = home_dir();
+fn home_disk(home: &Path) -> (PathBuf, u64, u64) {
     let Ok(disks) = Disks::new_with_refreshed_list() else {
         return (PathBuf::from("/"), 0, 0);
     };
@@ -667,4 +702,38 @@ pub fn now_unix() -> u64 {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::process::{FakeProcesses, ProcessSource};
+
+    #[test]
+    fn attribution_follows_cwd_and_parents_from_a_fake_table() {
+        let t = tempfile::tempdir().unwrap();
+        let home = t.path().canonicalize().unwrap();
+        let repo = home.join("code/repo");
+        let wt = repo.join(".claude/worktrees/w");
+        std::fs::create_dir_all(repo.join(".git")).unwrap();
+        std::fs::create_dir_all(wt.join("src")).unwrap();
+        std::fs::write(wt.join(".git"), "gitdir: x").unwrap();
+        let mut table = FakeProcesses::empty()
+            .with(10, "claude", Some(wt.join("src")), 1)
+            .with(11, "cargo", None, 1)
+            .with(12, "zsh", Some(repo.clone()), 1)
+            .with(13, "zsh", Some(home.clone()), 1);
+        table.procs[1].ppid = 10;
+        let mut foreign = table.procs[2].clone();
+        foreign.pid = 14;
+        foreign.uid = Some(table.uid + 1);
+        table.procs.push(foreign);
+        let mut cache = RootCache::new();
+        let roots = attribute(&table.list(), table.current_uid(), &home, &mut cache);
+        assert_eq!(roots.get(&10), Some(&(wt.clone(), true)));
+        assert_eq!(roots.get(&11), Some(&(wt.clone(), true)), "child inherits");
+        assert_eq!(roots.get(&12), Some(&(repo.clone(), false)));
+        assert!(!roots.contains_key(&13), "home itself is no workspace");
+        assert!(!roots.contains_key(&14), "other users are not attributed");
+    }
 }

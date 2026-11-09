@@ -3,15 +3,19 @@ pub mod config;
 pub mod diskmap;
 pub mod engine;
 pub mod git;
+pub mod journal;
 pub mod monitor;
 pub mod paths;
 pub mod process;
 pub mod reclaim;
+pub mod safety;
 
-pub use config::Config;
+pub use config::{Config, ConfigError, LoadedConfig};
 pub use engine::{Engine, Health, State, WorkspaceAction};
 pub use monitor::{Monitor, Snapshot};
-pub use reclaim::{CleanResult, ScanReport};
+pub use paths::Paths;
+pub use reclaim::ScanReport;
+pub use safety::{ActionResult, Gate, Outcome, Plan, PlanItem, Request, SkipReason};
 
 pub fn human_bytes(b: u64) -> String {
     let b = b as f64;

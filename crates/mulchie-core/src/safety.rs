@@ -1,0 +1,1688 @@
+//! The safety gate. Every cache deletion, worktree removal and signal goes through
+//! here; nothing else in Mulchie deletes directories, removes worktrees or sends
+//! signals.
+//!
+//! Scanners produce candidates. The gate re-reads every fact a decision depends
+//! on at the moment it acts, never from a cached scan, and answers each request
+//! with [`Outcome::Done`] or [`Outcome::Skipped`]. When a check cannot be
+//! completed (git times out, a backup step fails, a path cannot be
+//! canonicalized), the answer is "skipped", never "proceed".
+
+use serde::{Deserialize, Serialize};
+use std::io::Write;
+use std::path::{Component, Path, PathBuf};
+use std::sync::Mutex;
+use std::time::Duration;
+
+use crate::config::{create_private_dir, Config};
+use crate::diskmap::{self, last_activity};
+use crate::git::{self, Git, WorktreeEntry};
+use crate::journal::{Action, Journal};
+use crate::paths::{random_hex, Paths};
+use crate::process::{ProcFacts, ProcessSource};
+use crate::reclaim::{self, dir_size, ItemKind};
+
+/// Ignored directories that are regenerable caches. They are not archived before
+/// a worktree is removed. Any path with one of these as a component is left out.
+pub const KNOWN_CACHE_DIRS: &[&str] = &[
+    "target",
+    "node_modules",
+    ".next",
+    ".nuxt",
+    ".svelte-kit",
+    ".turbo",
+    ".parcel-cache",
+    ".angular",
+    "dist",
+    "build",
+    ".build",
+    ".gradle",
+    ".venv",
+    "venv",
+    "__pycache__",
+    ".pytest_cache",
+    ".mypy_cache",
+    ".ruff_cache",
+    ".tox",
+    "DerivedData",
+];
+
+/// The first line Cargo (and other tools) write to `CACHEDIR.TAG`.
+pub const CACHEDIR_TAG_SIGNATURE: &str = "Signature: 8a477f597d28d172789f06886806bc55";
+
+/// Process names never signalled, compared case-insensitively against the
+/// process name, its executable's file name and `argv[0]`'s file name.
+const PROTECTED_PREFIX: &str = "mulchie";
+
+/// git steps that write backups may take longer than a status read.
+const BACKUP_TIMEOUT: Duration = Duration::from_secs(120);
+
+/// Destructive actions run one at a time per process, so two callers (the API and
+/// an automatic sweep) never back up and remove the same worktree at once.
+static EXEC_LOCK: Mutex<()> = Mutex::new(());
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
+#[serde(rename_all = "snake_case")]
+pub enum SkipReason {
+    NotAbsolute,
+    NotFound,
+    Symlink,
+    NotCanonical,
+    OutsideScanRoots,
+    NotRecognisedCache,
+    MissingCachedirTag,
+    NodeModulesDisabled,
+    XcodeDisabled,
+    Busy,
+    NotStale,
+    NotAWorktree,
+    MissingExpectedHead,
+    HeadMoved,
+    Locked,
+    NotAgent,
+    NotIdle,
+    Dirty,
+    HasSubmodules,
+    IgnoredTooLarge,
+    BackupFailed,
+    ChangedDuringBackup,
+    NotPrunable,
+    PruneDeferred,
+    GitFailed,
+    RemoveFailed,
+    ProtectedProcess,
+    ForeignProcess,
+    ProcessGone,
+    StartTimeMismatch,
+    SignalFailed,
+    UnknownTarget,
+}
+
+impl SkipReason {
+    /// The machine-readable code, as serialized.
+    pub fn code(self) -> String {
+        serde_json::to_value(self)
+            .ok()
+            .and_then(|v| v.as_str().map(String::from))
+            .unwrap_or_default()
+    }
+}
+
+/// Why a request was not carried out.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Skip {
+    pub reason: SkipReason,
+    pub detail: String,
+}
+
+fn skip<T>(reason: SkipReason, detail: impl Into<String>) -> Result<T, Skip> {
+    Err(Skip {
+        reason,
+        detail: detail.into(),
+    })
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum BackupKind {
+    /// Uncommitted changes, including untracked files, as a binary git patch.
+    Patch,
+    /// Gitignored files that are not known caches, as a `tar.gz`.
+    IgnoredArchive,
+    /// A branch pointing at a detached HEAD.
+    Branch,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct Backup {
+    pub kind: BackupKind,
+    /// A file path, or a branch name for [`BackupKind::Branch`].
+    pub location: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "status", rename_all = "snake_case")]
+pub enum Outcome {
+    Done {
+        freed_bytes: u64,
+        backups: Vec<Backup>,
+    },
+    Skipped {
+        reason: SkipReason,
+        detail: String,
+    },
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ActionKind {
+    DeleteCache,
+    RemoveWorktree,
+    PruneWorktree,
+    Signal,
+}
+
+/// The outcome of one request.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ActionResult {
+    pub action: ActionKind,
+    /// The path, or `pid <n>` for a signal.
+    pub target: String,
+    #[serde(flatten)]
+    pub outcome: Outcome,
+}
+
+impl ActionResult {
+    pub fn is_done(&self) -> bool {
+        matches!(self.outcome, Outcome::Done { .. })
+    }
+
+    pub fn freed_bytes(&self) -> u64 {
+        match &self.outcome {
+            Outcome::Done { freed_bytes, .. } => *freed_bytes,
+            _ => 0,
+        }
+    }
+
+    pub fn backups(&self) -> &[Backup] {
+        match &self.outcome {
+            Outcome::Done { backups, .. } => backups,
+            _ => &[],
+        }
+    }
+
+    pub fn reason(&self) -> Option<SkipReason> {
+        match &self.outcome {
+            Outcome::Skipped { reason, .. } => Some(*reason),
+            _ => None,
+        }
+    }
+
+    /// One line for people.
+    pub fn summary(&self) -> String {
+        match &self.outcome {
+            Outcome::Done { backups, .. } => {
+                let verb = match self.action {
+                    ActionKind::DeleteCache => "Cleared",
+                    ActionKind::RemoveWorktree => "Removed worktree",
+                    ActionKind::PruneWorktree => "Pruned stale worktree entry",
+                    ActionKind::Signal => "Signalled",
+                };
+                let mut s = format!("{verb} {}", self.target);
+                for b in backups {
+                    let what = match b.kind {
+                        BackupKind::Patch => "patch",
+                        BackupKind::IgnoredArchive => "ignored files",
+                        BackupKind::Branch => "branch",
+                    };
+                    s.push_str(&format!("; {what} saved to {}", b.location));
+                }
+                s
+            }
+            Outcome::Skipped { detail, .. } => format!("Skipped {}: {detail}", self.target),
+        }
+    }
+
+    /// The journal entry for this result.
+    pub fn to_action(&self, at_unix: u64, source: &str, signal: Option<Signal>) -> Action {
+        let kind = match (self.action, signal) {
+            (ActionKind::DeleteCache, _) => "reclaim",
+            (ActionKind::RemoveWorktree | ActionKind::PruneWorktree, _) => "worktree",
+            (ActionKind::Signal, Some(Signal::Stop)) => "pause",
+            (ActionKind::Signal, Some(Signal::Cont)) => "resume",
+            (ActionKind::Signal, _) => "stop",
+        };
+        let (status, reason) = match &self.outcome {
+            Outcome::Done { .. } => ("done", None),
+            Outcome::Skipped { reason, .. } => ("skipped", Some(*reason)),
+        };
+        Action {
+            at_unix,
+            kind: kind.into(),
+            detail: self.summary(),
+            bytes: self.freed_bytes(),
+            workspace: None,
+            source: source.into(),
+            target: Some(self.target.clone()),
+            status: Some(status.into()),
+            reason,
+            backups: self.backups().to_vec(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum Signal {
+    Term,
+    Kill,
+    Stop,
+    Cont,
+}
+
+impl Signal {
+    pub fn number(self) -> i32 {
+        match self {
+            Signal::Term => libc::SIGTERM,
+            Signal::Kill => libc::SIGKILL,
+            Signal::Stop => libc::SIGSTOP,
+            Signal::Cont => libc::SIGCONT,
+        }
+    }
+
+    pub fn name(self) -> &'static str {
+        match self {
+            Signal::Term => "SIGTERM",
+            Signal::Kill => "SIGKILL",
+            Signal::Stop => "SIGSTOP",
+            Signal::Cont => "SIGCONT",
+        }
+    }
+}
+
+/// One thing a caller wants done. Plans contain these; callers send back the ones
+/// the user approved.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "action", rename_all = "snake_case")]
+pub enum Request {
+    /// Delete a recognised build cache. `require_stale` rechecks staleness now.
+    DeleteCache {
+        path: PathBuf,
+        #[serde(default)]
+        require_stale: bool,
+    },
+    /// Remove a git worktree whose HEAD is still `expected_head`.
+    RemoveWorktree {
+        path: PathBuf,
+        expected_head: String,
+        /// Remove even with uncommitted changes (a patch is saved first).
+        #[serde(default)]
+        allow_dirty: bool,
+        /// Only an idle agent worktree (what sweeps ask for).
+        #[serde(default)]
+        require_idle: bool,
+    },
+    /// Prune the admin entry of an agent worktree whose directory is gone.
+    PruneWorktree { repo: PathBuf, path: PathBuf },
+    /// Signal a process that still has the start time the caller saw.
+    Signal {
+        pid: u32,
+        signal: Signal,
+        expected_start_time: u64,
+    },
+}
+
+impl Request {
+    pub fn action(&self) -> ActionKind {
+        match self {
+            Request::DeleteCache { .. } => ActionKind::DeleteCache,
+            Request::RemoveWorktree { .. } => ActionKind::RemoveWorktree,
+            Request::PruneWorktree { .. } => ActionKind::PruneWorktree,
+            Request::Signal { .. } => ActionKind::Signal,
+        }
+    }
+
+    pub fn target(&self) -> String {
+        match self {
+            Request::DeleteCache { path, .. }
+            | Request::RemoveWorktree { path, .. }
+            | Request::PruneWorktree { path, .. } => path.display().to_string(),
+            Request::Signal { pid, .. } => format!("pid {pid}"),
+        }
+    }
+}
+
+/// One line of a plan: what would happen to one candidate, from facts read now.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PlanItem {
+    /// Send this back to execute the item.
+    pub request: Request,
+    pub target: String,
+    pub name: String,
+    pub repo_name: Option<String>,
+    pub head: Option<String>,
+    pub branch: Option<String>,
+    pub bytes: u64,
+    pub dirty_files: usize,
+    pub idle_days: Option<u64>,
+    pub ignored_files: usize,
+    pub ignored_bytes: u64,
+    /// What would be saved before removal.
+    pub would_backup: Vec<String>,
+    pub ready: bool,
+    pub reason: Option<SkipReason>,
+    pub verdict: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub struct Plan {
+    pub created_unix: u64,
+    pub items: Vec<PlanItem>,
+    /// Bytes the ready items would free.
+    pub ready_bytes: u64,
+}
+
+impl Plan {
+    /// The requests of every ready item.
+    pub fn approved(&self) -> Vec<Request> {
+        self.items
+            .iter()
+            .filter(|i| i.ready)
+            .map(|i| i.request.clone())
+            .collect()
+    }
+}
+
+/// The gate: configuration, locations, the live process table and the clock.
+pub struct Gate<'a> {
+    pub config: &'a Config,
+    pub paths: &'a Paths,
+    pub procs: &'a dyn ProcessSource,
+    pub journal: Option<&'a Journal>,
+    pub now: u64,
+}
+
+struct CacheFacts {
+    kind: ItemKind,
+    bytes: u64,
+}
+
+struct WorktreeFacts {
+    path: PathBuf,
+    repo: PathBuf,
+    name: String,
+    repo_name: String,
+    head: String,
+    branch: Option<String>,
+    detached: bool,
+    idle_days: Option<u64>,
+    dirty_files: usize,
+    status: String,
+    ignored: Vec<String>,
+    ignored_bytes: u64,
+    bytes: u64,
+}
+
+struct PruneFacts {
+    repo: PathBuf,
+    entry: WorktreeEntry,
+    repo_name: String,
+}
+
+impl<'a> Gate<'a> {
+    pub fn new(
+        config: &'a Config,
+        paths: &'a Paths,
+        procs: &'a dyn ProcessSource,
+        now: u64,
+    ) -> Self {
+        Self {
+            config,
+            paths,
+            procs,
+            journal: None,
+            now,
+        }
+    }
+
+    pub fn with_journal(mut self, journal: &'a Journal) -> Self {
+        self.journal = Some(journal);
+        self
+    }
+
+    // ---------------------------------------------------------------- plans
+
+    /// Check every request against the facts as they are now, without acting.
+    pub fn plan(&self, requests: &[Request]) -> Plan {
+        let items: Vec<PlanItem> = requests.iter().map(|r| self.plan_item(r)).collect();
+        let ready_bytes = items.iter().filter(|i| i.ready).map(|i| i.bytes).sum();
+        Plan {
+            created_unix: self.now,
+            items,
+            ready_bytes,
+        }
+    }
+
+    /// A sweep plan from scanned worktrees: every candidate the scanner marked
+    /// sweepable, re-checked now. Each ready item carries the HEAD read now.
+    pub fn plan_sweep(&self, worktrees: &[diskmap::Worktree]) -> Plan {
+        let reqs: Vec<Request> = worktrees
+            .iter()
+            .filter(|w| w.sweepable)
+            .map(|w| {
+                if w.missing {
+                    Request::PruneWorktree {
+                        repo: w.repo.clone(),
+                        path: w.path.clone(),
+                    }
+                } else {
+                    Request::RemoveWorktree {
+                        path: w.path.clone(),
+                        expected_head: String::new(),
+                        allow_dirty: true,
+                        require_idle: true,
+                    }
+                }
+            })
+            .collect();
+        self.plan(&reqs)
+    }
+
+    /// A reclaim plan from scanned caches: candidates the scanner marked stale,
+    /// re-checked now (staleness included), largest first, until `want_bytes`.
+    /// `None` takes every stale cache; `Some(0)` takes none.
+    pub fn plan_reclaim(&self, items: &[reclaim::Item], want_bytes: Option<u64>) -> Plan {
+        let mut cands: Vec<&reclaim::Item> = items.iter().filter(|i| i.stale).collect();
+        cands.sort_by_key(|i| std::cmp::Reverse(i.bytes));
+        let mut out = Vec::new();
+        let mut sum = 0u64;
+        for c in cands {
+            if let Some(w) = want_bytes {
+                if sum >= w {
+                    break;
+                }
+            }
+            let item = self.plan_item(&Request::DeleteCache {
+                path: c.path.clone(),
+                require_stale: true,
+            });
+            if item.ready {
+                sum += item.bytes;
+            }
+            out.push(item);
+        }
+        let ready_bytes = out.iter().filter(|i| i.ready).map(|i| i.bytes).sum();
+        Plan {
+            created_unix: self.now,
+            items: out,
+            ready_bytes,
+        }
+    }
+
+    fn plan_item(&self, req: &Request) -> PlanItem {
+        let target = req.target();
+        let mut item = PlanItem {
+            request: req.clone(),
+            name: target.clone(),
+            target,
+            repo_name: None,
+            head: None,
+            branch: None,
+            bytes: 0,
+            dirty_files: 0,
+            idle_days: None,
+            ignored_files: 0,
+            ignored_bytes: 0,
+            would_backup: Vec::new(),
+            ready: false,
+            reason: None,
+            verdict: String::new(),
+        };
+        let res: Result<String, Skip> = match req {
+            Request::DeleteCache {
+                path,
+                require_stale,
+            } => self.check_cache(path, *require_stale).map(|f| {
+                item.bytes = f.bytes;
+                item.name = f.kind.label().to_string();
+                format!("{} can be cleared", f.kind.label())
+            }),
+            Request::RemoveWorktree {
+                path,
+                expected_head,
+                allow_dirty,
+                require_idle,
+            } => {
+                let expected = (!expected_head.is_empty()).then_some(expected_head.as_str());
+                self.check_worktree(path, expected, *allow_dirty, *require_idle)
+                    .map(|f| {
+                        item.request = Request::RemoveWorktree {
+                            path: f.path.clone(),
+                            expected_head: f.head.clone(),
+                            allow_dirty: *allow_dirty,
+                            require_idle: *require_idle,
+                        };
+                        item.target = f.path.display().to_string();
+                        item.name = f.name.clone();
+                        item.repo_name = Some(f.repo_name.clone());
+                        item.head = Some(f.head.clone());
+                        item.branch = f.branch.clone();
+                        item.bytes = f.bytes;
+                        item.dirty_files = f.dirty_files;
+                        item.idle_days = f.idle_days;
+                        item.ignored_files = f.ignored.len();
+                        item.ignored_bytes = f.ignored_bytes;
+                        item.would_backup = self.would_backup(&f);
+                        match f.idle_days {
+                            Some(d) => format!("idle {d}d; removable"),
+                            None => "removable".to_string(),
+                        }
+                    })
+            }
+            Request::PruneWorktree { repo, path } => self.check_prune(repo, path).map(|f| {
+                item.name = file_name(&f.entry.path);
+                item.repo_name = Some(f.repo_name);
+                item.head = f.entry.head.clone();
+                item.branch = f.entry.branch.clone();
+                "directory is gone; git marks the entry prunable".to_string()
+            }),
+            Request::Signal {
+                pid,
+                expected_start_time,
+                ..
+            } => self.check_signal(*pid, *expected_start_time).map(|p| {
+                item.name = p.name;
+                "can be signalled".into()
+            }),
+        };
+        match res {
+            Ok(v) => {
+                item.ready = true;
+                item.verdict = v;
+            }
+            Err(s) => {
+                item.reason = Some(s.reason);
+                item.verdict = s.detail;
+            }
+        }
+        item
+    }
+
+    fn would_backup(&self, f: &WorktreeFacts) -> Vec<String> {
+        let mut v = Vec::new();
+        if f.dirty_files > 0 {
+            v.push(format!("patch of {} changed file(s)", f.dirty_files));
+        }
+        if !f.ignored.is_empty() {
+            v.push(format!(
+                "archive of {} ignored item(s), {}",
+                f.ignored.len(),
+                crate::human_bytes(f.ignored_bytes)
+            ));
+        }
+        if f.detached {
+            v.push(format!("branch {}", backup_branch_name(&f.name, &f.head)));
+        }
+        v
+    }
+
+    // ------------------------------------------------------------- execution
+
+    /// Carry out each request after re-checking it now. Every result, done or
+    /// skipped, is appended to the journal when the gate has one.
+    pub fn execute(&self, requests: &[Request], source: &str) -> Vec<ActionResult> {
+        requests
+            .iter()
+            .map(|r| self.execute_one(r, source))
+            .collect()
+    }
+
+    pub fn execute_one(&self, req: &Request, source: &str) -> ActionResult {
+        let outcome = {
+            let _g = EXEC_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+            let res = match req {
+                Request::DeleteCache {
+                    path,
+                    require_stale,
+                } => self.delete_cache(path, *require_stale),
+                Request::RemoveWorktree {
+                    path,
+                    expected_head,
+                    allow_dirty,
+                    require_idle,
+                } => {
+                    if expected_head.is_empty() {
+                        skip(
+                            SkipReason::MissingExpectedHead,
+                            "the request does not name the HEAD commit the caller saw",
+                        )
+                    } else {
+                        self.remove_worktree(path, expected_head, *allow_dirty, *require_idle)
+                    }
+                }
+                Request::PruneWorktree { repo, path } => self.prune_worktree(repo, path),
+                Request::Signal {
+                    pid,
+                    signal,
+                    expected_start_time,
+                } => self.send_signal(*pid, *signal, *expected_start_time),
+            };
+            match res {
+                Ok(o) => o,
+                Err(s) => Outcome::Skipped {
+                    reason: s.reason,
+                    detail: s.detail,
+                },
+            }
+        };
+        let result = ActionResult {
+            action: req.action(),
+            target: req.target(),
+            outcome,
+        };
+        if let Some(j) = self.journal {
+            let sig = match req {
+                Request::Signal { signal, .. } => Some(*signal),
+                _ => None,
+            };
+            let _ = j.append(&result.to_action(self.now, source, sig));
+        }
+        result
+    }
+
+    // ------------------------------------------------------------------ cache
+
+    fn canonical_roots(&self) -> Vec<PathBuf> {
+        self.config
+            .roots(self.paths)
+            .iter()
+            .filter_map(|r| r.canonicalize().ok())
+            .collect()
+    }
+
+    fn check_cache(&self, path: &Path, require_stale: bool) -> Result<CacheFacts, Skip> {
+        if !path.is_absolute() {
+            return skip(SkipReason::NotAbsolute, "path must be absolute");
+        }
+        let meta = match std::fs::symlink_metadata(path) {
+            Ok(m) => m,
+            Err(e) => return skip(SkipReason::NotFound, e.to_string()),
+        };
+        if meta.file_type().is_symlink() {
+            return skip(SkipReason::Symlink, "path is a symbolic link");
+        }
+        if !meta.is_dir() {
+            return skip(SkipReason::NotRecognisedCache, "not a directory");
+        }
+        let canon = match path.canonicalize() {
+            Ok(c) => c,
+            Err(e) => return skip(SkipReason::NotCanonical, e.to_string()),
+        };
+        if canon != path {
+            return skip(
+                SkipReason::NotCanonical,
+                format!("path resolves to {}", canon.display()),
+            );
+        }
+
+        let dd = self.paths.derived_data().canonicalize().ok();
+        if dd.as_deref() == Some(path) {
+            if !self.config.include_xcode {
+                return skip(SkipReason::XcodeDisabled, "include_xcode is off");
+            }
+            if let Some(p) =
+                self.procs.list().into_iter().find(|p| {
+                    matches!(p.name.to_ascii_lowercase().as_str(), "xcode" | "xcodebuild")
+                })
+            {
+                return skip(
+                    SkipReason::Busy,
+                    format!("{} (pid {}) is running", p.name, p.pid),
+                );
+            }
+            self.busy_check(path, false)?;
+            if require_stale {
+                self.stale_check(path, false)?;
+            }
+            return Ok(CacheFacts {
+                kind: ItemKind::XcodeDerivedData,
+                bytes: dir_size(path),
+            });
+        }
+
+        let roots = self.canonical_roots();
+        let Some(root) = roots
+            .iter()
+            .filter(|r| path.starts_with(r) && path != r.as_path())
+            .max_by_key(|r| r.components().count())
+        else {
+            return skip(
+                SkipReason::OutsideScanRoots,
+                "path is outside the configured scan roots",
+            );
+        };
+        if path == self.paths.home || path.components().count() < 4 {
+            return skip(SkipReason::OutsideScanRoots, "path is too shallow");
+        }
+        let kind = recognise_cache(path, self.config)?;
+        let parent = path.parent().unwrap_or(path);
+        let (project, in_worktree) = project_root(parent, root);
+        self.busy_check(&project, true)?;
+        if require_stale {
+            self.stale_check(path, in_worktree)?;
+        }
+        Ok(CacheFacts {
+            kind,
+            bytes: dir_size(path),
+        })
+    }
+
+    /// Skip when an own process's working directory, read now, is at or under
+    /// `root`. With `nested`, directories inside another git checkout below `root`
+    /// (a worktree inside the repo) belong to that checkout, not to `root`.
+    fn busy_check(&self, root: &Path, nested: bool) -> Result<(), Skip> {
+        if let Some(p) = busy_process(self.procs, root, nested) {
+            return skip(
+                SkipReason::Busy,
+                format!(
+                    "{} (pid {}) is working in {}",
+                    p.name,
+                    p.pid,
+                    p.cwd.as_deref().unwrap_or(root).display()
+                ),
+            );
+        }
+        Ok(())
+    }
+
+    fn stale_check(&self, path: &Path, in_worktree: bool) -> Result<(), Skip> {
+        let hours = if in_worktree {
+            self.config.worktree_target_stale_hours
+        } else {
+            self.config.stale_hours
+        };
+        let last = reclaim::last_used(path);
+        let age = self.now.saturating_sub(last);
+        if age < hours * 3600 {
+            return skip(
+                SkipReason::NotStale,
+                format!("used {}h ago; the stale window is {hours}h", age / 3600),
+            );
+        }
+        Ok(())
+    }
+
+    fn delete_cache(&self, path: &Path, require_stale: bool) -> Result<Outcome, Skip> {
+        let facts = self.check_cache(path, require_stale)?;
+        let parent = path.parent().unwrap_or(path);
+        let name = file_name(path);
+        let suffix = random_hex(6).map_err(|e| Skip {
+            reason: SkipReason::RemoveFailed,
+            detail: e.to_string(),
+        })?;
+        // Move aside first: a build that starts now gets a fresh directory instead
+        // of a half-deleted one.
+        let trash = parent.join(format!(".{name}.mulchie-delete-{suffix}"));
+        if let Err(e) = std::fs::rename(path, &trash) {
+            return skip(
+                SkipReason::RemoveFailed,
+                format!("could not move aside: {e}"),
+            );
+        }
+        if let Err(e) = std::fs::remove_dir_all(&trash) {
+            let left = dir_size(&trash);
+            return skip(
+                SkipReason::RemoveFailed,
+                format!(
+                    "moved to {} but deleting failed ({e}); {} left there",
+                    trash.display(),
+                    crate::human_bytes(left)
+                ),
+            );
+        }
+        Ok(Outcome::Done {
+            freed_bytes: facts.bytes,
+            backups: Vec::new(),
+        })
+    }
+
+    // --------------------------------------------------------------- worktree
+
+    fn git_skip(e: git::GitError) -> Skip {
+        Skip {
+            reason: SkipReason::GitFailed,
+            detail: e.to_string(),
+        }
+    }
+
+    fn check_worktree(
+        &self,
+        path: &Path,
+        expected_head: Option<&str>,
+        allow_dirty: bool,
+        require_idle: bool,
+    ) -> Result<WorktreeFacts, Skip> {
+        if !path.is_absolute() {
+            return skip(SkipReason::NotAbsolute, "path must be absolute");
+        }
+        let meta = match std::fs::symlink_metadata(path) {
+            Ok(m) => m,
+            Err(e) => {
+                return skip(
+                    SkipReason::NotFound,
+                    format!("{e}; a worktree whose directory is gone is pruned, not removed"),
+                )
+            }
+        };
+        if meta.file_type().is_symlink() {
+            return skip(SkipReason::Symlink, "path is a symbolic link");
+        }
+        if !meta.is_dir() {
+            return skip(SkipReason::NotAWorktree, "not a directory");
+        }
+        let canon = path.canonicalize().map_err(|e| Skip {
+            reason: SkipReason::NotCanonical,
+            detail: e.to_string(),
+        })?;
+
+        let list = git::worktree_list(self.paths, &canon).map_err(Self::git_skip)?;
+        let Some(main) = list.first() else {
+            return skip(SkipReason::NotAWorktree, "git lists no worktrees");
+        };
+        let repo = main.path.clone();
+        let Some(entry) = list
+            .iter()
+            .skip(1)
+            .find(|e| !e.bare && e.path.canonicalize().ok().as_deref() == Some(canon.as_path()))
+            .cloned()
+        else {
+            return skip(
+                SkipReason::NotAWorktree,
+                "not a linked worktree (the main checkout is never removed)",
+            );
+        };
+        let roots = self.canonical_roots();
+        let repo_canon = repo.canonicalize().unwrap_or_else(|_| repo.clone());
+        if !roots
+            .iter()
+            .any(|r| canon.starts_with(r) || repo_canon.starts_with(r))
+        {
+            return skip(
+                SkipReason::OutsideScanRoots,
+                "neither the worktree nor its repository is under a scan root",
+            );
+        }
+        if entry.prunable {
+            return skip(
+                SkipReason::GitFailed,
+                "git reports this worktree as prunable",
+            );
+        }
+        let Some(head) = entry.head.clone() else {
+            return skip(SkipReason::GitFailed, "git did not report a HEAD");
+        };
+        if let Some(exp) = expected_head {
+            if exp != head {
+                return skip(
+                    SkipReason::HeadMoved,
+                    format!("HEAD moved from {} to {}", short(exp), short(&head)),
+                );
+            }
+        }
+        if entry.locked {
+            return skip(SkipReason::Locked, "locked by git");
+        }
+        self.busy_check(&canon, false)?;
+        let name = file_name(&canon);
+        let agent = is_agent_worktree(&canon);
+        let mut idle_days = None;
+        if require_idle {
+            if !agent {
+                return skip(SkipReason::NotAgent, "sweeps only remove agent worktrees");
+            }
+            let last_commit: u64 =
+                git::git(self.paths, &canon, &["log", "-1", "--format=%ct", "HEAD"])
+                    .map_err(Self::git_skip)?
+                    .trim()
+                    .parse()
+                    .unwrap_or(0);
+            let last = last_activity(&canon).max(last_commit);
+            let days = self.now.saturating_sub(last) / 86_400;
+            if days < self.config.worktree_idle_days {
+                return skip(
+                    SkipReason::NotIdle,
+                    format!(
+                        "active {days}d ago; the idle window is {}d",
+                        self.config.worktree_idle_days
+                    ),
+                );
+            }
+            idle_days = Some(days);
+        }
+        if let Some(sub) = initialized_submodule(self.paths, &canon)? {
+            return skip(
+                SkipReason::HasSubmodules,
+                format!("submodule {sub} is checked out; its changes cannot be backed up"),
+            );
+        }
+        let status = git::git(
+            self.paths,
+            &canon,
+            &[
+                "status",
+                "--porcelain=v1",
+                "--untracked-files=all",
+                "--ignore-submodules=all",
+            ],
+        )
+        .map_err(Self::git_skip)?;
+        let dirty_files = status.lines().filter(|l| !l.is_empty()).count();
+        if dirty_files > 0 && !allow_dirty {
+            return skip(
+                SkipReason::Dirty,
+                format!(
+                    "{dirty_files} uncommitted file(s); allow backup to save a patch and remove"
+                ),
+            );
+        }
+        let (ignored, ignored_bytes) = ignored_to_archive(self.paths, &canon)?;
+        let max = self
+            .config
+            .backup_ignored_max_mb
+            .saturating_mul(1024 * 1024);
+        if ignored_bytes > max {
+            return skip(
+                SkipReason::IgnoredTooLarge,
+                format!(
+                    "{} of gitignored files that are not caches; the backup limit is {} MB",
+                    crate::human_bytes(ignored_bytes),
+                    self.config.backup_ignored_max_mb
+                ),
+            );
+        }
+        Ok(WorktreeFacts {
+            bytes: dir_size(&canon),
+            repo_name: file_name(&repo),
+            path: canon,
+            repo,
+            name,
+            head,
+            branch: entry.branch.clone(),
+            detached: entry.detached,
+            idle_days,
+            dirty_files,
+            status,
+            ignored,
+            ignored_bytes,
+        })
+    }
+
+    fn remove_worktree(
+        &self,
+        path: &Path,
+        expected_head: &str,
+        allow_dirty: bool,
+        require_idle: bool,
+    ) -> Result<Outcome, Skip> {
+        let f = self.check_worktree(path, Some(expected_head), allow_dirty, require_idle)?;
+        let backups = self.back_up(&f).map_err(|e| Skip {
+            reason: SkipReason::BackupFailed,
+            detail: format!("{e}; nothing was removed"),
+        })?;
+
+        // The backups describe the worktree as it was a moment ago. If anything
+        // changed while they were written, stop.
+        let list = git::worktree_list(self.paths, &f.path).map_err(Self::git_skip)?;
+        let now_head = list
+            .iter()
+            .find(|e| e.path.canonicalize().ok().as_deref() == Some(f.path.as_path()))
+            .and_then(|e| e.head.clone());
+        if now_head.as_deref() != Some(f.head.as_str()) {
+            return skip(SkipReason::HeadMoved, "HEAD moved while backing up");
+        }
+        let status = git::git(
+            self.paths,
+            &f.path,
+            &[
+                "status",
+                "--porcelain=v1",
+                "--untracked-files=all",
+                "--ignore-submodules=all",
+            ],
+        )
+        .map_err(Self::git_skip)?;
+        if status != f.status {
+            return skip(
+                SkipReason::ChangedDuringBackup,
+                "files changed while backing up; nothing was removed",
+            );
+        }
+        self.busy_check(&f.path, false)?;
+
+        let mut g = Git::new(self.paths, &f.repo).args(["worktree", "remove"]);
+        if f.dirty_files > 0 {
+            // Uncommitted work is in the patch; git refuses otherwise.
+            g = g.arg("--force");
+        }
+        g.arg(&f.path)
+            .timeout(BACKUP_TIMEOUT)
+            .run()
+            .map_err(|e| Skip {
+                reason: SkipReason::RemoveFailed,
+                detail: e.to_string(),
+            })?;
+        if f.path.exists() {
+            return skip(
+                SkipReason::RemoveFailed,
+                "git reported success but the directory is still there",
+            );
+        }
+        Ok(Outcome::Done {
+            freed_bytes: f.bytes,
+            backups,
+        })
+    }
+
+    /// Write every backup the worktree needs. Any failure fails the whole step.
+    fn back_up(&self, f: &WorktreeFacts) -> Result<Vec<Backup>, String> {
+        let mut out = Vec::new();
+        let needs_dir = f.dirty_files > 0 || !f.ignored.is_empty();
+        if needs_dir {
+            let dir = self.backup_set_dir(f)?;
+            if f.dirty_files > 0 {
+                let p = self.write_patch(f, &dir)?;
+                out.push(Backup {
+                    kind: BackupKind::Patch,
+                    location: p.display().to_string(),
+                });
+            }
+            if !f.ignored.is_empty() {
+                let p = write_ignored_archive(f, &dir)?;
+                out.push(Backup {
+                    kind: BackupKind::IgnoredArchive,
+                    location: p.display().to_string(),
+                });
+            }
+            let manifest = serde_json::json!({
+                "worktree": f.path,
+                "repo": f.repo,
+                "head": f.head,
+                "branch": f.branch,
+                "created_unix": self.now,
+                "backups": out,
+                "restore": "git worktree add <path> <head>; cd <path>; git apply --index changes.patch; tar -xzf ignored.tar.gz",
+            });
+            create_private_file(
+                &dir.join("manifest.json"),
+                &serde_json::to_vec_pretty(&manifest).unwrap_or_default(),
+            )
+            .map_err(|e| format!("could not write the backup manifest: {e}"))?;
+        }
+        if f.detached {
+            let b = self.ensure_backup_branch(f)?;
+            out.push(Backup {
+                kind: BackupKind::Branch,
+                location: b,
+            });
+        }
+        Ok(out)
+    }
+
+    /// A new directory `<backups>/<repo>-<name>-<now>-<random>`, mode 0700, created
+    /// exclusively.
+    fn backup_set_dir(&self, f: &WorktreeFacts) -> Result<PathBuf, String> {
+        use std::os::unix::fs::DirBuilderExt;
+        create_private_dir(&self.paths.backups_dir)
+            .map_err(|e| format!("backups directory unavailable: {e}"))?;
+        for _ in 0..8 {
+            let r = random_hex(6).map_err(|e| e.to_string())?;
+            let d = self.paths.backups_dir.join(format!(
+                "{}-{}-{}-{r}",
+                sanitize(&f.repo_name),
+                sanitize(&f.name),
+                self.now
+            ));
+            match std::fs::DirBuilder::new().mode(0o700).create(&d) {
+                Ok(()) => return Ok(d),
+                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                Err(e) => return Err(format!("could not create a backup directory: {e}")),
+            }
+        }
+        Err("could not pick a unique backup directory".into())
+    }
+
+    fn write_patch(&self, f: &WorktreeFacts, dir: &Path) -> Result<PathBuf, String> {
+        let real_index = git::git(self.paths, &f.path, &["rev-parse", "--git-path", "index"])
+            .map_err(|e| e.to_string())?;
+        let real_index = PathBuf::from(real_index.trim());
+        let real_index = if real_index.is_absolute() {
+            real_index
+        } else {
+            f.path.join(real_index)
+        };
+        let bytes = std::fs::read(&real_index)
+            .map_err(|e| format!("could not read the worktree index: {e}"))?;
+        let index = dir.join("index.tmp");
+        create_private_file(&index, &bytes).map_err(|e| e.to_string())?;
+        let res = (|| {
+            Git::new(self.paths, &f.path)
+                .env("GIT_INDEX_FILE", &index)
+                .args(["add", "-A"])
+                .timeout(BACKUP_TIMEOUT)
+                .run()
+                .map_err(|e| format!("could not stage a backup: {e}"))?;
+            Git::new(self.paths, &f.path)
+                .env("GIT_INDEX_FILE", &index)
+                .args(["diff", "--cached", "--binary", "HEAD"])
+                .timeout(BACKUP_TIMEOUT)
+                .run()
+                .map_err(|e| format!("could not write the patch: {e}"))
+        })();
+        let _ = std::fs::remove_file(&index);
+        let out = res?;
+        if out.stdout.is_empty() {
+            return Err(format!(
+                "{} file(s) are changed but the patch came out empty",
+                f.dirty_files
+            ));
+        }
+        let p = dir.join("changes.patch");
+        create_private_file(&p, &out.stdout).map_err(|e| e.to_string())?;
+        Ok(p)
+    }
+
+    fn ensure_backup_branch(&self, f: &WorktreeFacts) -> Result<String, String> {
+        let name = backup_branch_name(&f.name, &f.head);
+        let full = format!("refs/heads/{name}");
+        match git::git(
+            self.paths,
+            &f.repo,
+            &["rev-parse", "--verify", "--quiet", &full],
+        ) {
+            Ok(existing) if existing.trim() == f.head => return Ok(name),
+            Ok(existing) => {
+                return Err(format!(
+                    "branch {name} already exists at {}; it is never moved",
+                    short(existing.trim())
+                ))
+            }
+            Err(git::GitError::Failed { code: Some(1), .. }) => {}
+            Err(e) => return Err(e.to_string()),
+        }
+        git::git(self.paths, &f.repo, &["branch", &name, &f.head])
+            .map_err(|e| format!("could not create branch {name}: {e}"))?;
+        Ok(name)
+    }
+
+    // ------------------------------------------------------------------ prune
+
+    fn check_prune(&self, repo: &Path, path: &Path) -> Result<PruneFacts, Skip> {
+        if !repo.is_absolute() || !path.is_absolute() {
+            return skip(SkipReason::NotAbsolute, "paths must be absolute");
+        }
+        let repo = repo.canonicalize().map_err(|e| Skip {
+            reason: SkipReason::NotFound,
+            detail: format!("repository: {e}"),
+        })?;
+        if !self.canonical_roots().iter().any(|r| repo.starts_with(r)) {
+            return skip(
+                SkipReason::OutsideScanRoots,
+                "the repository is not under a scan root",
+            );
+        }
+        let list = git::worktree_list(self.paths, &repo).map_err(Self::git_skip)?;
+        let Some(entry) = list.iter().skip(1).find(|e| e.path == path).cloned() else {
+            return skip(SkipReason::NotAWorktree, "git does not list this worktree");
+        };
+        if !entry.prunable {
+            return skip(
+                SkipReason::NotPrunable,
+                "git does not mark this worktree prunable",
+            );
+        }
+        if entry.locked {
+            return skip(SkipReason::Locked, "locked by git");
+        }
+        if !is_agent_worktree(&entry.path) {
+            return skip(
+                SkipReason::NotAgent,
+                "only agent worktree entries are pruned",
+            );
+        }
+        let repo_name = file_name(list.first().map(|m| m.path.as_path()).unwrap_or(&repo));
+        Ok(PruneFacts {
+            repo,
+            entry,
+            repo_name,
+        })
+    }
+
+    fn prune_worktree(&self, repo: &Path, path: &Path) -> Result<Outcome, Skip> {
+        let f = self.check_prune(repo, path)?;
+        // `git worktree prune` has no per-entry form. Lock every other prunable
+        // entry so only the requested one can go, then unlock them.
+        let list = git::worktree_list(self.paths, &f.repo).map_err(Self::git_skip)?;
+        let mut held: Vec<PathBuf> = Vec::new();
+        let mut lock_err = None;
+        for e in list
+            .iter()
+            .skip(1)
+            .filter(|e| e.prunable && !e.locked && e.path != f.entry.path)
+        {
+            match Git::new(self.paths, &f.repo)
+                .args([
+                    "worktree",
+                    "lock",
+                    "--reason",
+                    "mulchie: held during a prune",
+                ])
+                .arg(&e.path)
+                .run()
+            {
+                Ok(_) => held.push(e.path.clone()),
+                Err(err) => {
+                    lock_err = Some(err);
+                    break;
+                }
+            }
+        }
+        let res = match lock_err {
+            Some(e) => Err(Skip {
+                reason: SkipReason::GitFailed,
+                detail: format!("could not hold other stale entries: {e}"),
+            }),
+            None => Git::new(self.paths, &f.repo)
+                .args(["worktree", "prune"])
+                .arg(format!(
+                    "--expire={}.days.ago",
+                    self.config.worktree_idle_days
+                ))
+                .run()
+                .map(|_| ())
+                .map_err(Self::git_skip),
+        };
+        // An entry left locked by a failed unlock is protected, not lost; its lock
+        // reason names Mulchie.
+        for p in &held {
+            let _ = Git::new(self.paths, &f.repo)
+                .args(["worktree", "unlock"])
+                .arg(p)
+                .run();
+        }
+        res?;
+        let after = git::worktree_list(self.paths, &f.repo).map_err(Self::git_skip)?;
+        if after.iter().any(|e| e.path == f.entry.path) {
+            return skip(
+                SkipReason::PruneDeferred,
+                format!(
+                    "git kept the entry: it is newer than the {}-day expiry",
+                    self.config.worktree_idle_days
+                ),
+            );
+        }
+        Ok(Outcome::Done {
+            freed_bytes: 0,
+            backups: Vec::new(),
+        })
+    }
+
+    // ----------------------------------------------------------------- signal
+
+    fn check_signal(&self, pid: u32, expected_start_time: u64) -> Result<ProcFacts, Skip> {
+        if pid <= 1 {
+            return skip(
+                SkipReason::ProtectedProcess,
+                "pid 0 and 1 are never signalled",
+            );
+        }
+        if pid == self.procs.self_pid() {
+            return skip(SkipReason::ProtectedProcess, "Mulchie never signals itself");
+        }
+        let Some(p) = self.procs.get(pid) else {
+            return skip(SkipReason::ProcessGone, "no such process");
+        };
+        if p.uid != Some(self.procs.current_uid()) {
+            return skip(
+                SkipReason::ForeignProcess,
+                "process belongs to another user",
+            );
+        }
+        if is_mulchie_process(&p) {
+            return skip(
+                SkipReason::ProtectedProcess,
+                format!("{} is a Mulchie process", p.name),
+            );
+        }
+        if p.start_time != expected_start_time {
+            return skip(
+                SkipReason::StartTimeMismatch,
+                "the pid now belongs to a different process",
+            );
+        }
+        Ok(p)
+    }
+
+    fn send_signal(
+        &self,
+        pid: u32,
+        signal: Signal,
+        expected_start_time: u64,
+    ) -> Result<Outcome, Skip> {
+        self.check_signal(pid, expected_start_time)?;
+        let rc = unsafe { libc::kill(pid as i32, signal.number()) };
+        if rc != 0 {
+            return skip(
+                SkipReason::SignalFailed,
+                std::io::Error::last_os_error().to_string(),
+            );
+        }
+        Ok(Outcome::Done {
+            freed_bytes: 0,
+            backups: Vec::new(),
+        })
+    }
+}
+
+// ----------------------------------------------------------------- helpers
+
+/// Whether `path` is a recognised build cache under the config's flags.
+pub fn recognise_cache(path: &Path, cfg: &Config) -> Result<ItemKind, Skip> {
+    let parent = path.parent().unwrap_or(path);
+    match file_name(path).as_str() {
+        "target" if parent.join("Cargo.toml").is_file() => {
+            if has_cachedir_tag(path) {
+                Ok(ItemKind::CargoTarget)
+            } else {
+                skip(
+                    SkipReason::MissingCachedirTag,
+                    "target/ has no CACHEDIR.TAG, so it may not be Cargo's",
+                )
+            }
+        }
+        "node_modules" if parent.join("package.json").is_file() => {
+            if cfg.include_node_modules {
+                Ok(ItemKind::NodeModules)
+            } else {
+                skip(
+                    SkipReason::NodeModulesDisabled,
+                    "include_node_modules is off",
+                )
+            }
+        }
+        ".next" if parent.join("package.json").is_file() => Ok(ItemKind::NextCache),
+        _ => skip(
+            SkipReason::NotRecognisedCache,
+            "not a recognised build cache",
+        ),
+    }
+}
+
+fn has_cachedir_tag(dir: &Path) -> bool {
+    let p = dir.join("CACHEDIR.TAG");
+    match std::fs::symlink_metadata(&p) {
+        Ok(m) if m.is_file() => {}
+        _ => return false,
+    }
+    std::fs::read(&p)
+        .map(|b| b.starts_with(CACHEDIR_TAG_SIGNATURE.as_bytes()))
+        .unwrap_or(false)
+}
+
+/// The checkout a cache belongs to: the nearest directory at or above `dir`, and
+/// not above `limit`, that has a `.git`; else `dir` itself. The flag says the
+/// checkout is a linked worktree (`.git` is a file).
+pub fn project_root(dir: &Path, limit: &Path) -> (PathBuf, bool) {
+    let mut cur = Some(dir);
+    while let Some(d) = cur {
+        if !d.starts_with(limit) {
+            break;
+        }
+        if let Ok(m) = std::fs::symlink_metadata(d.join(".git")) {
+            return (d.to_path_buf(), m.is_file());
+        }
+        cur = d.parent();
+    }
+    (dir.to_path_buf(), false)
+}
+
+/// Whether `cwd` counts as working in `root`: a component-wise prefix match.
+/// With `nested`, a `.git` strictly between `root` and `cwd` means `cwd` belongs to
+/// that inner checkout instead.
+pub fn cwd_in(cwd: &Path, root: &Path, nested: bool) -> bool {
+    if !cwd.starts_with(root) {
+        return false;
+    }
+    if !nested {
+        return true;
+    }
+    let mut cur = Some(cwd);
+    while let Some(d) = cur {
+        if d == root {
+            return true;
+        }
+        if std::fs::symlink_metadata(d.join(".git")).is_ok() {
+            return false;
+        }
+        cur = d.parent();
+    }
+    true
+}
+
+/// The first own process (other than Mulchie itself) working at or under `root`,
+/// with working directories read now and canonicalized.
+pub fn busy_process(src: &dyn ProcessSource, root: &Path, nested: bool) -> Option<ProcFacts> {
+    let uid = src.current_uid();
+    let me = src.self_pid();
+    let root = root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
+    src.list().into_iter().find(|p| {
+        if p.uid != Some(uid) || p.pid == me {
+            return false;
+        }
+        let Some(cwd) = &p.cwd else { return false };
+        let cwd = cwd.canonicalize().unwrap_or_else(|_| cwd.clone());
+        cwd_in(&cwd, &root, nested)
+    })
+}
+
+/// Whether any of `cwds` is at or under `root` (see [`cwd_in`]).
+pub fn any_cwd_in(cwds: &[PathBuf], root: &Path, nested: bool) -> bool {
+    cwds.iter().any(|c| cwd_in(c, root, nested))
+}
+
+/// Agent worktrees: named `agent-*`, or under a `.claude/worktrees/` directory.
+pub fn is_agent_worktree(path: &Path) -> bool {
+    if file_name(path).starts_with("agent-") {
+        return true;
+    }
+    let comps: Vec<Component> = path.components().collect();
+    comps
+        .windows(2)
+        .any(|w| w[0].as_os_str() == ".claude" && w[1].as_os_str() == "worktrees")
+        && comps.len() >= 3
+}
+
+pub fn is_mulchie_process(p: &ProcFacts) -> bool {
+    let starts = |s: &str| s.to_ascii_lowercase().starts_with(PROTECTED_PREFIX);
+    starts(&p.name)
+        || p.exe
+            .as_deref()
+            .map(|e| starts(&file_name(e)))
+            .unwrap_or(false)
+        || p.cmd
+            .first()
+            .map(|a| starts(a.rsplit('/').next().unwrap_or(a)))
+            .unwrap_or(false)
+}
+
+/// Whether `pid` exists (signal 0).
+pub fn pid_alive(pid: u32) -> bool {
+    pid > 0 && unsafe { libc::kill(pid as i32, 0) == 0 }
+}
+
+/// `backup/<name>-<12-char sha>`.
+pub fn backup_branch_name(name: &str, head: &str) -> String {
+    format!("backup/{}-{}", sanitize(name), short(head))
+}
+
+fn short(sha: &str) -> &str {
+    &sha[..sha.len().min(12)]
+}
+
+fn file_name(p: &Path) -> String {
+    p.file_name()
+        .map(|n| n.to_string_lossy().to_string())
+        .unwrap_or_default()
+}
+
+/// Safe for file names and branch names: `[A-Za-z0-9._-]`, no leading dot or dash.
+fn sanitize(s: &str) -> String {
+    let mut out: String = s
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-') {
+                c
+            } else {
+                '-'
+            }
+        })
+        .collect();
+    while out.contains("..") {
+        out = out.replace("..", ".");
+    }
+    let out = out.trim_start_matches(['.', '-']).trim_end_matches('.');
+    let out = out.strip_suffix(".lock").unwrap_or(out);
+    if out.is_empty() {
+        "worktree".into()
+    } else {
+        out.to_string()
+    }
+}
+
+fn create_private_file(path: &Path, data: &[u8]) -> std::io::Result<()> {
+    use std::os::unix::fs::OpenOptionsExt;
+    let mut f = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(path)?;
+    f.write_all(data)?;
+    f.sync_all()
+}
+
+/// The first checked-out submodule in `wt`, if any.
+fn initialized_submodule(paths: &Paths, wt: &Path) -> Result<Option<String>, Skip> {
+    if !wt.join(".gitmodules").is_file() {
+        return Ok(None);
+    }
+    let out = match git::git(
+        paths,
+        wt,
+        &[
+            "config",
+            "-f",
+            ".gitmodules",
+            "--get-regexp",
+            r"^submodule\..*\.path$",
+        ],
+    ) {
+        Ok(o) => o,
+        Err(git::GitError::Failed { code: Some(1), .. }) => return Ok(None),
+        Err(e) => return Err(Gate::git_skip(e)),
+    };
+    for line in out.lines() {
+        if let Some((_, p)) = line.split_once(' ') {
+            if std::fs::symlink_metadata(wt.join(p).join(".git")).is_ok() {
+                return Ok(Some(p.to_string()));
+            }
+        }
+    }
+    Ok(None)
+}
+
+/// Gitignored entries in `wt` that are not under a [`KNOWN_CACHE_DIRS`] directory,
+/// and their total apparent size.
+fn ignored_to_archive(paths: &Paths, wt: &Path) -> Result<(Vec<String>, u64), Skip> {
+    let out = Git::new(paths, wt)
+        .args([
+            "ls-files",
+            "-z",
+            "--others",
+            "--ignored",
+            "--exclude-standard",
+            "--directory",
+        ])
+        .run()
+        .map_err(Gate::git_skip)?;
+    let mut keep = Vec::new();
+    let mut bytes = 0u64;
+    for raw in out.stdout.split(|b| *b == 0) {
+        if raw.is_empty() {
+            continue;
+        }
+        let Ok(rel) = std::str::from_utf8(raw) else {
+            return skip(
+                SkipReason::BackupFailed,
+                "an ignored file name is not UTF-8 and cannot be archived safely",
+            );
+        };
+        let rel_path = Path::new(rel.trim_end_matches('/'));
+        if rel_path
+            .components()
+            .any(|c| KNOWN_CACHE_DIRS.iter().any(|k| c.as_os_str() == *k))
+        {
+            continue;
+        }
+        bytes += apparent_size(&wt.join(rel_path));
+        keep.push(rel.trim_end_matches('/').to_string());
+    }
+    keep.sort();
+    Ok((keep, bytes))
+}
+
+/// Sum of file lengths under `p`, not following symlinks.
+fn apparent_size(p: &Path) -> u64 {
+    let Ok(m) = std::fs::symlink_metadata(p) else {
+        return 0;
+    };
+    if !m.is_dir() {
+        return m.len();
+    }
+    let mut total = 0;
+    let mut stack = vec![p.to_path_buf()];
+    while let Some(d) = stack.pop() {
+        let Ok(rd) = std::fs::read_dir(&d) else {
+            continue;
+        };
+        for e in rd.flatten() {
+            let Ok(m) = std::fs::symlink_metadata(e.path()) else {
+                continue;
+            };
+            if m.is_dir() {
+                stack.push(e.path());
+            } else {
+                total += m.len();
+            }
+        }
+    }
+    total
+}
+
+/// `tar.gz` of the ignored entries, written to a file we created exclusively.
+fn write_ignored_archive(f: &WorktreeFacts, dir: &Path) -> Result<PathBuf, String> {
+    let list = dir.join("ignored.list");
+    let mut data = Vec::new();
+    for e in &f.ignored {
+        data.extend_from_slice(e.as_bytes());
+        data.push(0);
+    }
+    create_private_file(&list, &data).map_err(|e| e.to_string())?;
+    let archive = dir.join("ignored.tar.gz");
+    create_private_file(&archive, b"").map_err(|e| e.to_string())?;
+    let mut cmd = std::process::Command::new("tar");
+    cmd.env("COPYFILE_DISABLE", "1")
+        .arg("-czf")
+        .arg(&archive)
+        .arg("-C")
+        .arg(&f.path)
+        .arg("--null")
+        .arg("-T")
+        .arg(&list);
+    let res = git::run_with_timeout(cmd, BACKUP_TIMEOUT);
+    let _ = std::fs::remove_file(&list);
+    match res {
+        Ok(o) if o.success => {}
+        Ok(o) => return Err(format!("tar failed: {}", o.stderr.trim())),
+        Err(e) => return Err(format!("tar: {e}")),
+    }
+    let mut check = std::process::Command::new("tar");
+    check.arg("-tzf").arg(&archive);
+    match git::run_with_timeout(check, BACKUP_TIMEOUT) {
+        Ok(o) if o.success && !o.stdout.is_empty() => Ok(archive),
+        Ok(o) => Err(format!("archive did not verify: {}", o.stderr.trim())),
+        Err(e) => Err(format!("archive did not verify: {e}")),
+    }
+}
+
+#[cfg(test)]
+#[path = "safety_tests.rs"]
+mod tests;

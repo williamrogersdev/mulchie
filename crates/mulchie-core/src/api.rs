@@ -4,8 +4,8 @@ use std::net::{TcpListener, TcpStream};
 use std::path::PathBuf;
 use std::time::Duration;
 
-use crate::config::config_dir;
 use crate::engine::{Engine, ProcAction, WorkspaceAction};
+use crate::paths::config_dir;
 
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 
@@ -197,7 +197,7 @@ fn route(req: &Req, engine: &Engine) -> (u16, String) {
             ok(&serde_json::json!({ "ok": true }))
         }
         ("POST", "/v1/clean") => match body::<CleanBody>(req) {
-            Ok(b) if b.stale.unwrap_or(false) => ok(&engine.reclaim_stale(0, "api")),
+            Ok(b) if b.stale.unwrap_or(false) => ok(&engine.reclaim_stale(None, "api")),
             Ok(b) => ok(&engine.clean_paths(&b.paths.unwrap_or_default(), "api")),
             Err(e) => err(400, e),
         },
@@ -295,7 +295,7 @@ pub struct Client {
 
 impl Client {
     pub fn connect() -> Option<Self> {
-        let port = crate::config::Config::load().api_port;
+        let port = crate::config::effective_port(&crate::config::Config::load());
         let token = std::fs::read_to_string(token_path())
             .ok()?
             .trim()

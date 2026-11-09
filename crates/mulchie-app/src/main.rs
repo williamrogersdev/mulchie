@@ -1,8 +1,10 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
-use mulchie_core::diskmap::{PruneResult, RemoveResult, Worktree};
+use mulchie_core::diskmap::PruneResult;
 use mulchie_core::engine::{Advice, ProcAction, Sample};
-use mulchie_core::{human_bytes, CleanResult, Config, Engine, Health, State, WorkspaceAction};
+use mulchie_core::{
+    human_bytes, ActionResult, Config, Engine, Health, Plan, State, WorkspaceAction,
+};
 use serde::Serialize;
 use std::path::PathBuf;
 use std::time::Duration;
@@ -31,14 +33,14 @@ fn rescan(engine: tauri::State<Engine>) {
 }
 
 #[tauri::command]
-fn clean(engine: tauri::State<Engine>, paths: Vec<String>) -> Vec<CleanResult> {
+fn clean(engine: tauri::State<Engine>, paths: Vec<String>) -> Vec<ActionResult> {
     let paths: Vec<PathBuf> = paths.into_iter().map(PathBuf::from).collect();
     engine.clean_paths(&paths, "manual")
 }
 
 #[tauri::command]
-fn clean_stale(engine: tauri::State<Engine>) -> Vec<CleanResult> {
-    engine.reclaim_stale(0, "manual")
+fn clean_stale(engine: tauri::State<Engine>) -> Vec<ActionResult> {
+    engine.reclaim_stale(None, "manual")
 }
 
 #[tauri::command]
@@ -69,18 +71,18 @@ fn remove_worktrees(
     engine: tauri::State<Engine>,
     paths: Vec<String>,
     backup: bool,
-) -> Vec<RemoveResult> {
+) -> Vec<ActionResult> {
     let paths: Vec<PathBuf> = paths.into_iter().map(PathBuf::from).collect();
     engine.remove_worktrees(&paths, backup, "manual")
 }
 
 #[tauri::command]
-fn sweep_plan(engine: tauri::State<Engine>) -> Vec<Worktree> {
+fn sweep_plan(engine: tauri::State<Engine>) -> Plan {
     engine.sweep_plan()
 }
 
 #[tauri::command]
-fn sweep(engine: tauri::State<Engine>) -> Vec<RemoveResult> {
+fn sweep(engine: tauri::State<Engine>) -> Vec<ActionResult> {
     engine.sweep_worktrees("manual")
 }
 
@@ -247,9 +249,8 @@ fn notify(title: &str, body: &str) {
 }
 
 fn main() {
-    let config = Config::load();
-    let port = config.api_port;
-    let engine = Engine::new(config);
+    let engine = Engine::from_env();
+    let port = mulchie_core::config::effective_port(&engine.config());
     engine.start();
     let api_engine = engine.clone();
 
