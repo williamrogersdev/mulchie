@@ -1,0 +1,43 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  Reference copy of the LaunchAgent for `mulchie serve` on a headless Mac.
+  `mulchie service install` writes an equivalent file.
+
+  launchd does not expand ~ or $HOME. Replace the two placeholders first:
+    @MULCHIE_BIN@  absolute path to the binary, for example /Users/you/.local/bin/mulchie
+    @HOME@         your home directory, for example /Users/you
+
+  Manual install:
+    sed -e "s#@MULCHIE_BIN@#$HOME/.local/bin/mulchie#" -e "s#@HOME@#$HOME#" \
+      packaging/launchd/dev.mulchie.serve.plist > ~/Library/LaunchAgents/dev.mulchie.serve.plist
+    launchctl bootstrap "gui/$(id -u)" ~/Library/LaunchAgents/dev.mulchie.serve.plist
+  Remove:
+    launchctl bootout "gui/$(id -u)/dev.mulchie.serve"
+-->
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>dev.mulchie.serve</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>@MULCHIE_BIN@</string>
+    <string>serve</string>
+  </array>
+  <key>RunAtLoad</key>
+  <true/>
+  <key>KeepAlive</key>
+  <dict>
+    <key>SuccessfulExit</key>
+    <false/>
+  </dict>
+  <key>ThrottleInterval</key>
+  <integer>10</integer>
+  <key>ProcessType</key>
+  <string>Background</string>
+  <key>StandardOutPath</key>
+  <string>@HOME@/Library/Logs/mulchie-serve.log</string>
+  <key>StandardErrorPath</key>
+  <string>@HOME@/Library/Logs/mulchie-serve.log</string>
+</dict>
+</plist>
