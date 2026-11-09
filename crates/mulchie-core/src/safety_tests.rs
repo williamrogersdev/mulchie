@@ -897,3 +897,105 @@ fn skip_reasons_have_stable_codes() {
     assert_eq!(v["reason"], "head_moved");
     assert_eq!(v["action"], "remove_worktree");
 }
+
+// ------------------------------------------------------- P2 additions
+
+#[test]
+fn changes_during_backup_stop_the_removal() {
+    let env = Env::new();
+    let repo = env.repo("repo");
+    let wt = env.worktree(&repo, "agent-x", false);
+    std::fs::write(wt.join("work.txt"), "unsaved").unwrap();
+    let mut g = env.gate();
+    let late = wt.join("late.txt");
+    let late2 = late.clone();
+    g.after_backup = Some(Box::new(move || std::fs::write(&late2, "new").unwrap()));
+    let r = g.execute_one(&env.remove_req(&wt, &env.head(&wt)), "t");
+    assert_eq!(reason(&r), Some(SkipReason::ChangedDuringBackup), "{r:?}");
+    assert!(wt.join("work.txt").exists() && late.exists());
+
+    // A commit made while backing up moves HEAD: also stopped.
+    let mut g = env.gate();
+    let wt2 = wt.clone();
+    let paths = env.paths.clone();
+    g.after_backup = Some(Box::new(move || {
+        Git::new(&paths, &wt2)
+            .args(["-c", "user.name=t", "-c", "user.email=t@t"])
+            .args(["commit", "-q", "--allow-empty", "-m", "race"])
+            .run()
+            .unwrap();
+    }));
+    let r = g.execute_one(&env.remove_req(&wt, &env.head(&wt)), "t");
+    assert_eq!(reason(&r), Some(SkipReason::HeadMoved), "{r:?}");
+    assert!(wt.exists());
+}
+
+#[test]
+fn checked_out_submodules_block_removal() {
+    let env = Env::new();
+    let repo = env.repo("repo");
+    let wt = env.worktree(&repo, "agent-x", false);
+    std::fs::write(
+        wt.join(".gitmodules"),
+        "[submodule \"lib\"]\n\tpath = lib\n\turl = ../lib\n",
+    )
+    .unwrap();
+    std::fs::create_dir_all(wt.join("lib")).unwrap();
+    std::fs::write(wt.join("lib/.git"), "gitdir: ../.git/modules/lib\n").unwrap();
+    let r = env
+        .gate()
+        .execute_one(&env.remove_req(&wt, &env.head(&wt)), "t");
+    assert_eq!(reason(&r), Some(SkipReason::HasSubmodules), "{r:?}");
+    assert!(wt.exists());
+    // Declared but not checked out: no obstacle.
+    std::fs::rename(wt.join("lib/.git"), env._t.path().join("gitlink")).unwrap();
+    let r = env
+        .gate()
+        .execute_one(&env.remove_req(&wt, &env.head(&wt)), "t");
+    assert!(done(&r), "{r:?}");
+}
+
+#[test]
+fn same_second_backups_do_not_collide() {
+    let env = Env::new();
+    // Two repos with the same name, each with a dirty worktree of the same
+    // name, removed by one gate (one `now`): two backup sets.
+    let r1 = env.repo("one/repo");
+    let r2 = env.repo("two/repo");
+    let w1 = env.worktree(&r1, "agent-x", false);
+    let w2 = env.worktree(&r2, "agent-x", false);
+    std::fs::write(w1.join("a.txt"), "first").unwrap();
+    std::fs::write(w2.join("a.txt"), "second").unwrap();
+    let g = env.gate();
+    let res = g.execute(
+        &[
+            env.remove_req(&w1, &env.head(&w1)),
+            env.remove_req(&w2, &env.head(&w2)),
+        ],
+        "t",
+    );
+    assert!(res.iter().all(|r| r.is_done()), "{res:?}");
+    let patches: Vec<PathBuf> = res
+        .iter()
+        .flat_map(|r| r.backups().to_vec())
+        .filter(|b| b.kind == BackupKind::Patch)
+        .map(|b| PathBuf::from(b.location))
+        .collect();
+    assert_eq!(patches.len(), 2);
+    assert_ne!(patches[0].parent(), patches[1].parent());
+    let a = std::fs::read_to_string(&patches[0]).unwrap();
+    let b = std::fs::read_to_string(&patches[1]).unwrap();
+    assert!(a.contains("first") && b.contains("second"));
+}
+
+#[test]
+fn one_process_table_read_serves_a_whole_plan() {
+    let env = Env::new();
+    let caches: Vec<Request> = (0..5)
+        .map(|i| cache(&env.cargo_project(&format!("p{i}"))))
+        .collect();
+    let g = env.gate();
+    let plan = g.plan(&caches);
+    assert!(plan.items.iter().all(|i| i.ready), "{plan:?}");
+    assert_eq!(g.process_table_reads(), 1);
+}

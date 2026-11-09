@@ -400,6 +400,9 @@ pub struct Gate<'a> {
     pub now: u64,
     proc_view: Mutex<Option<(Instant, ProcView)>>,
     proc_reads: AtomicUsize,
+    /// Tests: runs after the backups are written, before the recheck.
+    #[cfg(test)]
+    pub(crate) after_backup: Option<Box<dyn Fn()>>,
 }
 
 struct CacheFacts {
@@ -444,6 +447,8 @@ impl<'a> Gate<'a> {
             now,
             proc_view: Mutex::new(None),
             proc_reads: AtomicUsize::new(0),
+            #[cfg(test)]
+            after_backup: None,
         }
     }
 
@@ -1076,6 +1081,10 @@ impl<'a> Gate<'a> {
             reason: SkipReason::BackupFailed,
             detail: format!("{e}; nothing was removed"),
         })?;
+        #[cfg(test)]
+        if let Some(h) = &self.after_backup {
+            h();
+        }
 
         // The backups describe the worktree as it was a moment ago. If anything
         // changed while they were written, stop.
