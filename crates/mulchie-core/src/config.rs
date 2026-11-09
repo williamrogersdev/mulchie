@@ -255,9 +255,13 @@ impl Config {
 /// The API port for this process: `MULCHIE_PORT` when set and valid, else the
 /// config's. The override is never written back to the config file.
 pub fn effective_port(cfg: &Config) -> u16 {
-    std::env::var("MULCHIE_PORT")
-        .ok()
-        .and_then(|p| p.parse().ok())
+    port_from(cfg, std::env::var("MULCHIE_PORT").ok().as_deref())
+}
+
+/// The port from an override value (`MULCHIE_PORT`) when it is a valid
+/// non-zero port, else the config's.
+pub fn port_from(cfg: &Config, env: Option<&str>) -> u16 {
+    env.and_then(|p| p.trim().parse().ok())
         .filter(|p: &u16| *p != 0)
         .unwrap_or(cfg.api_port)
 }
@@ -491,5 +495,19 @@ mod tests {
         cfg.save_to(&p, 1).unwrap();
         let text = std::fs::read_to_string(p.config_file()).unwrap();
         assert!(text.contains("\"api_port\": 47474"));
+    }
+
+    #[test]
+    fn port_override_from_env_value() {
+        let cfg = Config {
+            api_port: 7777,
+            ..Config::default()
+        };
+        assert_eq!(port_from(&cfg, None), 7777);
+        assert_eq!(port_from(&cfg, Some("8123")), 8123);
+        assert_eq!(port_from(&cfg, Some(" 8123 ")), 8123);
+        assert_eq!(port_from(&cfg, Some("0")), 7777, "0 is no port");
+        assert_eq!(port_from(&cfg, Some("70000")), 7777, "out of range");
+        assert_eq!(port_from(&cfg, Some("abc")), 7777);
     }
 }

@@ -4,11 +4,14 @@ pub mod diskmap;
 pub mod engine;
 pub mod git;
 pub mod journal;
+pub mod lock;
 pub mod monitor;
+pub mod notify;
 pub mod paths;
 pub mod process;
 pub mod reclaim;
 pub mod safety;
+pub mod shutdown;
 
 pub use config::{Config, ConfigError, LoadedConfig};
 pub use engine::{Engine, Health, State, WorkspaceAction};
