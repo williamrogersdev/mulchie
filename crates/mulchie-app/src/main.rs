@@ -467,10 +467,16 @@ fn main() {
         })
         .build(context)
         .expect("failed to build Mulchie");
-    app.run(move |_app, event| {
-        if let RunEvent::Exit = event {
-            exit_backend.shutdown();
-        }
+    // `--dashboard` opens the dashboard at launch instead of staying in the
+    // menu bar.
+    let open_at_launch = std::env::args().any(|a| a == "--dashboard");
+    app.run(move |app, event| match event {
+        RunEvent::Ready if open_at_launch => show_dashboard(app, None),
+        RunEvent::Exit => exit_backend.shutdown(),
+        // Opening Mulchie again (Finder, Spotlight, Dock) while it runs.
+        #[cfg(target_os = "macos")]
+        RunEvent::Reopen { .. } => show_dashboard(app, None),
+        _ => {}
     });
 }
 

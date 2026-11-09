@@ -30,8 +30,16 @@ export function findings() {
 export function findingsHtml(list, compact) {
   if (!list.length) return '<div class="empty" style="padding:12px">Nothing needs attention.</div>';
   return list.slice(0, compact ? 5 : 99).map(([lvl, t, d, go]) =>
-    `<div class="finding" data-go="${esc(go || '')}"><span class="ic" style="background:var(--${lvl})"></span><div class="t"><div>${esc(t)}</div>${compact ? '' : `<div class="muted">${esc(d)}</div>`}</div></div>`).join('');
+    `<div class="finding" role="button" tabindex="0" data-go="${esc(go || '')}"><span class="ic" style="background:var(--${lvl})"></span><div class="t"><div>${esc(t)}</div>${compact ? '' : `<div class="muted">${esc(d)}</div>`}</div></div>`).join('');
 }
+
+// An error string as a sentence: capitalised and ending in a full stop.
+const sentence = s => {
+  s = String(s || '').trim();
+  if (!s) return '';
+  s = s[0].toUpperCase() + s.slice(1);
+  return /[.!?]$/.test(s) ? s : s + '.';
+};
 
 // Problems with Mulchie itself, in words a user can act on. Each is
 // [level, title, detail, go?].
@@ -39,7 +47,7 @@ export function notices() {
   const out = [], S = st.S, conn = st.conn;
   if (conn?.mode === 'disconnected') {
     out.push(['bad', 'Not connected to Mulchie’s engine',
-      `${conn.detail || 'No engine answers.'} Retrying every few seconds${S ? '; the figures shown are from before the connection was lost' : ''}. If it stays gone, this app starts its own engine.`]);
+      `${sentence(conn.detail) || 'No engine answers.'} Retrying every few seconds${S ? '; the figures shown are from before the connection was lost' : ''}. If it stays gone, this app starts its own engine.`]);
   }
   if (!S) return out;
   if (S.config_error) {
@@ -70,7 +78,7 @@ export function notices() {
 
 export function noticesHtml(list, compact) {
   return list.map(([lvl, t, d, go]) =>
-    `<div class="notice ${lvl}" ${go ? `data-go="${esc(go)}"` : ''}><span class="ic"></span><div class="t"><div><b>${esc(t)}</b></div>${compact ? '' : `<div>${esc(d)}</div>`}</div></div>`).join('');
+    `<div class="notice ${lvl}" ${go ? `role="button" tabindex="0" data-go="${esc(go)}"` : ''}><span class="ic"></span><div class="t"><div><b>${esc(t)}</b></div>${compact ? '' : `<div>${esc(d)}</div>`}</div></div>`).join('');
 }
 
 // The connection badge: engine here, client of another engine, or offline.

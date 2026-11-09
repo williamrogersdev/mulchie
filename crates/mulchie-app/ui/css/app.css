@@ -196,3 +196,5 @@ body.panel #panel { display: flex; }
 .pi .bk { color: var(--c1); }
 .pi .bk .mono { font-size: 10.5px; }
 .modal .note { color: var(--tx3); font-size: 11px; margin-top: 8px; }
+.notice[data-go] { cursor: pointer; }
+[role="button"]:focus-visible { outline: 1px solid #4a7d4e; outline-offset: 1px; }

@@ -174,6 +174,12 @@ on('#bcStale', 'click', clearStale);
 
 document.addEventListener('keydown', e => {
   const ui = st.ui;
+  // Nav items, findings and notices act as buttons from the keyboard too.
+  if ((e.key === 'Enter' || e.key === ' ') && e.target.matches?.('[role="button"]')) {
+    e.preventDefault();
+    e.target.click();
+    return;
+  }
   if (e.key === 'Escape') {
     if (modalOpen()) dismissModal();
     else if (ui.pFocus) { ui.pFocus = null; render(); }
