@@ -1801,7 +1801,7 @@ dependencies = [
 
 [[package]]
 name = "mulchie"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "libc",
  "mulchie-core",
@@ -1810,7 +1810,7 @@ dependencies = [
 
 [[package]]
 name = "mulchie-app"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "mulchie-core",
  "serde",
@@ -1821,7 +1821,7 @@ dependencies = [
 
 [[package]]
 name = "mulchie-core"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "libc",
  "serde",
