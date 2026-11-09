@@ -1,7 +1,10 @@
 //! The local HTTP API on `127.0.0.1:<port>`.
 //!
 //! Every route except `GET /v1/health` needs `Authorization: Bearer <token>`,
-//! the token in `<config dir>/token` (0600, in a 0700 directory). Requests must
+//! the token in `<config dir>/token` (0600, in a 0700 directory). A second,
+//! read-only token in `<config dir>/token.read` (same rules) is accepted on
+//! the `GET` routes and the plan routes ([`read_only_allowed`]); anything else
+//! sent with it is 403 `read_only_token`. Requests must
 //! name `Host: 127.0.0.1:<port>` or `localhost:<port>` and carry no `Origin`, so
 //! a web page (even through DNS rebinding) cannot drive it. Request lines are
 //! limited to 8 KB, headers to 64 KB, bodies to 1 MB, a whole request to 10 s,
@@ -85,6 +88,20 @@ pub fn token_path_in(paths: &Paths) -> PathBuf {
     paths.config_dir.join("token")
 }
 
+/// The read-only token: reads and plans, never changes.
+pub fn read_only_token_path_in(paths: &Paths) -> PathBuf {
+    paths.config_dir.join("token.read")
+}
+
+/// Routes the read-only token may call: every `GET`, and the `POST`s that
+/// only plan.
+pub const READ_ONLY_POSTS: &[&str] = &["/v1/clean/plan", "/v1/worktree/plan"];
+
+/// Whether the read-only token may call `method path`.
+pub fn read_only_allowed(method: &str, path: &str) -> bool {
+    method == "GET" || (method == "POST" && READ_ONLY_POSTS.contains(&path))
+}
+
 /// The token file for this user's environment.
 pub fn token_path() -> PathBuf {
     token_path_in(&Paths::from_env())
@@ -152,7 +169,16 @@ fn read_token_file(path: &Path) -> std::io::Result<String> {
 
 /// The existing token, checked for ownership and permissions.
 pub fn read_token(paths: &Paths) -> std::io::Result<String> {
-    let path = token_path_in(paths);
+    read_token_at(&token_path_in(paths))
+}
+
+/// The existing read-only token, checked like [`read_token`].
+pub fn read_read_only_token(paths: &Paths) -> std::io::Result<String> {
+    read_token_at(&read_only_token_path_in(paths))
+}
+
+fn read_token_at(path: &Path) -> std::io::Result<String> {
+    let path = path.to_path_buf();
     check_token_file(&path)?;
     let t = read_token_file(&path)?;
     if !valid_token(&t) {
@@ -168,8 +194,18 @@ pub fn read_token(paths: &Paths) -> std::io::Result<String> {
 /// when there is none. An existing file with looser permissions or another
 /// owner is refused, never silently used or replaced.
 pub fn load_or_create_token_in(paths: &Paths) -> std::io::Result<String> {
+    load_or_create_token_at(paths, &token_path_in(paths))
+}
+
+/// The read-only token, created like [`load_or_create_token_in`]. It is a
+/// different random value from the full token.
+pub fn load_or_create_read_only_token_in(paths: &Paths) -> std::io::Result<String> {
+    load_or_create_token_at(paths, &read_only_token_path_in(paths))
+}
+
+fn load_or_create_token_at(paths: &Paths, path: &Path) -> std::io::Result<String> {
     create_private_dir(&paths.config_dir)?;
-    let path = token_path_in(paths);
+    let path = path.to_path_buf();
     for _ in 0..3 {
         match std::fs::symlink_metadata(&path) {
             Ok(_) => {
@@ -263,6 +299,7 @@ pub fn serve_with(engine: Engine, port: u16, limits: Limits) -> std::io::Result<
     let listener = TcpListener::bind(("127.0.0.1", port))?;
     let port = listener.local_addr()?.port();
     let token: Arc<str> = load_or_create_token_in(engine.paths())?.into();
+    let read_token: Arc<str> = load_or_create_read_only_token_in(engine.paths())?.into();
     let stop = Arc::new(AtomicBool::new(false));
     let active = Arc::new(AtomicUsize::new(0));
     let stop2 = stop.clone();
@@ -281,6 +318,7 @@ pub fn serve_with(engine: Engine, port: u16, limits: Limits) -> std::io::Result<
                 }
                 let engine = engine.clone();
                 let token = token.clone();
+                let read_token = read_token.clone();
                 // Released when the connection thread ends, or when it could
                 // not be started (the closure is dropped unrun).
                 let slot = Slot(active.clone());
@@ -288,7 +326,7 @@ pub fn serve_with(engine: Engine, port: u16, limits: Limits) -> std::io::Result<
                     .name("mulchie-api-conn".into())
                     .spawn(move || {
                         let _slot = slot;
-                        handle_conn(stream, &engine, &token, port, &limits);
+                        handle_conn(stream, &engine, &token, &read_token, port, &limits);
                     });
             }
         })?;
@@ -354,7 +392,14 @@ impl Read for DeadlineStream<'_> {
     }
 }
 
-fn handle_conn(stream: TcpStream, engine: &Engine, token: &str, port: u16, limits: &Limits) {
+fn handle_conn(
+    stream: TcpStream,
+    engine: &Engine,
+    token: &str,
+    read_token: &str,
+    port: u16,
+    limits: &Limits,
+) {
     let _ = stream.set_write_timeout(Some(limits.deadline));
     let deadline = Instant::now() + limits.deadline;
     let mut reader = BufReader::new(DeadlineStream {
@@ -364,7 +409,7 @@ fn handle_conn(stream: TcpStream, engine: &Engine, token: &str, port: u16, limit
     let resp = match read_req(&mut reader, limits, deadline) {
         Ok(req) => {
             let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                dispatch(&req, engine, token, port)
+                dispatch(&req, engine, token, read_token, port)
             }));
             r.unwrap_or_else(|_| {
                 ApiError::new(500, "internal_error", "the request failed inside Mulchie")
@@ -710,7 +755,7 @@ fn bearer_ok(auth: Option<&str>, token: &str) -> bool {
     constant_time_eq(t.trim().as_bytes(), token.as_bytes())
 }
 
-fn dispatch(req: &Req, engine: &Engine, token: &str, port: u16) -> Resp {
+fn dispatch(req: &Req, engine: &Engine, token: &str, read_token: &str, port: u16) -> Resp {
     if !host_ok(req.host.as_deref(), port) {
         return fail(
             403,
@@ -725,7 +770,19 @@ fn dispatch(req: &Req, engine: &Engine, token: &str, port: u16) -> Resp {
         return ok(&engine.health_summary());
     }
     if !bearer_ok(req.auth.as_deref(), token) {
-        return fail(401, "unauthorized", "missing or invalid bearer token");
+        if !bearer_ok(req.auth.as_deref(), read_token) {
+            return fail(401, "unauthorized", "missing or invalid bearer token");
+        }
+        if !read_only_allowed(&req.method, &req.path) {
+            return fail(
+                403,
+                "read_only_token",
+                format!(
+                    "the read-only token can read state and make plans, not {} {}",
+                    req.method, req.path
+                ),
+            );
+        }
     }
     route(req, engine)
 }
@@ -1004,6 +1061,19 @@ impl Client {
             return Err(format!("port {port} does not answer as Mulchie"));
         }
         let token = read_token(paths).map_err(|e| e.to_string())?;
+        Ok(Self { port, token })
+    }
+
+    /// Like [`Client::connect_in`], with the read-only token: reads and
+    /// plans work, everything else is refused by the engine.
+    pub fn connect_read_only_in(paths: &Paths, port: u16) -> Result<Self, String> {
+        verify_listener(paths, port)?;
+        let (code, v) =
+            http(port, "GET", "/v1/health", None, None, HEALTH_TIMEOUT).map_err(|e| e.message)?;
+        if code != 200 || v["name"] != "mulchie" {
+            return Err(format!("port {port} does not answer as Mulchie"));
+        }
+        let token = read_read_only_token(paths).map_err(|e| e.to_string())?;
         Ok(Self { port, token })
     }
 

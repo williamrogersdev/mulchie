@@ -621,3 +621,94 @@ fn leases_over_the_api() {
         .unwrap();
     assert_eq!(rel["released"], true);
 }
+
+// -------------------------------------------------------- read-only token
+
+#[test]
+fn the_read_only_token_reads_and_plans_only() {
+    let r = running(Limits::default());
+    let ro = read_read_only_token(r.engine.paths()).unwrap();
+    assert_ne!(ro, r.token, "a separate secret");
+    let mode = std::fs::metadata(read_only_token_path_in(r.engine.paths()))
+        .unwrap()
+        .permissions()
+        .mode();
+    assert_eq!(mode & 0o777, 0o600);
+    let auth = format!("Bearer {ro}");
+    for (method, path) in ROUTES {
+        let (code, v) = send(r.port, method, path, Some(&auth), "{}");
+        if read_only_allowed(method, path) {
+            assert!(code == 200 || code == 400, "{method} {path}: {code} {v}");
+            assert_ne!(v["code"], "read_only_token", "{method} {path}");
+        } else {
+            assert_eq!(
+                (code, v["code"].as_str()),
+                (403, Some("read_only_token")),
+                "{method} {path}"
+            );
+        }
+    }
+    // The plan routes work with it; executing does not.
+    let target = cache(&r.code_root(), "p");
+    let body = json!({ "paths": [target] }).to_string();
+    let (code, plan) = send(r.port, "POST", "/v1/clean/plan", Some(&auth), &body);
+    assert_eq!(code, 200, "{plan}");
+    assert_eq!(plan["items"][0]["ready"], true);
+    let items = json!({ "items": [plan["items"][0]["request"]] }).to_string();
+    let (code, _) = send(r.port, "POST", "/v1/clean", Some(&auth), &items);
+    assert_eq!(code, 403);
+    assert!(target.exists());
+    // The full token still works for everything.
+    let full = format!("Bearer {}", r.token);
+    let (code, _) = send(r.port, "POST", "/v1/clean", Some(&full), &items);
+    assert_eq!(code, 200);
+    assert!(!target.exists());
+}
+
+#[test]
+fn read_only_route_list() {
+    assert!(read_only_allowed("GET", "/v1/state"));
+    assert!(read_only_allowed("GET", "/v1/sweep"));
+    assert!(read_only_allowed("POST", "/v1/clean/plan"));
+    assert!(read_only_allowed("POST", "/v1/worktree/plan"));
+    for p in [
+        "/v1/clean",
+        "/v1/sweep",
+        "/v1/worktree/remove",
+        "/v1/prune",
+        "/v1/process",
+        "/v1/workspace",
+        "/v1/lease",
+        "/v1/release",
+        "/v1/scan",
+    ] {
+        assert!(!read_only_allowed("POST", p), "{p}");
+    }
+}
+
+#[test]
+fn a_loose_read_only_token_is_refused() {
+    let (_t, e) = engine();
+    let p = e.paths().clone();
+    load_or_create_read_only_token_in(&p).unwrap();
+    let f = read_only_token_path_in(&p);
+    std::fs::set_permissions(&f, std::fs::Permissions::from_mode(0o644)).unwrap();
+    assert!(read_read_only_token(&p).is_err());
+    assert!(load_or_create_read_only_token_in(&p).is_err());
+}
+
+#[test]
+fn the_read_only_client_cannot_change_anything() {
+    let r = running(Limits::default());
+    let c = Client::connect_read_only_in(r.engine.paths(), r.port).unwrap();
+    assert!(c.call("GET", "/v1/state", None).is_ok());
+    let e = c
+        .request(
+            "POST",
+            "/v1/sweep",
+            Some(&json!({ "auto": true })),
+            DEFAULT_TIMEOUT,
+        )
+        .unwrap_err();
+    assert_eq!((e.status, e.code.as_str()), (403, "read_only_token"));
+}
