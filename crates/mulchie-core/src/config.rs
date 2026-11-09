@@ -28,7 +28,15 @@ impl Default for Config {
     fn default() -> Self {
         let home = home_dir();
         let mut roots = Vec::new();
-        for name in ["Developer", "Projects", "code", "src", "dev", "repos", "work"] {
+        for name in [
+            "Developer",
+            "Projects",
+            "code",
+            "src",
+            "dev",
+            "repos",
+            "work",
+        ] {
             let p = home.join(name);
             if p.is_dir() {
                 roots.push(p);
@@ -80,7 +88,10 @@ impl Config {
 
     pub fn load() -> Self {
         let mut cfg = Self::load_from(&Self::path());
-        if let Some(port) = std::env::var("MULCHIE_PORT").ok().and_then(|p| p.parse().ok()) {
+        if let Some(port) = std::env::var("MULCHIE_PORT")
+            .ok()
+            .and_then(|p| p.parse().ok())
+        {
             cfg.api_port = port;
         }
         cfg

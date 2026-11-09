@@ -36,7 +36,8 @@ fn tools() -> Value {
 }
 
 fn call_tool(name: &str, a: &Value) -> Result<Value, String> {
-    let c = Client::connect().ok_or("Mulchie is not running. Start Mulchie.app or run `mulchie serve`.")?;
+    let c = Client::connect()
+        .ok_or("Mulchie is not running. Start Mulchie.app or run `mulchie serve`.")?;
     let get = |p: &str| c.call("GET", p, None);
     let post = |p: &str, b: Value| c.call("POST", p, Some(&b));
     match name {
@@ -65,11 +66,18 @@ fn call_tool(name: &str, a: &Value) -> Result<Value, String> {
             let sort = a["sort"].as_str().unwrap_or("cpu");
             let limit = a["limit"].as_u64().unwrap_or(20) as usize;
             let filter = a["workspace"].as_str().unwrap_or("");
-            let mut procs: Vec<Value> = st["snapshot"]["top"].as_array().cloned().unwrap_or_default();
-            procs.retain(|p| filter.is_empty() || p["group"].as_str().unwrap_or("").contains(filter));
+            let mut procs: Vec<Value> = st["snapshot"]["top"]
+                .as_array()
+                .cloned()
+                .unwrap_or_default();
+            procs.retain(|p| {
+                filter.is_empty() || p["group"].as_str().unwrap_or("").contains(filter)
+            });
             let key = |p: &Value| match sort {
                 "mem" => p["mem_bytes"].as_f64().unwrap_or(0.0),
-                "io" => p["read_bps"].as_f64().unwrap_or(0.0) + p["write_bps"].as_f64().unwrap_or(0.0),
+                "io" => {
+                    p["read_bps"].as_f64().unwrap_or(0.0) + p["write_bps"].as_f64().unwrap_or(0.0)
+                }
                 _ => p["cpu_pct"].as_f64().unwrap_or(0.0),
             };
             procs.sort_by(|x, y| key(y).total_cmp(&key(x)));
@@ -97,16 +105,26 @@ fn call_tool(name: &str, a: &Value) -> Result<Value, String> {
             let arr = h.as_array().cloned().unwrap_or_default();
             let start = arr.len().saturating_sub(n);
             let step = ((arr.len() - start) / 120).max(1);
-            Ok(Value::Array(arr[start..].iter().step_by(step).cloned().collect()))
+            Ok(Value::Array(
+                arr[start..].iter().step_by(step).cloned().collect(),
+            ))
         }
         "disk_breakdown" => {
             let st = get("/v1/state")?;
-            Ok(json!({ "disk_free": st["snapshot"]["disk_free"], "disk_total": st["snapshot"]["disk_total"], "forecast": st["forecast"], "diskmap": st["diskmap"], "scanning": st["scanning"] }))
+            Ok(
+                json!({ "disk_free": st["snapshot"]["disk_free"], "disk_total": st["snapshot"]["disk_total"], "forecast": st["forecast"], "diskmap": st["diskmap"], "scanning": st["scanning"] }),
+            )
         }
         "reclaim_candidates" => Ok(get("/v1/state")?["scan"].clone()),
-        "clean_caches" => post("/v1/clean", json!({ "paths": a["paths"], "stale": a["stale"].as_bool().unwrap_or(false) })),
+        "clean_caches" => post(
+            "/v1/clean",
+            json!({ "paths": a["paths"], "stale": a["stale"].as_bool().unwrap_or(false) }),
+        ),
         "prune_cache" => post("/v1/prune", json!({ "key": a["key"] })),
-        "remove_worktrees" => post("/v1/worktree/remove", json!({ "paths": a["paths"], "backup": a["backup"].as_bool().unwrap_or(false) })),
+        "remove_worktrees" => post(
+            "/v1/worktree/remove",
+            json!({ "paths": a["paths"], "backup": a["backup"].as_bool().unwrap_or(false) }),
+        ),
         "sweep_worktrees" => {
             if a["dry_run"].as_bool().unwrap_or(false) {
                 get("/v1/sweep")
@@ -114,7 +132,10 @@ fn call_tool(name: &str, a: &Value) -> Result<Value, String> {
                 post("/v1/sweep", json!({}))
             }
         }
-        "workspace_action" => post("/v1/workspace", json!({ "path": a["path"], "action": a["action"] })),
+        "workspace_action" => post(
+            "/v1/workspace",
+            json!({ "path": a["path"], "action": a["action"] }),
+        ),
         "process_action" => {
             let mut b = json!({ "pid": a["pid"], "action": a["action"] });
             if a["action"] == "renice" {
@@ -145,7 +166,9 @@ pub fn serve() -> i32 {
             let _ = out.flush();
             continue;
         };
-        let Some(id) = msg.get("id").cloned() else { continue };
+        let Some(id) = msg.get("id").cloned() else {
+            continue;
+        };
         let method = msg["method"].as_str().unwrap_or("");
         let params = &msg["params"];
         let result: Result<Value, (i64, String)> = match method {
@@ -161,15 +184,21 @@ pub fn serve() -> i32 {
                 let name = params["name"].as_str().unwrap_or("");
                 let args = params.get("arguments").cloned().unwrap_or(json!({}));
                 Ok(match call_tool(name, &args) {
-                    Ok(v) => json!({ "content": [{ "type": "text", "text": serde_json::to_string_pretty(&v).unwrap_or_default() }] }),
-                    Err(e) => json!({ "content": [{ "type": "text", "text": e }], "isError": true }),
+                    Ok(v) => {
+                        json!({ "content": [{ "type": "text", "text": serde_json::to_string_pretty(&v).unwrap_or_default() }] })
+                    }
+                    Err(e) => {
+                        json!({ "content": [{ "type": "text", "text": e }], "isError": true })
+                    }
                 })
             }
             _ => Err((-32601, format!("method not found: {method}"))),
         };
         let reply = match result {
             Ok(r) => json!({ "jsonrpc": "2.0", "id": id, "result": r }),
-            Err((code, m)) => json!({ "jsonrpc": "2.0", "id": id, "error": { "code": code, "message": m } }),
+            Err((code, m)) => {
+                json!({ "jsonrpc": "2.0", "id": id, "error": { "code": code, "message": m } })
+            }
         };
         let _ = writeln!(out, "{reply}");
         let _ = out.flush();

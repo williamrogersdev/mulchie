@@ -9,6 +9,9 @@ use sysinfo::{
 
 use crate::config::home_dir;
 
+/// Per-process git root lookup: `(root, in_worktree)`.
+type DirectEntry = Option<(PathBuf, bool)>;
+
 #[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq, Hash)]
 #[serde(rename_all = "snake_case")]
 pub enum ProcKind {
@@ -121,13 +124,50 @@ impl Snapshot {
 }
 
 const AGENTS: &[&str] = &[
-    "claude", "codex", "gemini", "droid", "kimi", "aider", "goose", "opencode", "amp", "qwen",
-    "cursor-agent", "crush", "cline", "copilot",
+    "claude",
+    "codex",
+    "gemini",
+    "droid",
+    "kimi",
+    "aider",
+    "goose",
+    "opencode",
+    "amp",
+    "qwen",
+    "cursor-agent",
+    "crush",
+    "cline",
+    "copilot",
 ];
 const BUILDS: &[&str] = &[
-    "cargo", "rustc", "clang", "clang++", "cc", "c++", "ld", "ld64", "swiftc", "swift-frontend",
-    "xcodebuild", "go", "gcc", "g++", "make", "ninja", "cmake", "tsc", "esbuild", "webpack",
-    "vite", "rollup", "gradle", "javac", "zig", "lld", "sccache", "build-script-build",
+    "cargo",
+    "rustc",
+    "clang",
+    "clang++",
+    "cc",
+    "c++",
+    "ld",
+    "ld64",
+    "swiftc",
+    "swift-frontend",
+    "xcodebuild",
+    "go",
+    "gcc",
+    "g++",
+    "make",
+    "ninja",
+    "cmake",
+    "tsc",
+    "esbuild",
+    "webpack",
+    "vite",
+    "rollup",
+    "gradle",
+    "javac",
+    "zig",
+    "lld",
+    "sccache",
+    "build-script-build",
 ];
 const RUNTIMES: &[&str] = &["node", "bun", "deno", "python", "python3", "ruby", "java"];
 
@@ -199,14 +239,22 @@ impl Monitor {
 
         let cache = &mut self.root_cache;
         let bcache = &mut self.branch_cache;
-        let mut direct: HashMap<u32, (u32, bool, Option<(PathBuf, bool)>)> = HashMap::with_capacity(self.sys.processes().len());
+        let mut direct: HashMap<u32, (u32, bool, DirectEntry)> =
+            HashMap::with_capacity(self.sys.processes().len());
         for (pid, p) in self.sys.processes() {
             if p.thread_kind().is_some() {
                 continue;
             }
             let own = p.user_id().map(|u| **u == my_uid).unwrap_or(false);
-            let root = if own { p.cwd().and_then(|c| cached_root(cache, c)) } else { None };
-            direct.insert(pid.as_u32(), (p.parent().map(|x| x.as_u32()).unwrap_or(0), own, root));
+            let root = if own {
+                p.cwd().and_then(|c| cached_root(cache, c))
+            } else {
+                None
+            };
+            direct.insert(
+                pid.as_u32(),
+                (p.parent().map(|x| x.as_u32()).unwrap_or(0), own, root),
+            );
         }
         let resolve = |pid: u32| -> Option<(PathBuf, bool)> {
             let (mut parent, own, root) = direct.get(&pid)?.clone();
@@ -234,7 +282,10 @@ impl Monitor {
             let kind = classify(&name);
             let du = p.disk_usage();
             let (read_bps, write_bps) = if io_valid {
-                ((du.read_bytes as f64 / secs) as u64, (du.written_bytes as f64 / secs) as u64)
+                (
+                    (du.read_bytes as f64 / secs) as u64,
+                    (du.written_bytes as f64 / secs) as u64,
+                )
             } else {
                 (0, 0)
             };
@@ -350,13 +401,21 @@ impl Monitor {
         let mut pick: Vec<u32> = Vec::new();
         all.sort_by(|a, b| b.cpu_pct.total_cmp(&a.cpu_pct));
         pick.extend(all.iter().take(60).map(|p| p.pid));
-        all.sort_by(|a, b| b.mem_bytes.cmp(&a.mem_bytes));
+        all.sort_by_key(|p| std::cmp::Reverse(p.mem_bytes));
         pick.extend(all.iter().take(60).map(|p| p.pid));
-        all.sort_by(|a, b| (b.read_bps + b.write_bps).cmp(&(a.read_bps + a.write_bps)));
-        pick.extend(all.iter().take(30).filter(|p| p.read_bps + p.write_bps > 0).map(|p| p.pid));
+        all.sort_by_key(|p| std::cmp::Reverse(p.read_bps + p.write_bps));
+        pick.extend(
+            all.iter()
+                .take(30)
+                .filter(|p| p.read_bps + p.write_bps > 0)
+                .map(|p| p.pid),
+        );
         pick.sort_unstable();
         pick.dedup();
-        let mut top: Vec<ProcInfo> = all.into_iter().filter(|p| pick.binary_search(&p.pid).is_ok()).collect();
+        let mut top: Vec<ProcInfo> = all
+            .into_iter()
+            .filter(|p| pick.binary_search(&p.pid).is_ok())
+            .collect();
         top.sort_by(|a, b| b.cpu_pct.total_cmp(&a.cpu_pct));
 
         let (disk_mount, disk_total, disk_free) = home_disk();
@@ -456,7 +515,10 @@ fn cached_root(
     found
 }
 
-fn cached_branch(cache: &mut HashMap<PathBuf, (Instant, Option<String>)>, root: &Path) -> Option<String> {
+fn cached_branch(
+    cache: &mut HashMap<PathBuf, (Instant, Option<String>)>,
+    root: &Path,
+) -> Option<String> {
     if let Some((t, b)) = cache.get(root) {
         if t.elapsed().as_secs() < 30 {
             return b.clone();
@@ -519,7 +581,11 @@ pub fn git_branch(root: &Path) -> Option<String> {
         let txt = std::fs::read_to_string(&dotgit).ok()?;
         let dir = txt.trim().strip_prefix("gitdir:")?.trim();
         let dir = PathBuf::from(dir);
-        let dir = if dir.is_absolute() { dir } else { root.join(dir) };
+        let dir = if dir.is_absolute() {
+            dir
+        } else {
+            root.join(dir)
+        };
         dir.join("HEAD")
     };
     let txt = std::fs::read_to_string(head).ok()?;
@@ -587,7 +653,11 @@ fn home_disk() -> (PathBuf, u64, u64) {
         }
     }
     match best {
-        Some(d) => (d.mount_point().to_path_buf(), d.total_space(), d.available_space()),
+        Some(d) => (
+            d.mount_point().to_path_buf(),
+            d.total_space(),
+            d.available_space(),
+        ),
         None => (PathBuf::from("/"), 0, 0),
     }
 }

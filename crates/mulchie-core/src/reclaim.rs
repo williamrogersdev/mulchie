@@ -80,9 +80,14 @@ pub fn scan(cfg: &Config, busy: &[PathBuf]) -> ScanReport {
                             let project = path.parent().unwrap_or(path).to_path_buf();
                             let bytes = dir_size(path);
                             let last = last_used(path);
-                            let (root, in_worktree) = git_root(&project).unwrap_or((project.clone(), false));
-                            let in_use = busy.iter().any(|b| *b == root);
-                            let limit = if in_worktree { wt_stale_secs } else { stale_secs };
+                            let (root, in_worktree) =
+                                git_root(&project).unwrap_or((project.clone(), false));
+                            let in_use = busy.contains(&root);
+                            let limit = if in_worktree {
+                                wt_stale_secs
+                            } else {
+                                stale_secs
+                            };
                             let stale = !in_use && now.saturating_sub(last) >= limit;
                             Item {
                                 path: path.clone(),
@@ -99,11 +104,14 @@ pub fn scan(cfg: &Config, busy: &[PathBuf]) -> ScanReport {
                 })
             })
             .collect();
-        handles.into_iter().flat_map(|h| h.join().unwrap_or_default()).collect()
+        handles
+            .into_iter()
+            .flat_map(|h| h.join().unwrap_or_default())
+            .collect()
     });
 
     items.retain(|i| i.bytes > 0);
-    items.sort_by(|a, b| b.bytes.cmp(&a.bytes));
+    items.sort_by_key(|a| std::cmp::Reverse(a.bytes));
     let total_bytes = items.iter().map(|i| i.bytes).sum();
     let stale_bytes = items.iter().filter(|i| i.stale).map(|i| i.bytes).sum();
     ScanReport {
@@ -119,7 +127,9 @@ fn walk(dir: &Path, depth: usize, cfg: &Config, out: &mut Vec<(PathBuf, ItemKind
     if depth > MAX_DEPTH {
         return;
     }
-    let Ok(rd) = std::fs::read_dir(dir) else { return };
+    let Ok(rd) = std::fs::read_dir(dir) else {
+        return;
+    };
     for entry in rd.flatten() {
         let Ok(ft) = entry.file_type() else { continue };
         if !ft.is_dir() || ft.is_symlink() {
@@ -157,7 +167,9 @@ pub fn dir_size(path: &Path) -> u64 {
     let mut total = 0u64;
     let mut stack = vec![path.to_path_buf()];
     while let Some(dir) = stack.pop() {
-        let Ok(rd) = std::fs::read_dir(&dir) else { continue };
+        let Ok(rd) = std::fs::read_dir(&dir) else {
+            continue;
+        };
         for entry in rd.flatten() {
             let Ok(meta) = entry.metadata() else { continue };
             if meta.is_dir() {
@@ -174,11 +186,20 @@ fn last_used(path: &Path) -> u64 {
     let mut newest = mtime(path);
     if let Ok(rd) = std::fs::read_dir(path) {
         for e in rd.flatten() {
-            newest = newest.max(e.metadata().ok().map(|m| to_unix(m.modified().ok())).unwrap_or(0));
+            newest = newest.max(
+                e.metadata()
+                    .ok()
+                    .map(|m| to_unix(m.modified().ok()))
+                    .unwrap_or(0),
+            );
             if let Ok(rd2) = std::fs::read_dir(e.path()) {
                 for e2 in rd2.flatten().take(256) {
-                    newest = newest
-                        .max(e2.metadata().ok().map(|m| to_unix(m.modified().ok())).unwrap_or(0));
+                    newest = newest.max(
+                        e2.metadata()
+                            .ok()
+                            .map(|m| to_unix(m.modified().ok()))
+                            .unwrap_or(0),
+                    );
                 }
             }
         }
@@ -236,11 +257,18 @@ pub fn verify_cleanable(path: &Path, cfg: &Config) -> Result<ItemKind, String> {
     if path == home.join("Library/Developer/Xcode/DerivedData") {
         return Ok(ItemKind::XcodeDerivedData);
     }
-    if !cfg.scan_roots.iter().any(|r| path.starts_with(r) && path != r) {
+    if !cfg
+        .scan_roots
+        .iter()
+        .any(|r| path.starts_with(r) && path != r)
+    {
         return Err("path is outside the configured scan roots".into());
     }
     let parent = path.parent().ok_or("no parent")?;
-    let name = path.file_name().map(|s| s.to_string_lossy().to_string()).unwrap_or_default();
+    let name = path
+        .file_name()
+        .map(|s| s.to_string_lossy().to_string())
+        .unwrap_or_default();
     match name.as_str() {
         "target" if parent.join("Cargo.toml").is_file() => Ok(ItemKind::CargoTarget),
         "node_modules" if parent.join("package.json").is_file() => Ok(ItemKind::NodeModules),
@@ -251,7 +279,11 @@ pub fn verify_cleanable(path: &Path, cfg: &Config) -> Result<ItemKind, String> {
 
 pub fn clean(path: &Path, cfg: &Config) -> CleanResult {
     if let Err(e) = verify_cleanable(path, cfg) {
-        return CleanResult { path: path.to_path_buf(), freed: 0, error: Some(e) };
+        return CleanResult {
+            path: path.to_path_buf(),
+            freed: 0,
+            error: Some(e),
+        };
     }
     let before = dir_size(path);
     let res = std::fs::remove_dir_all(path);
@@ -268,7 +300,11 @@ mod tests {
     use super::*;
 
     fn tmp(tag: &str) -> PathBuf {
-        let p = std::env::temp_dir().join(format!("mulchie-test-{tag}-{}-{}", std::process::id(), now_unix()));
+        let p = std::env::temp_dir().join(format!(
+            "mulchie-test-{tag}-{}-{}",
+            std::process::id(),
+            now_unix()
+        ));
         std::fs::create_dir_all(&p).unwrap();
         p.canonicalize().unwrap()
     }
@@ -284,7 +320,12 @@ mod tests {
         std::fs::create_dir_all(&other).unwrap();
         std::fs::write(other.join("x"), b"keep").unwrap();
 
-        let cfg = Config { scan_roots: vec![root.clone()], stale_hours: 0, include_xcode: false, ..Config::default() };
+        let cfg = Config {
+            scan_roots: vec![root.clone()],
+            stale_hours: 0,
+            include_xcode: false,
+            ..Config::default()
+        };
         let report = scan(&cfg, &[]);
         assert_eq!(report.items.len(), 1);
         assert_eq!(report.items[0].kind, ItemKind::CargoTarget);
@@ -307,8 +348,13 @@ mod tests {
         std::fs::create_dir_all(proj.join("target")).unwrap();
         std::fs::write(proj.join("Cargo.toml"), "").unwrap();
         std::fs::write(proj.join("target/x"), vec![0u8; 5000]).unwrap();
-        let cfg = Config { scan_roots: vec![root.clone()], stale_hours: 0, include_xcode: false, ..Config::default() };
-        let report = scan(&cfg, &[proj.clone()]);
+        let cfg = Config {
+            scan_roots: vec![root.clone()],
+            stale_hours: 0,
+            include_xcode: false,
+            ..Config::default()
+        };
+        let report = scan(&cfg, std::slice::from_ref(&proj));
         assert!(report.items[0].in_use);
         assert!(!report.items[0].stale);
         std::fs::remove_dir_all(root).ok();
@@ -326,8 +372,13 @@ mod tests {
         }
         std::fs::create_dir_all(repo.join(".git")).unwrap();
         std::fs::write(wt.join(".git"), "gitdir: elsewhere").unwrap();
-        let cfg = Config { scan_roots: vec![root.clone()], stale_hours: 0, include_xcode: false, ..Config::default() };
-        let report = scan(&cfg, &[wt.clone()]);
+        let cfg = Config {
+            scan_roots: vec![root.clone()],
+            stale_hours: 0,
+            include_xcode: false,
+            ..Config::default()
+        };
+        let report = scan(&cfg, std::slice::from_ref(&wt));
         let main = report.items.iter().find(|i| i.project == repo).unwrap();
         let tree = report.items.iter().find(|i| i.project == wt).unwrap();
         assert!(!main.in_use && main.stale && !main.in_worktree);

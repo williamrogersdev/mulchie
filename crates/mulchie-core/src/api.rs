@@ -37,7 +37,7 @@ pub fn load_or_create_token() -> std::io::Result<String> {
 pub fn serve(engine: Engine, port: u16) -> std::io::Result<std::thread::JoinHandle<()>> {
     let listener = TcpListener::bind(("127.0.0.1", port))?;
     let token = load_or_create_token()?;
-    Ok(std::thread::Builder::new()
+    std::thread::Builder::new()
         .name("mulchie-api".into())
         .spawn(move || {
             for stream in listener.incoming().flatten() {
@@ -47,7 +47,7 @@ pub fn serve(engine: Engine, port: u16) -> std::io::Result<std::thread::JoinHand
                     let _ = handle(stream, &engine, &token);
                 });
             }
-        })?)
+        })
 }
 
 struct Req {
@@ -86,7 +86,13 @@ fn read_req(stream: &TcpStream) -> std::io::Result<Req> {
     }
     let mut body = vec![0u8; len];
     r.read_exact(&mut body)?;
-    Ok(Req { method, path, auth, origin, body })
+    Ok(Req {
+        method,
+        path,
+        auth,
+        origin,
+        body,
+    })
 }
 
 fn respond(mut s: &TcpStream, code: u16, body: &str) -> std::io::Result<()> {
@@ -150,8 +156,18 @@ struct ReleaseBody {
 }
 
 const PROTECTED: &[&str] = &[
-    "/v1/state", "/v1/history", "/v1/advice", "/v1/scan", "/v1/clean", "/v1/workspace", "/v1/process",
-    "/v1/worktree/remove", "/v1/sweep", "/v1/prune", "/v1/lease", "/v1/release",
+    "/v1/state",
+    "/v1/history",
+    "/v1/advice",
+    "/v1/scan",
+    "/v1/clean",
+    "/v1/workspace",
+    "/v1/process",
+    "/v1/worktree/remove",
+    "/v1/sweep",
+    "/v1/prune",
+    "/v1/lease",
+    "/v1/release",
 ];
 
 fn body<T: serde::de::DeserializeOwned>(req: &Req) -> Result<T, String> {
@@ -163,7 +179,10 @@ fn ok<T: serde::Serialize>(v: &T) -> (u16, String) {
 }
 
 fn err(code: u16, msg: impl std::fmt::Display) -> (u16, String) {
-    (code, serde_json::json!({ "error": msg.to_string() }).to_string())
+    (
+        code,
+        serde_json::json!({ "error": msg.to_string() }).to_string(),
+    )
 }
 
 fn route(req: &Req, engine: &Engine) -> (u16, String) {
@@ -207,7 +226,11 @@ fn route(req: &Req, engine: &Engine) -> (u16, String) {
         },
         ("POST", "/v1/lease") => match body::<LeaseBody>(req) {
             Ok(b) => {
-                let label = if b.label.is_empty() { format!("pid {}", b.pid) } else { b.label };
+                let label = if b.label.is_empty() {
+                    format!("pid {}", b.pid)
+                } else {
+                    b.label
+                };
                 ok(&engine.acquire(&label, b.pid, b.ticket))
             }
             Err(e) => err(400, e),
@@ -223,30 +246,43 @@ fn route(req: &Req, engine: &Engine) -> (u16, String) {
 fn handle(stream: TcpStream, engine: &Engine, token: &str) -> std::io::Result<()> {
     let req = read_req(&stream)?;
     if req.origin.is_some() {
-        return respond(&stream, 403, r#"{"error":"browser requests are not allowed"}"#);
+        return respond(
+            &stream,
+            403,
+            r#"{"error":"browser requests are not allowed"}"#,
+        );
     }
     let path = req.path.split('?').next().unwrap_or("");
     if req.method == "GET" && path == "/v1/health" {
         let st = engine.snapshot_state();
         let adv = engine.advice();
-        return respond(&stream, 200, &serde_json::json!({
-            "name": "mulchie",
-            "version": VERSION,
-            "health": st.health,
-            "disk_free": st.snapshot.disk_free,
-            "disk_total": st.snapshot.disk_total,
-            "cpu_pct": st.snapshot.cpu_pct,
-            "load": st.snapshot.load,
-            "mem_free_pct": st.snapshot.mem_free_pct(),
-            "agents": st.snapshot.agent_count,
-            "builds": st.snapshot.build_count,
-            "free_slots": adv.free_slots,
-            "ok_to_start_heavy_work": adv.ok_to_start_heavy_work,
-            "reclaimable_stale": st.scan.as_ref().map(|s| s.stale_bytes).unwrap_or(0),
-        }).to_string());
+        return respond(
+            &stream,
+            200,
+            &serde_json::json!({
+                "name": "mulchie",
+                "version": VERSION,
+                "health": st.health,
+                "disk_free": st.snapshot.disk_free,
+                "disk_total": st.snapshot.disk_total,
+                "cpu_pct": st.snapshot.cpu_pct,
+                "load": st.snapshot.load,
+                "mem_free_pct": st.snapshot.mem_free_pct(),
+                "agents": st.snapshot.agent_count,
+                "builds": st.snapshot.build_count,
+                "free_slots": adv.free_slots,
+                "ok_to_start_heavy_work": adv.ok_to_start_heavy_work,
+                "reclaimable_stale": st.scan.as_ref().map(|s| s.stale_bytes).unwrap_or(0),
+            })
+            .to_string(),
+        );
     }
     if PROTECTED.contains(&path) && req.auth.as_deref() != Some(&format!("Bearer {token}")) {
-        return respond(&stream, 401, r#"{"error":"missing or invalid bearer token"}"#);
+        return respond(
+            &stream,
+            401,
+            r#"{"error":"missing or invalid bearer token"}"#,
+        );
     }
     let (code, out) = route(&req, engine);
     respond(&stream, code, &out)
@@ -260,14 +296,23 @@ pub struct Client {
 impl Client {
     pub fn connect() -> Option<Self> {
         let port = crate::config::Config::load().api_port;
-        let token = std::fs::read_to_string(token_path()).ok()?.trim().to_string();
+        let token = std::fs::read_to_string(token_path())
+            .ok()?
+            .trim()
+            .to_string();
         let c = Self { port, token };
         c.call("GET", "/v1/health", None).ok().map(|_| c)
     }
 
-    pub fn call(&self, method: &str, path: &str, body: Option<&serde_json::Value>) -> Result<serde_json::Value, String> {
+    pub fn call(
+        &self,
+        method: &str,
+        path: &str,
+        body: Option<&serde_json::Value>,
+    ) -> Result<serde_json::Value, String> {
         let addr = std::net::SocketAddr::from(([127, 0, 0, 1], self.port));
-        let mut s = TcpStream::connect_timeout(&addr, Duration::from_millis(800)).map_err(|e| format!("mulchie is not running ({e})"))?;
+        let mut s = TcpStream::connect_timeout(&addr, Duration::from_millis(800))
+            .map_err(|e| format!("mulchie is not running ({e})"))?;
         s.set_read_timeout(Some(Duration::from_secs(600))).ok();
         let payload = body.map(|b| b.to_string()).unwrap_or_default();
         write!(
@@ -280,12 +325,20 @@ impl Client {
         let mut raw = String::new();
         s.read_to_string(&mut raw).map_err(|e| e.to_string())?;
         let (head, body) = raw.split_once("\r\n\r\n").unwrap_or((&raw, ""));
-        let code: u16 = head.split_whitespace().nth(1).and_then(|c| c.parse().ok()).unwrap_or(0);
+        let code: u16 = head
+            .split_whitespace()
+            .nth(1)
+            .and_then(|c| c.parse().ok())
+            .unwrap_or(0);
         let v: serde_json::Value = serde_json::from_str(body).unwrap_or(serde_json::Value::Null);
         if code == 200 {
             Ok(v)
         } else {
-            Err(v.get("error").and_then(|e| e.as_str()).map(String::from).unwrap_or_else(|| format!("HTTP {code}")))
+            Err(v
+                .get("error")
+                .and_then(|e| e.as_str())
+                .map(String::from)
+                .unwrap_or_else(|| format!("HTTP {code}")))
         }
     }
 }

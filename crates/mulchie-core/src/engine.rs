@@ -133,7 +133,14 @@ pub struct State {
 }
 
 impl State {
-    fn log(&mut self, kind: &str, detail: String, bytes: u64, workspace: Option<String>, source: &str) {
+    fn log(
+        &mut self,
+        kind: &str,
+        detail: String,
+        bytes: u64,
+        workspace: Option<String>,
+        source: &str,
+    ) {
         self.actions.push_front(Action {
             at_unix: now_unix(),
             kind: kind.into(),
@@ -224,8 +231,18 @@ impl Engine {
         self.scan_requested.store(true, Ordering::SeqCst);
     }
 
-    pub fn log(&self, kind: &str, detail: String, bytes: u64, workspace: Option<String>, source: &str) {
-        self.state.lock().unwrap().log(kind, detail, bytes, workspace, source);
+    pub fn log(
+        &self,
+        kind: &str,
+        detail: String,
+        bytes: u64,
+        workspace: Option<String>,
+        source: &str,
+    ) {
+        self.state
+            .lock()
+            .unwrap()
+            .log(kind, detail, bytes, workspace, source);
     }
 
     pub fn start(&self) {
@@ -304,7 +321,13 @@ impl Engine {
                 st.throttled = reniced.len();
                 let low = snap.disk_total > 0 && snap.disk_free_gb() < cfg.alert_below_gb as f64;
                 if low && !st.low_disk {
-                    st.log("alert", format!("Free space below {} GB", cfg.alert_below_gb), snap.disk_free, None, "monitor");
+                    st.log(
+                        "alert",
+                        format!("Free space below {} GB", cfg.alert_below_gb),
+                        snap.disk_free,
+                        None,
+                        "monitor",
+                    );
                 }
                 st.low_disk = low;
                 let cap = capacity(&cfg, snap.cpu_count);
@@ -318,17 +341,37 @@ impl Engine {
                 if !newly.is_empty() {
                     let mut by_ws: BTreeMap<String, usize> = BTreeMap::new();
                     let mut seen = HashSet::new();
-                    for p in snap.workspaces.iter().flat_map(|w| w.procs.iter()).chain(snap.top.iter()) {
+                    for p in snap
+                        .workspaces
+                        .iter()
+                        .flat_map(|w| w.procs.iter())
+                        .chain(snap.top.iter())
+                    {
                         if newly.contains(&p.pid) && seen.insert(p.pid) {
                             *by_ws.entry(p.group.clone()).or_default() += 1;
                         }
                     }
                     let named: usize = by_ws.values().sum();
                     for (label, n) in by_ws {
-                        st.log("throttle", format!("Lowered priority of {n} build process(es) under pressure"), 0, Some(label), "optimizer");
+                        st.log(
+                            "throttle",
+                            format!("Lowered priority of {n} build process(es) under pressure"),
+                            0,
+                            Some(label),
+                            "optimizer",
+                        );
                     }
                     if newly.len() > named {
-                        st.log("throttle", format!("Lowered priority of {} build process(es)", newly.len() - named), 0, None, "optimizer");
+                        st.log(
+                            "throttle",
+                            format!(
+                                "Lowered priority of {} build process(es)",
+                                newly.len() - named
+                            ),
+                            0,
+                            None,
+                            "optimizer",
+                        );
                     }
                 }
             }
@@ -338,7 +381,8 @@ impl Engine {
                 && last_reclaim.elapsed() > Duration::from_secs(600)
             {
                 last_reclaim = Instant::now();
-                let need = ((cfg.auto_reclaim_target_gb as f64 * 1e9) as u64).saturating_sub(snap.disk_free);
+                let need = ((cfg.auto_reclaim_target_gb as f64 * 1e9) as u64)
+                    .saturating_sub(snap.disk_free);
                 self.reclaim_stale(need, "optimizer");
             }
 
@@ -393,12 +437,18 @@ impl Engine {
         let mut out = Vec::new();
         for p in paths {
             if let Err(e) = reclaim::verify_cleanable(p, &cfg) {
-                out.push(CleanResult { path: p.clone(), freed: 0, error: Some(e) });
+                out.push(CleanResult {
+                    path: p.clone(),
+                    freed: 0,
+                    error: Some(e),
+                });
                 continue;
             }
             let proj = p.parent().unwrap_or(p);
-            let root = reclaim::git_root(proj).map(|r| r.0).unwrap_or_else(|| proj.to_path_buf());
-            if busy.iter().any(|b| *b == root) {
+            let root = reclaim::git_root(proj)
+                .map(|r| r.0)
+                .unwrap_or_else(|| proj.to_path_buf());
+            if busy.contains(&root) {
                 out.push(CleanResult {
                     path: p.clone(),
                     freed: 0,
@@ -412,7 +462,11 @@ impl Engine {
         let ok: Vec<&CleanResult> = out.iter().filter(|r| r.error.is_none()).collect();
         let mut st = self.state.lock().unwrap();
         if !ok.is_empty() {
-            let what = if ok.len() == 1 { short_path(&ok[0].path) } else { format!("{} build caches", ok.len()) };
+            let what = if ok.len() == 1 {
+                short_path(&ok[0].path)
+            } else {
+                format!("{} build caches", ok.len())
+            };
             st.log("reclaim", format!("Cleared {what}"), freed, None, source);
         }
         let done: HashSet<PathBuf> = ok.iter().map(|r| r.path.clone()).collect();
@@ -447,7 +501,13 @@ impl Engine {
         let busy = st.snapshot.busy_paths();
         st.diskmap
             .as_ref()
-            .map(|m| m.worktrees.iter().filter(|w| w.sweepable && !busy.contains(&w.path)).cloned().collect())
+            .map(|m| {
+                m.worktrees
+                    .iter()
+                    .filter(|w| w.sweepable && !busy.contains(&w.path))
+                    .cloned()
+                    .collect()
+            })
             .unwrap_or_default()
     }
 
@@ -459,7 +519,13 @@ impl Engine {
     pub fn prune_cache(&self, key: &str, source: &str) -> PruneResult {
         let r = diskmap::prune_cache(key);
         if r.ok {
-            self.log("reclaim", format!("Pruned {key} cache"), r.freed, None, source);
+            self.log(
+                "reclaim",
+                format!("Pruned {key} cache"),
+                r.freed,
+                None,
+                source,
+            );
             if let Some(m) = self.state.lock().unwrap().diskmap.as_mut() {
                 if let Some(c) = m.categories.iter_mut().find(|c| c.key == key) {
                     c.bytes = c.bytes.saturating_sub(r.freed);
@@ -469,10 +535,18 @@ impl Engine {
         r
     }
 
-    pub fn remove_worktrees(&self, paths: &[PathBuf], backup_dirty: bool, source: &str) -> Vec<RemoveResult> {
+    pub fn remove_worktrees(
+        &self,
+        paths: &[PathBuf],
+        backup_dirty: bool,
+        source: &str,
+    ) -> Vec<RemoveResult> {
         let (map, busy) = {
             let st = self.state.lock().unwrap();
-            (st.diskmap.clone().unwrap_or_default(), st.snapshot.busy_paths())
+            (
+                st.diskmap.clone().unwrap_or_default(),
+                st.snapshot.busy_paths(),
+            )
         };
         let mut out = Vec::new();
         for p in paths {
@@ -487,7 +561,7 @@ impl Engine {
                 continue;
             };
             let mut wt = wt.clone();
-            if busy.iter().any(|b| *b == wt.path) {
+            if busy.contains(&wt.path) {
                 wt.in_use = true;
             }
             let r = diskmap::remove_worktree(&wt, backup_dirty);
@@ -502,7 +576,11 @@ impl Engine {
             }
             out.push(r);
         }
-        let done: HashSet<PathBuf> = out.iter().filter(|r| r.ok).map(|r| r.path.clone()).collect();
+        let done: HashSet<PathBuf> = out
+            .iter()
+            .filter(|r| r.ok)
+            .map(|r| r.path.clone())
+            .collect();
         if let Some(m) = self.state.lock().unwrap().diskmap.as_mut() {
             m.worktrees.retain(|w| !done.contains(&w.path));
             m.worktree_bytes = m.worktrees.iter().map(|w| w.bytes).sum();
@@ -510,7 +588,12 @@ impl Engine {
         out
     }
 
-    pub fn workspace_action(&self, path: &Path, action: WorkspaceAction, source: &str) -> Result<usize, String> {
+    pub fn workspace_action(
+        &self,
+        path: &Path,
+        action: WorkspaceAction,
+        source: &str,
+    ) -> Result<usize, String> {
         let (ws, nice) = {
             let st = self.state.lock().unwrap();
             let ws = st
@@ -524,12 +607,18 @@ impl Engine {
         };
         let me = std::process::id();
         let mut done = 0;
-        for p in ws.procs.iter().filter(|p| p.own && p.pid != me && p.pid > 1) {
+        for p in ws
+            .procs
+            .iter()
+            .filter(|p| p.own && p.pid != me && p.pid > 1)
+        {
             let ok = match action {
                 WorkspaceAction::Pause => signal(p.pid, libc::SIGSTOP),
                 WorkspaceAction::Resume => signal(p.pid, libc::SIGCONT),
                 WorkspaceAction::Deprioritize => renice(p.pid, nice.max(10)),
-                WorkspaceAction::StopBuilds => p.kind == ProcKind::Build && signal(p.pid, libc::SIGTERM),
+                WorkspaceAction::StopBuilds => {
+                    p.kind == ProcKind::Build && signal(p.pid, libc::SIGTERM)
+                }
                 WorkspaceAction::KillAll => {
                     signal(p.pid, libc::SIGCONT);
                     signal(p.pid, libc::SIGTERM)
@@ -542,8 +631,13 @@ impl Engine {
         let (kind, detail) = match action {
             WorkspaceAction::Pause => ("pause", format!("Paused {done} process(es)")),
             WorkspaceAction::Resume => ("resume", format!("Resumed {done} process(es)")),
-            WorkspaceAction::Deprioritize => ("throttle", format!("Lowered priority of {done} process(es)")),
-            WorkspaceAction::StopBuilds => ("stop", format!("Sent SIGTERM to {done} build process(es)")),
+            WorkspaceAction::Deprioritize => (
+                "throttle",
+                format!("Lowered priority of {done} process(es)"),
+            ),
+            WorkspaceAction::StopBuilds => {
+                ("stop", format!("Sent SIGTERM to {done} build process(es)"))
+            }
             WorkspaceAction::KillAll => ("stop", format!("Sent SIGTERM to all {done} process(es)")),
         };
         self.log(kind, detail, 0, Some(ws.label.clone()), source);
@@ -571,7 +665,11 @@ impl Engine {
             ProcAction::Stop => signal(pid, libc::SIGSTOP),
             ProcAction::Cont => signal(pid, libc::SIGCONT),
             ProcAction::Renice { nice } => unsafe {
-                libc::setpriority(libc::PRIO_PROCESS as _, pid as libc::id_t, nice.clamp(0, 20)) == 0
+                libc::setpriority(
+                    libc::PRIO_PROCESS as _,
+                    pid as libc::id_t,
+                    nice.clamp(0, 20),
+                ) == 0
             },
         };
         if !ok {
@@ -582,7 +680,10 @@ impl Engine {
             ProcAction::Kill => ("stop", format!("SIGKILL → {} ({pid})", info.name)),
             ProcAction::Stop => ("pause", format!("SIGSTOP → {} ({pid})", info.name)),
             ProcAction::Cont => ("resume", format!("SIGCONT → {} ({pid})", info.name)),
-            ProcAction::Renice { nice } => ("throttle", format!("renice {} → {} ({pid})", nice.clamp(0, 20), info.name)),
+            ProcAction::Renice { nice } => (
+                "throttle",
+                format!("renice {} → {} ({pid})", nice.clamp(0, 20), info.name),
+            ),
         };
         self.log(kind, detail, 0, Some(info.group), source);
         Ok(())
@@ -601,7 +702,10 @@ impl Engine {
             reasons.push(format!("memory is {:.0}% free", s.mem_free_pct()));
         }
         if s.cpu_count > 0 && s.load[0] > s.cpu_count as f64 * 2.0 {
-            reasons.push(format!("load average {:.0} on {} cores", s.load[0], s.cpu_count));
+            reasons.push(format!(
+                "load average {:.0} on {} cores",
+                s.load[0], s.cpu_count
+            ));
         }
         if s.disk_free_gb() < cfg.low_disk_gb as f64 {
             reasons.push(format!("only {:.0} GB disk free", s.disk_free_gb()));
@@ -621,28 +725,57 @@ impl Engine {
         let jobs = st.slots.jobs_per_slot.max(1);
         let id = match ticket {
             Some(t) if st.slots.active.iter().any(|l| l.id == t) => {
-                return LeaseReply { granted: true, ticket: t, jobs, position: 0, reason: "already granted".into() };
+                return LeaseReply {
+                    granted: true,
+                    ticket: t,
+                    jobs,
+                    position: 0,
+                    reason: "already granted".into(),
+                };
             }
             Some(t) if st.slots.waiting.iter().any(|w| w.id == t) => t,
             _ => {
                 let id = self.next_id.fetch_add(1, Ordering::SeqCst);
-                st.slots.waiting.push(Waiter { id, label: label.into(), pid, since_unix: now, last_poll: now });
+                st.slots.waiting.push(Waiter {
+                    id,
+                    label: label.into(),
+                    pid,
+                    since_unix: now,
+                    last_poll: now,
+                });
                 id
             }
         };
         if let Some(w) = st.slots.waiting.iter_mut().find(|w| w.id == id) {
             w.last_poll = now;
         }
-        let position = st.slots.waiting.iter().position(|w| w.id == id).unwrap_or(0);
+        let position = st
+            .slots
+            .waiting
+            .iter()
+            .position(|w| w.id == id)
+            .unwrap_or(0);
         let cap = st.slots.capacity.max(1);
         let mem_ok = st.snapshot.mem_total == 0
             || st.snapshot.mem_free_pct() >= st.config.throttle_mem_free_pct
             || st.slots.active.is_empty();
         if position == 0 && st.slots.active.len() < cap && mem_ok {
             let w = st.slots.waiting.remove(0);
-            st.slots.active.push(Lease { id, label: w.label, pid: w.pid, since_unix: now, jobs });
+            st.slots.active.push(Lease {
+                id,
+                label: w.label,
+                pid: w.pid,
+                since_unix: now,
+                jobs,
+            });
             let reason = format!("slot {}/{}", st.slots.active.len(), cap);
-            return LeaseReply { granted: true, ticket: id, jobs, position: 0, reason };
+            return LeaseReply {
+                granted: true,
+                ticket: id,
+                jobs,
+                position: 0,
+                reason,
+            };
         }
         let reason = if !mem_ok {
             "waiting for memory pressure to drop".to_string()
@@ -651,7 +784,13 @@ impl Engine {
         } else {
             format!("all {cap} build slots are busy")
         };
-        LeaseReply { granted: false, ticket: id, jobs, position, reason }
+        LeaseReply {
+            granted: false,
+            ticket: id,
+            jobs,
+            position,
+            reason,
+        }
     }
 
     pub fn release(&self, ticket: u64) -> bool {
@@ -686,7 +825,11 @@ fn forecast(h: &VecDeque<Sample>, cfg: &Config) -> Forecast {
             hours_to_full: Some(free / per_hour),
         }
     } else {
-        Forecast { bytes_per_hour: per_hour, hours_to_low: None, hours_to_full: None }
+        Forecast {
+            bytes_per_hour: per_hour,
+            hours_to_low: None,
+            hours_to_full: None,
+        }
     }
 }
 
@@ -723,7 +866,10 @@ fn short_path(p: &Path) -> String {
     let s = p.to_string_lossy();
     if let Some(i) = s.find("/.claude/worktrees/") {
         let repo = s[..i].rsplit('/').next().unwrap_or("");
-        let wt = s[i + "/.claude/worktrees/".len()..].split('/').next().unwrap_or("");
+        let wt = s[i + "/.claude/worktrees/".len()..]
+            .split('/')
+            .next()
+            .unwrap_or("");
         return format!("{repo} › {wt} cache");
     }
     let parts: Vec<&str> = s.split('/').filter(|x| !x.is_empty()).collect();
@@ -739,7 +885,10 @@ mod tests {
 
     #[test]
     fn slots_queue_in_order_and_release() {
-        let e = Engine::new(Config { max_heavy_jobs: 1, ..Config::default() });
+        let e = Engine::new(Config {
+            max_heavy_jobs: 1,
+            ..Config::default()
+        });
         {
             let mut st = e.state.lock().unwrap();
             st.slots.capacity = 1;

@@ -47,17 +47,29 @@ fn set_config(engine: tauri::State<Engine>, config: Config) -> Result<(), String
 }
 
 #[tauri::command]
-fn workspace_action(engine: tauri::State<Engine>, path: String, action: WorkspaceAction) -> Result<usize, String> {
+fn workspace_action(
+    engine: tauri::State<Engine>,
+    path: String,
+    action: WorkspaceAction,
+) -> Result<usize, String> {
     engine.workspace_action(std::path::Path::new(&path), action, "manual")
 }
 
 #[tauri::command]
-fn process_action(engine: tauri::State<Engine>, pid: u32, action: ProcAction) -> Result<(), String> {
+fn process_action(
+    engine: tauri::State<Engine>,
+    pid: u32,
+    action: ProcAction,
+) -> Result<(), String> {
     engine.process_action(pid, action, "manual")
 }
 
 #[tauri::command]
-fn remove_worktrees(engine: tauri::State<Engine>, paths: Vec<String>, backup: bool) -> Vec<RemoveResult> {
+fn remove_worktrees(
+    engine: tauri::State<Engine>,
+    paths: Vec<String>,
+    backup: bool,
+) -> Vec<RemoveResult> {
     let paths: Vec<PathBuf> = paths.into_iter().map(PathBuf::from).collect();
     engine.remove_worktrees(&paths, backup, "manual")
 }
@@ -125,21 +137,34 @@ fn reveal(engine: tauri::State<Engine>, path: String, terminal: bool) -> Result<
     let st = engine.snapshot_state();
     let p = PathBuf::from(&path);
     let known = st.snapshot.workspaces.iter().any(|w| w.path == p)
-        || st.scan.as_ref().map(|s| s.items.iter().any(|i| i.path == p || i.project == p)).unwrap_or(false)
+        || st
+            .scan
+            .as_ref()
+            .map(|s| s.items.iter().any(|i| i.path == p || i.project == p))
+            .unwrap_or(false)
         || st
             .diskmap
             .as_ref()
-            .map(|m| m.worktrees.iter().any(|w| w.path == p) || m.categories.iter().any(|c| c.path == p))
+            .map(|m| {
+                m.worktrees.iter().any(|w| w.path == p) || m.categories.iter().any(|c| c.path == p)
+            })
             .unwrap_or(false)
         || p == mulchie_core::config::config_dir().join("backups");
     if !known || !p.exists() {
         return Err("unknown path".into());
     }
-    let mut cmd = std::process::Command::new(if cfg!(target_os = "macos") { "open" } else { "xdg-open" });
+    let mut cmd = std::process::Command::new(if cfg!(target_os = "macos") {
+        "open"
+    } else {
+        "xdg-open"
+    });
     if terminal && cfg!(target_os = "macos") {
         cmd.args(["-a", "Terminal"]);
     }
-    cmd.arg(&path).spawn().map(|_| ()).map_err(|e| e.to_string())
+    cmd.arg(&path)
+        .spawn()
+        .map(|_| ())
+        .map_err(|e| e.to_string())
 }
 
 #[tauri::command]
@@ -156,7 +181,9 @@ fn show_dashboard(app: &AppHandle, view: Option<String>) {
     if let Some(p) = app.get_webview_window("panel") {
         let _ = p.hide();
     }
-    let Some(win) = app.get_webview_window("dashboard") else { return };
+    let Some(win) = app.get_webview_window("dashboard") else {
+        return;
+    };
     #[cfg(target_os = "macos")]
     let _ = app.set_activation_policy(tauri::ActivationPolicy::Regular);
     let _ = win.show();
@@ -181,7 +208,9 @@ fn tray_title(st: &State) -> String {
 }
 
 fn toggle_panel(app: &AppHandle, rect: Option<tauri::Rect>) {
-    let Some(win) = app.get_webview_window("panel") else { return };
+    let Some(win) = app.get_webview_window("panel") else {
+        return;
+    };
     if win.is_visible().unwrap_or(false) {
         let _ = win.hide();
         return;
@@ -190,7 +219,10 @@ fn toggle_panel(app: &AppHandle, rect: Option<tauri::Rect>) {
         let scale = win.scale_factor().unwrap_or(2.0);
         let pos = rect.position.to_physical::<f64>(scale);
         let size = rect.size.to_physical::<f64>(scale);
-        let w = win.outer_size().map(|s| s.width as f64).unwrap_or(400.0 * scale);
+        let w = win
+            .outer_size()
+            .map(|s| s.width as f64)
+            .unwrap_or(400.0 * scale);
         let x = pos.x + size.width / 2.0 - w / 2.0;
         let y = pos.y + size.height + 4.0;
         let _ = win.set_position(PhysicalPosition::new(x.max(0.0), y));
@@ -203,8 +235,14 @@ fn notify(title: &str, body: &str) {
     #[cfg(target_os = "macos")]
     {
         let esc = |s: &str| s.replace('\\', "\\\\").replace('"', "\\\"");
-        let script = format!("display notification \"{}\" with title \"{}\"", esc(body), esc(title));
-        let _ = std::process::Command::new("osascript").args(["-e", &script]).spawn();
+        let script = format!(
+            "display notification \"{}\" with title \"{}\"",
+            esc(body),
+            esc(title)
+        );
+        let _ = std::process::Command::new("osascript")
+            .args(["-e", &script])
+            .spawn();
     }
 }
 
@@ -280,7 +318,10 @@ fn main() {
                     if st.low_disk && !was_low {
                         notify(
                             "Mulchie: disk space low",
-                            &format!("{} free. Open Mulchie → Disk to reclaim.", human_bytes(st.snapshot.disk_free)),
+                            &format!(
+                                "{} free. Open Mulchie → Disk to reclaim.",
+                                human_bytes(st.snapshot.disk_free)
+                            ),
                         );
                     }
                     was_low = st.low_disk;

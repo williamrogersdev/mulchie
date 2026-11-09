@@ -48,7 +48,10 @@ fn main() {
         "mcp" => mcp::serve(),
         "config" => {
             println!("{}", Config::path().display());
-            println!("{}", serde_json::to_string_pretty(&Config::load()).unwrap_or_default());
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&Config::load()).unwrap_or_default()
+            );
             0
         }
         "-h" | "--help" | "help" => {
@@ -92,7 +95,12 @@ fn status(json: bool) -> i32 {
         s.cpu_count,
         human_bytes(s.swap_used)
     );
-    println!("{} agent process(es), {} build process(es) across {} workspace(s)\n", s.agent_count, s.build_count, s.workspaces.len());
+    println!(
+        "{} agent process(es), {} build process(es) across {} workspace(s)\n",
+        s.agent_count,
+        s.build_count,
+        s.workspaces.len()
+    );
     for w in s.workspaces.iter().take(15) {
         println!(
             "  {:<48} {:>6.0}% cpu  {:>9}  {} agent · {} build",
@@ -122,8 +130,20 @@ fn scan(json: bool) -> i32 {
         r.took_ms as f64 / 1000.0
     );
     for i in r.items.iter().take(30) {
-        let tag = if i.in_use { "in use" } else if i.stale { "stale" } else { "recent" };
-        println!("  {:>9}  {:<7} {:<18} {}", human_bytes(i.bytes), tag, i.kind.label(), i.path.display());
+        let tag = if i.in_use {
+            "in use"
+        } else if i.stale {
+            "stale"
+        } else {
+            "recent"
+        };
+        println!(
+            "  {:>9}  {:<7} {:<18} {}",
+            human_bytes(i.bytes),
+            tag,
+            i.kind.label(),
+            i.path.display()
+        );
     }
     0
 }
@@ -138,9 +158,16 @@ fn clean(args: &[String]) -> i32 {
     }
     let paths: Vec<PathBuf> = if stale {
         let r = engine.run_scan();
-        r.items.into_iter().filter(|i| i.stale).map(|i| i.path).collect()
+        r.items
+            .into_iter()
+            .filter(|i| i.stale)
+            .map(|i| i.path)
+            .collect()
     } else {
-        args.iter().filter(|a| !a.starts_with("--")).map(PathBuf::from).collect()
+        args.iter()
+            .filter(|a| !a.starts_with("--"))
+            .map(PathBuf::from)
+            .collect()
     };
     if paths.is_empty() {
         println!("nothing to clean");
@@ -168,7 +195,11 @@ fn clean(args: &[String]) -> i32 {
         }
     }
     println!("\nfreed {}", human_bytes(freed));
-    if failed > 0 { 1 } else { 0 }
+    if failed > 0 {
+        1
+    } else {
+        0
+    }
 }
 
 fn serve() -> i32 {
@@ -200,7 +231,10 @@ fn truncate(s: &str, n: usize) -> String {
 }
 
 fn flag<'a>(args: &'a [String], name: &str) -> Option<&'a str> {
-    args.iter().position(|a| a == name).and_then(|i| args.get(i + 1)).map(String::as_str)
+    args.iter()
+        .position(|a| a == name)
+        .and_then(|i| args.get(i + 1))
+        .map(String::as_str)
 }
 
 fn local_engine(scan: bool) -> Engine {
@@ -231,7 +265,10 @@ fn top(args: &[String], json_out: bool) -> i32 {
     let st = state(false);
     let sort = flag(args, "--sort").unwrap_or("cpu");
     let n: usize = flag(args, "-n").and_then(|x| x.parse().ok()).unwrap_or(25);
-    let mut procs: Vec<Value> = st["snapshot"]["top"].as_array().cloned().unwrap_or_default();
+    let mut procs: Vec<Value> = st["snapshot"]["top"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default();
     let key = |p: &Value| match sort {
         "mem" => f(p, "mem_bytes"),
         "io" => f(p, "read_bps") + f(p, "write_bps"),
@@ -240,7 +277,10 @@ fn top(args: &[String], json_out: bool) -> i32 {
     procs.sort_by(|a, b| key(b).total_cmp(&key(a)));
     procs.truncate(n);
     if json_out {
-        println!("{}", serde_json::to_string_pretty(&procs).unwrap_or_default());
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&procs).unwrap_or_default()
+        );
         return 0;
     }
     let snap = &st["snapshot"];
@@ -256,7 +296,10 @@ fn top(args: &[String], json_out: bool) -> i32 {
         human_bytes(f(snap, "read_bps") as u64),
         human_bytes(f(snap, "write_bps") as u64),
     );
-    println!("{:>7} {:>6} {:>9} {:>9} {:>4} {:<8} {:<16} {}", "PID", "CPU%", "MEM", "IO/s", "NI", "KIND", "NAME", "GROUP");
+    println!(
+        "{:>7} {:>6} {:>9} {:>9} {:>4} {:<8} {:<16} GROUP",
+        "PID", "CPU%", "MEM", "IO/s", "NI", "KIND", "NAME"
+    );
     for p in &procs {
         println!(
             "{:>7} {:>6.1} {:>9} {:>9} {:>4} {:<8} {:<16} {}",
@@ -275,7 +318,10 @@ fn top(args: &[String], json_out: bool) -> i32 {
 
 fn worktrees(json_out: bool) -> i32 {
     let st = state(true);
-    let wts = st["diskmap"]["worktrees"].as_array().cloned().unwrap_or_default();
+    let wts = st["diskmap"]["worktrees"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default();
     if json_out {
         println!("{}", serde_json::to_string_pretty(&wts).unwrap_or_default());
         return 0;
@@ -300,8 +346,16 @@ fn sweep(args: &[String]) -> i32 {
     let dry = args.iter().any(|a| a == "--dry-run");
     let client = Client::connect();
     let plan: Vec<Value> = match &client {
-        Some(c) => c.call("GET", "/v1/sweep", None).ok().and_then(|v| v.as_array().cloned()).unwrap_or_default(),
-        None => local_engine(true).sweep_plan().into_iter().filter_map(|w| serde_json::to_value(w).ok()).collect(),
+        Some(c) => c
+            .call("GET", "/v1/sweep", None)
+            .ok()
+            .and_then(|v| v.as_array().cloned())
+            .unwrap_or_default(),
+        None => local_engine(true)
+            .sweep_plan()
+            .into_iter()
+            .filter_map(|w| serde_json::to_value(w).ok())
+            .collect(),
     };
     if plan.is_empty() {
         println!("no idle agent worktrees to sweep");
@@ -321,8 +375,16 @@ fn sweep(args: &[String]) -> i32 {
         return 0;
     }
     let results: Vec<Value> = match &client {
-        Some(c) => c.call("POST", "/v1/sweep", Some(&json!({}))).ok().and_then(|v| v.as_array().cloned()).unwrap_or_default(),
-        None => local_engine(true).sweep_worktrees("cli").into_iter().filter_map(|r| serde_json::to_value(r).ok()).collect(),
+        Some(c) => c
+            .call("POST", "/v1/sweep", Some(&json!({})))
+            .ok()
+            .and_then(|v| v.as_array().cloned())
+            .unwrap_or_default(),
+        None => local_engine(true)
+            .sweep_worktrees("cli")
+            .into_iter()
+            .filter_map(|r| serde_json::to_value(r).ok())
+            .collect(),
     };
     report_removals(&results)
 }
@@ -349,8 +411,12 @@ fn prune(args: &[String]) -> i32 {
         return 2;
     };
     let r = match Client::connect() {
-        Some(c) => c.call("POST", "/v1/prune", Some(&json!({ "key": key }))).unwrap_or(Value::Null),
-        None => serde_json::to_value(mulchie_core::diskmap::prune_cache(key)).unwrap_or(Value::Null),
+        Some(c) => c
+            .call("POST", "/v1/prune", Some(&json!({ "key": key })))
+            .unwrap_or(Value::Null),
+        None => {
+            serde_json::to_value(mulchie_core::diskmap::prune_cache(key)).unwrap_or(Value::Null)
+        }
     };
     println!("{}", s(&r, "output"));
     println!("freed {}", human_bytes(f(&r, "freed") as u64));
@@ -358,7 +424,10 @@ fn prune(args: &[String]) -> i32 {
 }
 
 fn signal(args: &[String]) -> i32 {
-    let (Some(pid), Some(sig)) = (args.first().and_then(|p| p.parse::<u32>().ok()), args.get(1)) else {
+    let (Some(pid), Some(sig)) = (
+        args.first().and_then(|p| p.parse::<u32>().ok()),
+        args.get(1),
+    ) else {
         eprintln!("usage: mulchie signal <pid> <term|kill|stop|cont>");
         return 2;
     };
@@ -366,7 +435,11 @@ fn signal(args: &[String]) -> i32 {
         eprintln!("mulchie is not running; start Mulchie.app or `mulchie serve`");
         return 1;
     };
-    match c.call("POST", "/v1/process", Some(&json!({ "pid": pid, "action": sig }))) {
+    match c.call(
+        "POST",
+        "/v1/process",
+        Some(&json!({ "pid": pid, "action": sig })),
+    ) {
         Ok(_) => {
             println!("sent {sig} to {pid}");
             0
@@ -386,16 +459,26 @@ fn advice(json_out: bool) -> i32 {
     if json_out {
         println!("{}", serde_json::to_string_pretty(&v).unwrap_or_default());
     } else if v["ok_to_start_heavy_work"].as_bool().unwrap_or(false) {
-        println!("ok: {} free build slot(s), use -j{}", v["free_slots"], v["suggested_jobs"]);
+        println!(
+            "ok: {} free build slot(s), use -j{}",
+            v["free_slots"], v["suggested_jobs"]
+        );
     } else {
-        let reasons: Vec<&str> = v["reasons"].as_array().map(|a| a.iter().filter_map(Value::as_str).collect()).unwrap_or_default();
+        let reasons: Vec<&str> = v["reasons"]
+            .as_array()
+            .map(|a| a.iter().filter_map(Value::as_str).collect())
+            .unwrap_or_default();
         println!("wait: {}", reasons.join("; "));
     }
     0
 }
 
 fn run(args: &[String]) -> i32 {
-    let split = args.iter().position(|a| a == "--").map(|i| i + 1).unwrap_or(0);
+    let split = args
+        .iter()
+        .position(|a| a == "--")
+        .map(|i| i + 1)
+        .unwrap_or(0);
     let label = flag(&args[..split], "--label").map(String::from);
     let cmd = &args[split..];
     let Some(program) = cmd.first() else {
@@ -403,7 +486,10 @@ fn run(args: &[String]) -> i32 {
         return 2;
     };
     let label = label.unwrap_or_else(|| {
-        let cwd = std::env::current_dir().ok().and_then(|d| d.file_name().map(|n| n.to_string_lossy().to_string())).unwrap_or_default();
+        let cwd = std::env::current_dir()
+            .ok()
+            .and_then(|d| d.file_name().map(|n| n.to_string_lossy().to_string()))
+            .unwrap_or_default();
         format!("{cwd}: {}", cmd.join(" "))
     });
     let client = Client::connect();
@@ -420,7 +506,10 @@ fn run(args: &[String]) -> i32 {
                     if r["granted"].as_bool().unwrap_or(false) {
                         jobs = r["jobs"].as_u64();
                         if started.elapsed() > Duration::from_secs(1) {
-                            eprintln!("mulchie: slot granted after {:.0}s", started.elapsed().as_secs_f64());
+                            eprintln!(
+                                "mulchie: slot granted after {:.0}s",
+                                started.elapsed().as_secs_f64()
+                            );
                         }
                         break;
                     }
