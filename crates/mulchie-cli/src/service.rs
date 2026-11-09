@@ -160,7 +160,11 @@ fn install_cmds(platform: Platform, file: &Path, reload: bool) -> Vec<Vec<String
         Platform::Launchd => {
             let mut v = Vec::new();
             if reload {
-                v.push(s(&["launchctl", "bootout", &format!("gui/{}/{LAUNCHD_LABEL}", uid())]));
+                v.push(s(&[
+                    "launchctl",
+                    "bootout",
+                    &format!("gui/{}/{LAUNCHD_LABEL}", uid()),
+                ]));
             }
             v.push(s(&[
                 "launchctl",
@@ -190,7 +194,10 @@ fn shell_quote(s: &str) -> String {
 }
 
 fn show_cmd(c: &[String]) -> String {
-    c.iter().map(|a| shell_quote(a)).collect::<Vec<_>>().join(" ")
+    c.iter()
+        .map(|a| shell_quote(a))
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 fn run_cmd(c: &[String]) -> Result<(), String> {
@@ -315,7 +322,11 @@ fn install(paths: &Paths, platform: Platform, force: bool, dry_run: bool) -> i32
             println!(
                 "Would write {}{}:\n",
                 file.display(),
-                if existing.is_some() { " (replacing it)" } else { "" }
+                if existing.is_some() {
+                    " (replacing it)"
+                } else {
+                    ""
+                }
             );
             print!("{content}");
             if let Some(old) = &existing {
@@ -380,7 +391,11 @@ fn uninstall(paths: &Paths, platform: Platform, dry_run: bool) -> i32 {
     let existing = std::fs::read_to_string(&file).ok();
     let is_loaded = loaded(platform).unwrap_or(false);
     if existing.is_none() && !is_loaded {
-        println!("The {} is not installed ({}).", platform.name(), file.display());
+        println!(
+            "The {} is not installed ({}).",
+            platform.name(),
+            file.display()
+        );
         return 0;
     }
     if let Some(c) = &existing {
@@ -400,7 +415,13 @@ fn uninstall(paths: &Paths, platform: Platform, dry_run: bool) -> i32 {
             &format!("gui/{}/{LAUNCHD_LABEL}", uid()),
         ])],
         Platform::Launchd => vec![],
-        Platform::Systemd => vec![s(&["systemctl", "--user", "disable", "--now", SYSTEMD_UNIT])],
+        Platform::Systemd => vec![s(&[
+            "systemctl",
+            "--user",
+            "disable",
+            "--now",
+            SYSTEMD_UNIT,
+        ])],
     };
     let after: Vec<Vec<String>> = match platform {
         Platform::Systemd => vec![s(&["systemctl", "--user", "daemon-reload"])],
@@ -441,7 +462,10 @@ fn uninstall(paths: &Paths, platform: Platform, dry_run: bool) -> i32 {
             eprintln!("mulchie: note: {e}");
         }
     }
-    println!("The service is removed. Your config and backups in {} are kept.", paths.config_dir.display());
+    println!(
+        "The service is removed. Your config and backups in {} are kept.",
+        paths.config_dir.display()
+    );
     0
 }
 
@@ -489,12 +513,17 @@ fn status(paths: &Paths, platform: Platform, json_out: bool) -> i32 {
         match (st.installed, st.current) {
             (false, _) => "no",
             (true, true) => "yes",
-            (true, false) => "yes, but different from what `mulchie service install` would write now",
+            (true, false) =>
+                "yes, but different from what `mulchie service install` would write now",
         }
     );
     println!(
         "  {}: {}",
-        if platform == Platform::Launchd { "loaded" } else { "active" },
+        if platform == Platform::Launchd {
+            "loaded"
+        } else {
+            "active"
+        },
         match st.loaded {
             Some(true) => "yes",
             Some(false) => "no",
@@ -518,7 +547,9 @@ mod tests {
     use super::*;
 
     fn packaging(rel: &str) -> PathBuf {
-        Path::new(env!("CARGO_MANIFEST_DIR")).join("../../packaging").join(rel)
+        Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../packaging")
+            .join(rel)
     }
 
     #[test]

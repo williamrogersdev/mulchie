@@ -69,7 +69,10 @@ fn call(id: u64, name: &str, args: Value) -> Value {
 }
 
 fn text(r: &Value) -> String {
-    r["result"]["content"][0]["text"].as_str().unwrap().to_string()
+    r["result"]["content"][0]["text"]
+        .as_str()
+        .unwrap()
+        .to_string()
 }
 
 fn modern_meta() -> Value {
@@ -84,7 +87,14 @@ fn modern_meta() -> Value {
 fn initialize_negotiates() {
     let f = Fake::default();
     for v in LEGACY_VERSIONS {
-        let r = one(&f, req(1, "initialize", json!({ "protocolVersion": v, "capabilities": {}, "clientInfo": { "name": "t", "version": "1" } })));
+        let r = one(
+            &f,
+            req(
+                1,
+                "initialize",
+                json!({ "protocolVersion": v, "capabilities": {}, "clientInfo": { "name": "t", "version": "1" } }),
+            ),
+        );
         assert_eq!(r["result"]["protocolVersion"], *v);
         assert_eq!(r["result"]["serverInfo"]["name"], "mulchie");
         assert!(r["result"]["capabilities"]["tools"].is_object());
@@ -92,7 +102,14 @@ fn initialize_negotiates() {
     }
     // Unknown (future or ancient) versions get our latest legacy one.
     for v in ["1999-01-01", "2030-01-01", MODERN_VERSION] {
-        let r = one(&f, req(1, "initialize", json!({ "protocolVersion": v, "capabilities": {} })));
+        let r = one(
+            &f,
+            req(
+                1,
+                "initialize",
+                json!({ "protocolVersion": v, "capabilities": {} }),
+            ),
+        );
         assert_eq!(r["result"]["protocolVersion"], LEGACY_VERSIONS[0]);
     }
     let r = one(&f, req(1, "initialize", json!({})));
@@ -105,7 +122,11 @@ fn full_legacy_handshake() {
     let r = exchange(
         &f,
         &[
-            req(1, "initialize", json!({ "protocolVersion": "2025-06-18", "capabilities": {} })),
+            req(
+                1,
+                "initialize",
+                json!({ "protocolVersion": "2025-06-18", "capabilities": {} }),
+            ),
             json!({ "jsonrpc": "2.0", "method": "notifications/initialized" }),
             req(2, "ping", json!({})),
             json!({ "jsonrpc": "2.0", "method": "notifications/cancelled", "params": { "requestId": 9 } }),
@@ -133,7 +154,12 @@ fn tools_have_titles_and_annotations() {
         assert!(t["description"].as_str().unwrap().len() > 20, "{name}");
         assert_eq!(t["inputSchema"]["type"], "object", "{name}");
         let a = &t["annotations"];
-        for k in ["readOnlyHint", "destructiveHint", "idempotentHint", "openWorldHint"] {
+        for k in [
+            "readOnlyHint",
+            "destructiveHint",
+            "idempotentHint",
+            "openWorldHint",
+        ] {
             assert!(a[k].is_boolean(), "{name} {k}");
         }
         // Read-only tools are never destructive.
@@ -141,13 +167,7 @@ fn tools_have_titles_and_annotations() {
             assert_eq!(a["destructiveHint"], false, "{name}");
         }
     }
-    let ann = |n: &str| {
-        tools
-            .iter()
-            .find(|t| t["name"] == n)
-            .unwrap()["annotations"]
-            .clone()
-    };
+    let ann = |n: &str| tools.iter().find(|t| t["name"] == n).unwrap()["annotations"].clone();
     for n in [
         "clean_caches",
         "remove_worktrees",
@@ -159,11 +179,19 @@ fn tools_have_titles_and_annotations() {
         assert_eq!(ann(n)["destructiveHint"], true, "{n}");
         assert_eq!(ann(n)["readOnlyHint"], false, "{n}");
     }
-    for n in ["get_status", "can_i_build", "top_processes", "disk_breakdown"] {
+    for n in [
+        "get_status",
+        "can_i_build",
+        "top_processes",
+        "disk_breakdown",
+    ] {
         assert_eq!(ann(n)["readOnlyHint"], true, "{n}");
     }
     assert_eq!(ann("acquire_build_slot")["destructiveHint"], false);
-    let acquire = tools.iter().find(|t| t["name"] == "acquire_build_slot").unwrap();
+    let acquire = tools
+        .iter()
+        .find(|t| t["name"] == "acquire_build_slot")
+        .unwrap();
     let d = acquire["description"].as_str().unwrap();
     assert!(d.contains("renew") && d.contains("ttl_secs") && d.contains("release_build_slot"));
 }
@@ -180,24 +208,46 @@ fn jsonrpc_errors() {
     assert_eq!(one(&f, json!([1, 2]))["error"]["code"], INVALID_REQUEST);
     assert_eq!(one(&f, json!("x"))["error"]["code"], INVALID_REQUEST);
     let r = one(&f, json!({ "jsonrpc": "2.0", "id": 4 }));
-    assert_eq!((r["error"]["code"].clone(), r["id"].clone()), (json!(INVALID_REQUEST), json!(4)));
+    assert_eq!(
+        (r["error"]["code"].clone(), r["id"].clone()),
+        (json!(INVALID_REQUEST), json!(4))
+    );
     let r = one(&f, json!({ "jsonrpc": "1.0", "id": 5, "method": "ping" }));
     assert_eq!(r["error"]["code"], INVALID_REQUEST);
-    let r = one(&f, json!({ "jsonrpc": "2.0", "id": null, "method": "ping" }));
+    let r = one(
+        &f,
+        json!({ "jsonrpc": "2.0", "id": null, "method": "ping" }),
+    );
     assert_eq!(r["error"]["code"], INVALID_REQUEST);
-    let r = one(&f, json!({ "jsonrpc": "2.0", "id": 6, "method": "ping", "params": [1] }));
+    let r = one(
+        &f,
+        json!({ "jsonrpc": "2.0", "id": 6, "method": "ping", "params": [1] }),
+    );
     assert_eq!(r["error"]["code"], INVALID_PARAMS);
     let r = one(&f, req(7, "resources/list", json!({})));
     assert_eq!(r["error"]["code"], METHOD_NOT_FOUND);
     let r = one(&f, call(8, "no_such_tool", json!({})));
     assert_eq!(r["error"]["code"], INVALID_PARAMS);
-    assert!(r["error"]["message"].as_str().unwrap().contains("no_such_tool"));
+    assert!(r["error"]["message"]
+        .as_str()
+        .unwrap()
+        .contains("no_such_tool"));
     let r = one(&f, req(9, "tools/call", json!({ "arguments": {} })));
     assert_eq!(r["error"]["code"], INVALID_PARAMS);
-    let r = one(&f, req(10, "tools/call", json!({ "name": "get_status", "arguments": [1] })));
+    let r = one(
+        &f,
+        req(
+            10,
+            "tools/call",
+            json!({ "name": "get_status", "arguments": [1] }),
+        ),
+    );
     assert_eq!(r["error"]["code"], INVALID_PARAMS);
     // String ids are echoed.
-    let r = one(&f, json!({ "jsonrpc": "2.0", "id": "abc", "method": "ping" }));
+    let r = one(
+        &f,
+        json!({ "jsonrpc": "2.0", "id": "abc", "method": "ping" }),
+    );
     assert_eq!(r["id"], "abc");
     // Responses from the client are ignored.
     assert!(exchange(&f, &[json!({ "jsonrpc": "2.0", "id": 11, "result": {} })]).is_empty());
@@ -236,7 +286,11 @@ fn invalid_arguments_are_tool_errors() {
 fn engine_errors_are_tool_errors() {
     let f = Fake::default().failing(
         "GET /v1/advice",
-        ApiError::new(0, "engine_not_running", "Mulchie's engine is not running; start it"),
+        ApiError::new(
+            0,
+            "engine_not_running",
+            "Mulchie's engine is not running; start it",
+        ),
     );
     let r = one(&f, call(1, "can_i_build", json!({})));
     assert_eq!(r["result"]["isError"], true);
@@ -303,29 +357,62 @@ fn remove_and_clean_plan_first() {
         .with("POST /v1/worktree/remove", json!([]))
         .with("POST /v1/clean/plan", plan_with(&["/p/target"], &[]))
         .with("POST /v1/clean", json!([]));
-    one(&f, call(1, "remove_worktrees", json!({ "paths": ["/w/a"], "allow_dirty": true })));
+    one(
+        &f,
+        call(
+            1,
+            "remove_worktrees",
+            json!({ "paths": ["/w/a"], "allow_dirty": true }),
+        ),
+    );
     assert_eq!(
         f.posted("/v1/worktree/plan")[0],
         json!({ "paths": ["/w/a"], "allow_dirty": true })
     );
-    assert_eq!(f.posted("/v1/worktree/remove")[0]["items"][0]["path"], "/w/a");
-    one(&f, call(2, "clean_caches", json!({ "paths": ["/p/target"], "dry_run": true })));
+    assert_eq!(
+        f.posted("/v1/worktree/remove")[0]["items"][0]["path"],
+        "/w/a"
+    );
+    one(
+        &f,
+        call(
+            2,
+            "clean_caches",
+            json!({ "paths": ["/p/target"], "dry_run": true }),
+        ),
+    );
     assert!(f.posted("/v1/clean").is_empty());
-    one(&f, call(3, "clean_caches", json!({ "paths": ["/p/target"] })));
+    one(
+        &f,
+        call(3, "clean_caches", json!({ "paths": ["/p/target"] })),
+    );
     assert_eq!(f.posted("/v1/clean").len(), 1);
 }
 
 #[test]
 fn build_slot_uses_a_ttl_not_a_pid() {
     let f = Fake::default()
-        .with("POST /v1/lease", json!({ "granted": true, "ticket": 3, "jobs": 4 }))
+        .with(
+            "POST /v1/lease",
+            json!({ "granted": true, "ticket": 3, "jobs": 4 }),
+        )
         .with("POST /v1/release", json!({ "released": true }));
-    one(&f, call(1, "acquire_build_slot", json!({ "label": "tests" })));
+    one(
+        &f,
+        call(1, "acquire_build_slot", json!({ "label": "tests" })),
+    );
     let b = &f.posted("/v1/lease")[0];
     assert_eq!(b["ttl_secs"], 900);
     assert_eq!(b["label"], "tests");
     assert!(b.get("pid").is_none());
-    one(&f, call(2, "acquire_build_slot", json!({ "ticket": 3, "ttl_secs": 60 })));
+    one(
+        &f,
+        call(
+            2,
+            "acquire_build_slot",
+            json!({ "ticket": 3, "ttl_secs": 60 }),
+        ),
+    );
     assert_eq!(f.posted("/v1/lease")[1]["ticket"], 3);
     assert_eq!(f.posted("/v1/lease")[1]["ttl_secs"], 60);
     one(&f, call(3, "release_build_slot", json!({ "ticket": 3 })));
@@ -378,10 +465,7 @@ fn modern_requests() {
 
     // Missing required _meta field.
     let mut p = modern_meta();
-    p["_meta"]
-        .as_object_mut()
-        .unwrap()
-        .remove(META_CAPS);
+    p["_meta"].as_object_mut().unwrap().remove(META_CAPS);
     let r = one(&f, req(4, "tools/list", p));
     assert_eq!(r["error"]["code"], INVALID_PARAMS);
 
@@ -397,7 +481,10 @@ fn engine_api_without_engine_explains() {
     let r = one(&api, call(1, "get_status", json!({})));
     assert_eq!(r["result"]["isError"], true);
     let t = text(&r);
-    assert!(t.contains("not running") && t.contains("mulchie serve"), "{t}");
+    assert!(
+        t.contains("not running") && t.contains("mulchie serve"),
+        "{t}"
+    );
 }
 
 #[test]
@@ -413,8 +500,16 @@ fn against_a_real_engine() {
     let r = exchange(
         &api,
         &[
-            req(1, "initialize", json!({ "protocolVersion": "2025-11-25", "capabilities": {} })),
-            call(2, "acquire_build_slot", json!({ "label": "t", "ttl_secs": 30 })),
+            req(
+                1,
+                "initialize",
+                json!({ "protocolVersion": "2025-11-25", "capabilities": {} }),
+            ),
+            call(
+                2,
+                "acquire_build_slot",
+                json!({ "label": "t", "ttl_secs": 30 }),
+            ),
             call(3, "sweep_worktrees", json!({ "dry_run": true })),
         ],
     );
@@ -426,7 +521,10 @@ fn against_a_real_engine() {
     assert_eq!(engine.snapshot_state().slots.active[0].pid, None);
     let plan: Value = serde_json::from_str(&text(&r[2])).unwrap();
     assert_eq!(plan["items"], json!([]));
-    let r = one(&api, call(4, "release_build_slot", json!({ "ticket": ticket })));
+    let r = one(
+        &api,
+        call(4, "release_build_slot", json!({ "ticket": ticket })),
+    );
     assert_eq!(r["result"]["isError"], false);
     assert!(engine.snapshot_state().slots.active.is_empty());
     server.stop();

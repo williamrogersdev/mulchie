@@ -351,11 +351,12 @@ pub fn advice(paths: &Paths, json_out: bool) -> i32 {
 
 pub fn prune(paths: &Paths, key: &str, json_out: bool) -> i32 {
     let r = match conn::connect(paths) {
-        Conn::Engine(c) => match conn::call(&c, "POST", "/v1/prune", Some(&json!({ "key": key })))
-        {
-            Ok(v) => v,
-            Err(e) => return fail(conn::describe(&e)),
-        },
+        Conn::Engine(c) => {
+            match conn::call(&c, "POST", "/v1/prune", Some(&json!({ "key": key }))) {
+                Ok(v) => v,
+                Err(e) => return fail(conn::describe(&e)),
+            }
+        }
         Conn::NotRunning => {
             Conn::NotRunning.note_local("running the prune command here");
             let engine = Engine::new(paths.clone(), Config::load_from(paths));

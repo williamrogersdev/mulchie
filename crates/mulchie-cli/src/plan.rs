@@ -6,7 +6,9 @@ use crate::cli::Confirm;
 use crate::conn::{self, Conn};
 use mulchie_core::api::Client;
 use mulchie_core::safety::BackupKind;
-use mulchie_core::{human_bytes, ActionResult, Config, Engine, Outcome, Paths, Plan, PlanItem, Request};
+use mulchie_core::{
+    human_bytes, ActionResult, Config, Engine, Outcome, Paths, Plan, PlanItem, Request,
+};
 use serde_json::json;
 use std::io::{BufRead, IsTerminal, Write};
 use std::path::PathBuf;
@@ -60,7 +62,8 @@ impl Backend {
                     }
                 }
                 .map_err(|e| conn::describe(&e))?;
-                serde_json::from_value(v).map_err(|e| format!("unexpected plan from the engine: {e}"))
+                serde_json::from_value(v)
+                    .map_err(|e| format!("unexpected plan from the engine: {e}"))
             }
             Backend::Local(e) => Ok(match job {
                 Job::Sweep => e.sweep_plan(),
@@ -112,16 +115,20 @@ pub fn command(paths: &Paths, job: Job, confirm: Confirm, json_out: bool) -> i32
     let backend = match conn::connect(paths) {
         Conn::Engine(c) => Backend::Engine(c),
         Conn::NotRunning => {
-            Conn::NotRunning.note_local("planning locally; each item is still re-checked before it is touched");
+            Conn::NotRunning
+                .note_local("planning locally; each item is still re-checked before it is touched");
             Backend::Local(Engine::new(paths.clone(), Config::load_from(paths)))
         }
         other => {
             // An engine exists but cannot be used: acting beside it would
             // bypass its journal and state, so stop.
-            eprintln!("mulchie: {}", other.explain_required(match job {
-                Job::Sweep => "`mulchie sweep`",
-                _ => "`mulchie clean`",
-            }));
+            eprintln!(
+                "mulchie: {}",
+                other.explain_required(match job {
+                    Job::Sweep => "`mulchie sweep`",
+                    _ => "`mulchie clean`",
+                })
+            );
             return 1;
         }
     };
@@ -168,12 +175,17 @@ pub fn run(backend: &Backend, job: &Job, ui: &mut Ui) -> i32 {
             "executed": results.is_some(),
             "results": results,
         });
-        let _ = writeln!(ui.out, "{}", serde_json::to_string_pretty(&v).unwrap_or_default());
+        let _ = writeln!(
+            ui.out,
+            "{}",
+            serde_json::to_string_pretty(&v).unwrap_or_default()
+        );
     };
 
     // In JSON mode stdout carries only JSON; the readable plan goes to stderr
     // when someone has to read it to answer.
-    let show_text = !ui.json || (ui.interactive && !ui.confirm.yes && !ui.confirm.dry_run && !approved.is_empty());
+    let show_text = !ui.json
+        || (ui.interactive && !ui.confirm.yes && !ui.confirm.dry_run && !approved.is_empty());
     if show_text {
         let text = render_plan(job, &plan);
         let w: &mut dyn Write = if ui.json { &mut *ui.err } else { &mut *ui.out };
@@ -353,3 +365,7 @@ pub fn render_results(plan: &Plan, results: &[ActionResult]) -> String {
     ));
     s
 }
+
+#[cfg(test)]
+#[path = "plan_tests.rs"]
+mod tests;

@@ -13,7 +13,10 @@ pub enum Conn {
     /// Nobody holds the engine lock.
     NotRunning,
     /// An engine holds the lock but could not be used.
-    Unreachable { pid: u32, reason: String },
+    Unreachable {
+        pid: u32,
+        reason: String,
+    },
 }
 
 /// Connect to the engine that holds this user's lock, on the port it

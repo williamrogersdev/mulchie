@@ -86,17 +86,17 @@ impl Api for EngineApi {
             match conn::connect(&self.paths) {
                 Conn::Engine(c) => *guard = Some(c),
                 Conn::NotRunning => {
-                    return Err(ApiError::new(
-                        0,
-                        "engine_not_running",
-                        format!("Mulchie's engine is not running; {START_HINT}. Ask the user to start it."),
-                    ))
+                    let msg = format!("Mulchie's engine is not running; {START_HINT}.");
+                    return Err(ApiError::new(0, "engine_not_running", msg));
                 }
                 other => {
                     return Err(ApiError::new(
                         0,
                         "engine_unreachable",
-                        format!("{}; the user can run `mulchie doctor` to see why", other.why_not()),
+                        format!(
+                            "{}; the user can run `mulchie doctor` to see why",
+                            other.why_not()
+                        ),
                     ))
                 }
             }
@@ -129,7 +129,8 @@ struct Tool {
 }
 
 fn tool_list() -> Vec<Tool> {
-    let dry_run = json!({ "type": "boolean", "description": "Return the plan without changing anything" });
+    let dry_run =
+        json!({ "type": "boolean", "description": "Return the plan without changing anything" });
     vec![
         Tool {
             name: "get_status",
@@ -338,14 +339,20 @@ impl Tool {
 
 /// Check arguments against the small schema subset the tools use.
 fn validate(schema: &Value, args: &Map<String, Value>) -> Result<(), String> {
-    let props = schema["properties"].as_object().cloned().unwrap_or_default();
+    let props = schema["properties"]
+        .as_object()
+        .cloned()
+        .unwrap_or_default();
     for (k, v) in args {
         let Some(p) = props.get(k) else {
             let known: Vec<&str> = props.keys().map(String::as_str).collect();
             return Err(if known.is_empty() {
                 format!("unknown argument `{k}`: this tool takes no arguments")
             } else {
-                format!("unknown argument `{k}`; expected one of: {}", known.join(", "))
+                format!(
+                    "unknown argument `{k}`; expected one of: {}",
+                    known.join(", ")
+                )
             });
         };
         check_value(k, p, v)?;
@@ -434,7 +441,9 @@ fn split_plan(plan: &Value) -> (Vec<Value>, Vec<Value>) {
 fn execute_plan(api: &dyn Api, plan: &Value, route: &str) -> ToolResult {
     let (ready, not_ready) = split_plan(plan);
     if ready.is_empty() {
-        return Ok(json!({ "results": [], "not_ready": not_ready, "note": "nothing in the plan was ready, so nothing was changed" }));
+        return Ok(
+            json!({ "results": [], "not_ready": not_ready, "note": "nothing in the plan was ready, so nothing was changed" }),
+        );
     }
     let results = api
         .call("POST", route, Some(&json!({ "items": ready })))
@@ -480,7 +489,9 @@ fn call_tool(api: &dyn Api, name: &str, a: &Map<String, Value>) -> ToolResult {
                 .as_array()
                 .cloned()
                 .unwrap_or_default();
-            procs.retain(|p| filter.is_empty() || p["group"].as_str().unwrap_or("").contains(filter));
+            procs.retain(|p| {
+                filter.is_empty() || p["group"].as_str().unwrap_or("").contains(filter)
+            });
             let n = |p: &Value, k: &str| p[k].as_f64().unwrap_or(0.0);
             let key = |p: &Value| match sort {
                 "mem" => n(p, "mem_bytes"),
@@ -505,13 +516,19 @@ fn call_tool(api: &dyn Api, name: &str, a: &Map<String, Value>) -> ToolResult {
         }
         "get_history" => {
             let h = get("/v1/history")?;
-            let mins = a.get("minutes").and_then(Value::as_u64).unwrap_or(10).min(30);
+            let mins = a
+                .get("minutes")
+                .and_then(Value::as_u64)
+                .unwrap_or(10)
+                .min(30);
             // 20 samples a minute.
             let n = mins.saturating_mul(20) as usize;
             let arr = h.as_array().cloned().unwrap_or_default();
             let start = arr.len().saturating_sub(n);
             let step = ((arr.len() - start) / 120).max(1);
-            Ok(Value::Array(arr[start..].iter().step_by(step).cloned().collect()))
+            Ok(Value::Array(
+                arr[start..].iter().step_by(step).cloned().collect(),
+            ))
         }
         "disk_breakdown" => {
             let st = get("/v1/state")?;
@@ -527,16 +544,16 @@ fn call_tool(api: &dyn Api, name: &str, a: &Map<String, Value>) -> ToolResult {
             let st = get("/v1/state")?;
             if st["scan"].is_null() {
                 let _ = post("/v1/scan", json!({}));
-                return Ok(json!({ "scan": null, "note": "the engine has not finished a scan yet; one was requested, so ask again in a minute" }));
+                return Ok(
+                    json!({ "scan": null, "note": "the engine has not finished a scan yet; one was requested, so ask again in a minute" }),
+                );
             }
             Ok(st["scan"].clone())
         }
         "clean_caches" => {
             let paths = a.get("paths").and_then(Value::as_array);
             let plan = match (paths, flag("stale")) {
-                (Some(p), false) if !p.is_empty() => {
-                    post("/v1/clean/plan", json!({ "paths": p }))?
-                }
+                (Some(p), false) if !p.is_empty() => post("/v1/clean/plan", json!({ "paths": p }))?,
                 (None, true) => get("/v1/clean/plan")?,
                 (Some(_), true) => return Err("pass either paths or stale=true, not both".into()),
                 _ => return Err("pass paths (from reclaim_candidates) or stale=true".into()),
@@ -580,9 +597,14 @@ fn call_tool(api: &dyn Api, name: &str, a: &Map<String, Value>) -> ToolResult {
                     .filter(|p| arg("action") != "stop_builds" || p["kind"] == "build")
                     .map(|p| json!({ "pid": p["pid"], "name": p["name"], "kind": p["kind"] }))
                     .collect();
-                return Ok(json!({ "workspace": ws["label"], "action": arg("action"), "would_affect": procs }));
+                return Ok(
+                    json!({ "workspace": ws["label"], "action": arg("action"), "would_affect": procs }),
+                );
             }
-            post("/v1/workspace", json!({ "path": arg("path"), "action": arg("action") }))
+            post(
+                "/v1/workspace",
+                json!({ "path": arg("path"), "action": arg("action") }),
+            )
         }
         "process_action" => {
             if flag("dry_run") {
@@ -694,19 +716,36 @@ impl<'a> Session<'a> {
             if id.is_some() && (obj.contains_key("result") || obj.contains_key("error")) {
                 return None;
             }
-            let rid = if id_ok { id.unwrap_or(Value::Null) } else { Value::Null };
+            let rid = if id_ok {
+                id.unwrap_or(Value::Null)
+            } else {
+                Value::Null
+            };
             return Some(error_reply(rid, rpc_err(INVALID_REQUEST, "missing method")));
         };
         let Some(method) = method.as_str() else {
-            let rid = if id_ok { id.unwrap_or(Value::Null) } else { Value::Null };
-            return Some(error_reply(rid, rpc_err(INVALID_REQUEST, "method must be a string")));
+            let rid = if id_ok {
+                id.unwrap_or(Value::Null)
+            } else {
+                Value::Null
+            };
+            return Some(error_reply(
+                rid,
+                rpc_err(INVALID_REQUEST, "method must be a string"),
+            ));
         };
         if obj.get("jsonrpc").and_then(Value::as_str) != Some("2.0") {
-            if id.is_none() {
-                return None;
-            }
-            let rid = if id_ok { id.unwrap_or(Value::Null) } else { Value::Null };
-            return Some(error_reply(rid, rpc_err(INVALID_REQUEST, "jsonrpc must be \"2.0\"")));
+            // A notification gets no reply, even a malformed one.
+            id.as_ref()?;
+            let rid = if id_ok {
+                id.unwrap_or(Value::Null)
+            } else {
+                Value::Null
+            };
+            return Some(error_reply(
+                rid,
+                rpc_err(INVALID_REQUEST, "jsonrpc must be \"2.0\""),
+            ));
         }
         let Some(id) = id else {
             // A notification: never answered. `notifications/initialized`,
@@ -821,8 +860,8 @@ impl<'a> Session<'a> {
                     Some(Value::Object(m)) => m.clone(),
                     Some(_) => return Err(rpc_err(INVALID_PARAMS, "arguments must be an object")),
                 };
-                let outcome = validate(&tool.schema(), &args)
-                    .and_then(|()| call_tool(self.api, name, &args));
+                let outcome =
+                    validate(&tool.schema(), &args).and_then(|()| call_tool(self.api, name, &args));
                 Ok(match outcome {
                     Ok(v) => json!({
                         "content": [{ "type": "text", "text": serde_json::to_string_pretty(&v).unwrap_or_default() }],
@@ -834,13 +873,20 @@ impl<'a> Session<'a> {
                     }),
                 })
             }
-            _ => Err(rpc_err(METHOD_NOT_FOUND, format!("method not found: {method}"))),
+            _ => Err(rpc_err(
+                METHOD_NOT_FOUND,
+                format!("method not found: {method}"),
+            )),
         }
     }
 }
 
 /// Serve until the reader ends.
-pub fn serve<R: BufRead, W: Write>(mut reader: R, mut writer: W, api: &dyn Api) -> std::io::Result<()> {
+pub fn serve<R: BufRead, W: Write>(
+    mut reader: R,
+    mut writer: W,
+    api: &dyn Api,
+) -> std::io::Result<()> {
     let mut session = Session::new(api);
     let mut line = String::new();
     loop {

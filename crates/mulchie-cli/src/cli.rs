@@ -31,7 +31,6 @@ Examples:
     about = ABOUT,
     long_about = LONG_ABOUT,
     after_help = EXAMPLES,
-    propagate_version = true,
     max_term_width = 100
 )]
 pub struct Cli {
@@ -62,7 +61,9 @@ Only recognised build caches are deleted: Rust `target/` with CACHEDIR.TAG, `.ne
     Clean(CleanArgs),
 
     /// Processes by CPU, memory or disk I/O with workspace and command
-    #[command(after_help = "Examples:\n  mulchie top\n  mulchie top --sort mem -n 10\n  mulchie top --json")]
+    #[command(
+        after_help = "Examples:\n  mulchie top\n  mulchie top --sort mem -n 10\n  mulchie top --json"
+    )]
     Top(TopArgs),
 
     /// Every git worktree: size, idle days, dirty files, verdict
@@ -86,7 +87,9 @@ caches are archived, a detached HEAD gets a backup/<name> branch, and branches a
     Prune(PruneArgs),
 
     /// Send a signal to one of your processes (needs the engine)
-    #[command(after_help = "Examples:\n  mulchie signal 4242 term\n  mulchie signal 4242 stop\n  mulchie signal 4242 cont")]
+    #[command(
+        after_help = "Examples:\n  mulchie signal 4242 term\n  mulchie signal 4242 stop\n  mulchie signal 4242 cont"
+    )]
     Signal(SignalArgs),
 
     /// Is it OK to start heavy work right now?
@@ -146,7 +149,9 @@ how to add the MCP server. Nothing is changed. Exits 1 if any check fails.",
     Service(ServiceCommand),
 
     /// Print a shell completion script
-    #[command(after_help = "Examples:\n  mulchie completions bash > ~/.local/share/bash-completion/completions/mulchie\n  mulchie completions zsh > ~/.zfunc/_mulchie\n  mulchie completions fish > ~/.config/fish/completions/mulchie.fish")]
+    #[command(
+        after_help = "Examples:\n  mulchie completions bash > ~/.local/share/bash-completion/completions/mulchie\n  mulchie completions zsh > ~/.zfunc/_mulchie\n  mulchie completions fish > ~/.config/fish/completions/mulchie.fish"
+    )]
     Completions {
         /// The shell to generate completions for
         shell: clap_complete::Shell,
@@ -287,7 +292,9 @@ menu bar app already runs the engine, so a service is only for headless use.",
         dry_run: bool,
     },
     /// Stop and remove the service
-    #[command(after_help = "Examples:\n  mulchie service uninstall --dry-run\n  mulchie service uninstall")]
+    #[command(
+        after_help = "Examples:\n  mulchie service uninstall --dry-run\n  mulchie service uninstall"
+    )]
     Uninstall {
         /// Print what would be run and removed, change nothing
         #[arg(long, short = 'n')]
@@ -442,7 +449,9 @@ mod tests {
         assert!(force && dry_run);
         assert!(matches!(
             parse(&["service", "uninstall", "-n"]).unwrap().command,
-            Some(Command::Service(ServiceCommand::Uninstall { dry_run: true }))
+            Some(Command::Service(ServiceCommand::Uninstall {
+                dry_run: true
+            }))
         ));
         assert!(parse(&["service"]).is_err());
         assert!(parse(&["service", "restart"]).is_err());
@@ -450,8 +459,14 @@ mod tests {
 
     #[test]
     fn other_commands() {
-        assert!(matches!(parse(&["mcp"]).unwrap().command, Some(Command::Mcp)));
-        assert!(matches!(parse(&["serve"]).unwrap().command, Some(Command::Serve)));
+        assert!(matches!(
+            parse(&["mcp"]).unwrap().command,
+            Some(Command::Mcp)
+        ));
+        assert!(matches!(
+            parse(&["serve"]).unwrap().command,
+            Some(Command::Serve)
+        ));
         assert!(parse(&["serve", "--port", "1"]).is_err());
         assert!(matches!(
             parse(&["prune", "npm"]).unwrap().command,

@@ -82,7 +82,11 @@ pub fn checks(paths: &Paths, env: &Env) -> Vec<Check> {
     v.push(check(
         "version",
         Level::Info,
-        format!("mulchie {} at {}", env!("CARGO_PKG_VERSION"), env.exe.display()),
+        format!(
+            "mulchie {} at {}",
+            env!("CARGO_PKG_VERSION"),
+            env.exe.display()
+        ),
     ));
 
     v.push(match &env.on_path {
@@ -94,9 +98,11 @@ pub fn checks(paths: &Paths, env: &Env) -> Vec<Check> {
                 env.exe.parent().unwrap_or(Path::new("/")).display()
             ),
         ),
-        Some(p) if same_file(p, &env.exe) => {
-            check("path", Level::Pass, format!("`mulchie` on PATH is {}", p.display()))
-        }
+        Some(p) if same_file(p, &env.exe) => check(
+            "path",
+            Level::Pass,
+            format!("`mulchie` on PATH is {}", p.display()),
+        ),
         Some(p) => check(
             "path",
             Level::Warn,
@@ -138,7 +144,10 @@ pub fn checks(paths: &Paths, env: &Env) -> Vec<Check> {
         Err(_) => check(
             "config dir",
             Level::Warn,
-            format!("{} does not exist yet; the engine creates it (mode 700)", dir.display()),
+            format!(
+                "{} does not exist yet; the engine creates it (mode 700)",
+                dir.display()
+            ),
         ),
         Ok(m) if !m.is_dir() => check(
             "config dir",
@@ -148,7 +157,11 @@ pub fn checks(paths: &Paths, env: &Env) -> Vec<Check> {
         Ok(m) if m.uid() != uid => check(
             "config dir",
             Level::Fail,
-            format!("{} belongs to uid {}, not you (uid {uid})", dir.display(), m.uid()),
+            format!(
+                "{} belongs to uid {}, not you (uid {uid})",
+                dir.display(),
+                m.uid()
+            ),
         ),
         Ok(m) if m.mode() & 0o022 != 0 => check(
             "config dir",
@@ -170,7 +183,11 @@ pub fn checks(paths: &Paths, env: &Env) -> Vec<Check> {
                 dir.display()
             ),
         ),
-        Ok(_) => check("config dir", Level::Pass, format!("{} is private (700)", dir.display())),
+        Ok(_) => check(
+            "config dir",
+            Level::Pass,
+            format!("{} is private (700)", dir.display()),
+        ),
     });
 
     // Token.
@@ -179,7 +196,10 @@ pub fn checks(paths: &Paths, env: &Env) -> Vec<Check> {
         check(
             "token",
             Level::Warn,
-            format!("{} does not exist yet; the engine creates it", token.display()),
+            format!(
+                "{} does not exist yet; the engine creates it",
+                token.display()
+            ),
         )
     } else {
         match api::read_token(paths) {
@@ -243,7 +263,9 @@ pub fn checks(paths: &Paths, env: &Env) -> Vec<Check> {
     v.push(check(
         "mcp",
         Level::Info,
-        format!("agents connect with `{bin} mcp`; for Claude Code: claude mcp add mulchie -- {bin} mcp"),
+        format!(
+            "agents connect with `{bin} mcp`; for Claude Code: claude mcp add mulchie -- {bin} mcp"
+        ),
     ));
     v
 }
@@ -279,7 +301,10 @@ fn engine_check(paths: &Paths, holder: Option<&lock::Holder>, app: bool) -> Chec
             return check(
                 "engine",
                 Level::Fail,
-                format!("{who} (pid {}, port {port}) did not answer: {}", h.pid, e.message),
+                format!(
+                    "{who} (pid {}, port {port}) did not answer: {}",
+                    h.pid, e.message
+                ),
             )
         }
     };
@@ -297,7 +322,11 @@ fn engine_check(paths: &Paths, holder: Option<&lock::Holder>, app: bool) -> Chec
     if health["stale"] == true {
         return check(
             "engine",
-            if age.is_none() { Level::Warn } else { Level::Fail },
+            if age.is_none() {
+                Level::Warn
+            } else {
+                Level::Fail
+            },
             format!("{detail}; its figures are stale. If this persists, restart it"),
         );
     }
@@ -326,10 +355,18 @@ fn service_check(paths: &Paths, env: &Env, app_engine: bool) -> Check {
         } else {
             "only needed for a headless engine: `mulchie service install`"
         };
-        return check("service", Level::Info, format!("{name} not installed ({why})"));
+        return check(
+            "service",
+            Level::Info,
+            format!("{name} not installed ({why})"),
+        );
     }
     let Some(st) = st else {
-        return check("service", Level::Info, format!("{name} installed at {}", file.display()));
+        return check(
+            "service",
+            Level::Info,
+            format!("{name} installed at {}", file.display()),
+        );
     };
     if !st.current {
         return check(
