@@ -470,7 +470,7 @@ impl WatchProbe for SystemProbe {
             let mut cmd = std::process::Command::new("lsof");
             cmd.args(["-nP", "-iTCP", "-sTCP:LISTEN", "-F", "pn"]);
             let out = crate::git::run_with_timeout(cmd, PROBE_TIMEOUT).ok()?;
-            lsof_result(out.success, &out.stdout)
+            lsof_result(out.code, &out.stdout, &out.stderr)
         }
     }
 
@@ -503,11 +503,18 @@ impl WatchProbe for SystemProbe {
     }
 }
 
-/// Listeners from an `lsof` run. Only a successful run counts: lsof also
-/// exits 1 when nothing listens, but a failure looks the same, so a
-/// non-zero exit is "unknown" (`None`) and earlier findings are kept.
-pub fn lsof_result(success: bool, stdout: &[u8]) -> Option<Vec<Listener>> {
-    success.then(|| parse_lsof(&String::from_utf8_lossy(stdout)))
+/// Listeners from an `lsof` run. Exit 0 is parsed. lsof exits 1 with no
+/// output at all when nothing listens: that is an empty list. Any other
+/// exit (or exit 1 with output or an error message) is "unknown" (`None`)
+/// and earlier findings are kept.
+pub fn lsof_result(code: Option<i32>, stdout: &[u8], stderr: &str) -> Option<Vec<Listener>> {
+    match code {
+        Some(0) => Some(parse_lsof(&String::from_utf8_lossy(stdout))),
+        Some(1) if stdout.iter().all(u8::is_ascii_whitespace) && stderr.trim().is_empty() => {
+            Some(Vec::new())
+        }
+        _ => None,
+    }
 }
 
 /// The status from a `codesign` run. A timeout or spawn error is `None`,

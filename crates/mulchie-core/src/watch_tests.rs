@@ -936,12 +936,25 @@ fn every_kind_has_a_category_and_old_json_still_parses() {
 /// R9: a failed lsof is unknown, not "nothing listens"; a codesign that
 /// timed out or could not start gives no status (so nothing is cached);
 /// listener findings are kept while listeners are unknown.
+/// N12: lsof's exit 1 with no output and no message is "nothing listens".
 #[test]
 fn probe_failures_are_unknown_and_keep_findings() {
-    assert_eq!(lsof_result(false, b""), None, "non-zero exit, empty output");
-    assert_eq!(lsof_result(false, b"p1\nn*:80\n"), None);
-    assert_eq!(lsof_result(true, b"").map(|v| v.len()), Some(0));
-    assert_eq!(lsof_result(true, b"p7\nn*:8080\n").unwrap()[0].port, 8080);
+    let n = |v: Option<Vec<Listener>>| v.map(|v| v.len());
+    assert_eq!(n(lsof_result(Some(1), b"", "")), Some(0), "nothing listens");
+    assert_eq!(n(lsof_result(Some(1), b"\n", " \n")), Some(0));
+    assert_eq!(
+        lsof_result(Some(1), b"", "lsof: WARNING: can't stat()"),
+        None,
+        "exit 1 with a message"
+    );
+    assert_eq!(lsof_result(Some(1), b"p1\nn*:80\n", ""), None);
+    assert_eq!(lsof_result(Some(2), b"", ""), None);
+    assert_eq!(lsof_result(None, b"", ""), None, "killed by a signal");
+    assert_eq!(n(lsof_result(Some(0), b"", "")), Some(0));
+    assert_eq!(
+        lsof_result(Some(0), b"p7\nn*:8080\n", "").unwrap()[0].port,
+        8080
+    );
 
     let timed_out: Result<String, std::io::Error> = Err(std::io::Error::new(
         std::io::ErrorKind::TimedOut,
