@@ -318,7 +318,7 @@ pub fn run_with_timeout(cmd: Command, timeout: Duration) -> Result<ProcOutput, G
     run_capped(cmd, timeout, MAX_STDOUT)
 }
 
-fn run_capped(
+pub(crate) fn run_capped(
     mut cmd: Command,
     timeout: Duration,
     max_stdout: usize,

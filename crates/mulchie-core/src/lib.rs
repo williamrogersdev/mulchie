@@ -19,6 +19,7 @@ pub mod redact;
 pub mod safety;
 pub mod session;
 pub mod shutdown;
+pub mod updates;
 pub mod watch;
 
 pub use config::{Config, ConfigError, LoadedConfig};
