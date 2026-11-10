@@ -7,6 +7,12 @@ name: Release
 # A person reviews and publishes the draft;
 # publishing triggers publish.yml (Homebrew tap, crates.io).
 #
+# The committed updater config decides what a real release contains. With
+# bundle.createUpdaterArtifacts and plugins.updater.pubkey set in tauri.conf.json it is a
+# full release: the desktop app, signed and notarized, and the CLI. Without them it is a
+# CLI-only release: four CLI tarballs, no app, no Apple secrets, macOS binaries ad-hoc
+# signed only. See "CLI-only release" in docs/RELEASING.md.
+#
 # Manual run (Actions > Release > Run workflow) with dry_run on builds everything but
 # skips signing, notarization and upload, so it works before any secret exists.
 # Secrets and one-time setup: docs/RELEASING.md.
@@ -42,6 +48,7 @@ jobs:
       tag: ${{ steps.version.outputs.tag }}
       release: ${{ steps.version.outputs.release }}
       prerelease: ${{ steps.version.outputs.prerelease }}
+      app: ${{ steps.app.outputs.app }}
     steps:
       - name: Check out source
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -77,25 +84,50 @@ jobs:
             echo "prerelease=$PRERELEASE"
           } >> "$GITHUB_OUTPUT"
 
-      - name: Check updater configuration
-        if: steps.version.outputs.release == 'true'
+      # app=true: the desktop app is built, signed and shipped. A dry run always builds
+      # it, as it did before. A real release ships it only when the committed updater
+      # config is complete; otherwise it is a CLI-only release.
+      - name: Decide whether the app ships
+        id: app
+        env:
+          RELEASE: ${{ steps.version.outputs.release }}
         run: |
-          jq -e '.bundle.createUpdaterArtifacts == true and ((.plugins.updater.pubkey // "") | length > 0)' \
-            crates/mulchie-app/tauri.conf.json > /dev/null || {
-            echo "::error file=crates/mulchie-app/tauri.conf.json::Updater is not configured. Run scripts/release-setup.sh and commit the result (docs/RELEASING.md)."
-            exit 1
-          }
+          CONF=crates/mulchie-app/tauri.conf.json
+          ARTIFACTS="$(jq -r '.bundle.createUpdaterArtifacts == true' "$CONF")"
+          PUBKEY="$(jq -r '((.plugins.updater.pubkey // "") | length > 0)' "$CONF")"
+          if [[ "$RELEASE" != "true" ]]; then
+            APP=true
+          elif [[ "$ARTIFACTS" == "true" && "$PUBKEY" == "true" ]]; then
+            APP=true
+          else
+            APP=false
+            echo "::notice file=$CONF::Updater is not configured, so this is a CLI-only release: no desktop app, no Apple signing. To ship the app, run scripts/release-setup.sh and commit the result (docs/RELEASING.md, CLI-only release)."
+            if [[ "$ARTIFACTS" != "$PUBKEY" ]]; then
+              echo "::warning file=$CONF::The updater config is half set (createUpdaterArtifacts=$ARTIFACTS, pubkey set=$PUBKEY). Both are needed for the app."
+            fi
+          fi
+          echo "app=$APP, release=$RELEASE"
+          echo "app=$APP" >> "$GITHUB_OUTPUT"
 
       - name: Extract release notes from CHANGELOG.md
         env:
           VERSION: ${{ steps.version.outputs.version }}
           RELEASE: ${{ steps.version.outputs.release }}
+          APP: ${{ steps.app.outputs.app }}
         run: |
           if [[ "$RELEASE" == "true" ]]; then
             scripts/release-notes.sh "$VERSION" --release > release-notes.md
           elif ! scripts/release-notes.sh "$VERSION" > release-notes.md; then
             echo "::warning file=CHANGELOG.md::No usable notes for $VERSION yet; a tagged release would fail."
             echo "Dry run of $VERSION." > release-notes.md
+          fi
+          if [[ "$RELEASE" == "true" && "$APP" != "true" ]]; then
+            {
+              echo "**CLI only.** This release contains the \`mulchie\` CLI only. The macOS binaries are not Developer ID signed: installing with \`install.sh\` or \`curl\` works, but a browser download is quarantined by Gatekeeper. The desktop app is not included yet."
+              echo
+              cat release-notes.md
+            } > release-notes.with-banner.md
+            mv release-notes.with-banner.md release-notes.md
           fi
           cat release-notes.md
 
@@ -151,21 +183,24 @@ jobs:
           if-no-files-found: error
           retention-days: 14
 
-  # macOS binaries are signed with the Developer ID certificate and the hardened
-  # runtime, then notarized. A bare binary cannot be stapled; Gatekeeper looks the
-  # notarization up online. Both Apple targets build on the ARM runner.
+  # In a full release the macOS binaries are signed with the Developer ID certificate
+  # and the hardened runtime, then notarized. A bare binary cannot be stapled; Gatekeeper
+  # looks the notarization up online. Both Apple targets build on the ARM runner.
+  # In a CLI-only release (app=false) and in a dry run the job uses no environment and no
+  # secret; the binaries get an ad-hoc signature, which arm64 macOS requires to run.
   cli-macos:
     name: CLI ${{ matrix.target }}
     needs: prepare
     runs-on: macos-latest
     timeout-minutes: 45
-    environment: macos-signing
+    environment: ${{ needs.prepare.outputs.app == 'true' && 'macos-signing' || '' }}
     strategy:
       fail-fast: false
       matrix:
         target: [aarch64-apple-darwin, x86_64-apple-darwin]
     env:
-      RELEASE: ${{ needs.prepare.outputs.release }}
+      # SIGN: Developer ID signing and notarization (a full release only).
+      SIGN: ${{ needs.prepare.outputs.release == 'true' && needs.prepare.outputs.app == 'true' }}
     steps:
       - name: Check out source
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -185,7 +220,7 @@ jobs:
         run: cargo build --locked --release -p mulchie --target ${{ matrix.target }}
 
       - name: Check signing secrets
-        if: env.RELEASE == 'true'
+        if: env.SIGN == 'true'
         env:
           APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
           APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
@@ -204,7 +239,7 @@ jobs:
           exit $missing
 
       - name: Import Developer ID certificate
-        if: env.RELEASE == 'true'
+        if: env.SIGN == 'true'
         uses: ./.github/actions/import-certificate
         with:
           certificate: ${{ secrets.APPLE_CERTIFICATE }}
@@ -212,7 +247,7 @@ jobs:
           keychain-password: ${{ secrets.KEYCHAIN_PASSWORD }}
 
       - name: Sign with the hardened runtime
-        if: env.RELEASE == 'true'
+        if: env.SIGN == 'true'
         run: |
           BIN="target/${{ matrix.target }}/release/mulchie"
           codesign --force --options runtime --timestamp --sign "$APPLE_SIGNING_IDENTITY" "$BIN"
@@ -220,7 +255,7 @@ jobs:
           codesign -dv "$BIN" 2>&1 | grep -E 'flags=.*runtime' || { echo "::error::Hardened runtime flag is missing"; exit 1; }
 
       - name: Notarize
-        if: env.RELEASE == 'true'
+        if: env.SIGN == 'true'
         env:
           APPLE_ID: ${{ secrets.APPLE_ID }}
           APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
@@ -239,8 +274,30 @@ jobs:
             exit 1
           fi
 
+      # Cargo strips the binary after linking, which drops the linker's signature, and the
+      # x86_64 build on this ARM runner is never signed by the linker. So sign explicitly.
+      # codesign without a Developer ID needs no secret and no keychain.
+      - name: Sign ad hoc
+        if: env.SIGN != 'true'
+        run: |
+          BIN="target/${{ matrix.target }}/release/mulchie"
+          codesign --force --sign - "$BIN"
+          codesign --verify --strict --verbose=2 "$BIN"
+          codesign -dv "$BIN" 2>&1 | grep -F 'Signature=adhoc' || { echo "::error::The binary is not ad-hoc signed"; exit 1; }
+
       - name: Package
         run: scripts/package-cli.sh ${{ matrix.target }} dist
+
+      # The signature lives in the binary, so check the one inside the tarball.
+      - name: Verify the packaged binary
+        run: |
+          mkdir "$RUNNER_TEMP/unpack"
+          tar -xzf "dist/mulchie-${{ matrix.target }}.tar.gz" -C "$RUNNER_TEMP/unpack"
+          BIN="$RUNNER_TEMP/unpack/mulchie-${{ matrix.target }}/mulchie"
+          codesign --verify --strict --verbose=2 "$BIN"
+          if [[ "$SIGN" != "true" ]]; then
+            codesign -dv "$BIN" 2>&1 | grep -F 'Signature=adhoc' || { echo "::error::The packaged binary is not ad-hoc signed"; exit 1; }
+          fi
 
       - name: Upload
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
@@ -266,6 +323,7 @@ jobs:
   desktop:
     name: Desktop app (universal)
     needs: prepare
+    if: needs.prepare.outputs.app == 'true'
     runs-on: macos-latest
     timeout-minutes: 90
     environment: macos-signing
@@ -423,14 +481,27 @@ jobs:
           fi
 
   # Gathers every asset, writes latest.json and SHA256SUMS, and keeps them as one artifact.
+  # The desktop job is skipped when app=false, and a job whose `needs` was skipped is
+  # skipped too. So this job runs under !cancelled() and checks every result itself:
+  # the CLI jobs must have succeeded, and desktop must have succeeded, or been skipped
+  # because there is no app in this release. A failed or cancelled build never gets here.
   assemble:
     name: Assemble release assets
     needs: [prepare, cli-linux, cli-macos, desktop]
+    if: >-
+      ${{ !cancelled()
+      && needs.prepare.result == 'success'
+      && needs.cli-linux.result == 'success'
+      && needs.cli-macos.result == 'success'
+      && (needs.desktop.result == 'success'
+      || (needs.desktop.result == 'skipped' && needs.prepare.outputs.app != 'true')) }}
     runs-on: ubuntu-latest
     timeout-minutes: 10
     env:
       VERSION: ${{ needs.prepare.outputs.version }}
       TAG: ${{ needs.prepare.outputs.tag }}
+      RELEASE: ${{ needs.prepare.outputs.release }}
+      APP: ${{ needs.prepare.outputs.app }}
     steps:
       - name: Download build outputs
         uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
@@ -450,8 +521,40 @@ jobs:
         with:
           path: src
 
+      # Every asset a release promises must be here. A missing one fails the run before
+      # anything is written, so a draft is never created from a partial set.
+      - name: Check the expected assets
+        run: |
+          expected=()
+          for target in aarch64-apple-darwin x86_64-apple-darwin x86_64-unknown-linux-gnu aarch64-unknown-linux-gnu; do
+            expected+=("mulchie-$target.tar.gz" "mulchie-$target.tar.gz.sha256")
+          done
+          if [[ "$APP" == "true" ]]; then
+            expected+=("Mulchie_${VERSION}_universal.dmg")
+            if [[ "$RELEASE" == "true" ]]; then
+              expected+=("Mulchie_${VERSION}_universal.app.tar.gz" "Mulchie_${VERSION}_universal.app.tar.gz.sig")
+            fi
+          fi
+          missing=0
+          for name in "${expected[@]}"; do
+            if [[ ! -s "release/$name" ]]; then
+              echo "::error::Expected release asset $name is missing or empty"
+              missing=1
+            fi
+          done
+          if [[ "$APP" != "true" ]] && compgen -G 'release/*.dmg' > /dev/null; then
+            echo "::error::A DMG is present in a CLI-only release"
+            missing=1
+          fi
+          ls -l release
+          exit $missing
+
       - name: Write latest.json
         run: |
+          if [[ "$APP" != "true" ]]; then
+            echo "::notice::CLI-only release: no app, so no latest.json."
+            exit 0
+          fi
           ARCHIVE="Mulchie_${VERSION}_universal.app.tar.gz"
           if [[ -f "release/$ARCHIVE.sig" ]]; then
             src/scripts/make-latest-json.sh "$VERSION" \
@@ -466,7 +569,8 @@ jobs:
         run: |
           cd release
           # The per-file .sha256 and .sig files are inputs, not release subjects of their own.
-          FILES=(*.tar.gz *.dmg)
+          FILES=(*.tar.gz)
+          if [[ "$APP" == "true" ]]; then FILES+=(*.dmg); fi
           if [[ -f latest.json ]]; then FILES+=(latest.json); fi
           sha256sum -- "${FILES[@]}" > SHA256SUMS
           cat SHA256SUMS
@@ -483,7 +587,7 @@ jobs:
   draft-release:
     name: Create draft GitHub Release
     needs: [prepare, assemble]
-    if: needs.prepare.outputs.release == 'true'
+    if: needs.prepare.outputs.release == 'true'  # assemble succeeded, or this job is skipped
     runs-on: ubuntu-latest
     timeout-minutes: 10
     permissions:
@@ -513,7 +617,7 @@ jobs:
         with:
           subject-path: |
             release/*.tar.gz
-            release/*.dmg
+            ${{ needs.prepare.outputs.app == 'true' && 'release/*.dmg' || '' }}
 
       - name: Create or update the draft release
         run: |

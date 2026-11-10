@@ -1,15 +1,23 @@
 #!/usr/bin/env bash
 # Render the Homebrew cask and formula templates for a release.
 #
-#   scripts/render-homebrew.sh VERSION ASSETS_DIR OUT_DIR
+#   scripts/render-homebrew.sh [--formula-only] VERSION ASSETS_DIR OUT_DIR
 #
 # ASSETS_DIR holds the release assets: the four mulchie-<target>.tar.gz.sha256 files and
 # Mulchie_VERSION_universal.dmg (or a Mulchie_VERSION_universal.dmg.sha256 file).
 # Writes OUT_DIR/Casks/mulchie.rb and OUT_DIR/Formula/mulchie-cli.rb.
+# With --formula-only (a CLI-only release has no DMG) the DMG is not needed and only the
+# formula is written.
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
-version="${1:?usage: render-homebrew.sh VERSION ASSETS_DIR OUT_DIR}"
+formula_only=false
+if [ "${1:-}" = "--formula-only" ]; then
+  formula_only=true
+  shift
+fi
+
+version="${1:?usage: render-homebrew.sh [--formula-only] VERSION ASSETS_DIR OUT_DIR}"
 assets="${2:?missing ASSETS_DIR}"
 out="${3:?missing OUT_DIR}"
 
@@ -33,7 +41,10 @@ sha_from_checksum_file() {
 }
 
 dmg="$assets/Mulchie_${version}_universal.dmg"
-if [ -f "$dmg" ]; then
+sha_dmg=""
+if [ "$formula_only" = true ]; then
+  :
+elif [ -f "$dmg" ]; then
   sha_dmg="$(sha_of_file "$dmg")"
 elif [ -f "$dmg.sha256" ]; then
   sha_dmg="$(sha_from_checksum_file "$dmg.sha256")"
@@ -53,12 +64,17 @@ render() {
     "$1"
 }
 
-mkdir -p "$out/Casks" "$out/Formula"
-render packaging/homebrew/mulchie.rb.tmpl >"$out/Casks/mulchie.rb"
+mkdir -p "$out/Formula"
 render packaging/homebrew/mulchie-cli.rb.tmpl >"$out/Formula/mulchie-cli.rb"
+files=("$out/Formula/mulchie-cli.rb")
+if [ "$formula_only" != true ]; then
+  mkdir -p "$out/Casks"
+  render packaging/homebrew/mulchie.rb.tmpl >"$out/Casks/mulchie.rb"
+  files+=("$out/Casks/mulchie.rb")
+fi
 
-if grep -n '@[A-Z0-9_]*@' "$out/Casks/mulchie.rb" "$out/Formula/mulchie-cli.rb"; then
+if grep -n '@[A-Z0-9_]*@' "${files[@]}"; then
   echo "unfilled placeholders remain" >&2
   exit 1
 fi
-echo "rendered $out/Casks/mulchie.rb and $out/Formula/mulchie-cli.rb"
+echo "rendered ${files[*]}"
