@@ -15,6 +15,7 @@ pub mod procplan;
 pub mod reclaim;
 pub mod redact;
 pub mod safety;
+pub mod session;
 pub mod shutdown;
 pub mod watch;
 
