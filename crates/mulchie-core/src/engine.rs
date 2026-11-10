@@ -215,6 +215,8 @@ pub enum LeaseError {
     /// pid 1 (or 0), or a process of another user: its lifetime says nothing
     /// about the caller's build.
     PidNotAllowed(u32),
+    /// No random secret could be made for a new ticket; no ticket was made.
+    SecretUnavailable(String),
 }
 
 impl LeaseError {
@@ -226,6 +228,7 @@ impl LeaseError {
             LeaseError::PidNotAllowed(_) => "pid_not_allowed",
             LeaseError::SecretRequired => "release_secret_required",
             LeaseError::WrongSecret => "wrong_release_secret",
+            LeaseError::SecretUnavailable(_) => "secret_unavailable",
         }
     }
 }
@@ -250,6 +253,9 @@ impl std::fmt::Display for LeaseError {
                 "this ticket has a release secret; send it as \"secret\" to renew or poll"
             ),
             LeaseError::WrongSecret => write!(f, "the secret sent is not this ticket's"),
+            LeaseError::SecretUnavailable(e) => {
+                write!(f, "could not make a release secret for a new ticket: {e}")
+            }
         }
     }
 }
@@ -2334,8 +2340,11 @@ impl Engine {
         let id = match ticket.filter(|t| st.slots.waiting.iter().any(|w| w.id == *t)) {
             Some(t) => t,
             None => {
+                // Never a lease without a secret: anyone could release it.
+                let secret =
+                    release_secret().map_err(|e| LeaseError::SecretUnavailable(e.to_string()))?;
                 let id = self.next_id.fetch_add(1, Ordering::SeqCst);
-                new_secret = crate::paths::random_hex(16).ok();
+                new_secret = Some(secret);
                 st.slots.waiting.push(Waiter {
                     id,
                     label,
@@ -2490,6 +2499,21 @@ impl Engine {
     pub(crate) fn begin_shutdown(&self) {
         self.shutdown.store(true, Ordering::SeqCst);
     }
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Tests: make [`release_secret`] fail on this thread.
+    pub(crate) static FAIL_SECRETS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// A new lease's release secret.
+fn release_secret() -> std::io::Result<String> {
+    #[cfg(test)]
+    if FAIL_SECRETS.with(|f| f.get()) {
+        return Err(std::io::Error::other("no randomness (test)"));
+    }
+    crate::paths::random_hex(16)
 }
 
 fn expire_leases(slots: &mut Slots, now: u64, alive: &dyn Fn(u32, Option<u64>) -> bool) {

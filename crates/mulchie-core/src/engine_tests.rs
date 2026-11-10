@@ -1210,3 +1210,21 @@ fn renewing_or_polling_needs_the_secret_and_never_shortens() {
     e2.expire_leases_at(10_000);
     assert_eq!(e2.snapshot_state().slots.active[0].ttl_secs, None);
 }
+
+/// R11: when no random secret can be made, no lease is made either.
+#[test]
+fn no_secret_no_lease() {
+    let (_t, e) = engine();
+    one_slot(&e);
+    FAIL_SECRETS.with(|f| f.set(true));
+    let r = e.acquire_at(&lease("a", None, None, Some(60)), 100);
+    FAIL_SECRETS.with(|f| f.set(false));
+    assert!(matches!(r, Err(LeaseError::SecretUnavailable(_))), "{r:?}");
+    let st = e.snapshot_state();
+    assert!(st.slots.active.is_empty() && st.slots.waiting.is_empty());
+    assert!(e
+        .acquire_at(&lease("a", None, None, Some(60)), 100)
+        .unwrap()
+        .release_secret
+        .is_some());
+}
