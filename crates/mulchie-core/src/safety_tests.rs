@@ -1255,3 +1255,78 @@ fn changing_an_ignored_env_during_backup_stops_the_removal() {
         .execute_one(&env.remove_req(&wt, &env.head(&wt)), "t");
     assert!(done(&r), "{r:?}");
 }
+
+/// C5: pruning a missing detached worktree dropped its HEAD and reflog, so
+/// commits made there became unreachable.
+#[test]
+fn pruning_a_detached_entry_keeps_unreachable_commits_on_a_branch() {
+    let env = Env::new();
+    let repo = env.repo("repo");
+    let a = env.worktree(&repo, "agent-a", true);
+    env.git(&a, &["commit", "-q", "--allow-empty", "-m", "only here"]);
+    let lost = env.head(&a);
+    // A second detached entry whose HEAD main already reaches needs no branch.
+    let b = env.worktree(&repo, "agent-b", true);
+    env.vanish(&a, 0);
+    env.vanish(&b, 1);
+    age_admin_entry(&repo, "agent-a");
+    age_admin_entry(&repo, "agent-b");
+
+    let r = env.gate().execute_one(
+        &Request::PruneWorktree {
+            repo: repo.clone(),
+            path: a.clone(),
+        },
+        "t",
+    );
+    assert!(done(&r), "{r:?}");
+    let branch = backup_of(&r, BackupKind::Branch).expect("a backup branch");
+    assert_eq!(
+        env.git(&repo, &["rev-parse", &format!("refs/heads/{branch}")])
+            .trim(),
+        lost
+    );
+    assert!(!git::worktree_list(&env.paths, &repo)
+        .unwrap()
+        .iter()
+        .any(|e| e.path == a));
+
+    let r = env.gate().execute_one(
+        &Request::PruneWorktree {
+            repo: repo.clone(),
+            path: b.clone(),
+        },
+        "t",
+    );
+    assert!(done(&r), "{r:?}");
+    assert!(backup_of(&r, BackupKind::Branch).is_none(), "{r:?}");
+}
+
+#[test]
+fn pruning_skips_when_the_backup_branch_cannot_be_made() {
+    let env = Env::new();
+    let repo = env.repo("repo");
+    let a = env.worktree(&repo, "agent-a", true);
+    env.git(&a, &["commit", "-q", "--allow-empty", "-m", "only here"]);
+    let lost = env.head(&a);
+    // The backup branch name is taken by another commit.
+    let main = env.head(&repo);
+    env.git(
+        &repo,
+        &["branch", &backup_branch_name("agent-a", &lost), &main],
+    );
+    env.vanish(&a, 0);
+    age_admin_entry(&repo, "agent-a");
+    let r = env.gate().execute_one(
+        &Request::PruneWorktree {
+            repo: repo.clone(),
+            path: a.clone(),
+        },
+        "t",
+    );
+    assert_eq!(reason(&r), Some(SkipReason::BackupFailed), "{r:?}");
+    assert!(git::worktree_list(&env.paths, &repo)
+        .unwrap()
+        .iter()
+        .any(|e| e.path == a));
+}

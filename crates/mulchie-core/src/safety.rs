@@ -1443,14 +1443,37 @@ impl<'a> Gate<'a> {
     }
 
     fn ensure_backup_branch(&self, f: &WorktreeFacts) -> Result<String, String> {
-        let name = backup_branch_name(&f.name, &f.head);
+        self.backup_branch_at(&f.repo, &f.name, &f.head)
+    }
+
+    /// Whether any ref (branch, tag, remote, stash…) reaches `commit`.
+    fn reachable_from_a_ref(&self, repo: &Path, commit: &str) -> Result<bool, Skip> {
+        let out = git::git(
+            self.paths,
+            repo,
+            &[
+                "for-each-ref",
+                "--count=1",
+                "--format=%(refname)",
+                "--contains",
+                commit,
+            ],
+        )
+        .map_err(Self::git_skip)?;
+        Ok(!out.trim().is_empty())
+    }
+
+    /// `backup/<name>-<head>` at `head` in `repo`: created, or found already
+    /// there at the same commit. Never moved.
+    fn backup_branch_at(&self, repo: &Path, wt_name: &str, head: &str) -> Result<String, String> {
+        let name = backup_branch_name(wt_name, head);
         let full = format!("refs/heads/{name}");
         match git::git(
             self.paths,
-            &f.repo,
+            repo,
             &["rev-parse", "--verify", "--quiet", &full],
         ) {
-            Ok(existing) if existing.trim() == f.head => return Ok(name),
+            Ok(existing) if existing.trim() == head => return Ok(name),
             Ok(existing) => {
                 return Err(format!(
                     "branch {name} already exists at {}; it is never moved",
@@ -1460,7 +1483,7 @@ impl<'a> Gate<'a> {
             Err(git::GitError::Failed { code: Some(1), .. }) => {}
             Err(e) => return Err(e.to_string()),
         }
-        git::git(self.paths, &f.repo, &["branch", &name, &f.head])
+        git::git(self.paths, repo, &["branch", &name, head])
             .map_err(|e| format!("could not create branch {name}: {e}"))?;
         Ok(name)
     }
@@ -1510,6 +1533,28 @@ impl<'a> Gate<'a> {
 
     fn prune_worktree(&self, repo: &Path, path: &Path) -> Result<Outcome, Skip> {
         let f = self.check_prune(repo, path)?;
+        // `git worktree prune` deletes the entry's HEAD and reflog. A detached
+        // HEAD that no ref reaches would become unreachable (and later garbage
+        // collected): keep it on a backup branch first, or do not prune.
+        let mut backups = Vec::new();
+        if f.entry.detached {
+            let Some(head) = f.entry.head.as_deref() else {
+                return skip(SkipReason::GitFailed, "git did not report the entry's HEAD");
+            };
+            if !self.reachable_from_a_ref(&f.repo, head)? {
+                let name = file_name(&f.entry.path);
+                let b = self
+                    .backup_branch_at(&f.repo, &name, head)
+                    .map_err(|e| Skip {
+                        reason: SkipReason::BackupFailed,
+                        detail: format!("{e}; nothing was pruned"),
+                    })?;
+                backups.push(Backup {
+                    kind: BackupKind::Branch,
+                    location: b,
+                });
+            }
+        }
         // `git worktree prune` has no per-entry form. Lock every other prunable
         // entry so only the requested one can go, then unlock them.
         let list = git::worktree_list(self.paths, &f.repo).map_err(Self::git_skip)?;
@@ -1566,14 +1611,18 @@ impl<'a> Gate<'a> {
             return skip(
                 SkipReason::PruneDeferred,
                 format!(
-                    "git kept the entry: it is newer than the {}-day expiry",
-                    self.config.worktree_idle_days
+                    "git kept the entry: it is newer than the {}-day expiry{}",
+                    self.config.worktree_idle_days,
+                    backups
+                        .first()
+                        .map(|b| format!(" (its commit is kept on branch {})", b.location))
+                        .unwrap_or_default()
                 ),
             );
         }
         Ok(Outcome::Done {
             freed_bytes: 0,
-            backups: Vec::new(),
+            backups,
         })
     }
 
