@@ -8,6 +8,9 @@ use sysinfo::{
     System, UpdateKind,
 };
 
+use crate::consumers::{
+    self, ConsumerGroup, Consumers, CpuSummary, MemSummary, Members, ProcSample,
+};
 use crate::paths::home_dir;
 use crate::process::ProcFacts;
 
@@ -100,6 +103,16 @@ pub struct Snapshot {
     pub workspaces: Vec<Workspace>,
     pub groups: Vec<GroupUsage>,
     pub top: Vec<ProcInfo>,
+    /// Every process in exactly one group (workspace, app, process name, or
+    /// system), with the top 10 by CPU and by memory.
+    pub consumers: Consumers,
+    /// CPU pressure in words.
+    pub cpu_summary: CpuSummary,
+    /// Memory in words.
+    pub mem_summary: MemSummary,
+    /// Every member of every consumer group, for planning group actions.
+    #[serde(skip)]
+    pub members: std::sync::Arc<Members>,
 }
 
 impl Snapshot {
@@ -120,6 +133,15 @@ impl Snapshot {
 
     pub fn busy_paths(&self) -> Vec<PathBuf> {
         self.workspaces.iter().map(|w| w.path.clone()).collect()
+    }
+
+    /// A consumer group by key, from either top list.
+    pub fn consumer(&self, key: &str) -> Option<&ConsumerGroup> {
+        self.consumers
+            .by_cpu
+            .iter()
+            .chain(self.consumers.by_mem.iter())
+            .find(|g| g.key == key)
     }
 
     pub fn find_proc(&self, pid: u32) -> Option<&ProcInfo> {
@@ -253,6 +275,8 @@ pub struct Monitor {
     last: Instant,
     me: u32,
     samples: u64,
+    /// App bundle → CFBundleIdentifier, looked up once per bundle.
+    bundle_ids: HashMap<PathBuf, Option<String>>,
 }
 
 impl Monitor {
@@ -274,6 +298,7 @@ impl Monitor {
             last: Instant::now(),
             me: std::process::id(),
             samples: 0,
+            bundle_ids: HashMap::new(),
         }
     }
 
@@ -339,6 +364,14 @@ impl Monitor {
             })
             .collect();
         let roots = attribute(&facts, my_uid, &self.bases, &mut self.root_cache);
+        let ppid_of: HashMap<u32, u32> = facts.iter().map(|f| (f.pid, f.ppid)).collect();
+        let mut ancestors = Vec::new();
+        let mut cur = ppid_of.get(&self.me).copied().unwrap_or(0);
+        while cur > 1 && ancestors.len() < 32 {
+            ancestors.push(cur);
+            cur = ppid_of.get(&cur).copied().unwrap_or(0);
+        }
+        let mut samples: Vec<ProcSample> = Vec::with_capacity(facts.len());
         let bcache = &mut self.branch_cache;
         let home = self.home.clone();
         for (pid, p) in self.sys.processes() {
@@ -365,6 +398,18 @@ impl Monitor {
                 Some((root, wt)) => label_for(root, *wt),
                 None => app_group(p.exe(), &name),
             };
+            samples.push(ProcSample {
+                pid: pid.as_u32(),
+                ppid: p.parent().map(|x| x.as_u32()).unwrap_or(0),
+                own,
+                name: name.clone(),
+                exe: p.exe().map(|e| e.to_path_buf()),
+                workspace: ws_root.as_ref().map(|(r, _)| (r.clone(), group.clone())),
+                kind,
+                cpu_pct: p.cpu_usage(),
+                mem_bytes: p.memory(),
+                start_time: p.start_time(),
+            });
             let cmd = shorten_cmd(
                 &p.cmd()
                     .iter()
@@ -499,6 +544,47 @@ impl Monitor {
             .map(|l| [l.one, l.five, l.fifteen])
             .unwrap_or_default();
 
+        // Bundle ids: a few new bundles per sample, each looked up once.
+        let mut new_lookups = 0;
+        for sm in samples.iter().filter(|s| s.own) {
+            if new_lookups >= 16 {
+                break;
+            }
+            if let Some(b) = sm.exe.as_deref().and_then(consumers::outer_bundle) {
+                if let std::collections::hash_map::Entry::Vacant(e) = self.bundle_ids.entry(b) {
+                    let id = consumers::bundle_id(e.key());
+                    e.insert(id);
+                    new_lookups += 1;
+                }
+            }
+        }
+        if self.bundle_ids.len() > 2000 {
+            self.bundle_ids.clear();
+        }
+        let cpu_count = self.sys.cpus().len();
+        let mem_total = self.sys.total_memory();
+        let (consumers, members) = consumers::group(
+            &samples,
+            &consumers::GroupCtx {
+                cores: cpu_count,
+                mem_total,
+                self_pid: self.me,
+                ancestors: &ancestors,
+                macos: cfg!(target_os = "macos"),
+                bundle_ids: &self.bundle_ids,
+            },
+        );
+        let cpu_pct = self.sys.global_cpu_usage();
+        let cpu_summary = consumers::cpu_summary(cpu_pct, cpu_count, load[0], &consumers.by_cpu);
+        let mem_summary = consumers::mem_summary(
+            mem_total,
+            self.sys.available_memory(),
+            self.sys.total_swap(),
+            self.sys.used_swap(),
+            consumers::memory_pressure(),
+            &consumers.by_mem,
+        );
+
         Snapshot {
             at_unix: now_unix(),
             cpu_pct: self.sys.global_cpu_usage(),
@@ -519,6 +605,10 @@ impl Monitor {
             workspaces,
             groups: gl.into_iter().take(40).collect(),
             top,
+            consumers,
+            cpu_summary,
+            mem_summary,
+            members: std::sync::Arc::new(members),
         }
     }
 
@@ -922,6 +1012,34 @@ mod tests {
             classify_names("zsh", None, &os(&["zsh", "cargo"])),
             ProcKind::Other
         );
+    }
+
+    /// The real process table (read only): every sampled process is in a
+    /// group, and the summaries are filled in.
+    #[test]
+    fn a_real_sample_groups_every_process() {
+        let t = tempfile::tempdir().unwrap();
+        let mut m = Monitor::with_home(t.path().to_path_buf());
+        m.sample();
+        let s = m.sample();
+        let members: usize = s.members.values().map(|v| v.len()).sum();
+        assert_eq!(members, s.proc_count, "exactly one group each");
+        assert!(s.consumers.groups > 0 && !s.consumers.by_cpu.is_empty());
+        assert!(s.consumers.by_cpu.len() <= crate::consumers::TOP_GROUPS);
+        assert!(!s.cpu_summary.headline.is_empty() && !s.mem_summary.headline.is_empty());
+        eprintln!(
+            "{}\n{}\n{}\n{}",
+            s.cpu_summary.headline,
+            s.cpu_summary.detail,
+            s.mem_summary.headline,
+            s.mem_summary.detail
+        );
+        for g in s.consumers.by_cpu.iter().take(5) {
+            eprintln!(
+                "{:?} {} {:.1} cores {} procs main {} {:?} {:?}",
+                g.kind, g.name, g.cpu_cores, g.procs, g.main_pid, g.bundle_id, g.protected
+            );
+        }
     }
 
     #[test]

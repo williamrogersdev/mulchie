@@ -1,5 +1,6 @@
 pub mod api;
 pub mod config;
+pub mod consumers;
 pub mod diskmap;
 pub mod engine;
 pub mod git;
