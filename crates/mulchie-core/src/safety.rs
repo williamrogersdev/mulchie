@@ -121,6 +121,9 @@ pub enum SkipReason {
     /// A worktree has changes git hides from `status` (skip-worktree or
     /// assume-unchanged files that differ from the index).
     HiddenChanges,
+    /// A reopen that does not follow a quit, in the same batch, of a process
+    /// belonging to that app.
+    ReopenNotQuit,
 }
 
 impl SkipReason {
@@ -367,6 +370,13 @@ pub enum Request {
 /// How long [`Request::ReopenApp`] waits for the app's main process to exit.
 pub const REOPEN_WAIT: Duration = Duration::from_secs(20);
 
+/// A process a batch quit, for the [`Request::ReopenApp`] that may follow.
+struct QuitApp {
+    pid: u32,
+    start_time: u64,
+    bundle_id: Option<String>,
+}
+
 impl Request {
     pub fn action(&self) -> ActionKind {
         match self {
@@ -440,6 +450,8 @@ pub struct Gate<'a> {
     pub now: u64,
     proc_view: Mutex<Option<(Instant, ProcView)>>,
     proc_reads: AtomicUsize,
+    /// How long a reopen waits for the app to exit ([`REOPEN_WAIT`]).
+    reopen_wait: Duration,
     /// Tests: runs after the backups are written, before the recheck.
     #[cfg(test)]
     pub(crate) after_backup: Option<Box<dyn Fn()>>,
@@ -557,6 +569,7 @@ impl<'a> Gate<'a> {
             now,
             proc_view: Mutex::new(None),
             proc_reads: AtomicUsize::new(0),
+            reopen_wait: REOPEN_WAIT,
             #[cfg(test)]
             after_backup: None,
         }
@@ -803,16 +816,58 @@ impl<'a> Gate<'a> {
 
     /// Carry out each request after re-checking it now. Every result, done or
     /// skipped, is appended to the journal when the gate has one.
+    ///
+    /// A [`Request::ReopenApp`] is carried out only after a `Signal` earlier in
+    /// the same batch quit a process of that app (same pid and start time,
+    /// and an executable inside a bundle with that id).
     pub fn execute(&self, requests: &[Request], source: &str) -> Vec<ActionResult> {
+        let reopens = requests
+            .iter()
+            .any(|r| matches!(r, Request::ReopenApp { .. }));
+        let mut quit: Vec<QuitApp> = Vec::new();
         requests
             .iter()
-            .map(|r| self.execute_one(r, source))
+            .map(|r| match r {
+                Request::Signal {
+                    pid,
+                    signal: Signal::Term | Signal::Kill,
+                    expected_start_time,
+                } if reopens => {
+                    // Read the bundle before the process goes away.
+                    let bundle_id = self
+                        .procs
+                        .get(*pid)
+                        .filter(|p| p.start_time == *expected_start_time)
+                        .and_then(|p| p.exe)
+                        .and_then(|e| crate::consumers::outer_bundle(&e))
+                        .and_then(|b| crate::consumers::bundle_id(&b));
+                    let res = self.run_one(r, source, &[]);
+                    if matches!(res.outcome, Outcome::Done { .. }) {
+                        quit.push(QuitApp {
+                            pid: *pid,
+                            start_time: *expected_start_time,
+                            bundle_id,
+                        });
+                    }
+                    res
+                }
+                _ => self.run_one(r, source, &quit),
+            })
             .collect()
     }
 
+    /// One request on its own. A [`Request::ReopenApp`] is always refused
+    /// here: it needs the quit that precedes it in a batch ([`Gate::execute`]).
     pub fn execute_one(&self, req: &Request, source: &str) -> ActionResult {
+        self.run_one(req, source, &[])
+    }
+
+    fn run_one(&self, req: &Request, source: &str, quit: &[QuitApp]) -> ActionResult {
         let outcome = {
-            let _g = EXEC_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+            // A reopen waits for the app to exit without the lock, and takes
+            // it itself for the re-check and the `open`.
+            let _g = (!matches!(req, Request::ReopenApp { .. }))
+                .then(|| EXEC_LOCK.lock().unwrap_or_else(|e| e.into_inner()));
             let res = match req {
                 Request::DeleteCache {
                     path,
@@ -848,7 +903,7 @@ impl<'a> Gate<'a> {
                     bundle_id,
                     after_pid,
                     after_start_time,
-                } => self.reopen_app(bundle_id, *after_pid, *after_start_time),
+                } => self.reopen_app(bundle_id, *after_pid, *after_start_time, quit),
             };
             match res {
                 Ok(o) => o,
@@ -1865,34 +1920,55 @@ impl<'a> Gate<'a> {
         Ok(())
     }
 
-    /// Wait for the app's main process to exit (it was asked to quit by the
-    /// item before), then `open -b`.
+    /// Wait for the app's main process to exit (a `Signal` earlier in the
+    /// same batch quit it), then `open -b`. The wait does not hold the
+    /// execution lock; the facts are checked again under it before `open`.
     fn reopen_app(
         &self,
         bundle_id: &str,
         after_pid: u32,
         after_start_time: u64,
+        quit: &[QuitApp],
     ) -> Result<Outcome, Skip> {
         self.check_reopen(bundle_id)?;
-        let deadline = Instant::now() + REOPEN_WAIT;
-        loop {
-            let running = self
-                .procs
+        let quit_here = quit.iter().any(|q| {
+            q.pid == after_pid
+                && q.start_time == after_start_time
+                && q.bundle_id.as_deref() == Some(bundle_id)
+        });
+        if !quit_here {
+            return skip(
+                SkipReason::ReopenNotQuit,
+                format!(
+                    "no process of {bundle_id} (pid {after_pid}) was quit earlier in this batch"
+                ),
+            );
+        }
+        let running = || {
+            self.procs
                 .get(after_pid)
-                .is_some_and(|p| p.start_time == after_start_time);
-            if !running {
-                break;
-            }
+                .is_some_and(|p| p.start_time == after_start_time)
+        };
+        let deadline = Instant::now() + self.reopen_wait;
+        while running() {
             if Instant::now() >= deadline {
                 return skip(
                     SkipReason::TimedOut,
                     format!(
                         "pid {after_pid} did not exit within {}s; not reopened",
-                        REOPEN_WAIT.as_secs()
+                        self.reopen_wait.as_secs()
                     ),
                 );
             }
             std::thread::sleep(Duration::from_millis(250));
+        }
+        let _g = EXEC_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        self.check_reopen(bundle_id)?;
+        if running() {
+            return skip(
+                SkipReason::Busy,
+                format!("pid {after_pid} is running again; not reopened"),
+            );
         }
         let mut cmd = std::process::Command::new("/usr/bin/open");
         cmd.arg("-b").arg(bundle_id);

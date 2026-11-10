@@ -326,7 +326,7 @@ paths:
   /v1/process/execute:
     post:
       summary: Run approved process requests from a plan
-      description: "Send `{\"items\": [...]}`, the `request` objects (signal, renice or reopen_app) of approved items from `POST /v1/process/plan`. Each is re-checked; a pid with a different start time is skipped."
+      description: "Send `{\"items\": [...]}`, the `request` objects (signal, renice or reopen_app) of approved items from `POST /v1/process/plan`. Each is re-checked; a pid with a different start time is skipped. A reopen_app runs only when a signal earlier in the same request quit that pid and the process belonged to that bundle id; otherwise it is skipped with `reopen_not_quit`."
       requestBody:
         required: true
         content:

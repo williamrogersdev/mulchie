@@ -1548,3 +1548,89 @@ fn renice_requests_lower_only_and_protected_processes_are_refused() {
     );
     assert!(!done(&r));
 }
+
+/// R4: a reopen is carried out only after a quit of a process of that app in
+/// the same batch, and it waits for the app to exit without holding the
+/// execution lock.
+#[cfg(target_os = "macos")]
+#[test]
+fn reopen_needs_a_quit_in_the_same_batch_and_waits_without_the_lock() {
+    let mut env = Env::new();
+    let contents = env.root.join("Foo.app/Contents");
+    std::fs::create_dir_all(contents.join("MacOS")).unwrap();
+    std::fs::write(
+        contents.join("Info.plist"),
+        "<plist><dict><key>CFBundleIdentifier</key><string>com.example.foo</string></dict></plist>",
+    )
+    .unwrap();
+    let exe = contents.join("MacOS/foo");
+    let spawn = || {
+        std::process::Command::new("/bin/sleep")
+            .arg("30")
+            .spawn()
+            .unwrap()
+    };
+    let (mut a, mut b) = (spawn(), spawn());
+    env.procs = FakeProcesses::empty()
+        .with(a.id(), "foo", None, 55)
+        .with(b.id(), "foo", None, 56);
+    for p in &mut env.procs.procs {
+        p.exe = Some(exe.clone());
+    }
+    let reopen = |pid: u32, st: u64, id: &str| Request::ReopenApp {
+        bundle_id: id.into(),
+        after_pid: pid,
+        after_start_time: st,
+    };
+
+    // On its own, or with no quit before it: refused.
+    let r = env
+        .gate()
+        .execute_one(&reopen(a.id(), 55, "com.example.foo"), "t");
+    assert_eq!(reason(&r), Some(SkipReason::ReopenNotQuit), "{r:?}");
+    let rs = env
+        .gate()
+        .execute(&[reopen(a.id(), 55, "com.example.foo")], "t");
+    assert_eq!(reason(&rs[0]), Some(SkipReason::ReopenNotQuit));
+
+    // A quit of Foo followed by a reopen of another app: refused.
+    let rs = env.gate().execute(
+        &[sig(a.id(), 55), reopen(a.id(), 55, "com.example.other")],
+        "t",
+    );
+    assert!(done(&rs[0]), "{:?}", rs[0]);
+    assert_eq!(
+        reason(&rs[1]),
+        Some(SkipReason::ReopenNotQuit),
+        "{:?}",
+        rs[1]
+    );
+
+    // A quit of Foo, then its reopen: the fake still lists the process, so
+    // the reopen waits and times out, and the lock is free meanwhile.
+    // Other tests may hold the lock briefly; the old code held it for the
+    // whole 6 s wait.
+    std::thread::scope(|s| {
+        let start = Instant::now();
+        let h = s.spawn(|| {
+            let mut g = Gate::new(&env.cfg, &env.paths, &env.procs, env.now);
+            g.reopen_wait = Duration::from_secs(6);
+            g.execute(
+                &[sig(b.id(), 56), reopen(b.id(), 56, "com.example.foo")],
+                "t",
+            )
+        });
+        std::thread::sleep(Duration::from_millis(500));
+        drop(EXEC_LOCK.lock().unwrap_or_else(|e| e.into_inner()));
+        let got = start.elapsed();
+        assert!(
+            got < Duration::from_secs(4),
+            "the lock was held while waiting for the app to exit ({got:?})"
+        );
+        let rs = h.join().unwrap();
+        assert!(done(&rs[0]), "{:?}", rs[0]);
+        assert_eq!(reason(&rs[1]), Some(SkipReason::TimedOut), "{:?}", rs[1]);
+    });
+    let _ = a.wait();
+    let _ = b.wait();
+}
