@@ -3,6 +3,9 @@ mod commands;
 mod conn;
 mod diagnose;
 mod doctor;
+mod hook;
+mod hook_wire;
+mod hooks_install;
 mod mcp;
 mod mcp_install;
 mod mcp_tools;
@@ -13,7 +16,7 @@ mod run;
 mod service;
 
 use clap::{CommandFactory, Parser};
-use cli::{Cli, Command, ConfigCommand, McpCommand};
+use cli::{Cli, Command, ConfigCommand, HooksCommand, McpCommand};
 use mulchie_core::Paths;
 
 fn main() {
@@ -88,6 +91,18 @@ fn dispatch(paths: &Paths, cmd: Command) -> i32 {
             }
         },
         Command::Doctor(j) => doctor::command(paths, j.json),
+        Command::Hooks(h) => match h {
+            HooksCommand::Install {
+                client,
+                dry_run,
+                guard,
+            } => hooks_install::install(client, dry_run, guard),
+            HooksCommand::Uninstall { client, dry_run } => {
+                hooks_install::uninstall(client, dry_run)
+            }
+            HooksCommand::Status { out } => hooks_install::status(out.json),
+        },
+        Command::Hook(h) => hook::command(paths, h.client, &h.event, h.guard),
         Command::Service(s) => service::command(paths, &s),
         Command::Completions { shell } => {
             clap_complete::generate(

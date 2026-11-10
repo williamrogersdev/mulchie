@@ -139,6 +139,8 @@ fn every_subcommand_has_help() {
         "group",
         "findings",
         "inspect",
+        "hooks",
+        "hook",
         "advice",
         "run",
         "mcp",
@@ -676,4 +678,104 @@ fn top_findings_and_config() {
     assert!(o.status.success(), "{}", text(&o.stderr));
     assert!(engine.config().watch.dismissed.is_empty());
     server.stop();
+}
+
+/// `mulchie hook` with `input` on stdin; (status, stdout, stderr, time).
+fn hook(h: &Home, args: &[&str], input: Option<&str>) -> (Option<i32>, String, String, Duration) {
+    let mut c = h.cmd(args);
+    c.stdin(Stdio::piped());
+    let start = Instant::now();
+    let mut child = c.spawn().unwrap();
+    let stdin = child.stdin.take().unwrap();
+    // With no input the pipe stays open, as a stalled client would leave it.
+    let keep = match input {
+        Some(text) => {
+            let mut s = stdin;
+            s.write_all(text.as_bytes()).unwrap();
+            drop(s);
+            None
+        }
+        None => Some(stdin),
+    };
+    let o = wait_timeout(&mut child, Duration::from_secs(10));
+    drop(keep);
+    (
+        o.status.code(),
+        text(&o.stdout),
+        text(&o.stderr),
+        start.elapsed(),
+    )
+}
+
+#[test]
+fn hook_fails_open_and_quickly() {
+    let h = Home::new();
+    let ev = r#"{"session_id":"abc123","cwd":"/tmp","hook_event_name":"PreToolUse","tool_name":"Bash","tool_input":{"command":"ls"}}"#;
+    // No engine: allow, silently, and one line in the log.
+    let (code, out, err, _) = hook(&h, &["hook", "claude-code", "pre_tool"], Some(ev));
+    assert_eq!(code, Some(0));
+    assert_eq!((out.as_str(), err.as_str()), ("", ""));
+    let log = std::fs::read_to_string(h.paths().config_dir.join("hook.log")).unwrap();
+    assert!(
+        log.contains("claude-code pre_tool") && log.contains("no engine"),
+        "{log}"
+    );
+    // Cursor's permission hook needs JSON even when failing open.
+    let (code, out, _, _) = hook(
+        &h,
+        &["hook", "cursor", "beforeShellExecution"],
+        Some(r#"{"command":"ls"}"#),
+    );
+    assert_eq!(code, Some(0));
+    assert_eq!(out.trim(), r#"{"permission":"allow"}"#);
+    // Bad input: allow.
+    let (code, out, _, _) = hook(&h, &["hook", "copilot", "pre_tool"], Some("not json"));
+    assert_eq!((code, out.as_str()), (Some(0), ""));
+    // A client that never closes stdin does not hold the agent past the budget.
+    let (code, out, _, took) = hook(&h, &["hook", "claude-code", "pre_tool"], None);
+    assert_eq!((code, out.as_str()), (Some(0), ""));
+    assert!(took < Duration::from_secs(2), "{took:?}");
+    // An engine without an answer for this route (or any error): allow.
+    let (_engine, _lk, server) = h.engine();
+    let (code, out, _, took) = hook(
+        &h,
+        &["hook", "codex", "Stop"],
+        Some(r#"{"session_id":"s"}"#),
+    );
+    assert_eq!(code, Some(0));
+    assert_eq!(out.trim(), "{}", "Codex needs JSON from Stop");
+    assert!(took < Duration::from_secs(2), "{took:?}");
+    server.stop();
+}
+
+#[test]
+fn hooks_install_uses_only_the_temp_home() {
+    let h = Home::new();
+    let o = h.run(&["hooks", "install", "--client", "cursor", "--dry-run"]);
+    assert!(o.status.success(), "{}", text(&o.stderr));
+    assert!(
+        text(&o.stdout).contains("Would change"),
+        "{}",
+        text(&o.stdout)
+    );
+    let f = h.home.join(".cursor/hooks.json");
+    assert!(!f.exists());
+    let o = h.run(&["hooks", "install", "--client", "cursor"]);
+    assert!(o.status.success(), "{}", text(&o.stderr));
+    let v: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&f).unwrap()).unwrap();
+    let cmd = v["hooks"]["beforeShellExecution"][0]["command"]
+        .as_str()
+        .unwrap();
+    let exe = std::fs::canonicalize(env!("CARGO_BIN_EXE_mulchie")).unwrap();
+    assert!(
+        cmd.contains(&*exe.to_string_lossy()) && cmd.ends_with(" hook cursor pre_tool"),
+        "{cmd}"
+    );
+    let o = h.run(&["hooks", "status", "--json"]);
+    let s: serde_json::Value = serde_json::from_slice(&o.stdout).unwrap();
+    assert_eq!(s.as_array().unwrap().len(), 5);
+    let o = h.run(&["hooks", "uninstall", "--client", "cursor"]);
+    assert!(o.status.success(), "{}", text(&o.stderr));
+    let v: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&f).unwrap()).unwrap();
+    assert_eq!(v, serde_json::json!({ "version": 1, "hooks": {} }));
 }

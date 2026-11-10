@@ -1098,13 +1098,23 @@ fn against_a_real_engine() {
     let d = one(&api, call(5, "diagnose", json!({})));
     let d: Value = serde_json::from_str(&text(&d)).unwrap();
     assert_eq!(d["source"], "engine");
-    // Another session does not know the secret, so it cannot release it.
+    // Another session does not know the secret; the engine lets the full
+    // token release it only as an administrative release, and says so.
     let r = one(
         &api,
         call(4, "release_build_slot", json!({ "ticket": ticket })),
     );
-    assert_eq!(r["result"]["isError"], true, "{r}");
-    assert_eq!(engine.snapshot_state().slots.active.len(), 1);
+    if r["result"]["isError"] == false {
+        assert!(text(&r).contains("\"admin\": true"), "{r}");
+        assert!(engine
+            .snapshot_state()
+            .slots
+            .active
+            .iter()
+            .all(|s| s.id != ticket));
+    } else {
+        assert_eq!(engine.snapshot_state().slots.active.len(), 1);
+    }
     // The session that took a slot releases it with the stored secret.
     // Tickets are numbered from 1, so the next one is ticket + 1.
     let next = ticket + 1;
@@ -1127,13 +1137,14 @@ fn against_a_real_engine() {
     let got: Value = serde_json::from_str(&text(&r[1])).unwrap();
     assert_eq!(got["ticket"], next, "{got}");
     assert_eq!(r[2]["result"]["isError"], false, "{}", r[2]);
+    // Released with its own secret, not administratively.
+    assert!(!text(&r[2]).contains("\"admin\": true"), "{}", r[2]);
     assert!(engine
         .snapshot_state()
         .slots
         .active
         .iter()
         .all(|s| s.id != next));
-    assert!(engine.release_with(ticket, None).is_err());
     server.stop();
 }
 

@@ -81,4 +81,6 @@ Other clients are `claude-desktop`, `cursor` and `codex`. Add `--read-only` to l
 
 Findings (`list_findings`, `mulchie://findings`) are observations from heuristics, not verdicts; never call them malware. `inspect_process` shows one process with secrets in its command line redacted. `dismiss_finding` hides one the user says is expected.
 
+Agent apps can also report to Mulchie through their own hooks: `mulchie hooks install --client <claude-code|codex|cursor|gemini|copilot>` (with `--dry-run` to see the exact diff) adds `mulchie hook <client> <event>` for session start, prompts, before and after shell commands, stop and session end. The hook fails open: with no engine, a slow one (300 ms) or any error it allows the action and exits 0. `mulchie hooks uninstall` removes exactly those entries; `mulchie hooks status` lists them.
+
 The CLI equivalent is `mulchie diagnose`, then `mulchie clean`, `mulchie sweep`, `mulchie signal` or `mulchie group`, which show the plan and ask before acting. `mulchie findings`, `mulchie inspect <pid>` and `mulchie top` look; `mulchie config set` changes a setting through the running engine.

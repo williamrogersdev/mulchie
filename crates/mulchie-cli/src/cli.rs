@@ -212,6 +212,30 @@ how to add the MCP server. Nothing is changed. Exits 1 if any check fails.",
     )]
     Doctor(JsonArg),
 
+    /// Connect Mulchie to an agent's own hooks (session start, prompts, shell commands)
+    #[command(
+        subcommand,
+        long_about = "Add `mulchie hook` to an agent app's user-level hook configuration, so the \
+agent tells Mulchie when a session starts, before and after each shell command, and when it \
+stops. Mulchie answers with the machine's state, advice, limit breaches and guard rules \
+(risky commands: warn or block). Other hooks in the file are kept; the old file is backed \
+up; uninstall removes exactly the entries install added. Supported: claude-code, codex, \
+cursor, gemini, copilot."
+    )]
+    Hooks(HooksCommand),
+
+    /// Run by an agent's hook system: read its event on stdin and answer (fails open)
+    #[command(
+        long_about = "The command an agent's hook system runs; `mulchie hooks install` sets it \
+up. Reads the client's JSON event on stdin, tells the engine (with the read-only token), \
+and prints the client's own answer format. It fails open: with no engine, a slow engine \
+(300 ms budget), bad input or any error it allows the action, exits 0, and notes the \
+problem in <config dir>/hook.log at most once a minute. EVENT is session_start, prompt, \
+pre_tool, post_tool, stop or session_end (the client's own event names work too).",
+        after_help = "Examples:\n  echo '{\"session_id\":\"s\",\"cwd\":\"/tmp\"}' | mulchie hook claude-code session_start"
+    )]
+    Hook(HookArgs),
+
     /// Install, remove or inspect the background service (launchd on macOS, systemd on Linux)
     #[command(subcommand)]
     Service(ServiceCommand),
@@ -355,6 +379,100 @@ pub enum SortKey {
     Cpu,
     Mem,
     Io,
+}
+
+#[derive(ValueEnum, Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum HookClient {
+    /// Claude Code: ~/.claude/settings.json
+    ClaudeCode,
+    /// Codex: ~/.codex/hooks.json
+    Codex,
+    /// Cursor: ~/.cursor/hooks.json
+    Cursor,
+    /// Gemini CLI: ~/.gemini/settings.json
+    Gemini,
+    /// GitHub Copilot CLI: ~/.copilot/hooks/mulchie.json
+    Copilot,
+}
+
+impl HookClient {
+    pub fn name(self) -> &'static str {
+        match self {
+            HookClient::ClaudeCode => "claude-code",
+            HookClient::Codex => "codex",
+            HookClient::Cursor => "cursor",
+            HookClient::Gemini => "gemini",
+            HookClient::Copilot => "copilot",
+        }
+    }
+}
+
+/// How far guard rules may go in one client.
+#[derive(ValueEnum, Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GuardMode {
+    /// Never ask or block; guard warnings become advice
+    Off,
+    /// At most ask the user (blocks become asks where the client can ask)
+    Warn,
+    /// Follow the engine, including blocks
+    Block,
+}
+
+impl GuardMode {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            GuardMode::Off => "off",
+            GuardMode::Warn => "warn",
+            GuardMode::Block => "block",
+        }
+    }
+}
+
+#[derive(Subcommand, Debug, Clone)]
+pub enum HooksCommand {
+    /// Add Mulchie's hooks to an agent app
+    #[command(
+        after_help = "Examples:\n  mulchie hooks install --client claude-code --dry-run\n  mulchie hooks install --client codex\n  mulchie hooks install --client cursor --guard block"
+    )]
+    Install {
+        /// The agent app
+        #[arg(long, value_enum)]
+        client: HookClient,
+        /// Print the exact change, change nothing
+        #[arg(long, short = 'n')]
+        dry_run: bool,
+        /// How far guard rules may go in this app (default: as the engine's config says)
+        #[arg(long, value_enum)]
+        guard: Option<GuardMode>,
+    },
+    /// Remove exactly the hooks Mulchie added
+    #[command(after_help = "Examples:\n  mulchie hooks uninstall --client cursor --dry-run")]
+    Uninstall {
+        /// The agent app
+        #[arg(long, value_enum)]
+        client: HookClient,
+        /// Print the exact change, change nothing
+        #[arg(long, short = 'n')]
+        dry_run: bool,
+    },
+    /// Which apps have Mulchie's hooks, and for which events
+    #[command(after_help = "Examples:\n  mulchie hooks status\n  mulchie hooks status --json")]
+    Status {
+        #[command(flatten)]
+        out: JsonArg,
+    },
+}
+
+#[derive(Args, Debug)]
+pub struct HookArgs {
+    /// The agent app that runs this hook
+    #[arg(value_enum)]
+    pub client: HookClient,
+    /// The event
+    pub event: String,
+    /// How far guard rules may go in this app
+    #[arg(long, value_enum)]
+    pub guard: Option<GuardMode>,
 }
 
 #[derive(Args, Debug)]
@@ -713,6 +831,45 @@ mod tests {
         };
         assert!(s.tree && s.confirm.dry_run && s.out.json);
         assert!(parse(&["signal", "42", "term", "--yes", "--dry-run"]).is_err());
+    }
+
+    #[test]
+    fn hooks_args() {
+        let Some(Command::Hooks(HooksCommand::Install {
+            client,
+            dry_run,
+            guard,
+        })) = parse(&[
+            "hooks",
+            "install",
+            "--client",
+            "claude-code",
+            "-n",
+            "--guard",
+            "block",
+        ])
+        .unwrap()
+        .command
+        else {
+            panic!()
+        };
+        assert_eq!(
+            (client, dry_run, guard),
+            (HookClient::ClaudeCode, true, Some(GuardMode::Block))
+        );
+        assert!(parse(&["hooks", "install"]).is_err());
+        assert!(parse(&["hooks", "install", "--client", "aider"]).is_err());
+        assert!(parse(&["hooks", "status", "--json"]).is_ok());
+        let Some(Command::Hook(h)) = parse(&["hook", "copilot", "pre_tool", "--guard", "warn"])
+            .unwrap()
+            .command
+        else {
+            panic!()
+        };
+        assert_eq!(
+            (h.client, h.event.as_str(), h.guard),
+            (HookClient::Copilot, "pre_tool", Some(GuardMode::Warn))
+        );
     }
 
     #[test]

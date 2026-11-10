@@ -223,7 +223,7 @@ fn shell_line(program: &Path, args: &[String]) -> String {
         .join(" ")
 }
 
-fn now_unix() -> u64 {
+pub fn now_unix() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())
@@ -278,7 +278,7 @@ pub enum Edit {
     Write { text: String, what: String },
 }
 
-fn read_text(path: &Path) -> Result<Option<String>, String> {
+pub fn read_text(path: &Path) -> Result<Option<String>, String> {
     match std::fs::read_to_string(path) {
         Ok(s) => Ok(Some(s)),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
