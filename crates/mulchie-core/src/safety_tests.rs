@@ -1608,13 +1608,13 @@ fn reopen_needs_a_quit_in_the_same_batch_and_waits_without_the_lock() {
 
     // A quit of Foo, then its reopen: the fake still lists the process, so
     // the reopen waits and times out, and the lock is free meanwhile.
-    // Other tests may hold the lock briefly; the old code held it for the
-    // whole 6 s wait.
+    // Other tests may hold the lock for seconds; the old code held it for
+    // the whole 12 s wait.
     std::thread::scope(|s| {
         let start = Instant::now();
         let h = s.spawn(|| {
             let mut g = Gate::new(&env.cfg, &env.paths, &env.procs, env.now);
-            g.reopen_wait = Duration::from_secs(6);
+            g.reopen_wait = Duration::from_secs(12);
             g.execute(
                 &[sig(b.id(), 56), reopen(b.id(), 56, "com.example.foo")],
                 "t",
@@ -1624,7 +1624,7 @@ fn reopen_needs_a_quit_in_the_same_batch_and_waits_without_the_lock() {
         drop(EXEC_LOCK.lock().unwrap_or_else(|e| e.into_inner()));
         let got = start.elapsed();
         assert!(
-            got < Duration::from_secs(4),
+            got < Duration::from_secs(9),
             "the lock was held while waiting for the app to exit ({got:?})"
         );
         let rs = h.join().unwrap();
