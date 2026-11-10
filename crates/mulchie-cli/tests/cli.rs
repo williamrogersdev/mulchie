@@ -1091,3 +1091,216 @@ fn hooks_install_uses_only_the_temp_home() {
     let v: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&f).unwrap()).unwrap();
     assert_eq!(v, serde_json::json!({ "version": 1, "hooks": {} }));
 }
+
+/// A throwaway process tree for a session: a perl root (not a shell, not an
+/// agent) that double-forks away from this test so its parent is init, in
+/// its own session and process group, with two `sleep` children. Killed as
+/// a group on drop.
+struct Tree {
+    root: u32,
+    children: Vec<u32>,
+}
+
+impl Tree {
+    fn spawn(dir: &Path) -> Option<Self> {
+        let out = dir.join("tree.pids");
+        let script = r#"
+            use POSIX qw(setsid);
+            exit 0 if fork;
+            setsid();
+            my @k;
+            for (1..2) { my $p = fork; if ($p == 0) { exec "sleep", "300"; exit 1 } push @k, $p }
+            open my $f, ">", "$ARGV[0].tmp" or die; print $f join(" ", $$, @k); close $f;
+            rename "$ARGV[0].tmp", $ARGV[0];
+            1 while wait() != -1;
+            sleep 300;
+        "#;
+        let st = Command::new("perl")
+            .args(["-e", script])
+            .arg(&out)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .ok()?;
+        assert!(st.success());
+        let start = Instant::now();
+        while !out.exists() {
+            assert!(
+                start.elapsed() < Duration::from_secs(10),
+                "tree never started"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        let pids: Vec<u32> = std::fs::read_to_string(&out)
+            .unwrap()
+            .split_whitespace()
+            .map(|p| p.parse().unwrap())
+            .collect();
+        Some(Tree {
+            root: pids[0],
+            children: pids[1..].to_vec(),
+        })
+    }
+
+    fn alive(pid: u32) -> bool {
+        unsafe { libc::kill(pid as i32, 0) == 0 }
+    }
+}
+
+impl Drop for Tree {
+    fn drop(&mut self) {
+        // The root made its own process group: this reaches only the tree.
+        if unsafe { libc::getpgid(self.root as i32) } == self.root as i32 {
+            unsafe { libc::killpg(self.root as i32, libc::SIGKILL) };
+        }
+    }
+}
+
+/// Every pid named anywhere in a plan (items' requests and the affected list).
+fn plan_pids(v: &serde_json::Value, out: &mut Vec<u32>) {
+    match v {
+        serde_json::Value::Object(m) => {
+            for (k, x) in m {
+                if k == "pid" {
+                    out.push(x.as_u64().expect("a pid") as u32);
+                } else {
+                    plan_pids(x, out);
+                }
+            }
+        }
+        serde_json::Value::Array(a) => a.iter().for_each(|x| plan_pids(x, out)),
+        _ => {}
+    }
+}
+
+/// `mulchie sessions stop` against a real engine and a real process tree
+/// registered as a session. Safety: the session's root must be exactly the
+/// tree's root, and every pid in a plan must be the tree's own, before
+/// anything is executed; otherwise the test stops.
+#[test]
+fn sessions_stop_plans_and_stops_only_the_sessions_children() {
+    let h = Home::new();
+    let Some(tree) = Tree::spawn(&h.home) else {
+        eprintln!("no perl here; skipped");
+        return;
+    };
+    let ours: Vec<u32> = std::iter::once(tree.root)
+        .chain(tree.children.iter().copied())
+        .collect();
+    // The root hangs off init, so a hook naming it cannot reach this test's
+    // own ancestry (or a real agent session above it).
+    let ppid = Command::new("ps")
+        .args(["-o", "ppid=", "-p", &tree.root.to_string()])
+        .output()
+        .unwrap();
+    assert_eq!(
+        text(&ppid.stdout).trim(),
+        "1",
+        "the tree's root is not detached; stopping"
+    );
+    let (engine, _lk, server) = h.engine();
+    let paths = h.paths();
+    let c = api::Client::connect_in(&paths, server.port()).unwrap();
+    let reply = c
+        .call(
+            "POST",
+            "/v1/hook",
+            Some(&serde_json::json!({
+                "client": "test", "client_session_id": "t1",
+                "event": "session_start", "pid": tree.root, "cwd": h.home,
+            })),
+        )
+        .unwrap();
+    let sid = reply["session_id"]
+        .as_str()
+        .unwrap_or_else(|| panic!("no session: {reply}"))
+        .to_string();
+    let detail = c.call("GET", &format!("/v1/sessions/{sid}"), None).unwrap();
+    assert_eq!(
+        detail["session"]["root_pid"], tree.root,
+        "the session is not rooted at our tree; stopping: {detail}"
+    );
+    // One sample attributes the children to the session. Automation is off
+    // for it: this engine must not renice or act on anything it sees.
+    engine.set_automation_enabled(false);
+    engine.sample_tick(&mut mulchie_core::engine::SampleCtx::default());
+    engine.set_automation_enabled(true);
+
+    let only_ours = |v: &serde_json::Value, allowed: &[u32]| {
+        let mut pids = Vec::new();
+        plan_pids(&v["plan"]["items"], &mut pids);
+        plan_pids(&v["plan"]["affected"], &mut pids);
+        assert!(!pids.is_empty(), "the plan names no process: {v}");
+        for p in &pids {
+            assert!(
+                allowed.contains(p),
+                "the plan names pid {p}, not one of ours {allowed:?}; stopping: {v}"
+            );
+        }
+        pids
+    };
+
+    // With the agent: the root is in the plan (not executed).
+    let o = h.run(&[
+        "sessions",
+        "stop",
+        &sid,
+        "--include-agent",
+        "--dry-run",
+        "--json",
+    ]);
+    assert!(
+        o.status.success(),
+        "{} {}",
+        text(&o.stdout),
+        text(&o.stderr)
+    );
+    let v: serde_json::Value = serde_json::from_slice(&o.stdout).unwrap();
+    assert!(only_ours(&v, &ours).contains(&tree.root), "{v}");
+
+    // Without it: only the children.
+    let o = h.run(&["sessions", "stop", &sid, "--dry-run", "--json"]);
+    assert!(
+        o.status.success(),
+        "{} {}",
+        text(&o.stdout),
+        text(&o.stderr)
+    );
+    let v: serde_json::Value = serde_json::from_slice(&o.stdout).unwrap();
+    let pids = only_ours(&v, &tree.children);
+    assert!(!pids.contains(&tree.root), "the agent is spared: {v}");
+    // Shown as a plan; with no terminal and no --yes, nothing is changed.
+    let o = h.run(&["sessions", "stop", &sid]);
+    assert!(text(&o.stdout).contains("Plan:"), "{}", text(&o.stdout));
+    assert_eq!(
+        o.status.code(),
+        Some(2),
+        "no terminal, no --yes: {}",
+        text(&o.stderr)
+    );
+    assert!(ours.iter().all(|p| Tree::alive(*p)));
+
+    // Executed. No sample runs between the dry run and this, so the engine
+    // plans from the same snapshot; the results are checked as well.
+    let o = h.run(&["sessions", "stop", &sid, "--yes", "--json"]);
+    let v: serde_json::Value = serde_json::from_slice(&o.stdout)
+        .unwrap_or_else(|_| panic!("{} {}", text(&o.stdout), text(&o.stderr)));
+    let acted = only_ours(&v, &tree.children);
+    eprintln!(
+        "sessions stop: root {} children {:?}; the plan named {acted:?}; results {}",
+        tree.root, tree.children, v["results"]
+    );
+    assert_eq!(o.status.code(), Some(0), "{v} {}", text(&o.stderr));
+    assert_eq!(v["executed"], true);
+    let start = Instant::now();
+    while tree.children.iter().any(|p| Tree::alive(*p)) {
+        assert!(
+            start.elapsed() < Duration::from_secs(10),
+            "the children did not stop"
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    assert!(Tree::alive(tree.root), "the agent's own process was spared");
+    server.stop();
+}
