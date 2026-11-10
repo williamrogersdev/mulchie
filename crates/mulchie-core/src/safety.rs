@@ -16,7 +16,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use crate::config::{create_private_dir, Config};
-use crate::diskmap::{self, last_activity};
+use crate::diskmap::{self, last_activity_checked};
 use crate::git::{self, Git, WorktreeEntry};
 use crate::journal::{Action, Journal};
 use crate::paths::{random_hex, Paths};
@@ -1123,7 +1123,16 @@ impl<'a> Gate<'a> {
                     .trim()
                     .parse()
                     .unwrap_or(0);
-            let last = last_activity(&canon).max(last_commit);
+            let Some(walked) = last_activity_checked(&canon) else {
+                return skip(
+                    SkipReason::NotIdle,
+                    format!(
+                        "more than {} files; cannot tell when it was last used",
+                        diskmap::ACTIVITY_BUDGET
+                    ),
+                );
+            };
+            let last = walked.max(last_commit);
             let days = self.now.saturating_sub(last) / 86_400;
             if days < self.config.worktree_idle_days {
                 return skip(
