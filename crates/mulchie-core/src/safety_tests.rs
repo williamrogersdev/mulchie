@@ -1453,3 +1453,59 @@ fn ignored_names_starting_with_a_dash_are_archived() {
         "more"
     );
 }
+
+/// Renice through the gate: our own child only, lowering only, start time
+/// checked; protected names are refused even with the right start time.
+#[test]
+fn renice_requests_lower_only_and_protected_processes_are_refused() {
+    let mut child = std::process::Command::new("/bin/sleep")
+        .arg("30")
+        .spawn()
+        .unwrap();
+    let pid = child.id();
+    let before = crate::engine::nice_of(pid).unwrap();
+    let mut env = Env::new();
+    env.procs = FakeProcesses::empty().with(pid, "sleep", None, 55);
+    let req = |nice, st| Request::Renice {
+        pid,
+        nice,
+        expected_start_time: st,
+    };
+    if before < 18 {
+        let r = env.gate().execute_one(&req(before + 2, 54), "t");
+        assert_eq!(reason(&r), Some(SkipReason::StartTimeMismatch));
+        let r = env.gate().execute_one(&req(before + 2, 55), "t");
+        assert!(done(&r), "{r:?}");
+        assert_eq!(crate::engine::nice_of(pid), Some(before + 2));
+        let r = env.gate().execute_one(&req(before, 55), "t");
+        assert_eq!(
+            reason(&r),
+            Some(SkipReason::CommandFailed),
+            "never raises priority"
+        );
+    }
+    let r = env.gate().execute_one(&req(25, 55), "t");
+    assert!(!done(&r));
+
+    // The same pid presented as Finder: refused for signals and renice.
+    env.procs.procs[0].name = "Finder".into();
+    env.procs.procs[0].exe =
+        Some("/System/Library/CoreServices/Finder.app/Contents/MacOS/Finder".into());
+    let r = env.gate().execute_one(&sig(pid, 55), "t");
+    assert_eq!(reason(&r), Some(SkipReason::ProtectedProcess), "{r:?}");
+    let r = env.gate().execute_one(&req(19, 55), "t");
+    assert_eq!(reason(&r), Some(SkipReason::ProtectedProcess));
+    let _ = child.kill();
+    let _ = child.wait();
+
+    // Reopen: a bad bundle id never reaches `open`.
+    let r = env.gate().execute_one(
+        &Request::ReopenApp {
+            bundle_id: "-a Calculator".into(),
+            after_pid: pid,
+            after_start_time: 55,
+        },
+        "t",
+    );
+    assert!(!done(&r));
+}

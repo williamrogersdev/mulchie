@@ -9,6 +9,7 @@
 //! canonicalized), the answer is "skipped", never "proceed".
 
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::io::Write;
 use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -184,6 +185,8 @@ pub enum ActionKind {
     RemoveWorktree,
     PruneWorktree,
     Signal,
+    Renice,
+    ReopenApp,
 }
 
 /// The outcome of one request.
@@ -235,6 +238,8 @@ impl ActionResult {
                     ActionKind::RemoveWorktree => "Removed worktree",
                     ActionKind::PruneWorktree => "Pruned stale worktree entry",
                     ActionKind::Signal => "Signalled",
+                    ActionKind::Renice => "Lowered the priority of",
+                    ActionKind::ReopenApp => "Reopened",
                 };
                 let mut s = format!("{verb} {}", self.target);
                 for b in backups {
@@ -259,6 +264,8 @@ impl ActionResult {
             (ActionKind::Signal, Some(Signal::Stop)) => "pause",
             (ActionKind::Signal, Some(Signal::Cont)) => "resume",
             (ActionKind::Signal, _) => "stop",
+            (ActionKind::Renice, _) => "throttle",
+            (ActionKind::ReopenApp, _) => "restart",
         };
         let (status, reason) = match &self.outcome {
             Outcome::Done { .. } => ("done", None),
@@ -338,7 +345,27 @@ pub enum Request {
         signal: Signal,
         expected_start_time: u64,
     },
+    /// Lower the priority of a process (raise its nice value to `nice`,
+    /// 0–20; never lowers a nice value) that still has the start time the
+    /// caller saw.
+    Renice {
+        pid: u32,
+        nice: i32,
+        expected_start_time: u64,
+    },
+    /// Reopen an app (`open -b <bundle_id>`, macOS) once the process
+    /// `after_pid` (its main process, started at `after_start_time`) has
+    /// exited; waits up to [`REOPEN_WAIT`] for that. The second half of a
+    /// group restart.
+    ReopenApp {
+        bundle_id: String,
+        after_pid: u32,
+        after_start_time: u64,
+    },
 }
+
+/// How long [`Request::ReopenApp`] waits for the app's main process to exit.
+pub const REOPEN_WAIT: Duration = Duration::from_secs(20);
 
 impl Request {
     pub fn action(&self) -> ActionKind {
@@ -347,6 +374,8 @@ impl Request {
             Request::RemoveWorktree { .. } => ActionKind::RemoveWorktree,
             Request::PruneWorktree { .. } => ActionKind::PruneWorktree,
             Request::Signal { .. } => ActionKind::Signal,
+            Request::Renice { .. } => ActionKind::Renice,
+            Request::ReopenApp { .. } => ActionKind::ReopenApp,
         }
     }
 
@@ -355,7 +384,8 @@ impl Request {
             Request::DeleteCache { path, .. }
             | Request::RemoveWorktree { path, .. }
             | Request::PruneWorktree { path, .. } => path.display().to_string(),
-            Request::Signal { pid, .. } => format!("pid {pid}"),
+            Request::Signal { pid, .. } | Request::Renice { pid, .. } => format!("pid {pid}"),
+            Request::ReopenApp { bundle_id, .. } => format!("app {bundle_id}"),
         }
     }
 }
@@ -719,6 +749,24 @@ impl<'a> Gate<'a> {
                 item.name = p.name;
                 "can be signalled".into()
             }),
+            Request::Renice {
+                pid,
+                nice,
+                expected_start_time,
+            } => self
+                .check_renice(*pid, *nice, *expected_start_time)
+                .map(|(p, cur)| {
+                    item.name = p.name;
+                    format!("priority can be lowered (nice {cur} → {nice})")
+                }),
+            Request::ReopenApp {
+                bundle_id,
+                after_pid,
+                ..
+            } => self.check_reopen(bundle_id).map(|_| {
+                item.name = bundle_id.clone();
+                format!("{bundle_id} reopens once pid {after_pid} has exited")
+            }),
         };
         match res {
             Ok(v) => {
@@ -791,6 +839,16 @@ impl<'a> Gate<'a> {
                     signal,
                     expected_start_time,
                 } => self.send_signal(*pid, *signal, *expected_start_time),
+                Request::Renice {
+                    pid,
+                    nice,
+                    expected_start_time,
+                } => self.renice(*pid, *nice, *expected_start_time),
+                Request::ReopenApp {
+                    bundle_id,
+                    after_pid,
+                    after_start_time,
+                } => self.reopen_app(bundle_id, *after_pid, *after_start_time),
             };
             match res {
                 Ok(o) => o,
@@ -1716,6 +1774,23 @@ impl<'a> Gate<'a> {
                 format!("{} is a Mulchie process", p.name),
             );
         }
+        if let Some(r) = crate::consumers::protected_reason(
+            p.pid,
+            &p.name,
+            p.exe.as_deref(),
+            self.procs.self_pid(),
+        ) {
+            return skip(SkipReason::ProtectedProcess, r);
+        }
+        if self.engine_ancestors().contains(&pid) {
+            return skip(
+                SkipReason::ProtectedProcess,
+                format!(
+                    "{} started Mulchie; signalling it would stop Mulchie too",
+                    p.name
+                ),
+            );
+        }
         if p.start_time != expected_start_time {
             return skip(
                 SkipReason::StartTimeMismatch,
@@ -1723,6 +1798,115 @@ impl<'a> Gate<'a> {
             );
         }
         Ok(p)
+    }
+
+    /// The engine's parent, grandparent, … (not pid 1).
+    fn engine_ancestors(&self) -> Vec<u32> {
+        let view = self.procs_view(false);
+        let ppid: HashMap<u32, u32> = view.iter().map(|(p, _)| (p.pid, p.ppid)).collect();
+        let me = self.procs.self_pid();
+        // The view leaves out the engine itself: ask for it directly.
+        let mut cur = self.procs.get(me).map(|p| p.ppid).unwrap_or(0);
+        let mut out = Vec::new();
+        while cur > 1 && out.len() < 32 {
+            out.push(cur);
+            cur = ppid.get(&cur).copied().unwrap_or(0);
+        }
+        out
+    }
+
+    /// The process may be signalled, and `nice` is a lowering. Returns the
+    /// facts and the current nice value.
+    fn check_renice(
+        &self,
+        pid: u32,
+        nice: i32,
+        expected_start_time: u64,
+    ) -> Result<(ProcFacts, i32), Skip> {
+        if !(0..=20).contains(&nice) {
+            return skip(SkipReason::CommandFailed, "nice must be between 0 and 20");
+        }
+        let p = self.check_signal(pid, expected_start_time)?;
+        let cur = crate::engine::nice_of(pid).ok_or(Skip {
+            reason: SkipReason::ProcessGone,
+            detail: "could not read the priority".into(),
+        })?;
+        if cur >= nice {
+            return skip(
+                SkipReason::CommandFailed,
+                format!("already at nice {cur}; Mulchie only lowers priority"),
+            );
+        }
+        Ok((p, cur))
+    }
+
+    fn renice(&self, pid: u32, nice: i32, expected_start_time: u64) -> Result<Outcome, Skip> {
+        self.check_renice(pid, nice, expected_start_time)?;
+        crate::engine::set_nice(pid, nice).map_err(|e| Skip {
+            reason: SkipReason::SignalFailed,
+            detail: e.to_string(),
+        })?;
+        Ok(Outcome::Done {
+            freed_bytes: 0,
+            backups: Vec::new(),
+        })
+    }
+
+    fn check_reopen(&self, bundle_id: &str) -> Result<(), Skip> {
+        if !cfg!(target_os = "macos") {
+            return skip(
+                SkipReason::CommandFailed,
+                "reopening an app needs macOS (open -b)",
+            );
+        }
+        if !crate::consumers::valid_bundle_id(bundle_id) {
+            return skip(SkipReason::CommandFailed, "not a valid bundle id");
+        }
+        Ok(())
+    }
+
+    /// Wait for the app's main process to exit (it was asked to quit by the
+    /// item before), then `open -b`.
+    fn reopen_app(
+        &self,
+        bundle_id: &str,
+        after_pid: u32,
+        after_start_time: u64,
+    ) -> Result<Outcome, Skip> {
+        self.check_reopen(bundle_id)?;
+        let deadline = Instant::now() + REOPEN_WAIT;
+        loop {
+            let running = self
+                .procs
+                .get(after_pid)
+                .is_some_and(|p| p.start_time == after_start_time);
+            if !running {
+                break;
+            }
+            if Instant::now() >= deadline {
+                return skip(
+                    SkipReason::TimedOut,
+                    format!(
+                        "pid {after_pid} did not exit within {}s; not reopened",
+                        REOPEN_WAIT.as_secs()
+                    ),
+                );
+            }
+            std::thread::sleep(Duration::from_millis(250));
+        }
+        let mut cmd = std::process::Command::new("/usr/bin/open");
+        cmd.arg("-b").arg(bundle_id);
+        match git::run_with_timeout(cmd, Duration::from_secs(15)) {
+            Ok(o) if o.success => Ok(Outcome::Done {
+                freed_bytes: 0,
+                backups: Vec::new(),
+            }),
+            Ok(o) => skip(
+                SkipReason::CommandFailed,
+                format!("open -b failed: {}", o.stderr.trim()),
+            ),
+            Err(e) => skip(SkipReason::CommandFailed, format!("open -b: {e}")),
+        }
     }
 
     fn send_signal(

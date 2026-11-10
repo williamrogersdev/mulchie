@@ -78,6 +78,8 @@ pub const ROUTES: &[(&str, &str)] = &[
     ("POST", "/v1/prune"),
     ("POST", "/v1/workspace"),
     ("POST", "/v1/process"),
+    ("POST", "/v1/process/plan"),
+    ("POST", "/v1/process/execute"),
     ("POST", "/v1/lease"),
     ("POST", "/v1/release"),
 ];
@@ -95,7 +97,7 @@ pub fn read_only_token_path_in(paths: &Paths) -> PathBuf {
 
 /// Routes the read-only token may call: every `GET`, and the `POST`s that
 /// only plan.
-pub const READ_ONLY_POSTS: &[&str] = &["/v1/clean/plan", "/v1/worktree/plan"];
+pub const READ_ONLY_POSTS: &[&str] = &["/v1/clean/plan", "/v1/worktree/plan", "/v1/process/plan"];
 
 /// Whether the read-only token may call `method path`.
 pub fn read_only_allowed(method: &str, path: &str) -> bool {
@@ -865,6 +867,13 @@ fn is_cache(r: &Request) -> bool {
     matches!(r, Request::DeleteCache { .. })
 }
 
+fn is_process(r: &Request) -> bool {
+    matches!(
+        r,
+        Request::Signal { .. } | Request::Renice { .. } | Request::ReopenApp { .. }
+    )
+}
+
 fn is_worktree(r: &Request) -> bool {
     matches!(
         r,
@@ -985,6 +994,21 @@ fn route(req: &Req, engine: &Engine) -> Resp {
                 match engine.process_action(b.pid, b.action, "api") {
                     Ok(()) => ok(&serde_json::json!({ "ok": true })),
                     Err(e) => fail(400, "action_refused", e),
+                }
+            }
+            ("POST", "/v1/process/plan") => {
+                let b: crate::procplan::ProcessPlanRequest = body(req)?;
+                ok(&engine.process_plan(&b))
+            }
+            ("POST", "/v1/process/execute") => {
+                let b: ItemsBody = body(req)?;
+                match &b.items {
+                    Some(items) => run_items(engine, items, is_process, "signal, renice or reopen_app"),
+                    None => fail(
+                        400,
+                        "items_required",
+                        "expected {\"items\": [...]} with the requests of a plan from POST /v1/process/plan",
+                    ),
                 }
             }
             ("POST", "/v1/lease") => {

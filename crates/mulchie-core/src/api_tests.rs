@@ -671,7 +671,9 @@ fn read_only_route_list() {
     assert!(read_only_allowed("GET", "/v1/sweep"));
     assert!(read_only_allowed("POST", "/v1/clean/plan"));
     assert!(read_only_allowed("POST", "/v1/worktree/plan"));
+    assert!(read_only_allowed("POST", "/v1/process/plan"));
     for p in [
+        "/v1/process/execute",
         "/v1/clean",
         "/v1/sweep",
         "/v1/worktree/remove",
@@ -737,4 +739,51 @@ fn turning_away_a_trickling_client_is_bounded() {
     stop.store(true, std::sync::atomic::Ordering::SeqCst);
     client.join().unwrap();
     assert!(took < Duration::from_millis(400), "took {took:?}");
+}
+
+/// Process plans with the read token; executing needs the full token and only
+/// takes process requests.
+#[test]
+fn process_plans_and_execution_over_http() {
+    let r = running(Limits::default());
+    let ro = format!("Bearer {}", read_read_only_token(r.engine.paths()).unwrap());
+    let full = format!("Bearer {}", r.token);
+    let (code, v) = send(
+        r.port,
+        "POST",
+        "/v1/process/plan",
+        Some(&ro),
+        r#"{"pid": 4000123, "signal": "kill"}"#,
+    );
+    assert_eq!(code, 200, "{v}");
+    assert_eq!(v["refused"], "unknown_pid");
+    assert_eq!(v["ready"], false);
+    let (code, v) = send(
+        r.port,
+        "POST",
+        "/v1/process/plan",
+        Some(&ro),
+        r#"{"group": "system", "action": "quit"}"#,
+    );
+    assert_eq!(code, 200);
+    assert_eq!(v["refused"], "unknown_group", "{v}");
+    let (code, v) = send(
+        r.port,
+        "POST",
+        "/v1/process/plan",
+        Some(&ro),
+        r#"{"group": "x", "action": "explode"}"#,
+    );
+    assert_eq!((code, v["code"].as_str()), (400, Some("invalid_body")));
+
+    let items = json!({ "items": [{"action": "signal", "pid": 4000123, "signal": "term", "expected_start_time": 1}] }).to_string();
+    let (code, v) = send(r.port, "POST", "/v1/process/execute", Some(&ro), &items);
+    assert_eq!((code, v["code"].as_str()), (403, Some("read_only_token")));
+    let (code, v) = send(r.port, "POST", "/v1/process/execute", Some(&full), &items);
+    assert_eq!(code, 200, "{v}");
+    assert_eq!(v[0]["status"], "skipped");
+    assert_eq!(v[0]["reason"], "process_gone");
+    let bad = json!({ "items": [{"action": "delete_cache", "path": "/tmp/x"}] }).to_string();
+    let (code, v) = send(r.port, "POST", "/v1/process/execute", Some(&full), &bad);
+    assert_eq!((code, v["code"].as_str()), (400, Some("invalid_item")));
 }

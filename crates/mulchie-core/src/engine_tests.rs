@@ -769,3 +769,83 @@ fn an_old_scan_is_flagged_stale() {
     assert!(e.snapshot_state().scan_stale);
     assert!(e.health_summary().scan_stale);
 }
+
+fn member(f: &crate::process::ProcFacts, kind: ProcKind) -> crate::consumers::ProcSample {
+    crate::consumers::ProcSample {
+        pid: f.pid,
+        ppid: f.ppid,
+        own: true,
+        name: f.name.clone(),
+        exe: f.exe.clone(),
+        workspace: None,
+        kind,
+        cpu_pct: 50.0,
+        mem_bytes: 1,
+        start_time: f.start_time,
+    }
+}
+
+/// Group plans come from the latest sample, carry start times, refuse the
+/// caller's ancestors, and execute through the gate.
+#[test]
+fn group_plans_refuse_ancestors_and_execute_through_the_gate() {
+    let mut child = std::process::Command::new("/bin/sleep")
+        .arg("30")
+        .spawn()
+        .unwrap();
+    let pid = child.id();
+    let mut procs = FakeProcesses::empty().with(pid, "sleep", None, 777);
+    procs.procs[0].exe = Some(PathBuf::from("/bin/sleep"));
+    procs.procs[0].ppid = 1;
+    // A caller whose parent is the child (so the child is its ancestor).
+    let mut caller = procs.procs[0].clone();
+    caller.pid = 4_000_001;
+    caller.ppid = pid;
+    caller.name = "agent".into();
+    procs.procs.push(caller);
+    let (_t, e) = engine_with_procs(Config::default(), procs.clone());
+    let key = "process:sleep".to_string();
+    let snap = Snapshot {
+        members: Arc::new([(key.clone(), vec![member(&procs.procs[0], ProcKind::Other)])].into()),
+        ..Default::default()
+    };
+    e.state_mut().snapshot = Arc::new(snap);
+
+    let req = |caller: Option<u32>, action| crate::procplan::ProcessPlanRequest {
+        group: Some(key.clone()),
+        action: Some(action),
+        caller_pid: caller,
+        ..Default::default()
+    };
+    let p = e.process_plan(&req(Some(4_000_001), crate::consumers::GroupAction::Quit));
+    assert_eq!(p.refused.as_deref(), Some("protected"), "{p:?}");
+    assert!(!p.ready && p.items.is_empty());
+
+    let p = e.process_plan(&req(None, crate::consumers::GroupAction::Restart));
+    assert_eq!(p.refused.as_deref(), Some("restart_unavailable"));
+
+    let p = e.process_plan(&req(None, crate::consumers::GroupAction::Quit));
+    assert!(p.ready, "{p:?}");
+    assert_eq!(
+        p.approved(),
+        vec![Request::Signal {
+            pid,
+            signal: Signal::Term,
+            expected_start_time: 777
+        }]
+    );
+    let v = serde_json::to_value(&p).unwrap();
+    assert_eq!(v["items"][0]["request"]["expected_start_time"], 777);
+    assert_eq!(v["affected"][0]["how"], "signalled");
+    let r = e.execute(&p.approved(), "t");
+    assert!(r[0].is_done(), "{r:?}");
+    let status = child.wait().unwrap();
+    assert!(!status.success(), "terminated by the signal");
+
+    let p = e.process_plan(&crate::procplan::ProcessPlanRequest {
+        group: Some("app:/Applications/Nothing.app".into()),
+        action: Some(crate::consumers::GroupAction::Quit),
+        ..Default::default()
+    });
+    assert_eq!(p.refused.as_deref(), Some("unknown_group"));
+}

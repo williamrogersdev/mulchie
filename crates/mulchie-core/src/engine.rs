@@ -16,6 +16,7 @@ use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 use crate::config::{Config, ConfigError, LoadedConfig};
+use crate::consumers::{GroupKind, ProcSample};
 use crate::diskmap::{self, DiskMap, PruneResult};
 pub use crate::journal::Action;
 use crate::journal::Journal;
@@ -23,6 +24,7 @@ use crate::lock;
 use crate::monitor::{now_unix, KindInfo, Monitor, ProcKind, Snapshot};
 use crate::paths::Paths;
 use crate::process::{own_cwds, ProcessSource, SystemProcesses};
+use crate::procplan::{draft_group, draft_pid, ProcessPlan, ProcessPlanRequest};
 use crate::reclaim::{self, ScanReport};
 use crate::safety::{pid_alive, ActionResult, Gate, Outcome, Plan, Request, Signal};
 
@@ -1311,6 +1313,141 @@ impl Engine {
         Ok(done)
     }
 
+    /// Plan an action on one pid (optionally with its descendants) or on a
+    /// consumer group, from facts read now. Every item carries the start time
+    /// seen; send the approved requests to [`Engine::execute`].
+    pub fn process_plan(&self, req: &ProcessPlanRequest) -> ProcessPlan {
+        let now = now_unix();
+        let procs = self.procs.list();
+        let me = std::process::id();
+        let mut ancestors = ancestors_of(&procs, me);
+        if let Some(c) = req.caller_pid {
+            ancestors.push(c);
+            ancestors.extend(ancestors_of(&procs, c));
+        }
+        let (drafted, target, name, action) = match (&req.group, req.pid) {
+            (Some(key), _) => {
+                let Some(action) = req.action else {
+                    return ProcessPlan::refused(
+                        now,
+                        key,
+                        "",
+                        "invalid_request",
+                        "a group plan needs an action".into(),
+                    );
+                };
+                let act = serde_json::to_value(action)
+                    .ok()
+                    .and_then(|v| v.as_str().map(String::from))
+                    .unwrap_or_default();
+                let (members, group, nice) = {
+                    let st = lock(&self.state);
+                    (
+                        st.snapshot.members.get(key).cloned().unwrap_or_default(),
+                        st.snapshot.consumer(key).cloned(),
+                        st.config.build_nice.max(10),
+                    )
+                };
+                // Only processes still alive with the same start time.
+                let alive: HashMap<u32, u64> =
+                    procs.iter().map(|p| (p.pid, p.start_time)).collect();
+                let members: Vec<ProcSample> = members
+                    .into_iter()
+                    .filter(|m| alive.get(&m.pid) == Some(&m.start_time) && m.pid != me)
+                    .collect();
+                let kind = group_kind(key);
+                let bundle = key.strip_prefix("app:").map(PathBuf::from);
+                let name = group
+                    .as_ref()
+                    .map(|g| g.name.clone())
+                    .unwrap_or_else(|| default_group_name(key, &members));
+                if members.is_empty() {
+                    return ProcessPlan::refused(
+                        now,
+                        key,
+                        &act,
+                        "unknown_group",
+                        format!("no running processes in {key} in the latest sample"),
+                    );
+                }
+                let ctx_ids = HashMap::new();
+                let ctx = crate::consumers::GroupCtx {
+                    cores: 1,
+                    mem_total: 0,
+                    self_pid: me,
+                    ancestors: &ancestors,
+                    macos: cfg!(target_os = "macos"),
+                    bundle_ids: &ctx_ids,
+                };
+                if let Some(r) = crate::consumers::group_protection(kind, &members, &ctx) {
+                    return ProcessPlan::refused(now, key, &act, "protected", r);
+                }
+                let bundle_id = group
+                    .as_ref()
+                    .and_then(|g| g.bundle_id.clone())
+                    .or_else(|| bundle.as_deref().and_then(crate::consumers::bundle_id));
+                let d = draft_group(
+                    kind,
+                    &name,
+                    bundle.as_deref(),
+                    bundle_id.as_deref(),
+                    &members,
+                    action,
+                    nice,
+                    cfg!(target_os = "macos"),
+                );
+                (d, key.clone(), name, act)
+            }
+            (None, Some(pid)) => {
+                let signal = req.signal.unwrap_or(Signal::Term);
+                let act = serde_json::to_value(signal)
+                    .ok()
+                    .and_then(|v| v.as_str().map(String::from))
+                    .unwrap_or_default();
+                let name = procs
+                    .iter()
+                    .find(|p| p.pid == pid)
+                    .map(|p| p.name.clone())
+                    .unwrap_or_else(|| format!("pid {pid}"));
+                (
+                    draft_pid(&procs, pid, signal, req.tree),
+                    format!("pid {pid}"),
+                    name,
+                    act,
+                )
+            }
+            (None, None) => {
+                return ProcessPlan::refused(
+                    now,
+                    "",
+                    "",
+                    "invalid_request",
+                    "expected {\"pid\": N} or {\"group\": \"<key>\", \"action\": \"quit\"}".into(),
+                )
+            }
+        };
+        let d = match drafted {
+            Ok(d) => d,
+            Err((code, detail)) => {
+                return ProcessPlan::refused(now, &target, &action, code, detail)
+            }
+        };
+        let items = self.plan(&d.requests).items;
+        let ready = items.iter().any(|i| i.ready);
+        ProcessPlan {
+            created_unix: now,
+            target,
+            name,
+            action,
+            ready,
+            refused: None,
+            detail: d.detail,
+            items,
+            affected: d.affected,
+            restart: d.restart,
+        }
+    }
+
     pub fn process_action(&self, pid: u32, action: ProcAction, source: &str) -> Result<(), String> {
         if pid <= 1 || pid == std::process::id() {
             return Err("refusing to signal this process".into());
@@ -1592,6 +1729,43 @@ fn expire_leases(slots: &mut Slots, now: u64, alive: &dyn Fn(u32, Option<u64>) -
         w.pid.is_none_or(|p| alive(p, w.pid_start_time))
             && now.saturating_sub(w.last_poll) < WAITER_POLL_SECS
     });
+}
+
+/// The parent, grandparent, … of `pid` (not pid 1).
+fn ancestors_of(procs: &[crate::process::ProcFacts], pid: u32) -> Vec<u32> {
+    let ppid: HashMap<u32, u32> = procs.iter().map(|p| (p.pid, p.ppid)).collect();
+    let mut out = Vec::new();
+    let mut cur = ppid.get(&pid).copied().unwrap_or(0);
+    while cur > 1 && out.len() < 32 && !out.contains(&cur) {
+        out.push(cur);
+        cur = ppid.get(&cur).copied().unwrap_or(0);
+    }
+    out
+}
+
+fn group_kind(key: &str) -> GroupKind {
+    if key.starts_with("workspace:") {
+        GroupKind::Workspace
+    } else if key.starts_with("app:") {
+        GroupKind::App
+    } else if key == "system" {
+        GroupKind::System
+    } else {
+        GroupKind::Process
+    }
+}
+
+fn default_group_name(key: &str, members: &[ProcSample]) -> String {
+    if let Some(b) = key.strip_prefix("app:") {
+        return Path::new(b)
+            .file_stem()
+            .map(|s| s.to_string_lossy().to_string())
+            .unwrap_or_else(|| b.to_string());
+    }
+    if let Some(ws) = members.first().and_then(|m| m.workspace.as_ref()) {
+        return ws.1.clone();
+    }
+    key.strip_prefix("process:").unwrap_or(key).to_string()
 }
 
 /// `kill(pid, 0)` succeeds: the process exists and this user may signal it.

@@ -10,6 +10,7 @@ pub mod monitor;
 pub mod notify;
 pub mod paths;
 pub mod process;
+pub mod procplan;
 pub mod reclaim;
 pub mod safety;
 pub mod shutdown;
