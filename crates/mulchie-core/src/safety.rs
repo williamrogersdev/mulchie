@@ -2245,6 +2245,9 @@ fn write_ignored_archive(f: &WorktreeFacts, dir: &Path) -> Result<PathBuf, Strin
     let list = dir.join("ignored.list");
     let mut data = Vec::new();
     for e in &f.ignored {
+        // `./` first: GNU tar reads a `-T` entry beginning with `-` as an
+        // option (bsdtar does not); `./-x` is always a name.
+        data.extend_from_slice(b"./");
         data.extend_from_slice(e.as_bytes());
         data.push(0);
     }

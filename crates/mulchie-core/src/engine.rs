@@ -249,6 +249,11 @@ pub struct HealthSummary {
     /// Why the action journal could not be written, while that is so.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub journal_error: Option<String>,
+    /// Seconds since the last completed cache scan; `None` before the first.
+    pub scan_age_secs: Option<u64>,
+    /// The last scan is older than twice the scan interval (plus 10 minutes):
+    /// the scan loop may be stuck, and scan figures are old.
+    pub scan_stale: bool,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -280,6 +285,10 @@ pub struct State {
     pub journal_error: Option<String>,
     /// Build processes whose original priority could not be restored.
     pub restore_failed: usize,
+    /// Seconds since the last completed cache scan; `None` before the first.
+    pub scan_age_secs: Option<u64>,
+    /// See [`HealthSummary::scan_stale`].
+    pub scan_stale: bool,
 }
 
 impl State {
@@ -315,6 +324,16 @@ impl State {
                 .map(|w| w.bytes)
                 .sum();
         }
+    }
+
+    /// (seconds since the last scan, stale)
+    fn scan_age(&self, now: u64) -> (Option<u64>, bool) {
+        let Some(at) = self.scan.as_ref().map(|s| s.at_unix).filter(|a| *a > 0) else {
+            return (None, false);
+        };
+        let age = now.saturating_sub(at);
+        let limit = self.config.scan_interval_mins.max(1) * 60 * 2 + 600;
+        (Some(age), age > limit)
     }
 
     fn sample_age(&self, now: u64) -> Option<u64> {
@@ -497,6 +516,8 @@ impl Engine {
             loops: Loops::default(),
             journal_error: None,
             restore_failed: 0,
+            scan_age_secs: None,
+            scan_stale: false,
         };
         Self {
             state: Arc::new(Mutex::new(state)),
@@ -535,6 +556,7 @@ impl Engine {
         st.health = st.health_at(now);
         st.automation = st.automation && self.automation_allowed();
         st.journal_error = self.journal.last_error();
+        (st.scan_age_secs, st.scan_stale) = st.scan_age(now);
         st.restore_failed = lock(&self.reniced)
             .values()
             .filter(|r| r.restore_failed)
@@ -567,6 +589,8 @@ impl Engine {
             reclaimable_stale: st.scan.as_ref().map(|s| s.stale_bytes).unwrap_or(0),
             restarts: st.loops.sample.restarts + st.loops.scan.restarts,
             journal_error: self.journal.last_error(),
+            scan_age_secs: st.scan_age(now).0,
+            scan_stale: st.scan_age(now).1,
         }
     }
 

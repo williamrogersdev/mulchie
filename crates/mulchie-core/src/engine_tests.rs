@@ -749,3 +749,23 @@ fn priority_changes_skip_a_reused_pid() {
     let _ = child.kill();
     let _ = child.wait();
 }
+
+/// A scan loop that stopped producing scans shows as stale.
+#[test]
+fn an_old_scan_is_flagged_stale() {
+    let (_t, e) = engine();
+    assert_eq!(e.snapshot_state().scan_age_secs, None);
+    let interval = e.config().scan_interval_mins * 60;
+    e.state_mut().scan = Some(Arc::new(reclaim::ScanReport {
+        at_unix: now_unix() - 10,
+        ..Default::default()
+    }));
+    let st = e.snapshot_state();
+    assert!(st.scan_age_secs.unwrap() >= 10 && !st.scan_stale);
+    e.state_mut().scan = Some(Arc::new(reclaim::ScanReport {
+        at_unix: now_unix() - 2 * interval - 700,
+        ..Default::default()
+    }));
+    assert!(e.snapshot_state().scan_stale);
+    assert!(e.health_summary().scan_stale);
+}

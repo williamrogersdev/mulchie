@@ -49,6 +49,10 @@ pub struct ScanReport {
     pub items: Vec<Item>,
     pub total_bytes: u64,
     pub stale_bytes: u64,
+    /// Set when part of the scan failed (a measuring worker panicked): the
+    /// list is incomplete.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
 }
 
 const MAX_DEPTH: usize = 9;
@@ -81,6 +85,7 @@ pub fn scan(cfg: &Config, paths: &Paths, busy_cwds: &[PathBuf], now: u64) -> Sca
     let stale_secs = cfg.stale_hours * 3600;
     let wt_stale_secs = cfg.worktree_target_stale_hours * 3600;
 
+    let mut lost = 0usize;
     let mut items: Vec<Item> = std::thread::scope(|s| {
         let handles: Vec<_> = found
             .chunks(chunk)
@@ -118,10 +123,17 @@ pub fn scan(cfg: &Config, paths: &Paths, busy_cwds: &[PathBuf], now: u64) -> Sca
                 })
             })
             .collect();
-        handles
-            .into_iter()
-            .flat_map(|h| h.join().unwrap_or_default())
-            .collect()
+        let mut out = Vec::new();
+        for (h, part) in handles.into_iter().zip(found.chunks(chunk)) {
+            match h.join() {
+                Ok(v) => out.extend(v),
+                Err(_) => lost += part.len(),
+            }
+        }
+        out
+    });
+    let error = (lost > 0).then(|| {
+        format!("{lost} cache director(ies) could not be measured (a scan worker failed); the list is incomplete")
     });
 
     items.retain(|i| i.bytes > 0);
@@ -134,6 +146,7 @@ pub fn scan(cfg: &Config, paths: &Paths, busy_cwds: &[PathBuf], now: u64) -> Sca
         items,
         total_bytes,
         stale_bytes,
+        error,
     }
 }
 

@@ -1420,3 +1420,36 @@ fn unreadable_cwd_with_the_project_on_its_command_line_is_busy() {
     env.procs.procs[0].cmd = vec!["cargo".into(), "/elsewhere/Cargo.toml".into()];
     assert!(done(&env.gate().execute_one(&cache(&target), "t")));
 }
+
+/// Ignored names that begin with `-` are archived as names, not tar options.
+#[test]
+fn ignored_names_starting_with_a_dash_are_archived() {
+    let env = Env::new();
+    let repo = env.repo("repo");
+    let wt = env.worktree(&repo, "agent-x", false);
+    std::fs::write(wt.join("-rf.sqlite"), "data").unwrap();
+    std::fs::write(wt.join("--checkpoint=1.sqlite"), "more").unwrap();
+    let r = env
+        .gate()
+        .execute_one(&env.remove_req(&wt, &env.head(&wt)), "t");
+    assert!(done(&r), "{r:?}");
+    let archive = backup_of(&r, BackupKind::IgnoredArchive).unwrap();
+    let restore = env.root.join("restore");
+    std::fs::create_dir_all(&restore).unwrap();
+    assert!(std::process::Command::new("tar")
+        .arg("-xzf")
+        .arg(&archive)
+        .arg("-C")
+        .arg(&restore)
+        .status()
+        .unwrap()
+        .success());
+    assert_eq!(
+        std::fs::read_to_string(restore.join("-rf.sqlite")).unwrap(),
+        "data"
+    );
+    assert_eq!(
+        std::fs::read_to_string(restore.join("--checkpoint=1.sqlite")).unwrap(),
+        "more"
+    );
+}
