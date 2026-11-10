@@ -2308,6 +2308,28 @@ impl Engine {
                     .ok()
                     .and_then(|v| v.as_str().map(String::from))
                     .unwrap_or_default();
+                // The caller, its shell, terminal or agent, and Mulchie's own
+                // ancestors: the whole plan is refused (a tree plan of one of
+                // them would hold the caller too).
+                if ancestors.contains(&pid) {
+                    let who = if req.caller_pid == Some(pid) {
+                        "the caller itself"
+                    } else if req
+                        .caller_pid
+                        .is_some_and(|c| ancestors_of(&procs, c).contains(&pid))
+                    {
+                        "an ancestor of the caller (its shell, terminal or agent)"
+                    } else {
+                        "an ancestor of Mulchie"
+                    };
+                    return ProcessPlan::refused(
+                        now,
+                        &format!("pid {pid}"),
+                        &act,
+                        "protected",
+                        format!("pid {pid} is {who}; it is never signalled"),
+                    );
+                }
                 let name = procs
                     .iter()
                     .find(|p| p.pid == pid)

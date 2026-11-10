@@ -1263,14 +1263,18 @@ fn pid_and_tree_plans_block_the_callers_ancestors() {
         caller_pid: Some(4_000_002),
         ..Default::default()
     };
-    for tree in [false, true] {
-        let p = e.process_plan(&req(tree));
-        assert!(!p.ready, "tree={tree}: {p:?}");
-        assert!(!p.items.is_empty());
-        for i in &p.items {
-            assert!(!i.ready, "{i:?}");
-            assert_eq!(i.reason, Some(SkipReason::ProtectedProcess), "{i:?}");
-            assert!(i.verdict.contains("never signalled"), "{}", i.verdict);
+    // R15: the whole plan is refused, for the agent, the shell and the
+    // caller itself, with and without the tree.
+    for target in [pid, 4_000_001, 4_000_002] {
+        for tree in [false, true] {
+            let p = e.process_plan(&crate::procplan::ProcessPlanRequest {
+                pid: Some(target),
+                ..req(tree)
+            });
+            assert!(!p.ready, "tree={tree}: {p:?}");
+            assert_eq!(p.refused.as_deref(), Some("protected"), "{p:?}");
+            assert!(p.items.is_empty());
+            assert!(p.detail.contains("never signalled"), "{}", p.detail);
         }
     }
     // Without a caller the same pid can be planned.
@@ -1281,6 +1285,62 @@ fn pid_and_tree_plans_block_the_callers_ancestors() {
     assert!(p.ready, "{p:?}");
     let _ = child.kill();
     let _ = child.wait();
+}
+
+/// R15: against the real process table, a plan for the caller's parent (the
+/// shell of `mulchie signal $$`) is refused, alone and as a tree.
+#[test]
+fn plans_for_the_callers_real_parent_are_refused() {
+    let mut sh = std::process::Command::new("/bin/sh")
+        .args(["-c", "/bin/sleep 30; true"])
+        .spawn()
+        .unwrap();
+    let parent = sh.id();
+    // The sleep the shell started plays the caller.
+    let mut caller = None;
+    for _ in 0..50 {
+        let o = std::process::Command::new("pgrep")
+            .args(["-P", &parent.to_string()])
+            .output()
+            .unwrap();
+        caller = String::from_utf8_lossy(&o.stdout)
+            .trim()
+            .parse::<u32>()
+            .ok();
+        if caller.is_some() {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    let caller = caller.expect("the shell's child");
+    let t = tempfile::tempdir().unwrap();
+    let paths = Paths::under(t.path());
+    std::fs::create_dir_all(&paths.home).unwrap();
+    let e = Engine::new(
+        paths,
+        LoadedConfig {
+            config: Config::default(),
+            error: None,
+        },
+    )
+    .with_watch_probe(Arc::new(crate::watch::NoProbe));
+    for tree in [false, true] {
+        let p = e.process_plan(&crate::procplan::ProcessPlanRequest {
+            pid: Some(parent),
+            tree,
+            caller_pid: Some(caller),
+            ..Default::default()
+        });
+        assert_eq!(
+            p.refused.as_deref(),
+            Some("protected"),
+            "tree={tree}: {p:?}"
+        );
+        assert!(!p.ready);
+    }
+    let _ = sh.kill();
+    let _ = sh.wait();
+    unsafe { libc::kill(caller as i32, libc::SIGKILL) };
 }
 
 /// R8: config writes are one read-modify-write under a lock. A full
