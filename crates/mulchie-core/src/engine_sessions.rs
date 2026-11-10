@@ -49,8 +49,59 @@ pub(crate) enum LimitJob {
     Restore { breach_id: String },
     /// SIGCONT the processes a `pause` stopped.
     Resume { breach_id: String },
+    /// SIGCONT these paused processes now: sessions were turned off, or the
+    /// budget that paused them no longer pauses.
+    ResumeEntries {
+        entries: Vec<PausedProc>,
+        why: &'static str,
+    },
     /// Write `paused.json`.
     Persist,
+}
+
+/// Paused processes whose pause no longer applies and that no queued job
+/// resumes yet: every one when sessions are off; otherwise those whose breach
+/// is gone or whose budget no longer has that cap with action `pause`.
+fn paused_without_a_pause(sup: &Supervision, cfg: &Config) -> (Vec<PausedProc>, &'static str) {
+    let queued: HashSet<(u32, u64)> = sup
+        .jobs
+        .iter()
+        .filter_map(|j| match j {
+            LimitJob::ResumeEntries { entries, .. } => Some(entries),
+            _ => None,
+        })
+        .flatten()
+        .map(|p| (p.pid, p.start_time))
+        .collect();
+    let fresh = |p: &&PausedProc| !queued.contains(&(p.pid, p.start_time));
+    if !cfg.sessions.enabled {
+        let v = sup.paused.iter().filter(fresh).cloned().collect();
+        return (v, "sessions are turned off");
+    }
+    let still_pauses = |p: &PausedProc| {
+        sup.limits.get(&p.breach_id).is_some_and(|b| {
+            let ws = sup
+                .tracker
+                .get(&b.session_id)
+                .and_then(|s| s.workspace.clone());
+            cfg.limits.budget_for(ws.as_deref()).is_some_and(|bud| {
+                bud.caps()
+                    .iter()
+                    .any(|(n, c)| *n == b.cap.code() && c.action == LimitAction::Pause)
+            })
+        })
+    };
+    let v = sup
+        .paused
+        .iter()
+        .filter(fresh)
+        .filter(|p| !still_pauses(p))
+        .cloned()
+        .collect();
+    (
+        v,
+        "the limit that paused them was removed or no longer pauses",
+    )
 }
 
 impl LimitJob {
@@ -282,6 +333,9 @@ impl Engine {
         cfg: &Config,
     ) {
         let on = cfg.sessions.enabled;
+        // Every own process of the sample, also with sessions off: paused
+        // processes are pruned against it.
+        let sampled = procs;
         let procs: &[SessionProc] = if on { procs } else { &[] };
         let slots: Vec<u32> = {
             let st = lock(&self.state);
@@ -296,18 +350,32 @@ impl Engine {
             let mut sup = lock(&self.sup);
             let sup = &mut *sup;
             let events = sup.tracker.observe(now, procs, &slots, retain);
-            // Paused processes that exited need no resume.
-            let alive: HashSet<(u32, u64)> = procs.iter().map(|p| (p.pid, p.start_time)).collect();
-            let before = sup.paused.len();
-            sup.paused
-                .retain(|p| alive.contains(&(p.pid, p.start_time)));
-            if sup.paused.len() != before {
-                sup.jobs.push_back(LimitJob::Persist);
-                wake = true;
+            // Paused processes that exited need no resume. Only a real
+            // process list prunes: an empty one says nothing.
+            if !sampled.is_empty() {
+                let alive: HashSet<(u32, u64)> =
+                    sampled.iter().map(|p| (p.pid, p.start_time)).collect();
+                let before = sup.paused.len();
+                sup.paused
+                    .retain(|p| alive.contains(&(p.pid, p.start_time)));
+                if sup.paused.len() != before {
+                    sup.jobs.push_back(LimitJob::Persist);
+                    wake = true;
+                }
             }
             let lev = sup
                 .limits
                 .evaluate(now, sup.tracker.sessions(), &cfg.limits, machine);
+            // Paused processes whose pause no longer applies are resumed now
+            // (they stay listed until the worker has resumed them).
+            let (unpause, why) = paused_without_a_pause(sup, cfg);
+            if !unpause.is_empty() {
+                sup.jobs.push_back(LimitJob::ResumeEntries {
+                    entries: unpause,
+                    why,
+                });
+                wake = true;
+            }
             let mut rec: Vec<(String, &'static str, Value)> = Vec::new();
             for e in lev {
                 match e {
@@ -547,6 +615,16 @@ impl Engine {
                 } => self.kill_survivors(&breach_id, &targets),
                 LimitJob::Restore { breach_id } => self.restore_breach(&breach_id),
                 LimitJob::Resume { breach_id } => self.resume_breach(&breach_id, "limits"),
+                LimitJob::ResumeEntries { entries, why } => {
+                    self.log(
+                        "limit",
+                        format!("Resuming {} paused process(es): {why}", entries.len()),
+                        0,
+                        None,
+                        "limits",
+                    );
+                    self.resume_entries(&entries, "limits");
+                }
                 LimitJob::Persist => self.persist_paused(),
             }
         }

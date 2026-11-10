@@ -517,3 +517,70 @@ fn sessions_and_breaches_are_recorded() {
     e2.flush_record();
     assert!(e2.session_events(&id, 0, 100).unwrap().is_empty());
 }
+
+/// N1: a pause that no longer applies is resumed through the gate, never
+/// forgotten: sessions turned off, limits removed, or the cap's action
+/// changed away from pause. An empty sample prunes nothing.
+#[test]
+fn paused_processes_are_resumed_when_their_pause_no_longer_applies() {
+    let off = |c: &Config| Config {
+        sessions: crate::config::SessionsConfig {
+            enabled: false,
+            ..c.sessions.clone()
+        },
+        ..c.clone()
+    };
+    let no_limits = |c: &Config| Config {
+        limits: LimitsConfig::default(),
+        ..c.clone()
+    };
+    let notify = |_: &Config| cfg(LimitAction::Notify, false);
+    type Change<'a> = &'a dyn Fn(&Config) -> Config;
+    let changes: [(&str, Change); 3] = [
+        ("sessions off", &off),
+        ("limits removed", &no_limits),
+        ("action notify", &notify),
+    ];
+    for (what, change) in changes {
+        let mut work = Child::sleep();
+        let w = work.pid();
+        let c = cfg(LimitAction::Pause, false);
+        let (_t, e) = engine(&c, &[(w, 1000)]);
+        let busy = [
+            proc(77_777, 1, 500, Some("claude"), 0.0),
+            proc(w, 77_777, 1000, None, 300.0),
+        ];
+        e.observe_sessions(1_000, &busy, M, &c);
+        e.run_limit_jobs(1_000);
+        assert!(work.stopped(), "{what}: paused");
+        let c2 = change(&c);
+        // An empty sample (nothing read) forgets nothing.
+        e.observe_sessions(1_003, &[], M, &c2);
+        assert_eq!(lock(&e.sup).paused.len(), 1, "{what}");
+        let journaled = e.snapshot_state().actions.len();
+        e.observe_sessions(1_006, &busy, M, &c2);
+        e.run_limit_jobs(1_006);
+        assert!(!work.stopped(), "{what}: resumed");
+        assert!(lock(&e.sup).paused.is_empty(), "{what}");
+        assert!(load_paused(e.paths()).unwrap().is_empty(), "{what}");
+        assert!(
+            e.snapshot_state().actions.len() > journaled,
+            "{what}: the SIGCONT went through the gate and was journaled"
+        );
+    }
+    // Sessions off with only empty samples: shutdown still resumes.
+    let mut work = Child::sleep();
+    let w = work.pid();
+    let c = cfg(LimitAction::Pause, false);
+    let (_t, e) = engine(&c, &[(w, 1000)]);
+    let busy = [
+        proc(77_777, 1, 500, Some("claude"), 0.0),
+        proc(w, 77_777, 1000, None, 300.0),
+    ];
+    e.observe_sessions(1_000, &busy, M, &c);
+    e.run_limit_jobs(1_000);
+    assert!(work.stopped());
+    e.observe_sessions(1_003, &[], M, &off(&c));
+    e.shutdown(Duration::from_millis(10));
+    assert!(!work.stopped(), "shutdown resumes");
+}
