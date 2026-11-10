@@ -28,6 +28,15 @@ use crate::procplan::{draft_group, draft_pid, ProcessPlan, ProcessPlanRequest};
 use crate::reclaim::{self, ScanReport};
 use crate::safety::{pid_alive, ActionResult, Gate, Outcome, Plan, Request, Signal};
 use crate::watch::{self, Finding, FindingCounts, WatchProbe};
+use serde_json::{json, Value};
+
+#[path = "engine_sessions.rs"]
+mod sessions;
+use sessions::Supervision;
+pub use sessions::{
+    LimitsStatus, PausedProc, SessionBrief, SessionDetail, SessionMember, SessionsState,
+    PAUSED_FILE, STATE_SESSIONS_KEPT,
+};
 
 const HISTORY_LEN: usize = 600;
 pub const SAMPLE_SECS: u64 = 3;
@@ -320,6 +329,10 @@ pub struct HealthSummary {
     pub scan_stale: bool,
     /// Open watch findings by severity (see `GET /v1/findings`).
     pub findings: FindingCounts,
+    /// Agent sessions running now (see `GET /v1/sessions`).
+    pub sessions_running: usize,
+    /// Limit breaches not yet cleared (see `GET /v1/limits/status`).
+    pub breaches_active: usize,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -363,6 +376,8 @@ pub struct State {
     pub finding_counts: FindingCounts,
     /// When the watch detectors last ran.
     pub findings_unix: Option<u64>,
+    /// Agent sessions, limit breaches and the activity record, compact.
+    pub sessions: SessionsState,
 }
 
 impl State {
@@ -452,6 +467,15 @@ pub fn auto_reclaim_need(cfg: &Config, disk_free: u64) -> Option<u64> {
     let target = cfg.auto_reclaim_target_gb.saturating_mul(1_000_000_000);
     let need = target.saturating_sub(disk_free);
     (need > 0).then_some(need)
+}
+
+/// Findings the watch run produces (every category but limits and updates,
+/// which the sample loop and the update checker keep).
+fn watch_owned(f: &Finding) -> bool {
+    !matches!(
+        f.kind.category(),
+        watch::FindingCategory::Limit | watch::FindingCategory::Update
+    )
 }
 
 /// Lock a mutex, recovering the data if a panicking thread poisoned it. Every
@@ -631,6 +655,13 @@ pub struct Engine {
     /// The config file's bytes as this engine last loaded or wrote them
     /// (`None`: no file). Held across every config read-modify-write.
     config_disk: Arc<Mutex<Option<Vec<u8>>>>,
+    /// Sessions, limits and limit actions in flight (lock after `state`,
+    /// never while holding it).
+    sup: Arc<Mutex<Supervision>>,
+    /// Wakes the limits worker.
+    limit_wake: Arc<Condvar>,
+    /// The activity record writer, started on first use.
+    record: Arc<std::sync::OnceLock<crate::record::Record>>,
 }
 
 impl Engine {
@@ -680,6 +711,7 @@ impl Engine {
             findings: Vec::new(),
             finding_counts: FindingCounts::default(),
             findings_unix: None,
+            sessions: SessionsState::default(),
         };
         Self {
             state: Arc::new(Mutex::new(state)),
@@ -699,6 +731,9 @@ impl Engine {
             probe: Arc::new(watch::SystemProbe),
             api_port: Arc::new(AtomicU64::new(0)),
             config_disk: Arc::new(Mutex::new(config_disk)),
+            sup: Arc::new(Mutex::new(Supervision::default())),
+            limit_wake: Arc::new(Condvar::new()),
+            record: Arc::new(std::sync::OnceLock::new()),
         }
     }
 
@@ -740,6 +775,7 @@ impl Engine {
             .values()
             .filter(|r| r.restore_failed)
             .count();
+        st.sessions = self.sessions_state(&st.config);
         st
     }
 
@@ -747,6 +783,7 @@ impl Engine {
     pub fn health_summary(&self) -> HealthSummary {
         let now = now_unix();
         let adv = self.advice();
+        let (sessions_running, breaches_active) = self.session_counts();
         let st = lock(&self.state);
         let s = &st.snapshot;
         let health = st.health_at(now);
@@ -772,6 +809,8 @@ impl Engine {
             scan_age_secs: st.scan_age(now).0,
             scan_stale: st.scan_age(now).1,
             findings: st.finding_counts,
+            sessions_running,
+            breaches_active,
         }
     }
 
@@ -917,17 +956,20 @@ impl Engine {
         {
             threads.push(h);
         }
+        self.start_limits_worker(&mut threads);
     }
 
     pub fn is_shut_down(&self) -> bool {
         self.shutdown.load(Ordering::SeqCst)
     }
 
-    /// Stop both loops, wait up to `wait` for them (a scan in progress finishes
-    /// its current step first), and restore build priorities Mulchie lowered.
+    /// Stop the loops, wait up to `wait` for them (a scan in progress finishes
+    /// its current step first), restore build priorities Mulchie lowered and
+    /// resume processes it paused for a limit.
     pub fn shutdown(&self, wait: Duration) {
         self.shutdown.store(true, Ordering::SeqCst);
         self.jobs.ready.notify_all();
+        self.limit_wake.notify_all();
         let handles: Vec<JoinHandle<()>> = lock(&self.threads).drain(..).collect();
         let deadline = Instant::now() + wait;
         for h in handles {
@@ -939,6 +981,8 @@ impl Engine {
             }
         }
         self.restore_priorities("shutdown");
+        self.resume_all_paused("shutdown");
+        self.flush_record();
     }
 
     /// Sleep up to `d`, returning early on shutdown.
@@ -1025,6 +1069,7 @@ impl Engine {
             .monitor
             .get_or_insert_with(|| Monitor::with_home(self.paths.home.clone()));
         mon.set_roots(&cfg.roots(&self.paths));
+        mon.set_extra_agents(&cfg.agents.extra);
         let snap = mon.sample();
         let kinds = mon.process_kinds();
         self.apply_sample(snap, &kinds, ctx);
@@ -1082,6 +1127,17 @@ impl Engine {
             Vec::new()
         };
         let throttled = lock(&self.reniced).len();
+
+        self.observe_sessions(
+            now,
+            &snap.session_procs,
+            crate::limits::Machine {
+                cores: snap.cpu_count,
+                mem_mb: snap.mem_total as f64 / 1_048_576.0,
+                strained: matches!(health, Health::Strained | Health::Critical),
+            },
+            &cfg,
+        );
 
         let mut notes = Vec::new();
         {
@@ -1321,8 +1377,8 @@ impl Engine {
         let now = now_unix();
         if !cfg.watch.enabled {
             let mut st = lock(&self.state);
-            st.findings.clear();
-            st.finding_counts = FindingCounts::default();
+            st.findings.retain(|f| !watch_owned(f));
+            st.finding_counts = FindingCounts::of(&st.findings);
             st.findings_unix = None;
             return Vec::new();
         }
@@ -1334,7 +1390,11 @@ impl Engine {
             (
                 st.snapshot.clone(),
                 st.config_error.clone(),
-                st.findings.clone(),
+                st.findings
+                    .iter()
+                    .filter(|f| watch_owned(f))
+                    .cloned()
+                    .collect::<Vec<Finding>>(),
             )
         };
         let samples: HashMap<u32, ProcSample> = snap
@@ -1502,9 +1562,15 @@ impl Engine {
         let (findings, changes) = watch::finalize(raw, &prev, &cfg.watch, now);
         {
             let mut st = lock(&self.state);
-            st.finding_counts = FindingCounts::of(&findings);
-            st.findings = findings.clone();
+            st.findings.retain(|f| !watch_owned(f));
+            st.findings.extend(findings.iter().cloned());
+            sessions::sort_findings(&mut st.findings);
+            st.finding_counts = FindingCounts::of(&st.findings);
             st.findings_unix = Some(now);
+        }
+        if let Some(ls) = &listeners {
+            let pairs: Vec<(u32, u16)> = ls.iter().map(|l| (l.pid, l.port)).collect();
+            lock(&self.sup).tracker.set_listening(&pairs);
         }
         self.journal_findings(&changes, now);
         findings
@@ -1811,15 +1877,18 @@ impl Engine {
     pub fn execute(&self, requests: &[Request], source: &str) -> Vec<ActionResult> {
         let now = now_unix();
         let results = self.gate_run(|g| g.execute(requests, source));
-        let mut st = lock(&self.state);
-        for (r, req) in results.iter().zip(requests) {
-            let sig = match req {
-                Request::Signal { signal, .. } => Some(*signal),
-                _ => None,
-            };
-            st.push(r.to_action(now, source, sig));
+        {
+            let mut st = lock(&self.state);
+            for (r, req) in results.iter().zip(requests) {
+                let sig = match req {
+                    Request::Signal { signal, .. } => Some(*signal),
+                    _ => None,
+                };
+                st.push(r.to_action(now, source, sig));
+            }
+            st.forget(&results);
         }
-        st.forget(&results);
+        self.note_signals(requests, &results);
         results
     }
 
@@ -2101,6 +2170,60 @@ impl Engine {
             ancestors.extend(ancestors_of(&procs, c));
         }
         let (drafted, target, name, action) = match (&req.group, req.pid) {
+            _ if req.session.is_some() => {
+                let sid = req.session.clone().unwrap_or_default();
+                let Some(action) = req.action else {
+                    return ProcessPlan::refused(
+                        now,
+                        &sid,
+                        "",
+                        "invalid_request",
+                        "a session plan needs an action".into(),
+                    );
+                };
+                let act = serde_json::to_value(action)
+                    .ok()
+                    .and_then(|v| v.as_str().map(String::from))
+                    .unwrap_or_default();
+                let (session, members) = match self.session_members(&sid, req.include_agent) {
+                    Ok(x) => x,
+                    Err((code, detail)) => {
+                        return ProcessPlan::refused(now, &sid, &act, code, detail)
+                    }
+                };
+                let alive: HashMap<u32, u64> =
+                    procs.iter().map(|p| (p.pid, p.start_time)).collect();
+                let members: Vec<ProcSample> = members
+                    .into_iter()
+                    .filter(|m| alive.get(&m.pid) == Some(&m.start_time) && m.pid != me)
+                    .collect();
+                let name = format!("{} session", session.agent);
+                if members.is_empty() {
+                    return ProcessPlan::refused(
+                        now,
+                        &sid,
+                        &act,
+                        "unknown_group",
+                        if req.include_agent {
+                            format!("no running processes in session {sid} in the latest sample")
+                        } else {
+                            format!("session {sid} runs no processes besides the agent; set include_agent to include it")
+                        },
+                    );
+                }
+                let nice = lock(&self.state).config.build_nice.max(10);
+                let d = draft_group(
+                    GroupKind::Process,
+                    &name,
+                    None,
+                    None,
+                    &members,
+                    action,
+                    nice,
+                    cfg!(target_os = "macos"),
+                );
+                (d, sid, name, act)
+            }
             (Some(key), _) => {
                 let Some(action) = req.action else {
                     return ProcessPlan::refused(

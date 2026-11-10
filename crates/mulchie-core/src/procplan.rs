@@ -36,6 +36,13 @@ pub struct ProcessPlanRequest {
     /// one of its ancestors (its terminal, its agent app) are refused.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub caller_pid: Option<u32>,
+    /// A session id (`GET /v1/sessions`) with `action`: the session's
+    /// processes as of the last sample, without the agent itself unless
+    /// `include_agent`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session: Option<String>,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub include_agent: bool,
 }
 
 /// How one process is affected by a plan.

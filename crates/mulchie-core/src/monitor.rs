@@ -113,6 +113,12 @@ pub struct Snapshot {
     /// Every member of every consumer group, for planning group actions.
     #[serde(skip)]
     pub members: std::sync::Arc<Members>,
+    /// The user's own processes, for sessions (see [`crate::session`]).
+    #[serde(skip)]
+    pub session_procs: Vec<crate::session::SessionProc>,
+    /// Per-process bytes written are known on this platform.
+    #[serde(skip)]
+    pub write_bytes_available: bool,
 }
 
 impl Snapshot {
@@ -277,6 +283,21 @@ pub struct Monitor {
     samples: u64,
     /// App bundle → CFBundleIdentifier, looked up once per bundle.
     bundle_ids: HashMap<PathBuf, Option<String>>,
+    /// `agents.extra` from the config.
+    extra_agents: Vec<String>,
+    /// See [`Snapshot::write_bytes_available`].
+    write_bytes: bool,
+}
+
+/// Whether the platform reports bytes written per process: macOS always
+/// (`proc_pid_rusage`), Linux when `/proc/<pid>/io` is readable (checked on
+/// our own; some kernels and containers hide it, and sysinfo then reports 0,
+/// which must not read as "wrote nothing").
+fn write_bytes_reported() -> bool {
+    if cfg!(target_os = "macos") {
+        return true;
+    }
+    cfg!(target_os = "linux") && std::fs::read_to_string("/proc/self/io").is_ok()
 }
 
 impl Monitor {
@@ -299,6 +320,15 @@ impl Monitor {
             me: std::process::id(),
             samples: 0,
             bundle_ids: HashMap::new(),
+            extra_agents: Vec::new(),
+            write_bytes: write_bytes_reported(),
+        }
+    }
+
+    /// Executable names from `agents.extra` that start sessions too.
+    pub fn set_extra_agents(&mut self, extra: &[String]) {
+        if self.extra_agents != extra {
+            self.extra_agents = extra.to_vec();
         }
     }
 
@@ -372,6 +402,7 @@ impl Monitor {
             cur = ppid_of.get(&cur).copied().unwrap_or(0);
         }
         let mut samples: Vec<ProcSample> = Vec::with_capacity(facts.len());
+        let mut session_procs: Vec<crate::session::SessionProc> = Vec::new();
         let bcache = &mut self.branch_cache;
         let home = self.home.clone();
         for (pid, p) in self.sys.processes() {
@@ -419,6 +450,23 @@ impl Monitor {
                 .map(|a| a.to_string_lossy().to_string())
                 .collect();
             let cmd = shorten_cmd(&crate::redact::redact_args(&args).join(" "), &home);
+            if own {
+                session_procs.push(crate::session::SessionProc {
+                    pid: pid.as_u32(),
+                    ppid: p.parent().map(|x| x.as_u32()).unwrap_or(0),
+                    start_time: p.start_time(),
+                    name: name.clone(),
+                    own,
+                    agent: crate::session::agent_of(&name, p.exe(), &args, &self.extra_agents),
+                    cpu_pct: p.cpu_usage(),
+                    mem_bytes: p.memory(),
+                    written: self.write_bytes.then_some(du.total_written_bytes),
+                    stopped: matches!(p.status(), ProcessStatus::Stop),
+                    workspace: ws_root.as_ref().map(|r| r.0.clone()),
+                    cwd: p.cwd().map(|c| c.to_path_buf()),
+                    cmd: cmd.clone(),
+                });
+            }
             let info = ProcInfo {
                 pid: pid.as_u32(),
                 ppid: p.parent().map(|x| x.as_u32()).unwrap_or(0),
@@ -618,6 +666,8 @@ impl Monitor {
             cpu_summary,
             mem_summary,
             members: std::sync::Arc::new(members),
+            session_procs,
+            write_bytes_available: self.write_bytes,
         }
     }
 
