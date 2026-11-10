@@ -46,14 +46,34 @@ pub fn check_session_id(id: &str) -> Result<(), String> {
     }
 }
 
-/// The events path for a session, with the query the engine checks.
-pub fn events_path(id: &str, since: Option<u64>, limit: Option<u64>) -> String {
-    let mut qs = Vec::new();
-    if let Some(s) = since {
-        qs.push(format!("since={s}"));
+/// Which events to read: forward from `since`, or backward with `tail`
+/// (the last N) and `before` (a page's `prev_before`).
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct Page {
+    pub since: Option<u64>,
+    pub limit: Option<u64>,
+    pub tail: Option<u64>,
+    pub before: Option<u64>,
+}
+
+impl Page {
+    fn backward(&self) -> bool {
+        self.tail.is_some() || self.before.is_some()
     }
-    if let Some(l) = limit {
-        qs.push(format!("limit={l}"));
+}
+
+/// The events path for a session, with the query the engine checks.
+pub fn events_path(id: &str, page: &Page) -> String {
+    let mut qs = Vec::new();
+    for (k, v) in [
+        ("since", page.since),
+        ("limit", page.limit),
+        ("tail", page.tail),
+        ("before", page.before),
+    ] {
+        if let Some(v) = v {
+            qs.push(format!("{k}={v}"));
+        }
     }
     let base = format!("/v1/sessions/{id}/events");
     if qs.is_empty() {
@@ -146,6 +166,59 @@ fn paused_line(p: &Value) -> String {
     )
 }
 
+/// Whether this engine acts on a breach of the session's limits, in words.
+pub fn enforcement(x: &Value) -> String {
+    if x["enforced"] == true {
+        return "enforced here: a breach is acted on as its cap says".into();
+    }
+    match x["not_enforced_reason"].as_str() {
+        Some("hook_registered") => {
+            "not enforced: an agent hook reports this session, so Mulchie only reports".into()
+        }
+        Some("not_automating") => {
+            "not enforced: this engine does not hold the engine lock, or its config did not load"
+                .into()
+        }
+        Some("no_budget") => "not enforced: no budget applies to its workspace".into(),
+        Some("notify_only") => "not enforced: every cap of its budget only notifies".into(),
+        Some("ended") => "not enforced: the session ended".into(),
+        Some(r) => format!("not enforced ({r})"),
+        // An engine from before `enforced`.
+        None if x.get("enforced").is_none() => "unknown (this engine does not say)".into(),
+        None => "not enforced".into(),
+    }
+}
+
+/// The same in a word or two, for the list.
+fn enforcement_short(x: &Value) -> &'static str {
+    if x["enforced"] == true {
+        return "enforced";
+    }
+    match x["not_enforced_reason"].as_str() {
+        Some("hook_registered") => "hook: reports",
+        Some("not_automating") => "not here",
+        Some("no_budget") => "no budget",
+        Some("notify_only") => "notify only",
+        Some("ended") => "-",
+        _ if x.get("enforced").is_none() => "?",
+        _ => "no",
+    }
+}
+
+/// A session (or each of a list's) with `limits`: its enforcement in words.
+pub fn with_words(mut v: Value) -> Value {
+    if let Some(list) = v["sessions"].as_array_mut() {
+        for x in list {
+            x["limits"] = json!(enforcement(x));
+        }
+    }
+    if v["session"].is_object() {
+        let w = enforcement(&v["session"]);
+        v["session"]["limits"] = json!(w);
+    }
+    v
+}
+
 // ---------------------------------------------------------------- sessions
 
 pub fn render_list(v: &Value) -> String {
@@ -166,13 +239,13 @@ pub fn render_list(v: &Value) -> String {
         ended.len()
     ));
     s.push_str(&format!(
-        "  {:<22} {:<10} {:<8} {:>6} {:>9} {:>5} {:>8}  {}\n",
-        "id", "agent", "status", "cpu", "memory", "procs", "runtime", "workspace"
+        "  {:<22} {:<10} {:<8} {:>6} {:>9} {:>5} {:>8}  {:<13} {}\n",
+        "id", "agent", "status", "cpu", "memory", "procs", "runtime", "limits", "workspace"
     ));
     let line = |x: &Value| {
         let u = usage(x);
         format!(
-            "  {:<22} {:<10} {:<8} {:>6} {:>9} {:>5} {:>8}  {}\n",
+            "  {:<22} {:<10} {:<8} {:>6} {:>9} {:>5} {:>8}  {:<13} {}\n",
             st(x, "id"),
             crate::commands::truncate(st(x, "agent"), 10),
             st(x, "status"),
@@ -180,6 +253,7 @@ pub fn render_list(v: &Value) -> String {
             mb(&u["memory_mb"]),
             u["processes"].as_u64().unwrap_or(0),
             duration(u["runtime_secs"].as_u64().unwrap_or(0)),
+            enforcement_short(x),
             x["workspace"].as_str().or(x["cwd"].as_str()).unwrap_or("-"),
         )
     };
@@ -233,6 +307,7 @@ pub fn render_detail(v: &Value) -> String {
     if let Some(w) = u["write_mb_per_hour"].as_f64() {
         s.push_str(&format!("  writing:   {w:.0} MB/h\n"));
     }
+    s.push_str(&format!("  limits:    {}\n", enforcement(x)));
     let pk = &x["peak"];
     if pk.is_object() {
         s.push_str(&format!(
@@ -313,47 +388,92 @@ pub fn render_detail(v: &Value) -> String {
     s
 }
 
-pub fn render_events(v: &Value) -> String {
-    let evs = v["events"].as_array().cloned().unwrap_or_default();
-    if evs.is_empty() {
-        return "No events.\n".into();
+/// One `limit_action` event in words: what happened, to which cap, and why.
+fn limit_action_words(e: &Value) -> String {
+    let mut w = st(e, "outcome").replace('_', " ");
+    if let Some(cap) = e["cap"].as_str() {
+        w.push_str(&format!(" for the {cap} cap"));
     }
+    let mut more = Vec::new();
+    if let Some(a) = e["action"].as_str() {
+        more.push(format!("cap action {a}"));
+    }
+    if let Some(x) = e["state"].as_str() {
+        more.push(format!("now {}", x.replace('_', " ")));
+    }
+    if !more.is_empty() {
+        w.push_str(&format!(" ({})", more.join(", ")));
+    }
+    match (e["reason"].as_str(), e["detail"].as_str()) {
+        (Some(r), _) if !r.is_empty() => w.push_str(&format!(": refused because {r}")),
+        (_, Some(d)) if !d.is_empty() => w.push_str(&format!(": {d}")),
+        _ => {}
+    }
+    w
+}
+
+pub fn render_events(v: &Value, page: &Page) -> String {
+    let evs = v["events"].as_array().cloned().unwrap_or_default();
     let mut s = String::new();
+    if evs.is_empty() {
+        s.push_str("No events.\n");
+    }
     for e in &evs {
-        let mut rest: Vec<String> = Vec::new();
-        for k in [
-            "command", "tool", "rule", "decision", "cap", "action", "detail", "reason",
-        ] {
-            if let Some(x) = e[k].as_str().filter(|x| !x.is_empty()) {
-                rest.push(format!("{k}={}", crate::commands::truncate(x, 80)));
+        let text = if e["type"] == "limit_action" {
+            crate::commands::truncate(&limit_action_words(e), 160)
+        } else {
+            let mut rest: Vec<String> = Vec::new();
+            for k in [
+                "command", "tool", "rule", "decision", "cap", "action", "detail", "reason",
+            ] {
+                if let Some(x) = e[k].as_str().filter(|x| !x.is_empty()) {
+                    rest.push(format!("{k}={}", crate::commands::truncate(x, 80)));
+                }
             }
-        }
+            rest.join(" ")
+        };
+        // A hook call from a caller other than the one the session is bound
+        // to: recorded, but not the agent's own word.
+        let unbound = if e["unbound"] == true {
+            format!(
+                "  [unbound: from {} {}, not the session's own client]",
+                e["client"].as_str().unwrap_or("?"),
+                e["client_session_id"].as_str().unwrap_or("-")
+            )
+        } else {
+            String::new()
+        };
         s.push_str(&format!(
-            "  {:>5}  {}  {:<16} {}\n",
+            "  {:>5}  {}  {:<16} {text}{unbound}\n",
             e["seq"],
             e["t"]
                 .as_u64()
                 .map(|t| format!("{} ago", duration(now_unix().saturating_sub(t))))
                 .unwrap_or_default(),
             st(e, "type"),
-            rest.join(" ")
         ));
     }
-    s.push_str(&format!(
-        "More: --since {}\n",
-        v["next_since"].as_u64().unwrap_or(0)
-    ));
+    let id = v["session_id"].as_str().unwrap_or("<id>");
+    if page.backward() {
+        match v["prev_before"].as_u64() {
+            Some(b) => s.push_str(&format!(
+                "Older: mulchie sessions {} --events --tail {} --before {b}\n",
+                q(id),
+                page.tail.or(page.limit).unwrap_or(200)
+            )),
+            None => s.push_str("This is the start of the record.\n"),
+        }
+    } else {
+        s.push_str(&format!(
+            "Newer: mulchie sessions {} --events --since {}\n",
+            q(id),
+            v["next_since"].as_u64().unwrap_or(0)
+        ));
+    }
     s
 }
 
-pub fn sessions(
-    paths: &Paths,
-    id: Option<&str>,
-    events: bool,
-    since: Option<u64>,
-    limit: Option<u64>,
-    json_out: bool,
-) -> i32 {
+pub fn sessions(paths: &Paths, id: Option<&str>, events: bool, page: &Page, json_out: bool) -> i32 {
     if let Some(id) = id {
         if let Err(e) = check_session_id(id) {
             return fail(e);
@@ -364,21 +484,21 @@ pub fn sessions(
         Err(e) => return fail(e),
     };
     let (v, text) = match (id, events) {
-        (None, _) => match get(&c, "/v1/sessions") {
+        (None, _) => match get(&c, "/v1/sessions").map(with_words) {
             Ok(v) => {
                 let t = render_list(&v);
                 (v, t)
             }
             Err(e) => return fail(e),
         },
-        (Some(id), true) => match get(&c, &events_path(id, since, limit)) {
+        (Some(id), true) => match get(&c, &events_path(id, page)) {
             Ok(v) => {
-                let t = render_events(&v);
+                let t = render_events(&v, page);
                 (v, t)
             }
             Err(e) => return fail(e),
         },
-        (Some(id), false) => match get(&c, &format!("/v1/sessions/{id}")) {
+        (Some(id), false) => match get(&c, &format!("/v1/sessions/{id}")).map(with_words) {
             Ok(v) => {
                 let t = render_detail(&v);
                 (v, t)
@@ -712,13 +832,27 @@ mod tests {
         ] {
             assert!(!valid_session_id(bad), "{bad}");
         }
+        let fwd = Page {
+            since: Some(5),
+            limit: Some(10),
+            ..Page::default()
+        };
         assert_eq!(
-            events_path("s-1-2", Some(5), Some(10)),
+            events_path("s-1-2", &fwd),
             "/v1/sessions/s-1-2/events?since=5&limit=10"
         );
         assert_eq!(
-            events_path("s-1-2", None, None),
+            events_path("s-1-2", &Page::default()),
             "/v1/sessions/s-1-2/events"
+        );
+        let back = Page {
+            tail: Some(20),
+            before: Some(300),
+            ..Page::default()
+        };
+        assert_eq!(
+            events_path("s-1-2", &back),
+            "/v1/sessions/s-1-2/events?tail=20&before=300"
         );
     }
 
@@ -752,7 +886,7 @@ mod tests {
         );
         assert!(t.contains("mulchie sessions stop s-500-100"), "{t}");
         let ev = json!({"events":[{"agent":"claude","command":"claude","seq":1,"t":1,"type":"session_start"}],"next_since":1,"session_id":"s-500-100"});
-        let t = render_events(&ev);
+        let t = render_events(&ev, &Page::default());
         assert!(
             t.contains("session_start") && t.contains("--since 1"),
             "{t}"
@@ -816,5 +950,63 @@ mod tests {
             command_line(&["rm".into(), "-rf".into(), "it's".into()]),
             "rm -rf 'it'\\''s'"
         );
+    }
+
+    #[test]
+    fn enforcement_limit_actions_and_unbound_events_in_words() {
+        let mut l = list();
+        l["sessions"][0]["enforced"] = json!(false);
+        l["sessions"][0]["not_enforced_reason"] = json!("hook_registered");
+        let w = with_words(l);
+        assert!(
+            w["sessions"][0]["limits"]
+                .as_str()
+                .unwrap()
+                .contains("an agent hook reports this session"),
+            "{w}"
+        );
+        assert!(render_list(&w).contains("hook: reports"));
+        for (r, words) in [
+            ("not_automating", "does not hold the engine lock"),
+            ("no_budget", "no budget applies"),
+            ("notify_only", "only notifies"),
+            ("ended", "the session ended"),
+        ] {
+            let x = json!({ "enforced": false, "not_enforced_reason": r });
+            assert!(enforcement(&x).contains(words), "{r}");
+        }
+        let on = json!({ "enforced": true });
+        assert!(enforcement(&on).starts_with("enforced here"));
+        let detail = with_words(json!({ "session": on, "processes": [] }));
+        assert!(render_detail(&detail).contains("limits:    enforced here"));
+
+        let ev = json!({ "session_id": "s-1-2", "next_since": 9, "prev_before": 7, "events": [
+            { "seq": 7, "t": 1, "type": "limit_action", "breach_id": "b1", "cap": "memory_mb", "action": "pause", "outcome": "paused", "state": "done", "detail": "paused 3 processes" },
+            { "seq": 8, "t": 1, "type": "limit_action", "breach_id": "b1", "cap": "memory_mb", "action": "kill", "outcome": "refused", "state": "skipped", "detail": "protected", "reason": "pid 4 is protected" },
+            { "seq": 9, "t": 1, "type": "hook_pre_tool", "client": "cursor", "client_session_id": "x1", "unbound": true, "command": "ls" } ] });
+        let page = Page {
+            tail: Some(3),
+            ..Page::default()
+        };
+        let t = render_events(&ev, &page);
+        assert!(
+            t.contains(
+                "paused for the memory_mb cap (cap action pause, now done): paused 3 processes"
+            ),
+            "{t}"
+        );
+        assert!(
+            t.contains("refused for the memory_mb cap")
+                && t.contains("refused because pid 4 is protected"),
+            "{t}"
+        );
+        assert!(t.contains("[unbound: from cursor x1"), "{t}");
+        assert!(t.contains("--tail 3 --before 7"), "{t}");
+        let mut start = ev.clone();
+        start["prev_before"] = Value::Null;
+        assert!(render_events(&start, &page).contains("start of the record"));
+        // A resume after limits were turned off: no cap, action or state.
+        let gone = json!({ "outcome": "resumed", "cap": null, "action": null, "state": null, "detail": "resumed 2" });
+        assert_eq!(limit_action_words(&gone), "resumed: resumed 2");
     }
 }

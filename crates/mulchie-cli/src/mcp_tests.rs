@@ -1497,10 +1497,14 @@ fn read_only_diagnose_suggests_only_tools_it_offers() {
 
 #[test]
 fn sessions_limits_updates_and_guard_tools() {
-    let detail = json!({ "session": { "id": "s-500-100", "agent": "claude", "status": "running" },
+    let detail = json!({ "session": { "id": "s-500-100", "agent": "claude", "status": "running", "enforced": false, "not_enforced_reason": "no_budget" },
         "processes": [], "breaches": [], "paused_by_mulchie": [] });
     let f = Fake::default()
-        .with("GET /v1/sessions", json!({ "enabled": true, "sessions": [{ "id": "s-500-100" }] }))
+        .with("GET /v1/sessions", json!({ "enabled": true, "sessions": [{ "id": "s-500-100", "enforced": true }] }))
+        .with(
+            "GET /v1/sessions/s-500-100/events?tail=2&before=9",
+            json!({ "events": [{ "seq": 7, "t": 1, "type": "limit_action", "outcome": "paused" }], "next_since": 7, "prev_before": 7, "session_id": "s-500-100" }),
+        )
         .with("GET /v1/sessions/s-500-100", detail)
         .with(
             "GET /v1/sessions/s-500-100/events?since=3&limit=5",
@@ -1528,6 +1532,31 @@ fn sessions_limits_updates_and_guard_tools() {
     ));
     assert_eq!(v["events"][0]["seq"], 4);
     assert_eq!(v["next_since"], 4);
+    assert!(
+        v["session"]["limits"]
+            .as_str()
+            .unwrap()
+            .contains("no budget applies"),
+        "{v}"
+    );
+    let l = result(&one(&f, call(21, "list_sessions", json!({}))));
+    assert!(
+        l["sessions"][0]["limits"]
+            .as_str()
+            .unwrap()
+            .starts_with("enforced here"),
+        "{l}"
+    );
+    let v = result(&one(
+        &f,
+        call(
+            22,
+            "get_session",
+            json!({ "id": "s-500-100", "events": true, "tail": 2, "before": 9 }),
+        ),
+    ));
+    assert_eq!(v["prev_before"], 7);
+    assert_eq!(v["events"][0]["outcome"], "paused");
     // An id that is not a session id never reaches a path.
     let r = one(
         &f,

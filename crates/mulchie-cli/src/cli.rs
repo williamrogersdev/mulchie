@@ -617,8 +617,14 @@ pub struct SessionsArgs {
     #[arg(long, requires = "id")]
     pub events: bool,
     /// With --events: only events after this sequence number
-    #[arg(long, requires = "events")]
+    #[arg(long, requires = "events", conflicts_with_all = ["tail", "before"])]
     pub since: Option<u64>,
+    /// With --events: the last N events (1 to 1000); page back with --before
+    #[arg(long, requires = "events", value_parser = clap::value_parser!(u64).range(1..=1000))]
+    pub tail: Option<u64>,
+    /// With --events: only events before this sequence number (the `--before` the last page printed)
+    #[arg(long, requires = "events", value_parser = clap::value_parser!(u64).range(1..))]
+    pub before: Option<u64>,
     /// With --events: at most this many (1 to 1000, default 200)
     #[arg(long, requires = "events", value_parser = clap::value_parser!(u64).range(1..=1000))]
     pub limit: Option<u64>,

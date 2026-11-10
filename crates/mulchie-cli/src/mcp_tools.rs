@@ -174,7 +174,7 @@ pub fn tool_list() -> Vec<Tool> {
         read(
             "list_sessions",
             "Agent sessions",
-            "Agent sessions: each agent process and everything it started, running first, with CPU cores, memory, process count, build slots and runtime, and the workspace. Changes nothing. get_session shows one in detail.",
+            "Agent sessions: each agent process and everything it started, running first, with CPU cores, memory, process count, build slots and runtime, the workspace, and whether its limits are enforced here (limits, in words). Changes nothing. get_session shows one in detail.",
             json!({}),
         ),
         Tool {
@@ -182,12 +182,14 @@ pub fn tool_list() -> Vec<Tool> {
             ..read(
                 "get_session",
                 "One agent session",
-                "One session: its processes (command lines redacted), budget breaches and what Mulchie paused. With events=true, also its activity record (oldest first; pass next_since back as since to page). Changes nothing. To stop or pause it, use plan_process_action with session.",
+                "One session: its processes (command lines redacted), budget breaches, what Mulchie paused, and whether its limits are enforced here (session.limits in words, from enforced and not_enforced_reason). With events=true, also its activity record, oldest first: pass next_since back as since for newer events, or use tail and then before=prev_before to read backwards. limit_action events say what a cap did (outcome, cap, reason when refused); events with unbound=true came from a caller other than the session's own client. Changes nothing. To stop or pause it, use plan_process_action with session.",
                 json!({
                     "id": { "type": "string", "description": "A session id from list_sessions, s-<start time>-<pid>" },
                     "events": { "type": "boolean", "description": "Include the activity record" },
                     "since": { "type": "integer", "minimum": 0, "description": "With events: only events after this seq" },
-                    "limit": { "type": "integer", "minimum": 1, "maximum": 1000, "description": "With events: at most this many (default 200)" }
+                    "limit": { "type": "integer", "minimum": 1, "maximum": 1000, "description": "With events: at most this many (default 200)" },
+                    "tail": { "type": "integer", "minimum": 1, "maximum": 1000, "description": "With events: the last N events instead (not with since); page back with before" },
+                    "before": { "type": "integer", "minimum": 1, "description": "With events: only events below this seq; pass prev_before from the last page (null there means the start of the record)" }
                 }),
             )
         },
@@ -1167,19 +1169,23 @@ pub fn call_tool(cx: &mut Ctx, name: &str, a: &Map<String, Value>) -> ToolResult
             let pid = a.get("pid").and_then(Value::as_u64).unwrap_or(0);
             get(&format!("/v1/process/{pid}"))
         }
-        "list_sessions" => get("/v1/sessions"),
+        "list_sessions" => get("/v1/sessions").map(crate::sessions::with_words),
         "get_session" => {
             let id = a.get("id").and_then(Value::as_str).unwrap_or("");
             crate::sessions::check_session_id(id)?;
-            let mut v = get(&format!("/v1/sessions/{id}"))?;
+            let mut v = crate::sessions::with_words(get(&format!("/v1/sessions/{id}"))?);
             if flag("events") {
-                let ev = get(&crate::sessions::events_path(
-                    id,
-                    a.get("since").and_then(Value::as_u64),
-                    a.get("limit").and_then(Value::as_u64),
-                ))?;
+                let n = |k: &str| a.get(k).and_then(Value::as_u64);
+                let page = crate::sessions::Page {
+                    since: n("since"),
+                    limit: n("limit"),
+                    tail: n("tail"),
+                    before: n("before"),
+                };
+                let ev = get(&crate::sessions::events_path(id, &page))?;
                 v["events"] = ev["events"].clone();
                 v["next_since"] = ev["next_since"].clone();
+                v["prev_before"] = ev["prev_before"].clone();
             }
             Ok(v)
         }
