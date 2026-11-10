@@ -49,6 +49,18 @@ fn lease(label: &str, pid: Option<u32>, ticket: Option<u64>, ttl: Option<u64>) -
         pid,
         ticket,
         ttl_secs: ttl,
+        secret: None,
+    }
+}
+
+/// Renew or poll the ticket of `r` with its secret.
+fn again(r: &LeaseReply, ttl: Option<u64>) -> LeaseRequest {
+    LeaseRequest {
+        label: String::new(),
+        pid: None,
+        ticket: Some(r.ticket),
+        ttl_secs: ttl,
+        secret: r.release_secret.clone(),
     }
 }
 
@@ -82,9 +94,9 @@ fn slots_queue_in_order_and_release() {
     let c = e.acquire(&lease("c", me, None, None)).unwrap();
     assert_eq!(c.position, 1);
     assert!(e.release(a.ticket));
-    let c2 = e.acquire(&lease("c", me, Some(c.ticket), None)).unwrap();
+    let c2 = e.acquire(&again(&c, None)).unwrap();
     assert!(!c2.granted);
-    let b2 = e.acquire(&lease("b", me, Some(b.ticket), None)).unwrap();
+    let b2 = e.acquire(&again(&b, None)).unwrap();
     assert!(b2.granted);
     assert_eq!(b2.jobs, 4);
 }
@@ -134,9 +146,7 @@ fn ttl_leases_expire_unless_renewed() {
     assert!(a.granted);
     assert_eq!(a.expires_unix, Some(110));
     // Renew: the same ticket again.
-    let r = e
-        .acquire_at(&lease("a", None, Some(a.ticket), None), 105)
-        .unwrap();
+    let r = e.acquire_at(&again(&a, None), 105).unwrap();
     assert!(r.granted && r.reason == "renewed");
     assert_eq!(r.expires_unix, Some(115));
     e.expire_leases_at(114);
@@ -627,15 +637,10 @@ fn a_silent_head_waiter_leaves_after_the_poll_window() {
     assert_eq!(c.position, 1);
     assert!(e.release(a.ticket));
     // c keeps polling; b went quiet.
-    let c1 = e
-        .acquire_at(&lease("c", None, Some(c.ticket), None), t0 + 20)
-        .unwrap();
+    let c1 = e.acquire_at(&again(&c, None), t0 + 20).unwrap();
     assert!(!c1.granted, "b still within the poll window");
     let c2 = e
-        .acquire_at(
-            &lease("c", None, Some(c.ticket), None),
-            t0 + WAITER_POLL_SECS + 1,
-        )
+        .acquire_at(&again(&c, None), t0 + WAITER_POLL_SECS + 1)
         .unwrap();
     assert!(c2.granted, "{c2:?}");
 }
@@ -1150,4 +1155,58 @@ fn process_detail_shows_the_family_and_hides_other_users_command_lines() {
     assert!(e.process_detail(99).is_none());
     let v = serde_json::to_value(&d).unwrap();
     assert_eq!(v["parents"][0]["name"], "shell");
+}
+
+/// R1: a ticket is renewed or polled only with its secret, and a renewal
+/// never shortens a lease or adds a TTL to a pid lease.
+#[test]
+fn renewing_or_polling_needs_the_secret_and_never_shortens() {
+    let (_t, e) = engine();
+    one_slot(&e);
+    let a = e
+        .acquire_at(&lease("a", None, None, Some(600)), 100)
+        .unwrap();
+    assert!(a.granted);
+    let b = e
+        .acquire_at(&lease("b", None, None, Some(600)), 100)
+        .unwrap();
+    assert!(!b.granted);
+    // Someone who only read the ticket id from state.
+    let steal = lease("x", None, Some(a.ticket), Some(1));
+    assert_eq!(
+        e.acquire_at(&steal, 101).unwrap_err(),
+        LeaseError::SecretRequired
+    );
+    let wrong = LeaseRequest {
+        secret: Some("0".repeat(32)),
+        ..steal.clone()
+    };
+    assert_eq!(
+        e.acquire_at(&wrong, 101).unwrap_err(),
+        LeaseError::WrongSecret
+    );
+    assert_eq!(
+        e.acquire_at(&lease("x", None, Some(b.ticket), None), 101)
+            .unwrap_err(),
+        LeaseError::SecretRequired,
+        "polling a waiter needs its secret too"
+    );
+    // The owner asking for a shorter TTL keeps the later expiry.
+    let r = e.acquire_at(&again(&a, Some(1)), 101).unwrap();
+    assert_eq!(r.expires_unix, Some(700));
+    e.expire_leases_at(200);
+    assert_eq!(e.snapshot_state().slots.active.len(), 1);
+    let r = e.acquire_at(&again(&a, Some(900)), 102).unwrap();
+    assert_eq!(r.expires_unix, Some(1002), "extending is fine");
+    // A pid lease never gains a TTL.
+    let (_t2, e2) = engine();
+    one_slot(&e2);
+    let p = e2
+        .acquire_at(&lease("p", Some(std::process::id()), None, None), 100)
+        .unwrap();
+    assert!(p.granted);
+    let r = e2.acquire_at(&again(&p, Some(5)), 101).unwrap();
+    assert_eq!(r.expires_unix, None);
+    e2.expire_leases_at(10_000);
+    assert_eq!(e2.snapshot_state().slots.active[0].ttl_secs, None);
 }

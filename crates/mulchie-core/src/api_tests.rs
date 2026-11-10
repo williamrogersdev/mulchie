@@ -621,9 +621,26 @@ fn leases_over_the_api() {
     // The secret never appears in state.
     let st = c.call("GET", "/v1/state", None).unwrap().to_string();
     assert!(!st.contains(&secret));
+    // Renewing needs the secret (R1): 403 without it.
+    let e = c
+        .request(
+            "POST",
+            "/v1/lease",
+            Some(&json!({ "ticket": g["ticket"], "ttl_secs": 1 })),
+            DEFAULT_TIMEOUT,
+        )
+        .unwrap_err();
+    assert_eq!(
+        (e.status, e.code.as_str()),
+        (403, "release_secret_required")
+    );
     // A renewal does not hand it out again.
     let again = c
-        .call("POST", "/v1/lease", Some(&json!({ "ticket": g["ticket"] })))
+        .call(
+            "POST",
+            "/v1/lease",
+            Some(&json!({ "ticket": g["ticket"], "secret": secret })),
+        )
         .unwrap();
     assert!(again.get("release_secret").is_none(), "{again}");
     let e = c

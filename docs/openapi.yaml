@@ -507,6 +507,9 @@ paths:
         sees; keep it for `POST /v1/release`. The read-only token may take a lease only with
         `ttl_secs` and no `pid` (403 `read_only_token` otherwise). A `pid` of 0 or 1, another
         user's process or a dead one is refused with `pid_not_allowed`. Labels are redacted.
+        Renewing or polling a ticket needs its `secret` (403 `release_secret_required` without it,
+        403 `wrong_release_secret` with another). A renewal never shortens a lease's expiry and
+        never adds a TTL to a pid lease.
       requestBody:
         required: true
         content:
@@ -518,6 +521,7 @@ paths:
                 pid: { type: integer }
                 ticket: { type: integer }
                 ttl_secs: { type: integer, minimum: 1, maximum: 86400 }
+                secret: { type: string, description: With `ticket`, the `release_secret` from the reply that created it }
       responses:
         "200":
           description: The ticket's state

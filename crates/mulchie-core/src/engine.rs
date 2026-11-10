@@ -197,11 +197,19 @@ pub struct LeaseRequest {
     pub ticket: Option<u64>,
     #[serde(default)]
     pub ttl_secs: Option<u64>,
+    /// With `ticket`: the `release_secret` from the reply that created it.
+    /// Renewing or polling a ticket that has a secret requires it.
+    #[serde(default)]
+    pub secret: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum LeaseError {
     NeedsPidOrTtl,
+    /// Renewing or polling a ticket with a release secret needs the secret.
+    SecretRequired,
+    /// The secret sent is not the ticket's.
+    WrongSecret,
     PidNotAlive(u32),
     TtlOutOfRange(u64),
     /// pid 1 (or 0), or a process of another user: its lifetime says nothing
@@ -216,6 +224,8 @@ impl LeaseError {
             LeaseError::PidNotAlive(_) => "pid_not_alive",
             LeaseError::TtlOutOfRange(_) => "ttl_out_of_range",
             LeaseError::PidNotAllowed(_) => "pid_not_allowed",
+            LeaseError::SecretRequired => "release_secret_required",
+            LeaseError::WrongSecret => "wrong_release_secret",
         }
     }
 }
@@ -235,6 +245,11 @@ impl std::fmt::Display for LeaseError {
                 f,
                 "process {p} is pid 1 or belongs to another user; lease a process of your own"
             ),
+            LeaseError::SecretRequired => write!(
+                f,
+                "this ticket has a release secret; send it as \"secret\" to renew or poll"
+            ),
+            LeaseError::WrongSecret => write!(f, "the secret sent is not this ticket's"),
         }
     }
 }
@@ -2265,12 +2280,45 @@ impl Engine {
         if !known && pid.is_none() && req.ttl_secs.is_none() {
             return Err(LeaseError::NeedsPidOrTtl);
         }
+        if known {
+            // Whoever renews or polls a ticket must be the one who took it.
+            let t = req.ticket.unwrap_or_default();
+            let want = st
+                .slots
+                .active
+                .iter()
+                .find(|l| l.id == t)
+                .map(|l| l.release_secret.clone())
+                .or_else(|| {
+                    st.slots
+                        .waiting
+                        .iter()
+                        .find(|w| w.id == t)
+                        .map(|w| w.release_secret.clone())
+                })
+                .flatten();
+            if let Some(want) = want {
+                match req.secret.as_deref() {
+                    None => return Err(LeaseError::SecretRequired),
+                    Some(got) if !crate::api::constant_time_eq(got.as_bytes(), want.as_bytes()) => {
+                        return Err(LeaseError::WrongSecret)
+                    }
+                    Some(_) => {}
+                }
+            }
+        }
         let jobs = st.slots.jobs_per_slot.max(1);
         let ticket = req.ticket;
         if let Some(l) = ticket.and_then(|t| st.slots.active.iter_mut().find(|l| l.id == t)) {
-            if let Some(ttl) = req.ttl_secs.or(l.ttl_secs) {
-                l.ttl_secs = Some(ttl);
-                l.expires_unix = Some(now + ttl);
+            // A renewal extends a TTL lease; it never shortens one and never
+            // turns a pid lease into a TTL lease.
+            if let Some(old_ttl) = l.ttl_secs {
+                let ttl = req.ttl_secs.unwrap_or(old_ttl);
+                let new_expiry = now + ttl;
+                if l.expires_unix.is_none_or(|e| new_expiry >= e) {
+                    l.ttl_secs = Some(ttl);
+                    l.expires_unix = Some(new_expiry);
+                }
             }
             return Ok(LeaseReply {
                 granted: true,
@@ -2303,8 +2351,10 @@ impl Engine {
         };
         if let Some(w) = st.slots.waiting.iter_mut().find(|w| w.id == id) {
             w.last_poll = now;
-            if req.ttl_secs.is_some() {
-                w.ttl_secs = req.ttl_secs;
+            // A waiter's TTL may grow, never shrink, and a pid waiter never
+            // gains one.
+            if let (Some(new), Some(old)) = (req.ttl_secs, w.ttl_secs) {
+                w.ttl_secs = Some(new.max(old));
             }
         }
         let position = st

@@ -1170,6 +1170,10 @@ fn route(req: &Req, engine: &Engine, read_only: bool) -> Resp {
                 }
                 match engine.acquire(&b) {
                     Ok(r) => ok(&r),
+                    Err(
+                        e @ (crate::engine::LeaseError::SecretRequired
+                        | crate::engine::LeaseError::WrongSecret),
+                    ) => fail(403, e.code(), e.to_string()),
                     Err(e) => fail(400, e.code(), e.to_string()),
                 }
             }
