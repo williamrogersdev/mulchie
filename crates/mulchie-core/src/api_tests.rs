@@ -173,6 +173,9 @@ fn timeouts_per_route() {
         LONG_TIMEOUT
     );
     assert_eq!(timeout_for("POST", "/v1/lease"), DEFAULT_TIMEOUT);
+    // R16: a group restart can take 35 s.
+    assert_eq!(timeout_for("POST", "/v1/process/execute"), LONG_TIMEOUT);
+    assert_eq!(timeout_for("POST", "/v1/process"), LONG_TIMEOUT);
 }
 
 // --------------------------------------------------------- token files
@@ -1084,4 +1087,40 @@ fn config_routes_with_both_tokens() {
         24,
         "saved"
     );
+}
+
+/// R16: a client that hangs up before the reply does not stop the request:
+/// it runs to the end and its result is journaled, and the server goes on.
+#[test]
+fn an_execute_whose_client_hung_up_still_runs_and_is_recorded() {
+    use std::io::Write;
+    let r = running(Limits::default());
+    let body =
+        r#"{"items":[{"action":"signal","pid":4000123,"signal":"term","expected_start_time":7}]}"#;
+    let mut s = TcpStream::connect(("127.0.0.1", r.port)).unwrap();
+    write!(
+        s,
+        "POST /v1/process/execute HTTP/1.1\r\nHost: 127.0.0.1:{}\r\nAuthorization: Bearer {}\r\nContent-Length: {}\r\n\r\n{body}",
+        r.port,
+        r.token,
+        body.len()
+    )
+    .unwrap();
+    s.flush().unwrap();
+    drop(s);
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        let st = r.engine.snapshot_state();
+        if st
+            .actions
+            .iter()
+            .any(|a| a.target.as_deref().is_some_and(|t| t.contains("4000123")))
+        {
+            break;
+        }
+        assert!(std::time::Instant::now() < deadline, "not recorded");
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    let (code, _) = send(r.port, "GET", "/v1/health", None, "");
+    assert_eq!(code, 200);
 }

@@ -445,6 +445,10 @@ fn handle_conn(
         Err(ReqError::Closed) => return,
         Err(ReqError::Http(e)) => e.into_response(),
     };
+    // The request ran to the end whether or not the client is still there
+    // (its results are in the journal and `state.actions`); a client that
+    // gave up only misses the reply. Writing to it fails with EPIPE (Rust
+    // ignores SIGPIPE) or the write timeout, never a crash or a hang.
     let _ = write_response(&stream, &resp);
 }
 
@@ -1242,7 +1246,11 @@ pub fn timeout_for(method: &str, path: &str) -> Duration {
             | "/v1/sweep"
             | "/v1/worktree/plan"
             | "/v1/worktree/remove"
-            | "/v1/prune",
+            | "/v1/prune"
+            // A restart quits, waits up to 20 s for the app to exit, then
+            // reopens it with a 15 s timeout.
+            | "/v1/process"
+            | "/v1/process/execute",
         ) => LONG_TIMEOUT,
         _ => DEFAULT_TIMEOUT,
     }
