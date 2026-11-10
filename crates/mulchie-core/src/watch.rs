@@ -708,6 +708,39 @@ impl SigCache {
     }
 }
 
+/// A yes/no fact about a file (the quarantine flag), kept while the file's
+/// status-change time and size stay the same (setting or removing an
+/// extended attribute changes the ctime).
+#[derive(Debug, Default)]
+pub struct FlagCache {
+    map: HashMap<PathBuf, (i64, u64, bool)>,
+}
+
+impl FlagCache {
+    pub fn get(&self, p: &Path) -> Option<bool> {
+        let (ct, sz) = ctime_size(p)?;
+        self.map
+            .get(p)
+            .filter(|(c, s, _)| *c == ct && *s == sz)
+            .map(|e| e.2)
+    }
+
+    pub fn put(&mut self, p: &Path, v: bool) {
+        if let Some((ct, sz)) = ctime_size(p) {
+            if self.map.len() > 5000 {
+                self.map.clear();
+            }
+            self.map.insert(p.to_path_buf(), (ct, sz, v));
+        }
+    }
+}
+
+fn ctime_size(p: &Path) -> Option<(i64, u64)> {
+    use std::os::unix::fs::MetadataExt;
+    let m = std::fs::metadata(p).ok()?;
+    Some((m.ctime(), m.len()))
+}
+
 fn mtime_size(p: &Path) -> Option<(i64, u64)> {
     use std::os::unix::fs::MetadataExt;
     let m = std::fs::metadata(p).ok()?;

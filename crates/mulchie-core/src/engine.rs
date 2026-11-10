@@ -539,6 +539,8 @@ pub struct ScanCtx {
 struct WatchMem {
     tracker: watch::Tracker,
     sigs: watch::SigCache,
+    /// Quarantine flags already read, so each run reads the next ones.
+    quarantine: watch::FlagCache,
     /// Listening sockets from the last run, and when.
     listeners: Option<Vec<watch::Listener>>,
     listeners_unix: Option<u64>,
@@ -1358,14 +1360,23 @@ impl Engine {
         let mut sigs = HashMap::new();
         let mut quarantined = HashSet::new();
         if cfg.watch.check_signatures {
-            let known: HashSet<PathBuf> = {
+            let (known, quar_known): (HashSet<PathBuf>, HashSet<PathBuf>) = {
                 let w = lock(&self.watch);
-                procs
+                let own: Vec<PathBuf> = procs
                     .iter()
                     .filter(|p| p.uid == Some(uid))
                     .filter_map(|p| p.exe.clone())
-                    .filter(|e| w.sigs.get(e).is_some())
-                    .collect()
+                    .collect();
+                (
+                    own.iter()
+                        .filter(|e| w.sigs.get(e).is_some())
+                        .cloned()
+                        .collect(),
+                    own.iter()
+                        .filter(|e| w.quarantine.get(e).is_some())
+                        .cloned()
+                        .collect(),
+                )
             };
             let fresh: Vec<(PathBuf, Option<watch::SigStatus>)> = watch::signature_candidates(
                 &procs,
@@ -1380,18 +1391,32 @@ impl Engine {
                 (e, s)
             })
             .collect();
-            for e in watch::signature_candidates(
+            // Loose executables not read yet (or changed since): each run
+            // reads the next ones, so every candidate is reached in turn.
+            let quar_fresh: Vec<(PathBuf, bool)> = watch::signature_candidates(
                 &procs,
                 uid,
-                &|_| false,
+                &|p| quar_known.contains(p) || crate::consumers::outer_bundle(p).is_some(),
                 &temps,
                 QUARANTINE_CHECKS_PER_RUN,
-            ) {
-                if crate::consumers::outer_bundle(&e).is_none() && self.probe.quarantined(&e) {
-                    quarantined.insert(e);
+            )
+            .into_iter()
+            .map(|e| {
+                let q = self.probe.quarantined(&e);
+                (e, q)
+            })
+            .collect();
+            let mut w = lock(&self.watch);
+            for (e, q) in quar_fresh {
+                w.quarantine.put(&e, q);
+            }
+            for p in procs.iter().filter(|p| p.uid == Some(uid)) {
+                if let Some(e) = &p.exe {
+                    if w.quarantine.get(e) == Some(true) {
+                        quarantined.insert(e.clone());
+                    }
                 }
             }
-            let mut w = lock(&self.watch);
             for (e, s) in fresh {
                 if let Some(s) = s {
                     w.sigs.put(&e, s);

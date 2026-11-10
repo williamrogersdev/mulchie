@@ -1401,3 +1401,58 @@ fn unknown_listeners_keep_findings_and_failed_signatures_are_retried() {
     *probe.listeners.lock().unwrap() = Some(Vec::new());
     assert!(!has(&e.run_watch()), "gone once known again");
 }
+
+/// Counts quarantine reads; every file is quarantined.
+struct QuarProbe(AtomicU64);
+
+impl crate::watch::WatchProbe for QuarProbe {
+    fn listeners(&self) -> Option<Vec<crate::watch::Listener>> {
+        Some(Vec::new())
+    }
+    fn signature(&self, _: &Path) -> Option<crate::watch::SigStatus> {
+        None
+    }
+    fn quarantined(&self, _: &Path) -> bool {
+        self.0.fetch_add(1, Ordering::SeqCst);
+        true
+    }
+}
+
+/// R12: quarantine checks reach every candidate in turn (200 per run),
+/// and a flag read once is kept while the file is unchanged.
+#[test]
+fn quarantine_checks_rotate_through_every_candidate() {
+    use crate::watch::FindingKind;
+    let dir = tempfile::tempdir().unwrap();
+    let base = dir.path().canonicalize().unwrap();
+    let mut procs = FakeProcesses::empty();
+    let uid = procs.uid;
+    for i in 0..250u32 {
+        let exe = base.join(format!("tool{i}"));
+        std::fs::write(&exe, b"x").unwrap();
+        procs.procs.push(fact(100 + i, 5, uid, "tool", Some(exe)));
+    }
+    let (_t, e) = engine_with_procs(Config::default(), procs);
+    let probe = Arc::new(QuarProbe(AtomicU64::new(0)));
+    let e = e.with_watch_probe(probe.clone());
+    let count = |f: &[crate::watch::Finding]| {
+        f.iter()
+            .filter(|f| f.kind == FindingKind::QuarantinedExecutable)
+            .count()
+    };
+    let first = count(&e.run_watch());
+    assert_eq!(probe.0.load(Ordering::SeqCst), 200);
+    let second = count(&e.run_watch());
+    assert_eq!(
+        probe.0.load(Ordering::SeqCst),
+        250,
+        "the other 50, not the same 200"
+    );
+    assert!(second > first, "{first} then {second}");
+    e.run_watch();
+    assert_eq!(
+        probe.0.load(Ordering::SeqCst),
+        250,
+        "known flags are not read again"
+    );
+}

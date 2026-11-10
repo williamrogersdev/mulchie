@@ -79,6 +79,12 @@ pub enum GitError {
     Timeout(Duration),
     /// git exited unsuccessfully.
     Failed { code: Option<i32>, stderr: String },
+    /// The command wrote more to stdout than [`MAX_STDOUT`]; nothing is
+    /// returned rather than a truncated result (patches come from stdout).
+    OutputTooLarge(usize),
+    /// The command exited but its output stayed open (a background process
+    /// outside its process group kept it), so the output may be incomplete.
+    OutputOpen,
 }
 
 impl std::fmt::Display for GitError {
@@ -90,6 +96,13 @@ impl std::fmt::Display for GitError {
                 Some(c) => write!(f, "git exited with {c}: {stderr}"),
                 None => write!(f, "git was killed: {stderr}"),
             },
+            GitError::OutputTooLarge(n) => {
+                write!(f, "the command wrote more than {} MiB of output", n >> 20)
+            }
+            GitError::OutputOpen => write!(
+                f,
+                "the command exited but a background process kept its output open"
+            ),
         }
     }
 }
@@ -258,31 +271,66 @@ pub struct ProcOutput {
     pub stderr: String,
 }
 
+/// Captured stdout above this is an error ([`GitError::OutputTooLarge`]).
+pub const MAX_STDOUT: usize = 512 << 20;
+/// Captured stderr keeps its first this many bytes.
+pub const MAX_STDERR: usize = 1 << 20;
+/// After the command exits, how long its output may stay open before the
+/// process group is killed.
+const READER_GRACE: Duration = Duration::from_secs(2);
+
+/// Read `src` to its end on a thread, keeping at most `cap` bytes; the
+/// buffer and whether more was written arrive on the channel.
+fn spawn_reader<R: Read + Send + 'static>(
+    src: Option<R>,
+    cap: usize,
+) -> std::sync::mpsc::Receiver<(Vec<u8>, bool)> {
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let mut b = Vec::new();
+        let mut over = false;
+        if let Some(mut s) = src {
+            let mut buf = vec![0u8; 64 * 1024];
+            loop {
+                match s.read(&mut buf) {
+                    Ok(0) => break,
+                    Ok(n) if b.len() + n <= cap => b.extend_from_slice(&buf[..n]),
+                    Ok(n) => {
+                        let room = cap - b.len();
+                        b.extend_from_slice(&buf[..room.min(n)]);
+                        over = true;
+                    }
+                    Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+                    Err(_) => break,
+                }
+            }
+        }
+        let _ = tx.send((b, over));
+    });
+    rx
+}
+
 /// Run `cmd` in its own process group with stdout and stderr captured. Past
 /// `timeout` the whole group is killed and [`GitError::Timeout`] returned.
-pub fn run_with_timeout(mut cmd: Command, timeout: Duration) -> Result<ProcOutput, GitError> {
+/// Reading the output never waits without bound: once the command exits, a
+/// group member still holding it open is killed after [`READER_GRACE`].
+pub fn run_with_timeout(cmd: Command, timeout: Duration) -> Result<ProcOutput, GitError> {
+    run_capped(cmd, timeout, MAX_STDOUT)
+}
+
+fn run_capped(
+    mut cmd: Command,
+    timeout: Duration,
+    max_stdout: usize,
+) -> Result<ProcOutput, GitError> {
     use std::os::unix::process::CommandExt;
     cmd.stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .process_group(0);
     let mut child = cmd.spawn().map_err(|e| GitError::Spawn(e.to_string()))?;
-    let mut so = child.stdout.take();
-    let mut se = child.stderr.take();
-    let out_t = std::thread::spawn(move || {
-        let mut b = Vec::new();
-        if let Some(s) = so.as_mut() {
-            let _ = s.read_to_end(&mut b);
-        }
-        b
-    });
-    let err_t = std::thread::spawn(move || {
-        let mut b = Vec::new();
-        if let Some(s) = se.as_mut() {
-            let _ = s.read_to_end(&mut b);
-        }
-        b
-    });
+    let out_rx = spawn_reader(child.stdout.take(), max_stdout);
+    let err_rx = spawn_reader(child.stderr.take(), MAX_STDERR);
     let deadline = Instant::now() + timeout;
     let mut nap = Duration::from_millis(2);
     let status = loop {
@@ -303,12 +351,35 @@ pub fn run_with_timeout(mut cmd: Command, timeout: Duration) -> Result<ProcOutpu
     let Some(status) = status else {
         kill_group(child.id());
         let _ = child.wait();
-        let _ = out_t.join();
-        let _ = err_t.join();
+        // The readers end when the group is gone; one held open by a
+        // process outside the group is left behind, not waited for.
         return Err(GitError::Timeout(timeout));
     };
-    let stdout = out_t.join().unwrap_or_default();
-    let stderr = String::from_utf8_lossy(&err_t.join().unwrap_or_default()).to_string();
+    // The leader has exited; a group member may still hold the pipes.
+    let pid = child.id();
+    let grace = Instant::now() + READER_GRACE;
+    let mut after_kill: Option<Instant> = None;
+    let mut collect = |rx: &std::sync::mpsc::Receiver<(Vec<u8>, bool)>| {
+        let left = grace.saturating_duration_since(Instant::now());
+        if let Ok(v) = rx.recv_timeout(left) {
+            return Some(v);
+        }
+        let end = *after_kill.get_or_insert_with(|| {
+            kill_group(pid);
+            Instant::now() + Duration::from_millis(500)
+        });
+        rx.recv_timeout(end.saturating_duration_since(Instant::now()))
+            .ok()
+    };
+    let out = collect(&out_rx);
+    let err = collect(&err_rx);
+    let (Some((stdout, out_over)), Some((err_bytes, _))) = (out, err) else {
+        return Err(GitError::OutputOpen);
+    };
+    if out_over {
+        return Err(GitError::OutputTooLarge(max_stdout));
+    }
+    let stderr = String::from_utf8_lossy(&err_bytes).to_string();
     Ok(ProcOutput {
         success: status.success(),
         code: status.code(),
@@ -436,6 +507,47 @@ mod tests {
         let r = run_with_timeout(cmd, Duration::from_millis(150));
         assert!(matches!(r, Err(GitError::Timeout(_))));
         assert!(t.elapsed() < Duration::from_secs(2));
+    }
+
+    /// R12: a background process holding the output open does not block
+    /// the caller after the command exits; output is capped.
+    #[test]
+    fn output_reading_is_bounded() {
+        // Same process group: killed after the grace period, output kept.
+        let mut cmd = Command::new("/bin/sh");
+        cmd.args(["-c", "sleep 30 & echo hi"]);
+        let t = Instant::now();
+        let r = run_with_timeout(cmd, Duration::from_secs(60)).unwrap();
+        assert_eq!(String::from_utf8_lossy(&r.stdout), "hi\n");
+        assert!(t.elapsed() < Duration::from_secs(5), "{:?}", t.elapsed());
+
+        // A new session holds stdout: not waited for, reported as open.
+        let mut cmd = Command::new("/usr/bin/perl");
+        cmd.args([
+            "-MPOSIX",
+            "-e",
+            "if (fork) { print qq(hi\n); exit 0 } POSIX::setsid(); sleep 8;",
+        ]);
+        let t = Instant::now();
+        let r = run_with_timeout(cmd, Duration::from_secs(60));
+        assert!(
+            matches!(r, Err(GitError::OutputOpen)),
+            "{:?}",
+            r.map(|o| o.stdout)
+        );
+        assert!(t.elapsed() < Duration::from_secs(5), "{:?}", t.elapsed());
+
+        // Too much stdout is an error, never a truncated success.
+        let mut cmd = Command::new("/bin/sh");
+        cmd.args(["-c", "head -c 3000000 /dev/zero"]);
+        let r = run_capped(cmd, Duration::from_secs(30), 1 << 20);
+        assert!(matches!(r, Err(GitError::OutputTooLarge(_))));
+        // Stderr keeps its first MAX_STDERR bytes.
+        let mut cmd = Command::new("/bin/sh");
+        cmd.args(["-c", "head -c 3000000 /dev/zero >&2; echo ok"]);
+        let r = run_with_timeout(cmd, Duration::from_secs(30)).unwrap();
+        assert!(r.stderr.len() <= MAX_STDERR);
+        assert_eq!(String::from_utf8_lossy(&r.stdout), "ok\n");
     }
 
     #[test]
