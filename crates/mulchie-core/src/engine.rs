@@ -1633,15 +1633,24 @@ impl Engine {
                     }
                 }
             }
+            // Unknown (output codesign gave that is not understood) counts
+            // for this run only: it is not cached, so it is read again.
+            let mut unknown = HashSet::new();
             for (e, s) in fresh {
-                if let Some(s) = s {
-                    w.sigs.put(&e, s);
+                match s {
+                    Some(watch::SigStatus::Unknown) => {
+                        unknown.insert(e);
+                    }
+                    Some(s) => w.sigs.put(&e, s),
+                    None => {}
                 }
             }
             for p in procs.iter().filter(|p| p.uid == Some(uid)) {
                 if let Some(e) = &p.exe {
                     if let Some(s) = w.sigs.get(e) {
                         sigs.insert(e.clone(), s);
+                    } else if unknown.contains(e) {
+                        sigs.insert(e.clone(), watch::SigStatus::Unknown);
                     }
                 }
             }
@@ -2533,25 +2542,11 @@ impl Engine {
                 return ProcessPlan::refused(now, &target, &action, code, detail)
             }
         };
-        let mut items = self.plan(&d.requests).items;
-        // A pid or tree plan never signals the caller, its shell, terminal or
-        // agent, nor Mulchie's own ancestors (group plans refuse them above).
-        for item in &mut items {
-            if let Request::Signal { pid, .. } = &item.request {
-                if ancestors.contains(pid) {
-                    let who = if req.caller_pid == Some(*pid) {
-                        "the caller"
-                    } else if req.caller_pid.is_some() {
-                        "an ancestor of the caller or of Mulchie (its shell, terminal or agent)"
-                    } else {
-                        "an ancestor of Mulchie"
-                    };
-                    item.ready = false;
-                    item.reason = Some(crate::safety::SkipReason::ProtectedProcess);
-                    item.verdict = format!("pid {pid} is {who}; it is never signalled");
-                }
-            }
-        }
+        // No per-item ancestor check is needed: a tree plan holds the target
+        // and its descendants, so one of them is an ancestor of the caller or
+        // of Mulchie only when the target is, and that is refused above (from
+        // the same `procs`). Group plans refuse them in `group_protection`.
+        let items = self.plan(&d.requests).items;
         let ready = items.iter().any(|i| i.ready);
         ProcessPlan {
             created_unix: now,

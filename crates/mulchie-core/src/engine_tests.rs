@@ -1468,6 +1468,27 @@ fn unknown_listeners_keep_findings_and_failed_signatures_are_retried() {
     );
     *probe.listeners.lock().unwrap() = Some(Vec::new());
     assert!(!has(&e.run_watch()), "gone once known again");
+
+    // Output codesign gave that is not understood (Unknown) is not cached
+    // either: the next run reads the signature again.
+    *probe.sig.lock().unwrap() = Some(crate::watch::SigStatus::Unknown);
+    e.run_watch();
+    let calls = probe.sig_calls.load(Ordering::SeqCst);
+    e.run_watch();
+    assert!(
+        probe.sig_calls.load(Ordering::SeqCst) > calls,
+        "Unknown is not cached"
+    );
+    // A real answer is cached: no further reads.
+    *probe.sig.lock().unwrap() = Some(crate::watch::SigStatus::Unsigned);
+    e.run_watch();
+    let calls = probe.sig_calls.load(Ordering::SeqCst);
+    e.run_watch();
+    assert_eq!(
+        probe.sig_calls.load(Ordering::SeqCst),
+        calls,
+        "Unsigned is cached"
+    );
 }
 
 /// Counts quarantine reads; every file is quarantined.
