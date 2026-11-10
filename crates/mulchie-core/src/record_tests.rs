@@ -191,6 +191,140 @@ fn write_failures_surface_as_an_error() {
     assert_eq!(r.read(S, 0, 10).unwrap().len(), 1);
 }
 
+/// N12 and A5: pages seek through an index kept per file (one mark per
+/// STRIDE events, extended as the file grows, reset when it is replaced);
+/// `tail` and `before` page backwards; a read waits on the writer only while
+/// events are queued.
+#[test]
+fn pages_seek_through_the_index() {
+    let t = tempfile::tempdir().unwrap();
+    let dir = t.path().join("sessions");
+    let r = Record::new(
+        dir.clone(),
+        RecordLimits {
+            max_events: 100_000,
+            ..limits()
+        },
+    );
+    for i in 0..1000 {
+        r.event(S, i, "hook", json!({"i": i}));
+    }
+    r.flush();
+    assert_eq!(r.pending.load(Ordering::SeqCst), 0);
+    let seqs = |p: &Page| -> Vec<u64> {
+        p.events
+            .iter()
+            .map(|e| e["seq"].as_u64().unwrap())
+            .collect()
+    };
+    let p = r
+        .page(
+            S,
+            Query::Since {
+                since: 900,
+                limit: 10,
+            },
+        )
+        .unwrap();
+    assert_eq!(seqs(&p), (901..=910).collect::<Vec<_>>());
+    assert_eq!(p.prev_before, Some(901));
+    let p = r.page(S, Query::Tail { n: 5, before: None }).unwrap();
+    assert_eq!(seqs(&p), (996..=1000).collect::<Vec<_>>());
+    assert_eq!(p.prev_before, Some(996));
+    let p = r
+        .page(
+            S,
+            Query::Tail {
+                n: 5,
+                before: Some(996),
+            },
+        )
+        .unwrap();
+    assert_eq!(seqs(&p), (991..=995).collect::<Vec<_>>());
+    let p = r
+        .page(
+            S,
+            Query::Tail {
+                n: 10,
+                before: Some(3),
+            },
+        )
+        .unwrap();
+    assert_eq!(seqs(&p), vec![1, 2]);
+    assert_eq!(p.prev_before, None, "the start of the record");
+    {
+        let map = r.index.0.lock().unwrap();
+        let idx = &map[S];
+        assert_eq!(idx.marks.len(), 1000usize.div_ceil(STRIDE as usize));
+        assert!(idx.marks.windows(2).all(|w| w[1].0 - w[0].0 == STRIDE));
+        assert_eq!(idx.last_seq, 1000);
+    }
+    // The file grows: only the new lines are indexed.
+    let scanned = r.index.0.lock().unwrap()[S].scanned;
+    for i in 0..10 {
+        r.event(S, 2000 + i, "hook", json!({}));
+    }
+    r.flush();
+    let p = r.page(S, Query::Tail { n: 2, before: None }).unwrap();
+    assert_eq!(seqs(&p), vec![1009, 1010]);
+    assert!(r.index.0.lock().unwrap()[S].scanned > scanned);
+    // A replaced file (another inode) starts the index over.
+    let path = file_of(&dir, S);
+    std::fs::remove_file(&path).unwrap();
+    let mut body = String::new();
+    for seq in 1..=3 {
+        body.push_str(&format!("{{\"seq\":{seq},\"t\":1,\"type\":\"hook\"}}\n"));
+    }
+    body.push_str("{\"seq\":4,\"t\":1"); // still being written
+    std::fs::write(&path, body).unwrap();
+    let p = r
+        .page(
+            S,
+            Query::Tail {
+                n: 10,
+                before: None,
+            },
+        )
+        .unwrap();
+    assert_eq!(seqs(&p), vec![1, 2, 3]);
+    // Nothing queued: a reader's flush returns at once.
+    let at = std::time::Instant::now();
+    r.flush_pending(Duration::from_secs(5));
+    assert!(at.elapsed() < Duration::from_secs(1));
+}
+
+/// N11: a symlink, a FIFO or a hard link where a session file belongs is
+/// refused (never followed, never blocks) and the failure surfaces.
+#[test]
+fn writes_refuse_links_and_special_files() {
+    let t = tempfile::tempdir().unwrap();
+    let dir = t.path().join("sessions");
+    std::fs::create_dir_all(&dir).unwrap();
+    let outside = t.path().join("victim");
+    std::fs::write(&outside, b"keep\n").unwrap();
+    let cases = ["s-1-1", "s-2-2", "s-3-3"];
+    std::os::unix::fs::symlink(&outside, file_of(&dir, cases[0])).unwrap();
+    let fifo = std::ffi::CString::new(file_of(&dir, cases[1]).to_str().unwrap()).unwrap();
+    assert_eq!(unsafe { libc::mkfifo(fifo.as_ptr(), 0o600) }, 0);
+    std::fs::hard_link(&outside, file_of(&dir, cases[2])).unwrap();
+    for s in cases {
+        let r = Record::new(dir.clone(), limits());
+        r.event(s, 1, "hook", json!({"x": 1}));
+        r.flush();
+        let err = r.error().unwrap_or_default();
+        assert!(
+            err.contains("could not write the session record"),
+            "{s}: {err}"
+        );
+    }
+    assert_eq!(std::fs::read(&outside).unwrap(), b"keep\n");
+    // A plain file still works.
+    let r = Record::new(dir.clone(), limits());
+    r.event(S, 1, "hook", json!({}));
+    r.flush();
+    assert_eq!(r.error(), None);
+}
+
 /// N5: the directory cap holds at write time, live sessions included: a
 /// session whose next event would take the total past `max_total_bytes`
 /// gets one `truncated` event and nothing more. Long strings are cut.

@@ -23,6 +23,8 @@ pub const STATE_SESSIONS_KEPT: usize = 50;
 pub const PAUSED_FILE: &str = "paused.json";
 /// The limits worker wakes at least this often for scheduled jobs.
 const WORKER_POLL: Duration = Duration::from_secs(1);
+/// The longest a read of the activity record waits for queued events.
+pub const READ_FLUSH: Duration = Duration::from_millis(250);
 
 /// A process Mulchie paused for a limit and has not resumed yet.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -1199,8 +1201,29 @@ impl Engine {
         since: u64,
         limit: usize,
     ) -> std::io::Result<Vec<Value>> {
-        self.flush_record();
-        crate::record::read_events(&self.paths.config_dir.join("sessions"), id, since, limit)
+        Ok(self
+            .session_events_page(id, crate::record::Query::Since { since, limit })?
+            .events)
+    }
+
+    /// A page of a session's activity record. Events still queued are waited
+    /// for at most [`READ_FLUSH`]; the read seeks through the record's index.
+    pub fn session_events_page(
+        &self,
+        id: &str,
+        q: crate::record::Query,
+    ) -> std::io::Result<crate::record::Page> {
+        match self.record.get() {
+            Some(r) => {
+                r.flush_pending(READ_FLUSH);
+                r.page(id, q)
+            }
+            None => crate::record::EventIndex::default().read(
+                &self.paths.config_dir.join("sessions"),
+                id,
+                q,
+            ),
+        }
     }
 
     pub fn limits_status(&self) -> LimitsStatus {

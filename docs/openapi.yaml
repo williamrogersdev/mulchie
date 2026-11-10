@@ -681,10 +681,21 @@ paths:
         by the engine holding the lock, and only while `sessions.enabled`. Every command line and
         hook payload is redacted before it is stored. Pass `next_since` back as `since` to page.
         A session that is neither known nor recorded is 404 `unknown_session`.
+
+        To read backwards, pass `tail=N` for the last N events, then `before=<prev_before>` for
+        the page before that; events are still oldest first. `prev_before` is null when the page
+        starts at the first event. `before` without `tail` takes `limit` events. `since` does not
+        combine with `tail` or `before` (400 `invalid_query`).
+
+        A read waits for events still queued for the writer at most 250 ms, and seeks through an
+        index of byte offsets (one per 128 events), so it never reads the record from the start.
+        A record that is a symlink, FIFO or hard link is refused (500 `record_unreadable`).
       parameters:
         - { name: id, in: path, required: true, schema: { type: string, pattern: "^s-[0-9]+-[0-9]+$" } }
         - { name: since, in: query, required: false, schema: { type: integer, minimum: 0, default: 0 } }
         - { name: limit, in: query, required: false, schema: { type: integer, minimum: 1, maximum: 1000, default: 200 } }
+        - { name: tail, in: query, required: false, description: The last N events (below `before` when given), schema: { type: integer, minimum: 1, maximum: 1000 } }
+        - { name: before, in: query, required: false, description: Only events with `seq` below this, schema: { type: integer, minimum: 1 } }
       responses:
         "200":
           description: The events
@@ -695,6 +706,9 @@ paths:
                 properties:
                   session_id: { type: string }
                   next_since: { type: integer }
+                  prev_before:
+                    type: [integer, "null"]
+                    description: "`before` for the page of older events; null at the start of the record"
                   events:
                     type: array
                     items:

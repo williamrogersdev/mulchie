@@ -107,6 +107,9 @@ pub struct Record {
     tx: SyncSender<Msg>,
     error: Arc<Mutex<Option<String>>>,
     dropped: Arc<AtomicU64>,
+    /// Messages queued and not yet handled by the writer.
+    pending: Arc<AtomicU64>,
+    index: Arc<EventIndex>,
 }
 
 impl Record {
@@ -114,6 +117,7 @@ impl Record {
     pub fn new(dir: PathBuf, limits: RecordLimits) -> Self {
         let (tx, rx) = sync_channel(QUEUE);
         let error = Arc::new(Mutex::new(None));
+        let pending = Arc::new(AtomicU64::new(0));
         let w = Writer {
             dir: dir.clone(),
             limits,
@@ -121,6 +125,7 @@ impl Record {
             minutes: HashMap::new(),
             error: error.clone(),
             total: None,
+            pending: pending.clone(),
         };
         let _ = std::thread::Builder::new()
             .name("mulchie-record".into())
@@ -130,6 +135,8 @@ impl Record {
             tx,
             error,
             dropped: Arc::new(AtomicU64::new(0)),
+            pending,
+            index: Arc::new(EventIndex::default()),
         }
     }
 
@@ -138,9 +145,12 @@ impl Record {
     }
 
     fn send(&self, m: Msg) {
+        // Counted before the send, so the writer never sees it handled first.
+        self.pending.fetch_add(1, Ordering::SeqCst);
         match self.tx.try_send(m) {
             Ok(()) => {}
             Err(TrySendError::Full(_)) | Err(TrySendError::Disconnected(_)) => {
+                self.pending.fetch_sub(1, Ordering::SeqCst);
                 self.dropped.fetch_add(1, Ordering::Relaxed);
             }
         }
@@ -184,9 +194,24 @@ impl Record {
 
     /// Wait (up to 5 s) until everything queued so far is written.
     pub fn flush(&self) {
+        self.flush_within(Duration::from_secs(5));
+    }
+
+    /// For a reader: when events are still queued, wait for them at most
+    /// `max`; with nothing queued, return at once.
+    pub fn flush_pending(&self, max: Duration) {
+        if self.pending.load(Ordering::SeqCst) > 0 {
+            self.flush_within(max);
+        }
+    }
+
+    fn flush_within(&self, max: Duration) {
         let (tx, rx) = std::sync::mpsc::channel();
+        self.pending.fetch_add(1, Ordering::SeqCst);
         if self.tx.send(Msg::Flush(tx)).is_ok() {
-            let _ = rx.recv_timeout(Duration::from_secs(5));
+            let _ = rx.recv_timeout(max);
+        } else {
+            self.pending.fetch_sub(1, Ordering::SeqCst);
         }
     }
 
@@ -207,7 +232,12 @@ impl Record {
 
     /// Events of `session` with `seq` above `since`, at most `limit`.
     pub fn read(&self, session: &str, since: u64, limit: usize) -> std::io::Result<Vec<Value>> {
-        read_events(&self.dir, session, since, limit)
+        Ok(self.page(session, Query::Since { since, limit })?.events)
+    }
+
+    /// One page of `session`'s events, through this record's index.
+    pub fn page(&self, session: &str, q: Query) -> std::io::Result<Page> {
+        self.index.read(&self.dir, session, q)
     }
 }
 
@@ -218,32 +248,194 @@ pub fn file_of(dir: &Path, session: &str) -> PathBuf {
 }
 
 /// Events of `session` with `seq` above `since`, at most `limit`, oldest
-/// first. A missing file is no events.
+/// first. A missing file is no events. Without a [`Record`] (and its index),
+/// this reads from the start of the file.
 pub fn read_events(
     dir: &Path,
     session: &str,
     since: u64,
     limit: usize,
 ) -> std::io::Result<Vec<Value>> {
-    let f = match std::fs::File::open(file_of(dir, session)) {
+    Ok(EventIndex::default()
+        .read(dir, session, Query::Since { since, limit })?
+        .events)
+}
+
+/// Open a record for reading or appending: never through a symlink, never
+/// blocking (on a FIFO), and only a regular file with one link. `None` when
+/// there is no file.
+fn open_plain(path: &Path, append: bool) -> std::io::Result<Option<std::fs::File>> {
+    use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+    let mut o = std::fs::OpenOptions::new();
+    if append {
+        o.create(true).append(true).mode(0o600);
+    } else {
+        o.read(true);
+    }
+    let f = match o
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+        .open(path)
+    {
         Ok(f) => f,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(e) => return Err(e),
     };
-    let mut out = Vec::new();
-    for line in std::io::BufReader::new(f).lines() {
-        let line = line?;
-        let Ok(v) = serde_json::from_str::<Value>(&line) else {
-            continue;
-        };
-        if v["seq"].as_u64().is_some_and(|s| s > since) {
-            out.push(v);
-            if out.len() >= limit {
-                break;
+    let m = f.metadata()?;
+    if !m.file_type().is_file() || m.nlink() != 1 {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("{} is not a plain file", path.display()),
+        ));
+    }
+    Ok(Some(f))
+}
+
+/// One mark every this many events: a read seeks to the mark at or before
+/// the first event it wants, so it reads at most this many events it skips.
+const STRIDE: u64 = 128;
+/// Sessions whose index is kept; past this the index starts over.
+const INDEXED: usize = 256;
+
+/// Which events a read wants. Both answer oldest first.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum Query {
+    /// `seq` above `since`, at most `limit`.
+    Since { since: u64, limit: usize },
+    /// The last `n` events with `seq` below `before` (of the whole record
+    /// without it).
+    Tail { n: usize, before: Option<u64> },
+}
+
+/// A page of events.
+#[derive(Debug, Default, Clone, PartialEq)]
+pub struct Page {
+    pub events: Vec<Value>,
+    /// The `before` for the page just older than this one; `None` when this
+    /// page starts at the first event (or is empty).
+    pub prev_before: Option<u64>,
+}
+
+/// Where each file's lines start, built once and extended as the file grows.
+#[derive(Default)]
+struct Index {
+    ino: u64,
+    /// Bytes indexed so far (whole lines only).
+    scanned: u64,
+    last_seq: u64,
+    /// `(seq, byte offset of its line)`, one per [`STRIDE`] events.
+    marks: Vec<(u64, u64)>,
+}
+
+impl Index {
+    /// Index the lines written since the last call.
+    fn extend(&mut self, f: &mut std::fs::File, len: u64) -> std::io::Result<()> {
+        use std::io::{Seek, SeekFrom};
+        if self.scanned >= len {
+            return Ok(());
+        }
+        f.seek(SeekFrom::Start(self.scanned))?;
+        let mut r = std::io::BufReader::new(&mut *f);
+        let mut buf = Vec::new();
+        loop {
+            buf.clear();
+            let n = r.read_until(b'\n', &mut buf)?;
+            if n == 0 || buf.last() != Some(&b'\n') {
+                break; // the end, or a line still being written
             }
+            if let Some(seq) = seq_of(&buf) {
+                if self.marks.last().is_none_or(|m| seq >= m.0 + STRIDE) {
+                    self.marks.push((seq, self.scanned));
+                }
+                self.last_seq = self.last_seq.max(seq);
+            }
+            self.scanned += n as u64;
+        }
+        Ok(())
+    }
+
+    /// The offset to start reading at for events from `seq` on.
+    fn offset_for(&self, seq: u64) -> u64 {
+        match self.marks.partition_point(|m| m.0 <= seq) {
+            0 => 0,
+            i => self.marks[i - 1].1,
         }
     }
-    Ok(out)
+}
+
+fn seq_of(line: &[u8]) -> Option<u64> {
+    #[derive(serde::Deserialize)]
+    struct Seq {
+        seq: u64,
+    }
+    serde_json::from_slice::<Seq>(line).ok().map(|s| s.seq)
+}
+
+/// Byte offsets into the session records, so a page of events costs a seek
+/// and at most [`STRIDE`] skipped lines instead of a read from the start.
+#[derive(Default)]
+pub struct EventIndex(Mutex<HashMap<String, Index>>);
+
+impl EventIndex {
+    pub fn read(&self, dir: &Path, session: &str, q: Query) -> std::io::Result<Page> {
+        use std::io::{Seek, SeekFrom};
+        use std::os::unix::fs::MetadataExt;
+        let Some(mut f) = open_plain(&file_of(dir, session), false)? else {
+            return Ok(Page::default());
+        };
+        let m = f.metadata()?;
+        let mut map = self.0.lock().unwrap_or_else(|e| e.into_inner());
+        if map.len() >= INDEXED && !map.contains_key(session) {
+            map.clear();
+        }
+        let idx = map.entry(session.to_string()).or_default();
+        if idx.ino != m.ino() || m.len() < idx.scanned {
+            *idx = Index {
+                ino: m.ino(),
+                ..Index::default()
+            };
+        }
+        idx.extend(&mut f, m.len())?;
+        let (lo, hi, limit) = match q {
+            Query::Since { since, limit } => (since.saturating_add(1), u64::MAX, limit),
+            Query::Tail { n, before } => {
+                let hi = before
+                    .unwrap_or(u64::MAX)
+                    .min(idx.last_seq.saturating_add(1));
+                (hi.saturating_sub(n as u64).max(1), hi, n)
+            }
+        };
+        let start = idx.offset_for(lo);
+        drop(map);
+        let mut events = Vec::new();
+        if limit > 0 && lo < hi {
+            f.seek(SeekFrom::Start(start))?;
+            for line in std::io::BufReader::new(f).lines() {
+                let Ok(v) = serde_json::from_str::<Value>(&line?) else {
+                    continue;
+                };
+                let Some(seq) = v["seq"].as_u64() else {
+                    continue;
+                };
+                if seq >= hi {
+                    break;
+                }
+                if seq >= lo {
+                    events.push(v);
+                    if events.len() >= limit {
+                        break;
+                    }
+                }
+            }
+        }
+        let prev_before = events
+            .first()
+            .and_then(|e| e["seq"].as_u64())
+            .filter(|s| *s > 1);
+        Ok(Page {
+            events,
+            prev_before,
+        })
+    }
 }
 
 struct FileState {
@@ -269,6 +461,7 @@ struct Writer {
     /// Bytes of every record in the directory, live sessions included;
     /// read once, then kept up to date by writes (a sweep re-reads it).
     total: Option<u64>,
+    pending: Arc<AtomicU64>,
 }
 
 impl Writer {
@@ -302,6 +495,7 @@ impl Writer {
                     let _ = done.send(());
                 }
             }
+            self.pending.fetch_sub(1, Ordering::SeqCst);
         }
     }
 
@@ -313,11 +507,13 @@ impl Writer {
     fn state_of(&mut self, session: &str) -> &mut FileState {
         let path = file_of(&self.dir, session);
         self.files.entry(session.to_string()).or_insert_with(|| {
-            let bytes = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
+            let bytes = std::fs::symlink_metadata(&path)
+                .map(|m| m.len())
+                .unwrap_or(0);
             let mut events = 0;
             let mut truncated = false;
             if bytes > 0 {
-                if let Ok(f) = std::fs::File::open(&path) {
+                if let Ok(Some(f)) = open_plain(&path, false) {
                     for line in std::io::BufReader::new(f).lines().map_while(Result::ok) {
                         if let Ok(v) = serde_json::from_str::<Value>(&line) {
                             events = v["seq"].as_u64().unwrap_or(events);
@@ -524,14 +720,12 @@ fn record_files(dir: &Path) -> Vec<(Option<u64>, u64, PathBuf, String)> {
     files
 }
 
+/// Append one line, through [`open_plain`]: a symlink, FIFO or hard link in
+/// the file's place is refused, never followed and never waited on.
 fn write_line(dir: &Path, path: &Path, line: &[u8]) -> std::io::Result<()> {
-    use std::os::unix::fs::OpenOptionsExt;
     create_private_dir(dir)?;
-    let mut f = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .mode(0o600)
-        .open(path)?;
+    let mut f = open_plain(path, true)?
+        .ok_or_else(|| std::io::Error::other("the record could not be created"))?;
     f.write_all(line)
 }
 

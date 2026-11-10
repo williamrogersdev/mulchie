@@ -953,28 +953,60 @@ fn session_route(req: &Req, engine: &Engine, rest: &str) -> Resp {
         };
     }
     let r = (|| -> Result<Resp, Resp> {
-        let since = query_u64(req, "since")?.unwrap_or(0);
+        let since = query_u64(req, "since")?;
         let limit = query_u64(req, "limit")?.unwrap_or(200);
         if !(1..=1000).contains(&limit) {
             return Ok(fail(400, "invalid_query", "limit must be 1 to 1000"));
         }
+        let tail = query_u64(req, "tail")?;
+        let before = query_u64(req, "before")?;
+        if tail.is_some_and(|n| !(1..=1000).contains(&n)) {
+            return Ok(fail(400, "invalid_query", "tail must be 1 to 1000"));
+        }
+        if before == Some(0) {
+            return Ok(fail(
+                400,
+                "invalid_query",
+                "before must be a seq of 1 or more",
+            ));
+        }
+        let q = if tail.is_some() || before.is_some() {
+            if since.is_some() {
+                return Ok(fail(
+                    400,
+                    "invalid_query",
+                    "since does not combine with tail or before",
+                ));
+            }
+            crate::record::Query::Tail {
+                n: tail.unwrap_or(limit) as usize,
+                before,
+            }
+        } else {
+            crate::record::Query::Since {
+                since: since.unwrap_or(0),
+                limit: limit as usize,
+            }
+        };
         let known = engine.session(id).is_some();
-        match engine.session_events(id, since, limit as usize) {
-            Ok(ev) if ev.is_empty() && !known => Ok(fail(
+        match engine.session_events_page(id, q) {
+            Ok(p) if p.events.is_empty() && !known && before.is_none() => Ok(fail(
                 404,
                 "unknown_session",
                 format!("no session or record {id}"),
             )),
-            Ok(ev) => {
-                let next = ev
+            Ok(p) => {
+                let next = p
+                    .events
                     .last()
                     .and_then(|e| e.get("seq"))
                     .and_then(serde_json::Value::as_u64)
-                    .unwrap_or(since);
+                    .unwrap_or(since.unwrap_or(0));
                 Ok(ok(&serde_json::json!({
                     "session_id": id,
-                    "events": ev,
+                    "events": p.events,
                     "next_since": next,
+                    "prev_before": p.prev_before,
                 })))
             }
             Err(e) => Ok(fail(500, "record_unreadable", e.to_string())),

@@ -1239,6 +1239,23 @@ fn sessions_hooks_and_updates_over_the_api() {
             "/v1/sessions/s-500-100/events?limit=x",
             (400, "invalid_query"),
         ),
+        // A5: tail and before.
+        (
+            "/v1/sessions/s-500-100/events?tail=0",
+            (400, "invalid_query"),
+        ),
+        (
+            "/v1/sessions/s-500-100/events?tail=1001",
+            (400, "invalid_query"),
+        ),
+        (
+            "/v1/sessions/s-500-100/events?before=0",
+            (400, "invalid_query"),
+        ),
+        (
+            "/v1/sessions/s-500-100/events?since=1&tail=5",
+            (400, "invalid_query"),
+        ),
     ] {
         let (path, query) = path.split_once('?').unwrap_or((path, ""));
         let target = if query.is_empty() {
@@ -1264,6 +1281,16 @@ fn sessions_hooks_and_updates_over_the_api() {
     eprintln!("GET /v1/sessions/s-500-100/events -> {v}");
     assert!(v["events"].is_array());
     assert!(v["next_since"].is_u64());
+    assert!(v["prev_before"].is_null(), "{v}");
+    let (code, v) = send(
+        r.port,
+        "GET",
+        "/v1/sessions/s-500-100/events?tail=1&before=5",
+        Some(&ro),
+        "",
+    );
+    assert_eq!(code, 200, "{v}");
+    assert!(v["events"].as_array().unwrap().len() <= 1, "{v}");
 
     let (code, v) = send(r.port, "GET", "/v1/limits/status", Some(&ro), "");
     assert_eq!(code, 200, "{v}");
