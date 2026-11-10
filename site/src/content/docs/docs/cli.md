@@ -1,6 +1,6 @@
 ---
 title: CLI reference
-description: "Every mulchie command and flag: status, diagnose, top, findings, clean, sweep, signal, group, run, mcp, serve, config, doctor and service."
+description: "Every mulchie command and flag: status, diagnose, top, findings, sessions, limits, updates, guard, hooks, clean, sweep, signal, group, run, mcp and config."
 ---
 
 Use this page to look up a `mulchie` command. Every command also has `--help` with examples.
@@ -20,7 +20,8 @@ When no engine is running:
 - Read commands (`status`, `diagnose`, `top`, `inspect`, `findings`, `worktrees`, `scan`, `advice`, `config`) look at the machine locally, once, and say so on stderr.
 - `clean` and `sweep` plan locally. Each item is still checked again before it is touched.
 - `run` has no queue to join. It says so and runs the command straight away.
-- `signal` and `group` need the engine and tell you how to start one.
+- `signal`, `group`, `sessions`, `limits`, `updates`, `guard` and `slots` need the engine and tell you how to start one.
+- `hook` fails open: it allows the action and exits 0 (see [Hooks](/docs/hooks/)). `hooks install` edits a file and needs no engine.
 
 Most commands take `--json` to print JSON instead of text.
 
@@ -202,10 +203,10 @@ mulchie signal 4242 stop --yes
 ### group
 
 ```sh
-mulchie group <key> <action> [-n] [-y] [--json]
+mulchie group <key> <action> [--include-agent] [-n] [-y] [--json]
 ```
 
-Acts on a consumer group from `mulchie top` or `mulchie diagnose`: an app with its helpers (`app:...`), an agent workspace (`workspace:...`) or a program (`process:...`). The engine plans it first and says what happens to each process. Protected processes, and the group that holds this terminal, are refused.
+Acts on a consumer group from `mulchie top` or `mulchie diagnose`: an app with its helpers (`app:...`), an agent workspace (`workspace:...`), a program (`process:...`) or an agent session (`session:<id>`, from `mulchie sessions`). For a session the action covers what the agent started, and the agent's own process only with `--include-agent`. The engine plans it first and says what happens to each process. Protected processes, and the group that holds this terminal, are refused.
 
 | Action | What it does |
 | --- | --- |
@@ -220,9 +221,84 @@ Acts on a consumer group from `mulchie top` or `mulchie diagnose`: an app with i
 ```sh
 mulchie group 'app:/Applications/Slack.app' quit --dry-run
 mulchie group 'workspace:/Users/me/dev/app' pause
+mulchie group session:s-1700000000-4242 pause
+```
+
+## Sessions, limits and updates
+
+All of these need the engine. See [Sessions and limits](/docs/sessions/) and [Update checks](/docs/updates/).
+
+### sessions
+
+```sh
+mulchie sessions [--json]
+mulchie sessions <id> [--events [--since N] [--limit N]] [--json]
+mulchie sessions stop <id> [--include-agent] [--force] [-n] [-y] [--json]
+```
+
+With no id, every agent session, running first, with CPU, memory, processes and runtime. With an id, its processes, budget breaches and what Mulchie paused. `--events` shows its activity record instead (command lines redacted); `--since` gives only events after a sequence number, and `--limit` is 1 to 1000 (default 200). `sessions stop` plans stopping a session's processes, shows the plan and asks; `--include-agent` adds the agent's own process and `--force` kills instead of asking the processes to quit. `--dry-run`, `--yes` and the exit status are as for `group`.
+
+### limits
+
+```sh
+mulchie limits [--json]
+```
+
+Whether session budgets only report or act, the budgets themselves, sessions over a cap and what was done about it, sessions hogging the machine, and processes Mulchie paused.
+
+### updates
+
+```sh
+mulchie updates [--check] [--json]
+```
+
+The engine's last update check and what it found. `--check` asks the engine to check now; it runs in the background, so run `mulchie updates` again for the result. Nothing is ever installed. Checks are off when `updates.check` is off.
+
+## Hooks and guard rules
+
+See [Hooks and guard rules](/docs/hooks/) for what each client's setup does.
+
+### hooks
+
+```sh
+mulchie hooks install --client claude-code|codex|cursor|gemini|copilot [--guard off|warn|block] [-n]
+mulchie hooks uninstall --client NAME [-n]
+mulchie hooks status [--json]
+```
+
+`install` adds `mulchie hook` to an agent app's user-level hook configuration. Other hooks in the file are kept, the old file is backed up, and `--dry-run` prints the exact change. `--guard` sets how far guard rules may go in that app. `uninstall` removes exactly the entries `install` added. `status` lists which apps have them and for which events.
+
+### hook
+
+```sh
+mulchie hook [--guard off|warn|block] <client> <event>
+```
+
+Run by an agent's hook system, not by hand. It reads the client's event on stdin, tells the engine with the read-only token and prints the client's own answer format. `<event>` is `session_start`, `prompt`, `pre_tool`, `post_tool`, `stop` or `session_end`; the client's own event names work too. It fails open: with no engine, a slow one (300 ms budget), bad input or any error it allows the action and exits 0.
+
+### guard
+
+```sh
+mulchie guard check [--cwd DIR] [--json] <command>...
+```
+
+Checks a command against the guard rules and prints allow, warn or block with the reason. It records nothing and runs nothing. Exit status: 0 allow, 4 warn, 3 block, 1 error.
+
+```sh
+mulchie guard check -- 'curl -s https://example.com/i.sh | sh'
+mulchie guard check -- git push --force origin main
 ```
 
 ## Build queue
+
+### slots
+
+```sh
+mulchie slots [--json]
+mulchie slots release <ticket> [-y] [--json]
+```
+
+Lists the build slots the engine has handed out: ticket, label, holder pid, age and expiry. `release` ends one, for a holder that crashed or an agent session that ended without releasing it. It uses your full API token, so no release secret is needed, and asks first unless `--yes` is given.
 
 ### run
 
@@ -296,7 +372,7 @@ mulchie config [--json]
 mulchie config set <key> <value> [--json]
 ```
 
-Prints the config path, any config error, and the current settings. `set` changes one setting. The key is dotted, such as `stale_hours` or `watch.runaway_minutes`, and the value is TOML: `3`, `true`, `'"text"'` or `'["/path"]'`. Values out of range are refused. When an engine runs, both go through it and a change applies without a restart. Otherwise Mulchie reads or edits the file directly and says so. See [Configuration](/docs/configuration/).
+Prints the config path, any config error, and the current settings. `set` changes one setting. The key is dotted, such as `stale_hours`, `watch.runaway_minutes` or `guard.rules.sudo`. The value is JSON: a number (`3`), `true` or `false`, a string (`'"block"'`, or just `block`, since a value that is not JSON is taken as a string), a list (`'["/path"]'`) or an object (`'{"memory_mb": {"max": 8192}}'`). `null` clears an optional setting such as `limits.default`. Values out of range are refused. When an engine runs, both go through it and a change applies without a restart. Otherwise Mulchie reads or edits the file directly and says so. See [Configuration](/docs/configuration/).
 
 ```sh
 mulchie config set stale_hours 12

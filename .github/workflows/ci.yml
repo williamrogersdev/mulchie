@@ -49,6 +49,12 @@ jobs:
       - name: Clippy
         run: cargo clippy --locked ${{ matrix.packages }} --all-targets -- -D warnings
 
+      # The build without the HTTPS client (`--no-default-features`), for Linux
+      # packagers who want no network code; update checks then report that.
+      - name: Clippy without the network feature
+        if: runner.os == 'Linux'
+        run: cargo clippy --locked -p mulchie-core -p mulchie --all-targets --no-default-features -- -D warnings
+
       - name: Test
         run: cargo test --locked ${{ matrix.packages }}
 

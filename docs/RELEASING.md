@@ -37,8 +37,12 @@ prints the `gh secret set` commands. It does not run them. Commit the `tauri.con
 
 Back up the private key and its password. If you lose them, installed apps cannot update.
 
-The app also needs the Tauri updater plugin wired in code. That is an app change, not a
-release step. Until it lands, the updater files are built but nothing reads them.
+The updater is wired in the app (`crates/mulchie-app/src/update.rs`). The app registers the Tauri
+updater plugin only when `plugins.updater.pubkey` in `tauri.conf.json` is set, and "Check for
+Updates…" in its menu then reads `latest.json` from the latest GitHub Release. Until you have run
+the script and committed the result, a build says that updates are not configured, and
+`release.yml` refuses a tagged release (it checks `bundle.createUpdaterArtifacts` and the public
+key) so a release cannot ship an app that cannot update.
 
 ### 3. Create the `macos-signing` environment
 
@@ -66,10 +70,12 @@ Environment secrets (`macos-signing`):
 | `TAURI_SIGNING_PRIVATE_KEY` | Contents of `~/.tauri/mulchie-updater.key` | `gh secret set TAURI_SIGNING_PRIVATE_KEY --env macos-signing < ~/.tauri/mulchie-updater.key` |
 | `TAURI_SIGNING_PRIVATE_KEY_PASSWORD` | The key's password | Chosen in `release-setup.sh` |
 
-Repository secrets (for `publish.yml`):
+Repository secrets (for `publish.yml` and `site.yml`):
 
 | Secret | What it is | Where to get it |
 | --- | --- | --- |
+| `CLOUDFLARE_API_TOKEN` | API token that can deploy Workers (used by `site.yml` to publish `site/dist`) | Cloudflare dashboard, My Profile, API Tokens |
+| `CLOUDFLARE_ACCOUNT_ID` | The Cloudflare account that owns the `mulchie-site` Worker | Cloudflare dashboard, Workers & Pages |
 | `HOMEBREW_TAP_TOKEN` | Fine-grained personal access token with Contents read and write on `williamrogersdev/homebrew-tap` only | github.com/settings/personal-access-tokens |
 | `CARGO_REGISTRY_TOKEN` | crates.io API token with the publish-new and publish-update scopes | crates.io, Account Settings, API Tokens |
 
@@ -78,7 +84,7 @@ Repository secrets (for `publish.yml`):
 `TAURI_SIGNING_PRIVATE_KEY_PASSWORD` use the same names as the `eavesy` repository.
 The workflows use an Apple ID and app-specific password for notarization. They do not read an App Store Connect API key.
 
-If `HOMEBREW_TAP_TOKEN` or `CARGO_REGISTRY_TOKEN` is missing, `publish.yml` skips that job with a notice.
+If `HOMEBREW_TAP_TOKEN` or `CARGO_REGISTRY_TOKEN` is missing, `publish.yml` skips that job with a notice. If a Cloudflare secret is missing, `site.yml` builds and checks the site but skips the deploy with a notice.
 If a signing secret is missing, a tagged release fails early and names it.
 
 The first crates.io publish of `mulchie-core` and `mulchie` claims those names. Check they are free.
@@ -88,6 +94,15 @@ The first crates.io publish of `mulchie-core` and `mulchie` claims those names. 
 Actions, Release, Run workflow, leave "dry_run" on. It builds all four CLI targets and the universal
 app with a throwaway updater key, skips signing, notarization and upload, and keeps the result as
 the `release-assets` artifact. Run it before the first real release and after any change to the workflows.
+
+## First release (0.3.0): steps only the maintainer can take
+
+These change things outside the repository. Do them in this order. The sections above have the commands.
+
+1. Run `scripts/release-setup.sh` and add the secrets it lists: the Apple certificate and the Apple ID, app-specific password and team ID used for notarization, the updater key, the tap token, the crates.io token and the Cloudflare token and account ID.
+2. Create `williamrogersdev/homebrew-tap`.
+3. Merge to `main`, push tag `v0.3.0`, review the draft release, publish it.
+4. Confirm the first site deploy and the `mulchie.com` route in Cloudflare. `site/wrangler.jsonc` has no route: attach the custom domain in the Cloudflare dashboard (or add a `routes` entry with `custom_domain: true`) once DNS is ready.
 
 ## Each release
 
@@ -135,7 +150,7 @@ hdiutil detach /tmp/mulchie-dmg
 # Provenance
 gh attestation verify "Mulchie_${V}_universal.dmg" --repo williamrogersdev/mulchie
 
-# Updater manifest
+# Updater manifest (and, from an installed app, "Check for Updates…" in its menu)
 curl -fsSL https://github.com/williamrogersdev/mulchie/releases/latest/download/latest.json | jq '.version, (.platforms | keys)'
 
 # Installer, in a clean shell

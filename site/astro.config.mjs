@@ -19,7 +19,7 @@ export default defineConfig({
     starlight({
       title: 'Mulchie',
       disable404Route: true,
-      description: 'Documentation for Mulchie, the monitor and optimizer for machines that run many AI coding agents.',
+      description: 'Documentation for Mulchie, the supervisor for machines that run many AI coding agents.',
       logo: { src: './src/assets/mark.png', alt: '' },
       favicon: '/favicon-32.png',
       social: [{ icon: 'github', label: 'GitHub', href: 'https://github.com/williamrogersdev/mulchie' }],
@@ -36,6 +36,10 @@ export default defineConfig({
       ],
       sidebar: [
         { label: 'Start', items: [{ slug: 'docs' }, { slug: 'docs/getting-started' }, { label: 'Install', link: '/install/' }] },
+        {
+          label: 'Supervise agents',
+          items: [{ slug: 'docs/sessions' }, { slug: 'docs/hooks' }, { slug: 'docs/updates' }],
+        },
         {
           label: 'Reference',
           items: [
@@ -55,7 +59,7 @@ export default defineConfig({
         starlightLlmsTxt({
           projectName: 'Mulchie',
           description:
-            'Mulchie is an open source (MIT) macOS menu bar app, CLI, local HTTP API and MCP server that keeps one machine healthy while many AI coding agents run on it.',
+            'Mulchie is an open source (MIT) macOS menu bar app, CLI, local HTTP API and MCP server that keeps one machine healthy while many AI coding agents run on it. It is a supervisor, not a sandbox and not an antivirus.',
           details:
             'Core and CLI also run headless on Linux. Source: https://github.com/williamrogersdev/mulchie. Install: https://mulchie.com/install/.',
           optionalLinks: [

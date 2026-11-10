@@ -28,7 +28,9 @@ The engine writes two tokens when it starts, in the config directory (`~/.config
 | Token | File | Accepted for |
 | --- | --- | --- |
 | Full | `token` | Every route. |
-| Read-only | `token.read` | Every `GET` route, `POST /v1/clean/plan`, `POST /v1/worktree/plan`, `POST /v1/process/plan`, and `POST /v1/lease` (only with `ttl_secs` and no `pid`) and `POST /v1/release`. Any other route answers 403 `read_only_token`. |
+| Read-only | `token.read` | Every `GET` route, `POST /v1/clean/plan`, `POST /v1/worktree/plan`, `POST /v1/process/plan`, `POST /v1/lease` (only with `ttl_secs` and no `pid`), `POST /v1/release`, and the agent-hook routes `POST /v1/hook` and `POST /v1/guard/check`. Any other route answers 403 `read_only_token`. |
+
+`POST /v1/hook` writes to the session's activity record and can register a session, so anyone who can read `token.read` can add events to it. The record is not tamper-proof (see [Sessions and limits](/docs/sessions/#the-activity-record)).
 
 Both files have mode `0600` in a `0700` directory. A token file that other users can read, or that another user owns, is refused.
 
@@ -63,10 +65,25 @@ Requests are capped at 8 KB per line, 64 KB of headers and a 1 MB body. The serv
 | POST | `/v1/findings/undismiss` | Show a dismissed finding again (`{"id"}`). |
 | GET | `/v1/config` | The config in use, why the file was not used (if so), and its path. |
 | PUT | `/v1/config` | Replace the config (`{"config": {...}}`). Full token only. |
+| PATCH | `/v1/config` | Change some keys with a JSON merge patch. Full token only. |
+| GET | `/v1/sessions` | Agent sessions, running first. |
+| GET | `/v1/sessions/{id}` | One session with its processes, breaches and paused processes. |
+| GET | `/v1/sessions/{id}/events` | The session's activity record. Query: `since`, `limit`, or `tail` and `before` to read backwards. |
+| GET | `/v1/limits/status` | Budgets, breaches, hogs, paused processes, and whether this engine enforces. |
+| POST | `/v1/hook` | An agent hook reports an event and gets advice, a guard decision and any limit breaches. |
+| POST | `/v1/guard/check` | Check a command against the guard rules. Records nothing. |
+| GET | `/v1/updates` | The last update check and its result. |
+| POST | `/v1/updates/check` | Ask for an update check now. Full token only. 409 `updates_off` when checks are off. |
 | POST | `/v1/lease` | Join the build queue, poll a ticket, or renew a slot. |
 | POST | `/v1/release` | Release a slot or leave the queue. |
 
 Errors are JSON: `{"error": "...", "code": "..."}`, with status 400 for a bad body, 401 for a bad token, 403 for a refused origin, host or read-only token, and 404, 405, 413 or 500 otherwise.
+
+## Config
+
+`GET /v1/config` returns the config, its path, why the file was not used (if so) and a `revision` of the file's content. `PATCH /v1/config` takes a JSON merge patch (objects merge, `null` removes a key so it takes its default, anything else replaces) and applies it to the file's current content. `PUT /v1/config` replaces the whole config. Both validate (400 `invalid_config`), refuse a key the config does not have (400 `unknown_key`, naming it) and save atomically.
+
+Send the `revision` you read as an `If-Match` header or an `if_revision` query parameter to write only if nothing changed the file since; otherwise the answer is 409 `config_changed`. A `PUT` is refused with 409 `config_changed` anyway when the file changed since the engine loaded it. An engine that does not hold the engine lock answers 409 `not_lock_holder`.
 
 ## Plan, then execute
 

@@ -4,7 +4,7 @@ import { SITE, REPO, RELEASES, VERSION } from '../lib/meta';
 
 const title = 'Mulchie: keep your machine usable while AI agents build';
 const description =
-  'Open source monitor, build queue and safe cleaner for machines running many AI coding agents. macOS menu bar app, CLI, local API and MCP server.';
+  'Open source supervisor for machines running many AI coding agents: monitor, build queue, budgets, hooks and safe cleanup. macOS app, CLI, local API, MCP.';
 
 const jsonLd = {
   '@context': 'https://schema.org',
@@ -28,7 +28,7 @@ const jsonLd = {
   <div class="wrap hero">
     <div>
       <h1>Keep your machine usable while AI agents build on it.</h1>
-      <p class="lede">Mulchie shows what uses CPU, memory and disk per repo and worktree, queues heavy builds, and cleans up what agents leave behind, with a plan you approve first.</p>
+      <p class="lede">Mulchie shows what uses CPU, memory and disk per repo, worktree and agent, queues heavy builds, holds agents to budgets you set, and cleans up what they leave behind, with a plan you approve first.</p>
       <p class="who">For developers who run Claude Code, Codex, Cursor agents and similar tools side by side on one Mac or Linux box.</p>
       <div class="cta">
         <a class="btn primary" href="/install/">Install Mulchie</a>
@@ -112,6 +112,20 @@ health <span class="a">strained</span>  ·  disk 142 GB free of 460 GB  ·  memo
     </div>
   </section>
 
+  <section class="sec wrap split" aria-labelledby="supervise">
+    <div>
+      <h2 id="supervise">Supervise the agents, not just the machine</h2>
+      <p>Mulchie groups each agent with everything it started into a session, so you see what Claude Code or Codex is using, not just <code>rustc</code>. It is a supervisor. It is not a sandbox and not an antivirus, and an agent that wants to get around it can.</p>
+      <p class="note"><a href="/docs/sessions/">Sessions and limits</a>, <a href="/docs/hooks/">hooks and guard rules</a> and <a href="/docs/updates/">update checks</a></p>
+    </div>
+    <ul class="facts">
+      <li><strong>Limits report by default.</strong>A budget caps CPU, memory, processes, writes or runtime per session. The action is <code>notify</code> unless you pick <code>deprioritize</code>, <code>pause</code> or <code>stop</code>. The agent itself is spared unless you say otherwise, and only the engine holding the lock acts.</li>
+      <li><strong>Hooks for five agents.</strong>Claude Code, Codex, Cursor, Gemini CLI and Copilot CLI can tell Mulchie when a session starts and before each shell command. A hook fails open: if Mulchie is down or slow, the agent carries on.</li>
+      <li><strong>Guard rules are a tripwire.</strong>They warn, or block if you ask, on risky shell commands such as <code>curl | sh</code> or a force-push. They read command text, so they miss obfuscated commands.</li>
+      <li><strong>Update checks never install.</strong>The engine asks GitHub and npm for newer versions and reports them. Turn it off with <code>updates.check off</code>. Vulnerability lookups are off unless you enable them.</li>
+    </ul>
+  </section>
+
   <section class="sec wrap split flip" aria-labelledby="safety">
     <div>
       <h2 id="safety">It deletes things, so it checks first</h2>
@@ -142,15 +156,16 @@ Not ready (1):
   <section class="sec wrap split" aria-labelledby="agents">
     <div>
       <h2 id="agents">Agents use it too</h2>
-      <p>Agents talk to the same engine you do. One command adds the MCP server to Claude Code, Claude Desktop, Cursor or Codex. Agents start with a diagnosis, ask whether to start a build, take a build slot, and plan cleanups that you approve. Deleting is always two calls: a plan, then execute. Add <code>--read-only</code> for an agent that should look but not act.</p>
+      <p>Agents talk to the same engine you do. One command adds the MCP server to Claude Code, Claude Desktop, Cursor or Codex. Agents start with a diagnosis, ask whether to start a build or whether a command is risky, take a build slot, and plan cleanups that you approve. Deleting is always two calls: a plan, then execute. Add <code>--read-only</code> for an agent that should look but not act.</p>
       <p>The dashboard has a ready-made snippet for your <code>AGENTS.md</code>. There is also a local HTTP API for scripts and <code>curl</code>.</p>
       <p class="note"><a href="/docs/mcp/">MCP tools</a> and <a href="/docs/http-api/">HTTP API</a></p>
     </div>
     <div class="stack" style="display:grid;gap:1.5rem">
-      <div class="term" role="group" aria-label="Connect an agent over MCP">
+      <div class="term" role="group" aria-label="Connect an agent over MCP and hooks">
         <div class="term-bar"><i></i><i></i><i></i><span>connect an agent</span></div>
         <pre tabindex="0"><code><span class="p">$</span> <span class="k">mulchie mcp install --client claude-code</span>
-<span class="p">$</span> <span class="k">mulchie mcp install --client cursor --read-only</span></code></pre>
+<span class="p">$</span> <span class="k">mulchie mcp install --client cursor --read-only</span>
+<span class="p">$</span> <span class="k">mulchie hooks install --client claude-code</span></code></pre>
       </div>
       <div class="term" role="group" aria-label="Queue a build">
         <pre tabindex="0"><code><span class="p">$</span> <span class="k">mulchie run -- cargo build</span>

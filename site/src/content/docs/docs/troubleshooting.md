@@ -39,6 +39,8 @@ Errors are JSON with a stable `code`:
 | 403 `read_only_token` | You used the read-only token on a route that changes things. Use the full token, or only read and plan. |
 | 403 `origin_refused` | The request has a browser `Origin` header. The API is not meant for web pages. Call it from a script or `curl`. |
 | 403 `bad_host` | The `Host` header must be `127.0.0.1:<port>` or `localhost:<port>`. |
+| 409 `config_changed` | The config file changed since you read it (or since the engine loaded it). Read it again and reapply your change. |
+| 409 `not_lock_holder` | This engine does not hold the engine lock, so it does not write the config. Use the engine that does. |
 
 If the engine refuses to start its API because a token file has loose permissions, fix it with `chmod 600` on the file (`token` or `token.read` in the config directory), and `chmod 700` on the directory.
 
@@ -55,6 +57,18 @@ Each skipped item has a reason. The usual ones:
 - The worktree has a checked-out submodule, holds another git repository, has local edits git hides, or is locked.
 
 `actions.jsonl` in the config directory has the record of every executed and skipped action. See the [safety model](/docs/safety/).
+
+## A hook did nothing, or the agent was not warned
+
+- Run `mulchie hooks status` to see which apps have Mulchie's hooks. `mulchie hooks install --client <app> --dry-run` shows what would change.
+- Codex runs a new or changed hook only after you trust it: run `/hooks` in Codex.
+- Restart the agent app if it does not pick the hooks up (Cursor, Gemini CLI), or start a new session (Copilot CLI, Claude Code).
+- A hook fails open, so a missing or slow engine is not an error to the agent. `hook.log` in the config directory has the reason, at most one line a minute.
+- Guard rules answer `warn` by default. Codex and Gemini CLI cannot ask you to confirm, so for them a warning is text only. See [Hooks and guard rules](/docs/hooks/#warn-and-block-by-client).
+
+## A limit did not pause or stop a session
+
+`mulchie limits` says whether limits act. Limits only report when no budget is set or every cap's action is `notify` (the default). A session an agent hook registered is never acted on. Only the engine that holds the lock acts, so an engine running beside another, or one whose config did not load, reports and never signals. The agent's own process is spared unless the budget sets `include_agent`. See [Sessions and limits](/docs/sessions/#what-limits-do-not-do).
 
 ## Where did my uncommitted work go?
 

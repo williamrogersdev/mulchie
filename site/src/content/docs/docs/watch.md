@@ -9,7 +9,7 @@ Use findings to spot processes that look left over, runaway or out of place, and
 
 Findings are observations made by simple heuristics: how long a process has run, how much CPU it uses, where its program file lives, which network addresses it listens on. Each one says what was seen and why it may matter.
 
-A finding is not a verdict. **None of them means malware was found.** Mulchie is not an antivirus. It has no signatures, no file hashes and no lookups against any list, and it sends nothing anywhere. A finding that a process runs from a temporary folder is a reason to check that you know what the process is, nothing more. Most turn out to be a dev server or an updated app.
+A finding is not a verdict. **None of them means malware was found.** Mulchie is not an antivirus. The watch has no signatures, no file hashes and no lookups against any list, and it sends nothing anywhere. A finding that a process runs from a temporary folder is a reason to check that you know what the process is, nothing more. Most turn out to be a dev server or an updated app.
 
 The watch only looks at processes owned by you. It never acts on its own. Acting on a finding, for example quitting a process, goes through a plan that you confirm. See the [safety model](/docs/safety/).
 
@@ -81,6 +81,22 @@ The last two kinds are macOS only. This group is where people most often see a f
 | `api_exposed` | Mulchie's API port is listening beyond this machine. It should listen on `127.0.0.1` only, so another program may have taken the port. | high |
 | `engine_lock_not_held` | Another Mulchie engine is in charge. Only that one reclaims, sweeps and throttles. Expected when the app and `mulchie serve` both run. | medium |
 | `config_not_loaded` | The config file was not used because it could not be parsed or a value is out of range. Mulchie runs on defaults with automatic reclaim and sweep off until you fix it. | medium |
+
+## Kinds about sessions and updates
+
+These come from [sessions and limits](/docs/sessions/) and [update checks](/docs/updates/), not from the process watch, and they appear in the same list.
+
+| Kind | What was seen | Severity |
+| --- | --- | --- |
+| `limit_exceeded` | An agent session stayed over a cap of its budget for the sustain time. The title says which cap, the value and what Mulchie did. | medium; high when the action is `pause` or `stop` |
+| `session_hog` | An agent session uses at least `limits.hog_share_pct` of the machine's CPU or memory while health is strained or critical. Only a report; no budget is needed. | medium |
+| `paused_list_unreadable` | The file of processes Mulchie paused for a limit could not be read at start, so processes paused by an earlier engine may still be stopped. | high |
+| `mulchie_update` | A newer Mulchie release is out. | low |
+| `agent_update` | A newer version of an installed agent tool is out. | low |
+| `homebrew_outdated` | Homebrew packages are outdated, from Homebrew's local data. | info |
+| `advisory` | A package in a workspace lockfile has a known vulnerability in OSV.dev. Only with `updates.advisories` on. | from the advisory |
+
+An update finding never installs anything. It names the command you can run.
 
 ## Turning the watch off
 

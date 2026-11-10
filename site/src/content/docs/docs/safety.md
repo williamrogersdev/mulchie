@@ -11,7 +11,15 @@ Mulchie deletes directories and signals processes, so one rule shapes the design
 
 Scanners only produce candidates. Every cache deletion, worktree removal and signal goes through one module, the safety gate. It re-reads the facts for each candidate and returns an outcome per item: `done`, or `skipped` with a reason. When a check cannot be completed, for example git times out or a backup step fails, the answer is skipped, never proceed.
 
-Two exceptions are not deletions of your files: `mulchie run` forwards signals to its own command, and Mulchie ends a git command of its own that timed out.
+A few things happen outside the gate. None deletes your files or signals another program's process:
+
+- Mulchie ends a git command of its own that timed out.
+- `mulchie run` forwards SIGINT and SIGTERM to the command it started.
+- Mulchie deletes its own [activity records](/docs/sessions/#the-activity-record) in `sessions/` after `sessions.retain_days` or when they pass `sessions.max_total_mb`, and its own hook log when it grows past 256 KiB, and an empty or half-written token file from a crash.
+- Mulchie lowers the priority of a build under pressure, and puts back a priority it lowered (a build it throttled, or a session it deprioritized). Each time it first checks that the process is still the one it sampled, by start time, so a reused pid is skipped.
+- Mulchie checks whether a process is alive by sending it signal 0, which signals nothing.
+
+Everything else that deletes or signals goes through the gate, including every action a [session limit](/docs/sessions/#limits) takes.
 
 Every executed or skipped action is appended to `actions.jsonl` in the [config directory](/docs/configuration/#files-mulchie-writes).
 
@@ -62,6 +70,16 @@ Each backup set is a folder in `backups/` named `<repo>-<name>-<unix time>-<rand
 
 `mulchie top` marks protected groups with `*`.
 
+## Limits and guard rules
+
+[Limits](/docs/sessions/#limits) report by default. A `deprioritize`, `pause` or `stop` action happens only when you configured it, only on the engine that holds the lock, never to a session that only an agent hook registered, and not to the agent's own process unless the budget sets `include_agent`. Each such action goes through the gate and is journaled.
+
+[Guard rules](/docs/hooks/#guard-rules) read the text of a shell command and answer allow, warn or block to the agent's client. They are a tripwire for agents that are not hiding anything. They are not a sandbox and miss obfuscated commands, and nothing stops an agent that does not ask. A hook never stalls an agent: with no engine, a slow one or any error, it allows the action.
+
+## Update checks
+
+[Update checks](/docs/updates/) look up newer versions and name the command that would install them. They never install, upgrade or download anything to run. The check for known vulnerabilities in your lockfiles is off unless you turn it on, because it sends package names and versions to OSV.dev.
+
 ## What the watch does
 
 The [watch](/docs/watch/) only reads. Its findings are observations, not verdicts, and not malware detection. It never signals or deletes. Acting on a finding is an ordinary plan that you confirm.
@@ -88,3 +106,5 @@ Command lines, build-queue labels and process details shown by the API, the CLI 
 - Delete a branch.
 - Signal another user's process.
 - Delete or signal because of a finding alone.
+- Install or upgrade anything, or run an agent tool to ask its version.
+- Send your prompts or command output anywhere. Hooks send command text to the engine on `127.0.0.1` only.

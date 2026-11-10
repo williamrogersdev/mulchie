@@ -1,6 +1,6 @@
 ---
 title: Getting started
-description: "Install Mulchie, check the setup, and run your first status, diagnose, advice and build-queue commands, then connect an agent over MCP."
+description: "Install Mulchie, check the setup, run your first status, diagnose and build-queue commands, then connect an agent over MCP and hooks and see its sessions."
 ---
 
 This page takes you from install to a first look at your machine, a first cleanup preview and a connected agent.
@@ -92,3 +92,25 @@ mulchie mcp install --client claude-code
 Other clients are `claude-desktop`, `cursor` and `codex`. Without `--client`, the command lists the agent apps it found and changes nothing. Add `--read-only` for an agent that should look and plan but not delete, signal or prune. Restart the agent app afterwards.
 
 See [MCP](/docs/mcp/) for the tools and how plans work. The dashboard under **Agent API** has the same commands and text to paste into `AGENTS.md` or `CLAUDE.md`.
+
+## See what each agent is using
+
+```sh
+mulchie sessions
+mulchie limits
+```
+
+A session is an agent and everything it started. `sessions` lists them with CPU, memory, processes and runtime, and `limits` says whether any budget is set. With no budget Mulchie only reports; nothing is paused or stopped unless you configure it. See [Sessions and limits](/docs/sessions/).
+
+## Let the agent report to Mulchie
+
+```sh
+mulchie hooks install --client claude-code --dry-run
+mulchie hooks install --client claude-code
+```
+
+This adds hooks so the agent tells Mulchie when a session starts and before and after each shell command. Mulchie answers with the machine's state, advice, limit breaches and guard rules, which warn by default. A hook never stalls the agent: with no engine it allows the action. Supported: Claude Code, Codex, Cursor, Gemini CLI and Copilot CLI. See [Hooks and guard rules](/docs/hooks/).
+
+## Updates
+
+The engine checks for newer versions of Mulchie and of the agent tools it finds, and reports them. It installs nothing. See [Update checks](/docs/updates/) for what it contacts and how to turn it off.

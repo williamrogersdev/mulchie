@@ -84,6 +84,10 @@ mulchie doctor
 
 On macOS, `serve` sends low-disk notifications with `osascript`. On Linux it uses `notify-send` when it is installed, and otherwise sends none.
 
+## Limits and updates need the lock holder
+
+Session limits act, and update checks run, only in the engine that holds the lock. On a machine with one engine that is the engine you started. If the app and a service both run, the one that lost the lock is a client of the other. See [Sessions and limits](/docs/sessions/#what-limits-do-not-do) and [Update checks](/docs/updates/).
+
 ## Use it from another tool
 
 With the engine running, the CLI, `mulchie mcp` and the [HTTP API](/docs/http-api/) all talk to it. Read commands also work without an engine by looking at the machine locally. `signal`, `group` and the build queue need the engine.
