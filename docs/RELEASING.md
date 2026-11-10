@@ -106,8 +106,11 @@ These change things outside the repository. Do them in this order. The sections 
 
 ## Each release
 
-1. Bump the version in `Cargo.toml` (`[workspace.package] version`). It is the only place.
-   Update `[workspace.dependencies] mulchie-core` to the same version, then `cargo update -w` so `Cargo.lock` follows.
+1. Bump the version in `Cargo.toml` (`[workspace.package] version`) and set `[workspace.dependencies] mulchie-core`
+   to the same version, then `cargo update -w` so `Cargo.lock` follows. Two more files must carry it, and the
+   `discovery` test fails if they do not: `server.json` (`version` and the package `version`) and `docs/openapi.yaml`
+   (`info.version`). The app's `package.json` is not checked by anything, but keep it equal. The app's bundle version
+   comes from `Cargo.toml`; `tauri.conf.json` has no version.
 2. In `CHANGELOG.md`, move the unreleased entries under `## [X.Y.Z] - YYYY-MM-DD`. The release is refused while the heading says Unreleased.
 3. Open a pull request, let CI pass, merge to `main`.
 4. Tag the merge commit and push the tag:
@@ -125,6 +128,49 @@ These change things outside the repository. Do them in this order. The sections 
 
 If a release build fails, fix the cause, delete the tag locally and on GitHub, and tag again. A draft
 release from the failed run can be deleted. Never reuse a version that reached crates.io; bump instead.
+
+## Release candidates
+
+Cut `vX.Y.Z-rc.N` first when you want signing, notarization, the updater and the artifacts to fail on a version
+nobody installs. Anything with a `-` suffix after `X.Y.Z` is a pre-release. The pipeline builds, signs and
+notarizes it exactly like a release, and then differs in four ways:
+
+- The draft GitHub Release is created with the pre-release flag, so `releases/latest` does not move. `install.sh` with no
+  version, the in-app updater (`releases/latest/download/latest.json`) and Mulchie's own update check keep seeing the last
+  stable release. Keep the flag on when you publish the draft.
+- `publish.yml` skips Homebrew and crates.io (a crates.io publish cannot be undone). The crates job prints a notice. It
+  also skips on a tag with a `-` even if the pre-release flag was cleared.
+- The release notes are the `## [X.Y.Z]` section of `CHANGELOG.md`, with a first line saying they are for a release
+  candidate. The section may still say Unreleased. A `## [X.Y.Z-rc.N]` section, if you write one, is used instead.
+- Nothing is published to the MCP registry by the workflows (that is a manual step, see below).
+
+Steps:
+
+1. On a branch, set the version to `X.Y.Z-rc.N` in `Cargo.toml` (both places), `server.json` (both places) and
+   `docs/openapi.yaml`, then `cargo update -w`. Keep `package.json` equal. Leave `CHANGELOG.md` as it is.
+2. Run `cargo test --locked -p mulchie --test discovery` and `scripts/workspace-version.sh v$VERSION`, then run the
+   Release workflow by hand from the branch with dry_run on.
+3. Open a pull request, merge, and tag the merge commit `git tag -s vX.Y.Z-rc.N` and push it. The workflow checks the tag
+   equals the workspace version.
+4. Check the draft: it is marked Pre-release, has the same assets as a release, and `latest.json` names the rc version.
+   Publish it (this keeps it a pre-release and runs only the skipped-job notices).
+5. Install the rc: `curl -fsSL https://mulchie.com/install.sh | MULCHIE_VERSION=X.Y.Z-rc.N sh`, or download the DMG.
+   Do not use `releases/latest` to find it. Run the signature, notarization and attestation checks below with `V=X.Y.Z-rc.N`.
+   The in-app updater and Homebrew are not exercised by an rc.
+6. If the rc is bad, fix on `main` and tag `X.Y.Z-rc.N+1`. Delete a failed tag and draft as in "Each release".
+
+From rc to final:
+
+1. Set the version to `X.Y.Z` in the same files as step 1 and `cargo update -w`.
+2. In `CHANGELOG.md` replace `Unreleased` in the `## [X.Y.Z]` heading with the date.
+3. Merge, tag `vX.Y.Z` and continue from "Each release", step 4. The final build is a full release: tap, crates.io and
+   `latest` all move, and an installed rc sees `X.Y.Z` as an update (a stable install never sees an rc).
+
+The MCP registry entry in `server.json` points at the crates.io package, which an rc does not publish. Only publish
+`server.json` to the registry for a final release.
+
+Known limit: macOS shows the bundle version as `X.Y.Z-rc.N` (Tauri writes the version into
+`CFBundleShortVersionString` unchanged). Developer ID signing and notarization do not check it; only the App Store would.
 
 ## Checks after publishing
 

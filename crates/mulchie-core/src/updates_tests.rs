@@ -113,6 +113,23 @@ fn semver_comparison_never_claims_outdated_without_semver() {
 }
 
 #[test]
+fn mulchie_update_offer_follows_the_release_candidate_rules() {
+    let offered = mulchie_update_offered;
+    // A stable install is never offered a pre-release, even a newer one.
+    assert_eq!(offered("0.4.0-rc.1", "0.3.0", false), Some(false));
+    assert_eq!(offered("0.3.0-rc.1", "0.2.9", false), Some(false));
+    assert_eq!(offered("0.4.0", "0.3.0", true), Some(false), "API flag");
+    assert_eq!(offered("0.4.0", "0.3.0", false), Some(true));
+    // An rc install is offered the final release and a later rc, not an older one.
+    assert_eq!(offered("0.3.0", "0.3.0-rc.1", false), Some(true));
+    assert_eq!(offered("0.3.0-rc.2", "0.3.0-rc.1", true), Some(true));
+    assert_eq!(offered("0.3.0-rc.10", "0.3.0-rc.2", false), Some(true));
+    assert_eq!(offered("0.3.0-rc.1", "0.3.0-rc.1", false), Some(false));
+    assert_eq!(offered("0.2.9", "0.3.0-rc.1", false), Some(false));
+    assert_eq!(offered("latest", "0.3.0", false), None);
+}
+
+#[test]
 fn cargo_lock_keeps_registry_packages() {
     let t = r#"
 version = 4

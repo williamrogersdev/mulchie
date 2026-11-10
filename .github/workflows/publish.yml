@@ -3,6 +3,8 @@ name: Publish
 # Runs when a person publishes the draft release created by release.yml:
 #   - updates the Homebrew tap (cask and formula)
 #   - publishes mulchie-core and mulchie to crates.io
+# Both are skipped for a pre-release (a tag such as v0.3.0-rc.1, or a release marked as a
+# pre-release): a crates.io publish cannot be undone and the tap has no pre-release channel.
 # Each job skips with a notice when its secret is missing. Re-running is safe.
 # Secrets: docs/RELEASING.md.
 
@@ -23,7 +25,7 @@ env:
 jobs:
   homebrew:
     name: Update Homebrew tap
-    if: ${{ !github.event.release.prerelease }}
+    if: ${{ !github.event.release.prerelease && !contains(github.event.release.tag_name, '-') }}
     runs-on: ubuntu-latest
     timeout-minutes: 15
     env:
@@ -104,11 +106,15 @@ jobs:
     timeout-minutes: 30
     env:
       CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+      PRERELEASE: ${{ github.event.release.prerelease }}
     steps:
       - name: Check for the registry token
         id: gate
         run: |
-          if [[ -z "$CARGO_REGISTRY_TOKEN" ]]; then
+          if [[ "$PRERELEASE" == "true" || "$TAG" == *-* ]]; then
+            echo "::notice::$TAG is a pre-release, so nothing was published to crates.io (a publish cannot be undone). See docs/RELEASING.md."
+            echo "enabled=false" >> "$GITHUB_OUTPUT"
+          elif [[ -z "$CARGO_REGISTRY_TOKEN" ]]; then
             echo "::notice::CARGO_REGISTRY_TOKEN is not set, so nothing was published to crates.io. See docs/RELEASING.md."
             echo "enabled=false" >> "$GITHUB_OUTPUT"
           else
