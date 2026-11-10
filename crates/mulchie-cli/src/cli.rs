@@ -96,10 +96,10 @@ caches are archived, a detached HEAD gets a backup/<name> branch, and branches a
 descendants too (deepest first). The engine plans it first: which processes would be \
 signalled, and why any is refused (protected processes, other users' processes, Mulchie \
 itself, and this terminal and its parents are never signalled). After you confirm, each \
-process is re-checked by its start time, so a pid reused since the plan is skipped.",
-        after_help = "Exit status: 0 done (or --dry-run, or declined); 1 an item was skipped or a call failed; \
-2 confirmation was needed but stdin is not a terminal; 3 the plan is refused or nothing in it is ready.\n\n\
-Examples:\n  mulchie signal 4242 term --dry-run\n  mulchie signal 4242 term\n  mulchie signal 4242 stop --yes\n  mulchie signal 4242 term --tree"
+process is re-checked by its start time, so a pid reused since the plan is skipped.\n\n\
+Exit status: 0 done, a dry run, or declined; 1 an item was skipped or a call failed; 2 \
+confirmation was needed but stdin is not a terminal; 3 the plan is refused or nothing in it is ready.",
+        after_help = "Examples:\n  mulchie signal 4242 term --dry-run\n  mulchie signal 4242 term\n  mulchie signal 4242 stop --yes\n  mulchie signal 4242 term --tree"
     )]
     Signal(SignalArgs),
 
@@ -112,10 +112,10 @@ session (session:<id> from `mulchie sessions`: its processes, and the agent itse
 quit, force-quit, pause, resume, lower-priority, stop-builds, and restart where the plan \
 offers it. The engine plans it first and says what happens to each process; protected \
 processes and the group holding this terminal are refused. After you confirm, each process \
-is re-checked by its start time.",
-        after_help = "Exit status: 0 done (or --dry-run, or declined); 1 an item was skipped or a call failed; \
-2 confirmation was needed but stdin is not a terminal; 3 the plan is refused or nothing in it is ready.\n\n\
-Examples:\n  mulchie group 'app:/Applications/Slack.app' quit --dry-run\n  mulchie group session:s-1700000000-4242 pause\n  mulchie group 'workspace:/Users/me/dev/app' pause\n  mulchie group 'workspace:/Users/me/dev/app' lower-priority --yes"
+is re-checked by its start time.\n\n\
+Exit status: 0 done, a dry run, or declined; 1 an item was skipped or a call failed; 2 \
+confirmation was needed but stdin is not a terminal; 3 the plan is refused or nothing in it is ready.",
+        after_help = "Examples:\n  mulchie group 'app:/Applications/Slack.app' quit --dry-run\n  mulchie group session:s-1700000000-4242 pause\n  mulchie group 'workspace:/Users/me/dev/app' pause\n  mulchie group 'workspace:/Users/me/dev/app' lower-priority --yes"
     )]
     Group(GroupArgs),
 
@@ -869,6 +869,30 @@ menu bar app already runs the engine, so a service is only for headless use.",
 mod tests {
     use super::*;
     use clap::CommandFactory;
+
+    #[test]
+    fn signal_and_group_help_give_the_exit_codes() {
+        use clap::CommandFactory;
+        let mut cmd = Cli::command();
+        for name in ["signal", "group"] {
+            let help = cmd
+                .find_subcommand_mut(name)
+                .unwrap()
+                .render_long_help()
+                .to_string()
+                .split_whitespace()
+                .collect::<Vec<_>>()
+                .join(" ");
+            for want in [
+                "0 done, a dry run, or declined",
+                "1 an item was skipped or a call failed",
+                "2 confirmation was needed but stdin is not a terminal",
+                "3 the plan is refused or nothing in it is ready",
+            ] {
+                assert!(help.contains(want), "{name}: {want}\n{help}");
+            }
+        }
+    }
 
     fn parse(args: &[&str]) -> Result<Cli, clap::Error> {
         Cli::try_parse_from(std::iter::once("mulchie").chain(args.iter().copied()))
