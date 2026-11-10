@@ -154,6 +154,9 @@ impl Engine {
             st.cache.report.clone()
         };
         let workspaces = self.update_workspaces();
+        // No probed program may come from a workspace or a scan root.
+        let mut avoid = workspaces.clone();
+        avoid.extend(cfg.roots(&self.paths));
         let exe = std::env::current_exe().ok();
         let input = updates::CheckInput {
             cfg: &cfg.updates,
@@ -162,6 +165,7 @@ impl Engine {
             version: env!("CARGO_PKG_VERSION"),
             workspaces: &workspaces,
             brew_cache: Some(updates::brew_api_cache(&self.paths.home)),
+            avoid_dirs: &avoid,
             now,
         };
         let report = updates::check(

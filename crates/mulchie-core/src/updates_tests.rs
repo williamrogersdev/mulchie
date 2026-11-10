@@ -45,11 +45,16 @@ impl Http for FakeHttp {
 #[derive(Default)]
 pub(crate) struct FakeRunner {
     pub tools: HashMap<String, (bool, String)>,
+    /// Where `find` says a tool is (default `/fake/bin/<name>`).
+    pub paths: HashMap<String, PathBuf>,
     pub runs: Mutex<Vec<String>>,
 }
 
 impl Runner for FakeRunner {
     fn find(&self, name: &str) -> Option<PathBuf> {
+        if let Some(p) = self.paths.get(name) {
+            return Some(p.clone());
+        }
         self.tools
             .contains_key(name)
             .then(|| PathBuf::from(format!("/fake/bin/{name}")))
@@ -362,6 +367,7 @@ fn input<'a>(cfg: &'a UpdatesConfig, ws: &'a [PathBuf], home: &'a Path) -> Check
         version: "0.3.0",
         workspaces: ws,
         brew_cache: None,
+        avoid_dirs: ws,
         now: 1_000,
     }
 }
@@ -399,8 +405,28 @@ fn a_full_check_reports_outdated_tools_and_advisories() {
         .to_string(),
     )
     .unwrap();
-    let brew_cache = t.path().join("formula.jws.json");
-    std::fs::write(&brew_cache, "{}").unwrap();
+    // Installs read by their metadata (N10): an npm package, a cask, and
+    // one with no version anywhere.
+    let pkg = t.path().join("lib/node_modules/@anthropic-ai/claude-code");
+    std::fs::create_dir_all(&pkg).unwrap();
+    std::fs::write(
+        pkg.join("package.json"),
+        json!({"name": "@anthropic-ai/claude-code", "version": "2.0.14"}).to_string(),
+    )
+    .unwrap();
+    std::fs::write(pkg.join("cli.js"), "").unwrap();
+    std::fs::create_dir_all(t.path().join("bin")).unwrap();
+    std::os::unix::fs::symlink(pkg.join("cli.js"), t.path().join("bin/claude")).unwrap();
+    let cask = t.path().join("Caskroom/codex/0.46.0");
+    std::fs::create_dir_all(&cask).unwrap();
+    std::fs::write(cask.join("codex"), "").unwrap();
+    let cursor = t.path().join("cursor/versions/2025.10.01-abc");
+    std::fs::create_dir_all(&cursor).unwrap();
+    std::fs::write(cursor.join("cursor-agent"), "").unwrap();
+    let hb = t.path().join("hb");
+    std::fs::create_dir_all(hb.join("bin")).unwrap();
+    std::fs::create_dir_all(hb.join("Library/Taps/homebrew/homebrew-core")).unwrap();
+    std::fs::write(hb.join("bin/brew"), "").unwrap();
     let mut http = FakeHttp::default();
     http.gets.insert(
         MULCHIE_RELEASE_URL.into(),
@@ -434,6 +460,12 @@ fn a_full_check_reports_outdated_tools_and_advisories() {
                 {"name": "pinned", "installed_versions": ["1"], "current_version": "2", "pinned": true}
             ], "casks": []}).to_string())),
         ]),
+        paths: HashMap::from([
+            ("claude".into(), t.path().join("bin/claude")),
+            ("codex".into(), cask.join("codex")),
+            ("cursor-agent".into(), cursor.join("cursor-agent")),
+            ("brew".into(), hb.join("bin/brew")),
+        ]),
         ..FakeRunner::default()
     };
     let cfg = UpdatesConfig {
@@ -441,8 +473,7 @@ fn a_full_check_reports_outdated_tools_and_advisories() {
         ..UpdatesConfig::default()
     };
     let wss = [ws.clone()];
-    let mut inp = input(&cfg, &wss, t.path());
-    inp.brew_cache = Some(brew_cache);
+    let inp = input(&cfg, &wss, t.path());
     let r = check(&http, &run, &inp, None);
     assert!(r.errors.is_empty(), "{:?}", r.errors);
     let m = r.mulchie.as_ref().unwrap();
@@ -452,20 +483,41 @@ fn a_full_check_reports_outdated_tools_and_advisories() {
         Some("brew upgrade williamrogersdev/tap/mulchie-cli")
     );
     let claude = r.agents.iter().find(|a| a.name == "claude").unwrap();
+    assert_eq!(claude.installed.as_deref(), Some("2.0.14"));
+    assert!(claude
+        .version_from
+        .as_deref()
+        .unwrap()
+        .starts_with("package.json at"));
     assert!(claude.outdated);
     assert_eq!(claude.command.as_deref(), Some("claude update"));
     let codex = r.agents.iter().find(|a| a.name == "codex").unwrap();
+    assert_eq!(
+        codex.installed.as_deref(),
+        Some("0.46.0"),
+        "from the cask path"
+    );
     assert!(!codex.outdated, "a non-semver latest makes no claim");
     let cursor = r.agents.iter().find(|a| a.name == "cursor-agent").unwrap();
     assert_eq!(cursor.latest, None);
-    assert!(!cursor.outdated);
-    assert_eq!(r.homebrew.as_ref().unwrap().len(), 1, "pinned left out");
-    assert!(run
-        .runs
-        .lock()
+    assert_eq!(cursor.installed, None, "not semver: unknown");
+    assert!(cursor
+        .version_from
+        .as_deref()
         .unwrap()
-        .iter()
-        .any(|x| x.contains("HOMEBREW_NO_AUTO_UPDATE")));
+        .contains("--version is not run"));
+    assert!(!cursor.outdated);
+    // No agent tool was run: only brew.
+    let runs = run.runs.lock().unwrap().clone();
+    assert!(runs.iter().all(|x| x.starts_with("brew ")), "{runs:?}");
+    assert_eq!(
+        r.homebrew_path.as_deref(),
+        Some(hb.join("bin/brew").as_path())
+    );
+    assert_eq!(r.homebrew.as_ref().unwrap().len(), 1, "pinned left out");
+    assert!(run.runs.lock().unwrap().iter().any(
+        |x| x.contains("HOMEBREW_NO_AUTO_UPDATE") && x.contains("HOMEBREW_NO_INSTALL_FROM_API")
+    ));
     let f = findings(&r);
     let kinds: Vec<FindingKind> = f.iter().map(|f| f.kind).collect();
     assert!(kinds.contains(&FindingKind::MulchieUpdate));
@@ -506,13 +558,10 @@ fn homebrew_needs_local_data() {
         ..FakeRunner::default()
     };
     let mut errs = Vec::new();
-    assert_eq!(
-        homebrew(&run, Some(Path::new("/nope/formula.jws.json")), &mut errs),
-        None
-    );
+    assert_eq!(homebrew(&run, &[], &mut errs), (None, None));
     assert!(
         run.runs.lock().unwrap().is_empty(),
-        "brew not run without its cache"
+        "brew not run without its local core tap"
     );
     assert!(parse_brew_outdated("{}").is_err());
     assert!(parse_brew_outdated("garbage").is_err());
@@ -568,4 +617,74 @@ fn hostile_input_never_panics() {
             let _ = parse_vuln(&v);
         }
     }
+}
+
+/// N10: where executables are looked for, what a probe runs with, and the
+/// installed version read from metadata only.
+#[test]
+fn probes_come_from_safe_places_and_versions_from_metadata() {
+    let home = Path::new("/Users/u");
+    let ws = PathBuf::from("/Users/u/code/app");
+    let path = std::ffi::OsString::from(
+        ".:node_modules/.bin:/Users/u/code/app/node_modules/.bin:/opt/x/bin::/usr/bin",
+    );
+    let dirs = search_dirs(Some(&path), home, std::slice::from_ref(&ws));
+    assert!(dirs.iter().all(|d| d.is_absolute()), "{dirs:?}");
+    assert!(!dirs.iter().any(|d| d.starts_with(&ws)), "{dirs:?}");
+    assert_eq!(dirs[0], PathBuf::from("/opt/x/bin"));
+    assert!(dirs.contains(&PathBuf::from("/Users/u/.local/bin")));
+    assert_eq!(
+        dirs.iter()
+            .filter(|d| d.as_path() == Path::new("/usr/bin"))
+            .count(),
+        1
+    );
+    // The default find_outside refuses a tool inside a workspace.
+    let run = FakeRunner {
+        tools: HashMap::from([("claude".into(), (true, String::new()))]),
+        paths: HashMap::from([("claude".into(), ws.join("node_modules/.bin/claude"))]),
+        ..FakeRunner::default()
+    };
+    assert_eq!(run.find_outside("claude", std::slice::from_ref(&ws)), None);
+    // A probe's PATH: its own directory, then system directories only.
+    assert_eq!(
+        probe_path(Path::new("/nonexistent/opt/bin/brew")),
+        "/nonexistent/opt/bin:/usr/bin:/bin:/usr/sbin:/sbin"
+    );
+    // Versions: package.json of the right package, or a version directory;
+    // a node version directory is not the tool's version.
+    let t = tempfile::tempdir().unwrap();
+    let nvm = t
+        .path()
+        .join("nvm/versions/node/v20.11.0/lib/node_modules/@openai/codex");
+    std::fs::create_dir_all(nvm.join("bin")).unwrap();
+    std::fs::write(nvm.join("bin/codex.js"), "").unwrap();
+    std::fs::write(
+        nvm.join("package.json"),
+        json!({"name": "@openai/codex", "version": "0.50.1"}).to_string(),
+    )
+    .unwrap();
+    let (v, from) = installed_from_metadata(&nvm.join("bin/codex.js"), Some("@openai/codex"));
+    assert_eq!(v.as_deref(), Some("0.50.1"), "{from}");
+    // Another package's package.json is not read as this one's.
+    let (v, _) = installed_from_metadata(&nvm.join("bin/codex.js"), Some("@google/gemini-cli"));
+    assert_eq!(v, None, "the node version directory is not a tool version");
+    let native = t.path().join("share/claude/versions/2.0.20");
+    std::fs::create_dir_all(native.parent().unwrap()).unwrap();
+    std::fs::write(&native, "").unwrap();
+    let (v, from) = installed_from_metadata(&native, Some("@anthropic-ai/claude-code"));
+    assert_eq!(v.as_deref(), Some("2.0.20"));
+    assert!(from.starts_with("install path"));
+    // brew is not run from a workspace either.
+    let run = FakeRunner {
+        tools: HashMap::from([("brew".into(), (true, "{}".into()))]),
+        paths: HashMap::from([("brew".into(), ws.join("bin/brew"))]),
+        ..FakeRunner::default()
+    };
+    let mut errs = Vec::new();
+    assert_eq!(
+        homebrew(&run, std::slice::from_ref(&ws), &mut errs),
+        (None, None)
+    );
+    assert!(run.runs.lock().unwrap().is_empty());
 }

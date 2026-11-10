@@ -844,6 +844,10 @@ paths:
         start, then every `updates.interval_hours`, sooner after errors. Sources: the Mulchie
         release on GitHub, agent tools' versions against npm, Homebrew's local data, and OSV.dev for
         packages in workspace lockfiles. With `updates.check: off` nothing is requested or run.
+        Agent tools are looked for in absolute `PATH` directories outside the workspaces and scan
+        roots and are never run: their installed version comes from package metadata. `brew
+        outdated` runs with a minimal `PATH`, `HOMEBREW_NO_AUTO_UPDATE=1` and
+        `HOMEBREW_NO_INSTALL_FROM_API=1`, and only when the local homebrew/core tap exists.
       responses:
         "200":
           description: The status
@@ -859,7 +863,14 @@ paths:
                   failures: { type: integer, description: Consecutive checks with errors }
                   available: { type: integer, description: Open findings of category `update` }
                   errors: { type: array, items: { type: string } }
-                  report: { type: object, description: The last check in full }
+                  report:
+                    type: object
+                    description: >-
+                      The last check in full. Each tool in `agents` (and `mulchie`) has `path` (the
+                      binary found), `installed`, `latest`, `outdated`, `command`, `source` and
+                      `version_from` (where `installed` was read: `package.json at …` or
+                      `install path …`, or why it is unknown; agent tools are never run).
+                      `homebrew_path` is the `brew` that was run, when it was.
         default: { $ref: "#/components/responses/Error" }
   /v1/updates/check:
     post:

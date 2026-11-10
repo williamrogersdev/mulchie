@@ -3,14 +3,19 @@
 //!
 //! Sources:
 //! - Mulchie: the latest GitHub release of `williamrogersdev/mulchie`.
-//! - Agent tools: the installed version from the tool's own `--version`
-//!   (10 s timeout); the latest from the npm registry's dist-tags for tools
-//!   published there (Claude Code, Codex, Gemini CLI). Tools with no
-//!   documented source of a latest version (`cursor-agent`) are listed with
-//!   their installed version only.
-//! - Homebrew: `brew outdated --json=v2` with auto-update, hints and
-//!   analytics off, run only when Homebrew's local API cache exists, so it
-//!   reads local data.
+//! - Agent tools: found in absolute `PATH` directories outside every known
+//!   workspace and scan root, plus the usual install places. Their own
+//!   `--version` is never run (it cannot be shown free of side effects): the
+//!   installed version is read from package metadata, the npm package's
+//!   `package.json` above the binary's real path, or a version directory of
+//!   the install (`Caskroom/<cask>/<version>/`, `…/versions/<version>`).
+//!   With neither, the installed version is unknown. The latest comes from
+//!   the npm registry's dist-tags for tools published there (Claude Code,
+//!   Codex, Gemini CLI); `cursor-agent` has no documented source.
+//! - Homebrew: `brew outdated --json=v2` with a minimal `PATH`,
+//!   `HOMEBREW_NO_AUTO_UPDATE=1`, `HOMEBREW_NO_INSTALL_FROM_API=1`, hints and
+//!   analytics off, run only when the local `homebrew/core` tap exists (with
+//!   API installs off, brew would otherwise fetch it), so it reads local data.
 //! - Advisories (opt-in, `updates.advisories`): package names and versions
 //!   from the `Cargo.lock`, `package-lock.json` (v1, v2, v3) and `go.mod` at
 //!   the root of each workspace in use, sent to OSV.dev `querybatch` in
@@ -45,7 +50,6 @@ const NPM_DIST_TAGS: &str = "https://registry.npmjs.org/-/package/";
 
 /// Every request: connect, send and read within this.
 pub const HTTP_TIMEOUT: Duration = Duration::from_secs(15);
-const VERSION_TIMEOUT: Duration = Duration::from_secs(10);
 const BREW_TIMEOUT: Duration = Duration::from_secs(60);
 /// Response size caps.
 const SMALL_REPLY: usize = 256 * 1024;
@@ -194,6 +198,12 @@ fn host_of(url: &str) -> &str {
 pub trait Runner: Send + Sync {
     /// The executable `name` on this machine, if any.
     fn find(&self, name: &str) -> Option<PathBuf>;
+    /// Like [`Runner::find`], never in a directory under one of `avoid`
+    /// (workspaces: a repository must not choose what Mulchie runs).
+    fn find_outside(&self, name: &str, avoid: &[PathBuf]) -> Option<PathBuf> {
+        self.find(name)
+            .filter(|p| !avoid.iter().any(|a| p.starts_with(a)))
+    }
     /// Run it with a timeout; `Some((exited 0, stdout))`, `None` when it
     /// could not run or timed out.
     fn run(
@@ -212,28 +222,75 @@ pub struct SystemRunner {
     pub home: PathBuf,
 }
 
+/// Where to look for an executable: the absolute entries of `path_var`
+/// (relative ones such as `.` or `node_modules/.bin` are dropped), then the
+/// usual install places; none under a directory in `avoid`.
+pub fn search_dirs(
+    path_var: Option<&std::ffi::OsStr>,
+    home: &Path,
+    avoid: &[PathBuf],
+) -> Vec<PathBuf> {
+    let mut dirs: Vec<PathBuf> = path_var
+        .map(|p| std::env::split_paths(p).collect())
+        .unwrap_or_default();
+    for d in [
+        "/opt/homebrew/bin",
+        "/usr/local/bin",
+        "/home/linuxbrew/.linuxbrew/bin",
+        "/usr/bin",
+    ] {
+        dirs.push(PathBuf::from(d));
+    }
+    for d in [".local/bin", ".cargo/bin", ".npm-global/bin", ".bun/bin"] {
+        dirs.push(home.join(d));
+    }
+    let mut out: Vec<PathBuf> = Vec::new();
+    for d in dirs {
+        if d.is_absolute() && !avoid.iter().any(|a| d.starts_with(a)) && !out.contains(&d) {
+            out.push(d);
+        }
+    }
+    out
+}
+
+/// The minimal `PATH` a probe runs with: the system directories and the
+/// probed program's own directory (and its real one), where an interpreter
+/// it needs (`node`) is usually installed next to it.
+pub fn probe_path(prog: &Path) -> String {
+    let mut dirs: Vec<String> = Vec::new();
+    let real = std::fs::canonicalize(prog).ok();
+    for p in [Some(prog), real.as_deref()].into_iter().flatten() {
+        if let Some(d) = p.parent().and_then(|d| d.to_str()) {
+            if !d.is_empty() && !d.contains(':') && !dirs.iter().any(|x| x == d) {
+                dirs.push(d.to_string());
+            }
+        }
+    }
+    dirs.extend(["/usr/bin", "/bin", "/usr/sbin", "/sbin"].map(String::from));
+    dirs.join(":")
+}
+
 impl Runner for SystemRunner {
     fn find(&self, name: &str) -> Option<PathBuf> {
-        let mut dirs: Vec<PathBuf> = std::env::var_os("PATH")
-            .map(|p| std::env::split_paths(&p).collect())
-            .unwrap_or_default();
-        for d in [
-            "/opt/homebrew/bin",
-            "/usr/local/bin",
-            "/home/linuxbrew/.linuxbrew/bin",
-            "/usr/bin",
-        ] {
-            dirs.push(PathBuf::from(d));
-        }
-        for d in [".local/bin", ".cargo/bin", ".npm-global/bin", ".bun/bin"] {
-            dirs.push(self.home.join(d));
-        }
-        dirs.into_iter().map(|d| d.join(name)).find(|p| {
-            std::fs::metadata(p).is_ok_and(|m| {
-                use std::os::unix::fs::PermissionsExt;
-                m.is_file() && m.permissions().mode() & 0o111 != 0
+        self.find_outside(name, &[])
+    }
+
+    fn find_outside(&self, name: &str, avoid: &[PathBuf]) -> Option<PathBuf> {
+        let path = std::env::var_os("PATH");
+        search_dirs(path.as_deref(), &self.home, avoid)
+            .into_iter()
+            .map(|d| d.join(name))
+            .find(|p| {
+                std::fs::metadata(p).is_ok_and(|m| {
+                    use std::os::unix::fs::PermissionsExt;
+                    m.is_file() && m.permissions().mode() & 0o111 != 0
+                })
             })
-        })
+            .filter(|p| {
+                // A link into a workspace is refused too.
+                let real = std::fs::canonicalize(p).unwrap_or_else(|_| p.clone());
+                !avoid.iter().any(|a| real.starts_with(a))
+            })
     }
 
     fn run(
@@ -247,6 +304,9 @@ impl Runner for SystemRunner {
         let mut cmd = std::process::Command::new(prog);
         cmd.args(args)
             .stdin(std::process::Stdio::null())
+            .env("PATH", probe_path(prog))
+            .env("HOMEBREW_NO_AUTO_UPDATE", "1")
+            .env("HOMEBREW_NO_INSTALL_FROM_API", "1")
             .env("NO_COLOR", "1");
         for (k, v) in env {
             cmd.env(k, v);
@@ -762,6 +822,10 @@ pub struct ToolVersion {
     pub command: Option<String>,
     /// Where `latest` came from (`github`, `npm`), or why there is none.
     pub source: String,
+    /// Where `installed` was read (`package.json at …`, `install path …`),
+    /// or why it is unknown.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub version_from: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -800,6 +864,9 @@ pub struct Report {
     pub packages_checked: usize,
     /// `source: why`, for every source that failed.
     pub errors: Vec<String>,
+    /// The `brew` that was run, when it was.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub homebrew_path: Option<PathBuf>,
 }
 
 /// Agent tools: (name, executable, npm package with the latest version,
@@ -859,8 +926,13 @@ pub struct CheckInput<'a> {
     pub version: &'a str,
     /// Workspaces whose lockfiles are checked for advisories.
     pub workspaces: &'a [PathBuf],
-    /// Homebrew's local API cache, which must exist for `brew outdated`.
+    /// Homebrew's local API cache. Not used since brew runs with API
+    /// installs off (it needs the local core tap instead); kept so callers
+    /// that set it still build.
     pub brew_cache: Option<PathBuf>,
+    /// Directories no probed program may come from: the workspaces and scan
+    /// roots.
+    pub avoid_dirs: &'a [PathBuf],
     pub now: u64,
 }
 
@@ -903,6 +975,7 @@ pub fn check(http: &dyn Http, run: &dyn Runner, inp: &CheckInput, prev: Option<&
                     outdated,
                     command: outdated.then(|| mulchie_command(inp.exe, inp.home)),
                     source: "github".into(),
+                    version_from: Some("this build".into()),
                 });
             }
             Err(e) => {
@@ -913,13 +986,11 @@ pub fn check(http: &dyn Http, run: &dyn Runner, inp: &CheckInput, prev: Option<&
     }
     if inp.cfg.agents {
         for (name, exe, npm, self_update) in AGENT_TOOLS {
-            let Some(path) = run.find(exe) else { continue };
-            let installed = run
-                .run(&path, &["--version"], &[], VERSION_TIMEOUT, 64 * 1024)
-                .filter(|(ok, _)| *ok)
-                .and_then(|(_, out)| version_in(&out))
-                .map(|v| v.to_string());
+            let Some(path) = run.find_outside(exe, inp.avoid_dirs) else {
+                continue;
+            };
             let real = std::fs::canonicalize(&path).unwrap_or(path.clone());
+            let (installed, version_from) = installed_from_metadata(&real, *npm);
             let (latest, source) = match npm {
                 Some(pkgname) => {
                     let url = format!("{NPM_DIST_TAGS}{}/dist-tags", pkgname.replace('/', "%2f"));
@@ -962,12 +1033,14 @@ pub fn check(http: &dyn Http, run: &dyn Runner, inp: &CheckInput, prev: Option<&
                 outdated,
                 command,
                 source,
+                version_from: Some(version_from),
             });
         }
     }
     if inp.cfg.homebrew {
-        r.homebrew = homebrew(run, inp.brew_cache.as_deref(), &mut r.errors)
-            .or_else(|| prev.and_then(|p| p.homebrew.clone()));
+        let (hb, path) = homebrew(run, inp.avoid_dirs, &mut r.errors);
+        r.homebrew_path = path;
+        r.homebrew = hb.or_else(|| prev.and_then(|p| p.homebrew.clone()));
     }
     if inp.cfg.advisories {
         match advisories(http, inp.workspaces) {
@@ -986,18 +1059,93 @@ pub fn check(http: &dyn Http, run: &dyn Runner, inp: &CheckInput, prev: Option<&
     r
 }
 
+/// The installed version of a tool from its package metadata, never by
+/// running it: the npm package's `package.json` above its real path, else a
+/// version directory of the install (`Caskroom/<cask>/<v>/`,
+/// `…/versions/<v>/`). Returns the version and where it was read, or why
+/// there is none.
+pub fn installed_from_metadata(real: &Path, npm: Option<&str>) -> (Option<String>, String) {
+    if let Some(pkg) = npm {
+        for dir in real.ancestors().skip(1).take(8) {
+            let pj = dir.join("package.json");
+            let small = std::fs::metadata(&pj).is_ok_and(|m| m.is_file() && m.len() < 1 << 20);
+            if !small {
+                continue;
+            }
+            let Ok(v) = std::fs::read(&pj)
+                .map_err(|_| ())
+                .and_then(|b| serde_json::from_slice::<Value>(&b).map_err(|_| ()))
+            else {
+                continue;
+            };
+            if v.get("name").and_then(Value::as_str) != Some(pkg) {
+                continue;
+            }
+            if let Some(ver) = v
+                .get("version")
+                .and_then(Value::as_str)
+                .and_then(parse_version)
+            {
+                return (
+                    Some(ver.to_string()),
+                    format!("package.json at {}", pj.display()),
+                );
+            }
+        }
+    }
+    let comps: Vec<&std::ffi::OsStr> = real.iter().collect();
+    for i in (1..comps.len()).rev() {
+        let parent = comps[i - 1].to_str().unwrap_or("");
+        let grand = if i >= 2 {
+            comps[i - 2].to_str().unwrap_or("")
+        } else {
+            ""
+        };
+        if parent != "versions" && grand != "Caskroom" {
+            continue;
+        }
+        if let Some(v) = comps[i].to_str().and_then(parse_version) {
+            return (
+                Some(v.to_string()),
+                format!("install path {}", real.display()),
+            );
+        }
+    }
+    (
+        None,
+        format!(
+            "no package metadata at {}; the tool's own --version is not run",
+            real.display()
+        ),
+    )
+}
+
+/// The `homebrew/core` tap of the brew at `brew`, which `brew outdated`
+/// reads with API installs off.
+fn core_tap(brew: &Path) -> Option<PathBuf> {
+    let real = std::fs::canonicalize(brew).unwrap_or_else(|_| brew.to_path_buf());
+    let repo = real.parent()?.parent()?;
+    [repo.to_path_buf(), repo.join("Homebrew")]
+        .into_iter()
+        .map(|r| r.join("Library/Taps/homebrew/homebrew-core"))
+        .find(|t| t.is_dir())
+}
+
 fn homebrew(
     run: &dyn Runner,
-    cache: Option<&Path>,
+    avoid: &[PathBuf],
     errors: &mut Vec<String>,
-) -> Option<Vec<BrewOutdated>> {
-    let brew = run.find("brew")?;
-    if !cache.is_some_and(|c| c.is_file()) {
-        // Without local data `brew outdated` would fetch it.
-        return None;
+) -> (Option<Vec<BrewOutdated>>, Option<PathBuf>) {
+    let Some(brew) = run.find_outside("brew", avoid) else {
+        return (None, None);
+    };
+    if core_tap(&brew).is_none() {
+        // With API installs off and no local core tap, brew would fetch it.
+        return (None, None);
     }
     let env = [
         ("HOMEBREW_NO_AUTO_UPDATE", "1"),
+        ("HOMEBREW_NO_INSTALL_FROM_API", "1"),
         ("HOMEBREW_NO_ENV_HINTS", "1"),
         ("HOMEBREW_NO_ANALYTICS", "1"),
     ];
@@ -1011,13 +1159,13 @@ fn homebrew(
         BREW_REPLY,
     ) else {
         errors.push("homebrew: brew outdated did not finish".into());
-        return None;
+        return (None, Some(brew));
     };
     match parse_brew_outdated(&out) {
-        Ok(v) => Some(v),
+        Ok(v) => (Some(v), Some(brew)),
         Err(e) => {
             errors.push(format!("homebrew: {e}"));
-            None
+            (None, Some(brew))
         }
     }
 }
