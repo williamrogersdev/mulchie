@@ -485,3 +485,21 @@ fn a_missing_binary_allows_and_a_present_one_decides() {
         "hook codex prompt"
     );
 }
+
+#[test]
+fn a_file_that_would_change_on_rewrite_is_left_alone() {
+    let t = t();
+    let f = t.env.file(ClaudeCode);
+    std::fs::create_dir_all(f.parent().unwrap()).unwrap();
+    for text in [
+        "{\n  \"big\": 12345678901234567890123\n}\n",
+        "{\n  \"hooks\": {},\n  \"hooks\": {\"Stop\": []}\n}\n",
+    ] {
+        std::fs::write(&f, text).unwrap();
+        let e = install_in(&t.env, ClaudeCode, false, None).unwrap_err();
+        assert!(e.contains("left as it is"), "{e}");
+        assert_eq!(std::fs::read_to_string(&f).unwrap(), text);
+        assert!(uninstall_in(&t.env, ClaudeCode, false).is_err());
+        assert_eq!(std::fs::read_to_string(&f).unwrap(), text);
+    }
+}

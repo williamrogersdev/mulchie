@@ -6,6 +6,7 @@ mod doctor;
 mod hook;
 mod hook_wire;
 mod hooks_install;
+mod json_faithful;
 mod mcp;
 mod mcp_install;
 mod mcp_tools;

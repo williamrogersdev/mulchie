@@ -436,6 +436,14 @@ fn parse_root(old: Option<&str>, path: &Path, c: HookClient) -> Result<Value, St
             )
         })?,
     };
+    if let Some(s) = old {
+        crate::json_faithful::check(s).map_err(|e| {
+            format!(
+                "{} cannot be rewritten without changing it: {e}. Fix that, or add the hooks by hand (`mulchie hooks install --dry-run` shows them). It was left as it is.",
+                path.display()
+            )
+        })?;
+    }
     let Value::Object(mut obj) = root else {
         return Err(format!(
             "{} is not a JSON object; it was left as it is",

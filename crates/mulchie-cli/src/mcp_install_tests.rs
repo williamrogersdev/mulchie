@@ -534,3 +534,28 @@ fn snippet_shape() {
         json!({ "mcpServers": { "mulchie": { "command": "/opt/mulchie/bin/mulchie", "args": ["mcp", "--read-only"] } } })
     );
 }
+
+#[test]
+fn a_json_config_that_would_change_on_rewrite_is_refused() {
+    let want = json!({ "command": "/bin/mulchie", "args": ["mcp"] });
+    let p = Path::new("/tmp/x.json");
+    let e = edit_json(
+        Some(r#"{"n": 12345678901234567890123}"#),
+        p,
+        Some(&want),
+        false,
+    )
+    .unwrap_err();
+    assert!(
+        e.contains("left as it is") && e.contains("12345678901234567890123"),
+        "{e}"
+    );
+    let e = edit_json(
+        Some(r#"{"mcpServers": {}, "mcpServers": {}}"#),
+        p,
+        Some(&want),
+        false,
+    )
+    .unwrap_err();
+    assert!(e.contains("twice"), "{e}");
+}

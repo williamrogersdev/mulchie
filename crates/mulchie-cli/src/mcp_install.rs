@@ -304,6 +304,14 @@ pub fn edit_json(
             )
         })?,
     };
+    if let Some(s) = old {
+        crate::json_faithful::check(s).map_err(|e| {
+            format!(
+                "{} cannot be rewritten without changing it: {e}. Fix that, or add the server by hand (see `mulchie mcp config`). It was left as it is.",
+                path.display()
+            )
+        })?;
+    }
     let Some(obj) = root.as_object_mut() else {
         return Err(format!(
             "{} is not a JSON object; it was left as it is",
