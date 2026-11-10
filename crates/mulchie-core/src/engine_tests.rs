@@ -1456,3 +1456,58 @@ fn quarantine_checks_rotate_through_every_candidate() {
         "known flags are not read again"
     );
 }
+
+/// R13: lowering a workspace's priority re-reads each process and skips a
+/// pid whose start time no longer matches (reused) or that is not ours.
+#[test]
+fn deprioritize_rechecks_each_process_before_renicing() {
+    let mut child = std::process::Command::new("/bin/sleep")
+        .arg("30")
+        .spawn()
+        .unwrap();
+    let pid = child.id();
+    let before = crate::engine::nice_of(pid).unwrap();
+    let procs = FakeProcesses::empty().with(pid, "sleep", None, 777);
+    let (_t, e) = engine_with_procs(Config::default(), procs);
+    let ws = |start| crate::monitor::Workspace {
+        path: PathBuf::from("/code/r"),
+        label: "r".into(),
+        repo: "r".into(),
+        name: "r".into(),
+        branch: None,
+        is_worktree: false,
+        exists: true,
+        paused: false,
+        throttled: 0,
+        agents: 0,
+        builds: 1,
+        cpu_pct: 0.0,
+        mem_bytes: 0,
+        read_bps: 0,
+        write_bps: 0,
+        orphan: None,
+        procs: vec![info(pid, start, ProcKind::Build)],
+    };
+    e.state_mut().snapshot = Arc::new(Snapshot {
+        workspaces: vec![ws(776)],
+        ..Default::default()
+    });
+    let n = e
+        .workspace_action(Path::new("/code/r"), WorkspaceAction::Deprioritize, "t")
+        .unwrap();
+    assert_eq!(n, 0, "start time differs: not reniced");
+    assert_eq!(crate::engine::nice_of(pid), Some(before));
+    if before < 10 {
+        e.state_mut().snapshot = Arc::new(Snapshot {
+            workspaces: vec![ws(777)],
+            ..Default::default()
+        });
+        let n = e
+            .workspace_action(Path::new("/code/r"), WorkspaceAction::Deprioritize, "t")
+            .unwrap();
+        assert_eq!(n, 1);
+        assert!(crate::engine::nice_of(pid).unwrap() > before);
+    }
+    let _ = child.kill();
+    let _ = child.wait();
+}

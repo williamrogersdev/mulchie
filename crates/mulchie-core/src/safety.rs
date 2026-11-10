@@ -367,6 +367,10 @@ pub enum Request {
     },
 }
 
+/// Tests: a hook given the patch file before it is verified.
+#[cfg(test)]
+pub(crate) type PatchHook = Box<dyn Fn(&Path)>;
+
 /// How long [`Request::ReopenApp`] waits for the app's main process to exit.
 pub const REOPEN_WAIT: Duration = Duration::from_secs(20);
 
@@ -455,6 +459,10 @@ pub struct Gate<'a> {
     /// Tests: runs after the backups are written, before the recheck.
     #[cfg(test)]
     pub(crate) after_backup: Option<Box<dyn Fn()>>,
+    /// Tests: runs on `changes.patch` after it is written, before it is
+    /// verified.
+    #[cfg(test)]
+    pub(crate) before_verify: Option<PatchHook>,
 }
 
 struct CacheFacts {
@@ -572,6 +580,8 @@ impl<'a> Gate<'a> {
             reopen_wait: REOPEN_WAIT,
             #[cfg(test)]
             after_backup: None,
+            #[cfg(test)]
+            before_verify: None,
         }
     }
 
@@ -1604,6 +1614,10 @@ impl<'a> Gate<'a> {
         }
         let p = dir.join("changes.patch");
         create_private_file(&p, &out.stdout).map_err(|e| e.to_string())?;
+        #[cfg(test)]
+        if let Some(h) = &self.before_verify {
+            h(&p);
+        }
         self.verify_patch(f, dir, &p)?;
         Ok((p, tree))
     }

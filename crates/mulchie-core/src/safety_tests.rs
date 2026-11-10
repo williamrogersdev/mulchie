@@ -1658,3 +1658,38 @@ fn user_services_of_systemd_user_are_not_signalled() {
     assert!(i[1].ready, "in a workspace: {:?}", i[1]);
     assert!(i[2].ready, "another parent: {:?}", i[2]);
 }
+
+/// R13: a patch that does not apply to HEAD is a failed backup, through the
+/// whole removal: nothing is removed and the changes stay in place.
+#[test]
+fn a_patch_that_does_not_verify_fails_the_removal() {
+    let env = Env::new();
+    let repo = env.repo("repo");
+    let wt = env.worktree(&repo, "agent-x", false);
+    std::fs::write(wt.join("work.txt"), "unsaved").unwrap();
+    let head = env.head(&wt);
+    let mut g = env.gate();
+    g.before_verify = Some(Box::new(|p: &Path| {
+        // A hunk against a file HEAD does not have.
+        std::fs::write(
+            p,
+            "diff --git a/missing.txt b/missing.txt\n--- a/missing.txt\n+++ b/missing.txt\n@@ -1 +1 @@\n-old\n+new\n",
+        )
+        .unwrap();
+    }));
+    let r = g.execute_one(&env.remove_req(&wt, &head), "t");
+    assert_eq!(reason(&r), Some(SkipReason::BackupFailed), "{r:?}");
+    let Outcome::Skipped { detail, .. } = &r.outcome else {
+        unreachable!()
+    };
+    assert!(detail.contains("does not apply"), "{detail}");
+    assert!(wt.exists());
+    assert_eq!(
+        std::fs::read_to_string(wt.join("work.txt")).unwrap(),
+        "unsaved"
+    );
+    // Without the corruption the same removal goes through.
+    let r = env.gate().execute_one(&env.remove_req(&wt, &head), "t");
+    assert!(done(&r), "{r:?}");
+    assert!(!wt.exists());
+}
