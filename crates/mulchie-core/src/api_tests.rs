@@ -712,3 +712,29 @@ fn the_read_only_client_cannot_change_anything() {
         .unwrap_err();
     assert_eq!((e.status, e.code.as_str()), (403, "read_only_token"));
 }
+
+/// C7: a client trickling bytes at the 503 cannot hold the accept thread past
+/// the overall budget.
+#[test]
+fn turning_away_a_trickling_client_is_bounded() {
+    let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = l.local_addr().unwrap().port();
+    let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let stop2 = stop.clone();
+    let client = std::thread::spawn(move || {
+        let mut c = TcpStream::connect(("127.0.0.1", port)).unwrap();
+        while !stop2.load(std::sync::atomic::Ordering::SeqCst) {
+            if c.write_all(b"x").is_err() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(40));
+        }
+    });
+    let (s, _) = l.accept().unwrap();
+    let t = Instant::now();
+    reject_busy(&s);
+    let took = t.elapsed();
+    stop.store(true, std::sync::atomic::Ordering::SeqCst);
+    client.join().unwrap();
+    assert!(took < Duration::from_millis(400), "took {took:?}");
+}

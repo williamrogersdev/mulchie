@@ -346,12 +346,13 @@ impl Drop for Slot {
 }
 
 /// Too many connections: answer 503 on the accept thread, spending at most
-/// about 100 ms on this client. The request bytes are drained before closing so
-/// the answer is not lost to a reset.
+/// [`REJECT_BUDGET`] on this client in all (write and drain together). The
+/// request bytes are drained before closing so the answer is not lost to a
+/// reset; a client trickling bytes cannot hold the accept thread past the
+/// budget.
 fn reject_busy(stream: &TcpStream) {
-    let t = Some(Duration::from_millis(50));
-    let _ = stream.set_read_timeout(t);
-    let _ = stream.set_write_timeout(t);
+    let deadline = Instant::now() + REJECT_BUDGET;
+    let _ = stream.set_write_timeout(Some(REJECT_BUDGET / 2));
     let resp = ApiError::new(
         503,
         "too_many_connections",
@@ -363,12 +364,19 @@ fn reject_busy(stream: &TcpStream) {
     let mut sink = [0u8; 4096];
     let mut left: usize = 64 * 1024;
     while left > 0 {
+        let rest = deadline.saturating_duration_since(Instant::now());
+        if rest.is_zero() || stream.set_read_timeout(Some(rest)).is_err() {
+            break;
+        }
         match (&*stream).read(&mut sink) {
             Ok(0) | Err(_) => break,
             Ok(n) => left = left.saturating_sub(n),
         }
     }
 }
+
+/// The most time the accept thread spends turning away one client.
+const REJECT_BUDGET: Duration = Duration::from_millis(100);
 
 /// A reader that never blocks past the request deadline.
 struct DeadlineStream<'a> {
