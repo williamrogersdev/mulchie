@@ -19,7 +19,15 @@ serde_json.workspace = true
 sysinfo.workspace = true
 semver.workspace = true
 toml.workspace = true
-ureq.workspace = true
+# HTTPS for update and advisory checks (rustls with ring, webpki roots). Its C
+# build needs a compiler for the target, so it sits behind `network`.
+ureq = { workspace = true, optional = true }
+
+[features]
+default = ["network"]
+# Update checks over HTTPS. Without it every check reports that this build
+# has no network support, and nothing leaves the machine.
+network = ["dep:ureq"]
 
 [dev-dependencies]
 tempfile.workspace = true
