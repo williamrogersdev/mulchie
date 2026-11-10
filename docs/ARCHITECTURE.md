@@ -114,6 +114,60 @@ A lease needs a live pid or a TTL. `mulchie run` leases against its own pid, for
 
 Windows is out of scope.
 
+## Supervising agent sessions
+
+Mulchie watches what agents do on the machine, holds them to limits, tells them when they are causing trouble, and keeps a record. It is a supervisor, not a sandbox and not an antivirus: an agent that wants to evade it can. The docs say so wherever these features are described.
+
+### Sessions
+
+A **session** is one run of a coding agent: a root process recognised as an agent (a built-in list of agent binaries, extended by `agents.extra` in config) plus every descendant, in the workspace of the root's working directory. Its identity is the root's pid and start time, so a reused pid is a new session. A session ends when its root exits.
+
+Per session the sample loop keeps: CPU cores in use, memory, process count, bytes written, runtime, listening ports, build slots held, and the peaks of each.
+
+### Limits
+
+`limits` in config sets a default budget and per-workspace overrides. A budget may cap CPU cores, memory, process count, bytes written per hour and runtime. Each cap has a `sustain_secs` and one action:
+
+| Action | What happens |
+| --- | --- |
+| `notify` (default) | A finding and a notification. Nothing is signalled. |
+| `deprioritize` | The session's processes are niced; priority is restored when it is back under the cap. |
+| `pause` | The session's descendants receive `SIGSTOP`. They resume on request or when `resume_after_secs` passes. |
+| `stop` | The session's descendants receive `SIGTERM`, then `SIGKILL` after a grace period. |
+
+- With no `limits` set, Mulchie only reports: a session that holds most of the machine while health is poor becomes a finding.
+- `pause` and `stop` happen only when the user configured them. They never apply to the agent's root process unless `include_agent` is set, so the agent stays alive to be told what happened.
+- Every limit action is a signal request through the safety gate (owner, pid 1, Mulchie's own processes and start-time checks all apply) and is journaled.
+- A breach is delivered to the agent through its next hook call and through `diagnose`, with the cap, the measured value and what Mulchie did.
+
+### Activity record
+
+Each session has an append-only record in `<config dir>/sessions/<id>.jsonl`: start and end, processes started (command lines with secrets redacted), ports opened, build slots, hook events, limit breaches, and every Mulchie action that touched it. Records are capped per session and deleted after `sessions.retain_days`. The API serves the session list, one session's summary and its events.
+
+### Hooks
+
+`mulchie hook <client> <event>` is the command an agent's own hook system runs. It reads the client's event on stdin, records it in the session's activity record, and answers in the client's format. `mulchie hooks install --client <name>` adds it to that client's configuration, with the same care as `mcp install` (backup, atomic write, `--dry-run`).
+
+- On session start it gives the agent the machine's state and the house rules, such as wrapping heavy builds in `mulchie run`.
+- Before a shell command it can add advice (the machine is under pressure; queue this build) or apply a **guard rule**. Guard rules match risky commands, such as deleting outside the workspace or piping a download into a shell. Each rule is `off`, `warn` (the client asks the user) or `block`. The default is `warn`.
+- It reports any limit breach that has not yet been delivered to that session.
+- It fails open. If the engine is down or slow (300 ms budget) the hook exits successfully and silently, so Mulchie can never stall an agent.
+
+Only clients whose hook mechanism is documented are supported.
+
+### Updates and advisories
+
+`updates.rs` produces findings in the `update` category. It never installs anything; each finding names the command that would.
+
+| Check | Source | Default |
+| --- | --- | --- |
+| Mulchie itself | Latest GitHub release | on |
+| Installed agent tools | Each tool's own version command against its registry | on |
+| Homebrew packages | `brew outdated`, local data only | on when `brew` exists |
+| Known vulnerabilities in workspace lockfiles | OSV.dev batch query | off; opt-in, because it sends package names and versions to a third party |
+
+Results are cached for 24 hours. `updates.check` in config turns network checks off entirely. Requests carry no identifier beyond a `mulchie/<version>` user agent.
+
 ## Clients
 
 **CLI.** Parsed with clap: per-command help, shell completions, strict flags. Read commands fall back to a local scan when no engine is running and say so. Commands that need the engine (`signal`, queueing in `run`) say that it is not running and how to start it. `mulchie doctor` checks the install end to end. `mulchie service install` sets up the headless engine.

@@ -99,6 +99,28 @@ Rewrite the README and docs against the shipped behaviour and real `--help` outp
 ### P9. End-to-end check
 Build the DMG locally with the Developer ID identity, install from it, run `mulchie doctor`, exercise sweep against a throwaway repo, run `install.sh` against local artifacts, load the site build.
 
+## Added after the first plan
+
+These run before P7 to P9. Core packages run one after another, because they share `crates/mulchie-core/**`.
+
+### P10. Agent interface (done)
+`diagnose`, plan-then-execute MCP tools, read-only token and mode, `mcp install`, `AGENTS.md`, `server.json`, `docs/openapi.yaml`, MCP tests in CI.
+
+### P11. Core: security findings, review fixes, consumers
+Paths: `crates/mulchie-core/**`. Findings (leftover processes, listeners, unsigned or oddly placed binaries, Mulchie's own posture), process detail, signal plans, config routes, secret redaction, review fixes C1 to C13, top consumers per app and plain-language CPU and memory summaries.
+
+### P12. App: drill-down and actions
+Paths: `crates/mulchie-app/**`. Tables that fit, row detail with actions, findings, tray panel with top consumers, app review fixes.
+
+### P13. Core: sessions, limits, activity record, updates
+Paths: `crates/mulchie-core/**`. After P11. The "Supervising agent sessions" section of the architecture: session tracking, limits and their actions through the gate, the activity record, `updates.rs`, the API routes and `docs/openapi.yaml`.
+
+### P14. CLI and MCP: hooks, sessions, updates
+Paths: `crates/mulchie-cli/**`. After P13. `mulchie hook`, `mulchie hooks install|uninstall`, `mulchie sessions`, `mulchie limits`, `mulchie updates`; MCP tools and `diagnose` output for sessions, breaches, findings and updates; CLI review fixes.
+
+### P15. App: sessions, limits, updates
+Paths: `crates/mulchie-app/**`. After P13 and P12. Sessions view with the activity record, limit settings, update findings.
+
 ## Steps only the maintainer can take
 
 These change things outside the repository. `docs/RELEASING.md` has the commands.
