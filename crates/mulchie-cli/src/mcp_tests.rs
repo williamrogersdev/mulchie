@@ -142,12 +142,22 @@ fn full_legacy_handshake() {
     assert!(r[2]["result"].get("resultType").is_none());
 }
 
+fn tool_names(r: &Value) -> Vec<String> {
+    r["result"]["tools"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|t| t["name"].as_str().unwrap().to_string())
+        .collect()
+}
+
 #[test]
 fn tools_have_titles_and_annotations() {
     let f = Fake::default();
     let r = one(&f, req(1, "tools/list", json!({})));
     let tools = r["result"]["tools"].as_array().unwrap();
-    assert_eq!(tools.len(), 15);
+    assert_eq!(tools.len(), 17);
+    assert_eq!(tools[0]["name"], "diagnose", "diagnose comes first");
     for t in tools {
         let name = t["name"].as_str().unwrap();
         assert!(t["title"].is_string(), "{name}");
@@ -168,10 +178,14 @@ fn tools_have_titles_and_annotations() {
         }
     }
     let ann = |n: &str| tools.iter().find(|t| t["name"] == n).unwrap()["annotations"].clone();
+    let desc = |n: &str| {
+        tools.iter().find(|t| t["name"] == n).unwrap()["description"]
+            .as_str()
+            .unwrap()
+            .to_string()
+    };
     for n in [
-        "clean_caches",
-        "remove_worktrees",
-        "sweep_worktrees",
+        "execute_plan",
         "prune_cache",
         "workspace_action",
         "process_action",
@@ -180,20 +194,105 @@ fn tools_have_titles_and_annotations() {
         assert_eq!(ann(n)["readOnlyHint"], false, "{n}");
     }
     for n in [
+        "diagnose",
         "get_status",
         "can_i_build",
         "top_processes",
         "disk_breakdown",
+        "plan_cache_cleanup",
+        "plan_worktree_removal",
+        "plan_worktree_sweep",
     ] {
         assert_eq!(ann(n)["readOnlyHint"], true, "{n}");
     }
+    // No one-step deletion is offered.
+    let names = tool_names(&r);
+    for gone in ["clean_caches", "remove_worktrees", "sweep_worktrees"] {
+        assert!(!names.contains(&gone.to_string()), "{gone}");
+    }
+    for n in [
+        "plan_cache_cleanup",
+        "plan_worktree_removal",
+        "plan_worktree_sweep",
+    ] {
+        let d = desc(n);
+        assert!(
+            d.contains("Changes nothing") && d.contains("execute_plan"),
+            "{n}: {d}"
+        );
+    }
+    let d = desc("execute_plan");
+    assert!(
+        d.contains("approved") && d.contains("re-checked") && d.contains("restore"),
+        "{d}"
+    );
     assert_eq!(ann("acquire_build_slot")["destructiveHint"], false);
-    let acquire = tools
-        .iter()
-        .find(|t| t["name"] == "acquire_build_slot")
-        .unwrap();
-    let d = acquire["description"].as_str().unwrap();
+    let d = desc("acquire_build_slot");
     assert!(d.contains("renew") && d.contains("ttl_secs") && d.contains("release_build_slot"));
+}
+
+#[test]
+fn read_only_mode_hides_and_refuses_destructive_tools() {
+    let f = Fake::default()
+        .with("POST /v1/prune", json!({ "ok": true }))
+        .with("GET /v1/sweep", plan_with(&["/w/a"], &[]))
+        .with("POST /v1/lease", json!({ "granted": true, "ticket": 1 }));
+    let mut s = Session::read_only(&f);
+    let r = s.handle(req(1, "tools/list", json!({}))).unwrap();
+    let names = tool_names(&r);
+    assert_eq!(names.len(), 13, "{names:?}");
+    for n in [
+        "execute_plan",
+        "prune_cache",
+        "workspace_action",
+        "process_action",
+    ] {
+        assert!(!names.contains(&n.to_string()), "{n}");
+    }
+    for n in [
+        "diagnose",
+        "plan_worktree_sweep",
+        "acquire_build_slot",
+        "release_build_slot",
+    ] {
+        assert!(names.contains(&n.to_string()), "{n}");
+    }
+    let init = s
+        .handle(req(
+            2,
+            "initialize",
+            json!({ "protocolVersion": "2025-11-25", "capabilities": {} }),
+        ))
+        .unwrap();
+    assert!(init["result"]["instructions"]
+        .as_str()
+        .unwrap()
+        .contains("read-only"));
+
+    // Called anyway: refused before reaching the engine.
+    let r = s
+        .handle(call(3, "prune_cache", json!({ "key": "npm" })))
+        .unwrap();
+    assert_eq!(r["result"]["isError"], true);
+    assert!(text(&r).contains("read-only"), "{}", text(&r));
+    let r = s
+        .handle(call(
+            4,
+            "execute_plan",
+            json!({ "plan_id": "x", "items": ["/w/a"] }),
+        ))
+        .unwrap();
+    assert_eq!(r["result"]["isError"], true);
+    // Plans still work, but hand out no plan_id.
+    let r = s.handle(call(5, "plan_worktree_sweep", json!({}))).unwrap();
+    let v: Value = serde_json::from_str(&text(&r)).unwrap();
+    assert!(v.get("plan_id").is_none(), "{v}");
+    assert_eq!(v["ready"][0]["target"], "/w/a");
+    // Build slots still work.
+    let r = s.handle(call(6, "acquire_build_slot", json!({}))).unwrap();
+    assert_eq!(r["result"]["isError"], false);
+    assert!(f.posted("/v1/prune").is_empty());
+    assert!(f.posted("/v1/sweep").is_empty());
 }
 
 #[test]
@@ -224,7 +323,7 @@ fn jsonrpc_errors() {
         json!({ "jsonrpc": "2.0", "id": 6, "method": "ping", "params": [1] }),
     );
     assert_eq!(r["error"]["code"], INVALID_PARAMS);
-    let r = one(&f, req(7, "resources/list", json!({})));
+    let r = one(&f, req(7, "sampling/createMessage", json!({})));
     assert_eq!(r["error"]["code"], METHOD_NOT_FOUND);
     let r = one(&f, call(8, "no_such_tool", json!({})));
     assert_eq!(r["error"]["code"], INVALID_PARAMS);
@@ -266,13 +365,20 @@ fn invalid_arguments_are_tool_errors() {
         ("top_processes", json!({ "limit": "5" })),
         ("get_status", json!({ "verbose": true })),
         ("prune_cache", json!({})),
-        ("remove_worktrees", json!({ "paths": [] })),
-        ("remove_worktrees", json!({ "paths": [3] })),
+        ("plan_worktree_removal", json!({ "paths": [] })),
+        ("plan_worktree_removal", json!({ "paths": [3] })),
+        ("plan_worktree_removal", json!({})),
+        ("execute_plan", json!({ "plan_id": "x", "items": [] })),
+        ("execute_plan", json!({ "items": ["/a"] })),
         ("acquire_build_slot", json!({ "ttl_secs": 0 })),
         ("acquire_build_slot", json!({ "ttl_secs": 100000 })),
         ("process_action", json!({ "pid": 1, "action": "term" })),
-        ("clean_caches", json!({})),
-        ("clean_caches", json!({ "stale": true, "paths": ["/x"] })),
+        ("plan_cache_cleanup", json!({})),
+        (
+            "plan_cache_cleanup",
+            json!({ "stale": true, "paths": ["/x"] }),
+        ),
+        ("plan_cache_cleanup", json!({ "dry_run": true })),
     ] {
         let r = one(&f, call(1, name, args.clone()));
         assert_eq!(r["result"]["isError"], true, "{name} {args}: {r}");
@@ -317,76 +423,314 @@ fn plan_with(ready: &[&str], not_ready: &[&str]) -> Value {
     json!({ "created_unix": 1, "items": items, "ready_bytes": 0 })
 }
 
-#[test]
-fn sweep_executes_exactly_the_plan() {
-    let plan = plan_with(&["/w/a", "/w/b"], &["/w/c"]);
-    let f = Fake::default()
-        .with("GET /v1/sweep", plan.clone())
-        .with("POST /v1/sweep", json!([]));
-    // A dry run returns the plan and changes nothing.
-    let r = one(&f, call(1, "sweep_worktrees", json!({ "dry_run": true })));
-    assert_eq!(r["result"]["isError"], false);
-    let shown: Value = serde_json::from_str(&text(&r)).unwrap();
-    assert_eq!(shown, plan);
-    assert!(f.posted("/v1/sweep").is_empty());
-    // A real run posts the ready requests and nothing else.
-    let r = one(&f, call(2, "sweep_worktrees", json!({})));
-    assert_eq!(r["result"]["isError"], false);
-    let posted = f.posted("/v1/sweep");
-    assert_eq!(posted.len(), 1);
-    assert_eq!(
-        posted[0]["items"],
-        json!([plan["items"][0]["request"], plan["items"][1]["request"]])
-    );
-    let out: Value = serde_json::from_str(&text(&r)).unwrap();
-    assert_eq!(out["not_ready"][0]["target"], "/w/c");
+fn result(r: &Value) -> Value {
+    assert_eq!(r["result"]["isError"], false, "{r}");
+    serde_json::from_str(&text(r)).unwrap()
 }
 
 #[test]
-fn nothing_ready_posts_nothing() {
+fn sweep_plans_then_executes_only_approved_items() {
+    let plan = plan_with(&["/w/a", "/w/b"], &["/w/c"]);
+    let f = Fake::default()
+        .with("GET /v1/sweep", plan.clone())
+        .with(
+            "POST /v1/sweep",
+            json!([{ "action": "remove_worktree", "target": "/w/a", "status": "done", "freed_bytes": 2048,
+                "backups": [{ "kind": "patch", "location": "/b/a.patch" }, { "kind": "branch", "location": "backup/a" }] }]),
+        );
+    let mut s = Session::new(&f);
+    // The plan changes nothing.
+    let shown = result(&s.handle(call(1, "plan_worktree_sweep", json!({}))).unwrap());
+    assert!(f.posted("/v1/sweep").is_empty());
+    let id = shown["plan_id"].as_str().unwrap().to_string();
+    assert_eq!(shown["ready_count"], 2);
+    assert_eq!(shown["ready"][0]["target"], "/w/a");
+    assert_eq!(shown["not_ready"][0]["target"], "/w/c");
+    assert!(shown["next"].as_str().unwrap().contains("execute_plan"));
+
+    // Items outside the plan, or not ready in it, are refused.
+    for bad in ["/w/zzz", "/w/c"] {
+        let r = s
+            .handle(call(
+                2,
+                "execute_plan",
+                json!({ "plan_id": id, "items": [bad] }),
+            ))
+            .unwrap();
+        assert_eq!(r["result"]["isError"], true, "{bad}");
+    }
+    assert!(f.posted("/v1/sweep").is_empty());
+    // An unknown plan is refused.
+    let r = s
+        .handle(call(
+            3,
+            "execute_plan",
+            json!({ "plan_id": "nope", "items": ["/w/a"] }),
+        ))
+        .unwrap();
+    assert_eq!(r["result"]["isError"], true);
+
+    // Only the approved item is posted, with the plan's own request.
+    let out = result(
+        &s.handle(call(
+            4,
+            "execute_plan",
+            json!({ "plan_id": id, "items": ["/w/a"] }),
+        ))
+        .unwrap(),
+    );
+    let posted = f.posted("/v1/sweep");
+    assert_eq!(posted.len(), 1);
+    assert_eq!(posted[0]["items"], json!([plan["items"][0]["request"]]));
+    assert_eq!(out["done"], 1);
+    assert_eq!(out["results"][0]["backups"][0]["location"], "/b/a.patch");
+    let restore = out["results"][0]["restore"].as_str().unwrap();
+    assert!(
+        restore.contains("git worktree add '/w/a' backup/a")
+            && restore.contains("apply '/b/a.patch'"),
+        "{restore}"
+    );
+
+    // A plan runs once.
+    let r = s
+        .handle(call(
+            5,
+            "execute_plan",
+            json!({ "plan_id": id, "items": ["/w/b"] }),
+        ))
+        .unwrap();
+    assert_eq!(r["result"]["isError"], true);
+    assert_eq!(f.posted("/v1/sweep").len(), 1);
+}
+
+#[test]
+fn old_plans_expire() {
+    let f = Fake::default()
+        .with("GET /v1/sweep", plan_with(&["/w/a"], &[]))
+        .with("POST /v1/sweep", json!([]));
+    let mut s = Session::new(&f);
+    let shown = result(&s.handle(call(1, "plan_worktree_sweep", json!({}))).unwrap());
+    s.plans
+        .age_all(crate::mcp_tools::PLAN_TTL + std::time::Duration::from_secs(1));
+    let r = s
+        .handle(call(
+            2,
+            "execute_plan",
+            json!({ "plan_id": shown["plan_id"], "items": ["/w/a"] }),
+        ))
+        .unwrap();
+    assert_eq!(r["result"]["isError"], true);
+    assert!(text(&r).contains("30 minutes"));
+    assert!(f.posted("/v1/sweep").is_empty());
+}
+
+#[test]
+fn nothing_ready_gives_no_plan_id() {
     let f = Fake::default().with("GET /v1/clean/plan", plan_with(&[], &["/c"]));
-    let r = one(&f, call(1, "clean_caches", json!({ "stale": true })));
-    assert_eq!(r["result"]["isError"], false);
+    let r = one(&f, call(1, "plan_cache_cleanup", json!({ "stale": true })));
+    let v = result(&r);
+    assert!(v.get("plan_id").is_none());
     assert!(f.posted("/v1/clean").is_empty());
 }
 
 #[test]
-fn remove_and_clean_plan_first() {
+fn removal_and_cache_plans_go_to_their_routes() {
     let f = Fake::default()
         .with("POST /v1/worktree/plan", plan_with(&["/w/a"], &[]))
         .with("POST /v1/worktree/remove", json!([]))
         .with("POST /v1/clean/plan", plan_with(&["/p/target"], &[]))
         .with("POST /v1/clean", json!([]));
-    one(
-        &f,
-        call(
+    let mut s = Session::new(&f);
+    let w = result(
+        &s.handle(call(
             1,
-            "remove_worktrees",
+            "plan_worktree_removal",
             json!({ "paths": ["/w/a"], "allow_dirty": true }),
-        ),
+        ))
+        .unwrap(),
     );
     assert_eq!(
         f.posted("/v1/worktree/plan")[0],
         json!({ "paths": ["/w/a"], "allow_dirty": true })
     );
+    let c = result(
+        &s.handle(call(
+            2,
+            "plan_cache_cleanup",
+            json!({ "paths": ["/p/target"] }),
+        ))
+        .unwrap(),
+    );
+    assert!(f.posted("/v1/worktree/remove").is_empty() && f.posted("/v1/clean").is_empty());
+    result(
+        &s.handle(call(
+            3,
+            "execute_plan",
+            json!({ "plan_id": w["plan_id"], "items": ["/w/a"] }),
+        ))
+        .unwrap(),
+    );
     assert_eq!(
         f.posted("/v1/worktree/remove")[0]["items"][0]["path"],
         "/w/a"
     );
-    one(
-        &f,
-        call(
-            2,
-            "clean_caches",
-            json!({ "paths": ["/p/target"], "dry_run": true }),
-        ),
-    );
-    assert!(f.posted("/v1/clean").is_empty());
-    one(
-        &f,
-        call(3, "clean_caches", json!({ "paths": ["/p/target"] })),
+    result(
+        &s.handle(call(
+            4,
+            "execute_plan",
+            json!({ "plan_id": c["plan_id"], "items": ["/p/target"] }),
+        ))
+        .unwrap(),
     );
     assert_eq!(f.posted("/v1/clean").len(), 1);
+}
+
+#[test]
+fn workspace_and_process_actions_preview_by_default() {
+    let state = json!({ "snapshot": {
+        "top": [{ "pid": 42, "name": "cargo", "kind": "build" }],
+        "workspaces": [{ "path": "/w/a", "label": "a", "procs": [
+            { "pid": 42, "name": "cargo", "kind": "build", "own": true },
+            { "pid": 43, "name": "claude", "kind": "agent", "own": true }
+        ] }]
+    }});
+    let f = Fake::default()
+        .with("GET /v1/state", state)
+        .with("POST /v1/workspace", json!({ "ok": true }))
+        .with("POST /v1/process", json!({ "ok": true }));
+    let v = result(&one(
+        &f,
+        call(
+            1,
+            "workspace_action",
+            json!({ "path": "/w/a", "action": "stop_builds" }),
+        ),
+    ));
+    assert_eq!(v["preview"], true);
+    assert_eq!(v["would_affect"].as_array().unwrap().len(), 1);
+    let v = result(&one(
+        &f,
+        call(2, "process_action", json!({ "pid": 42, "action": "term" })),
+    ));
+    assert_eq!(v["process"]["pid"], 42);
+    assert!(f.posted("/v1/workspace").is_empty() && f.posted("/v1/process").is_empty());
+    result(&one(
+        &f,
+        call(
+            3,
+            "workspace_action",
+            json!({ "path": "/w/a", "action": "pause", "execute": true }),
+        ),
+    ));
+    result(&one(
+        &f,
+        call(
+            4,
+            "process_action",
+            json!({ "pid": 42, "action": "renice", "execute": true }),
+        ),
+    ));
+    assert_eq!(f.posted("/v1/workspace").len(), 1);
+    assert_eq!(f.posted("/v1/process")[0]["nice"], 10);
+}
+
+#[test]
+fn diagnose_from_the_engine_and_without_one() {
+    let f = Fake::default()
+        .with(
+            "GET /v1/state",
+            json!({ "health": "ok", "snapshot": { "disk_free": 1, "disk_total": 2 } }),
+        )
+        .with("GET /v1/advice", json!({ "ok_to_start_heavy_work": true }));
+    let v = result(&one(&f, call(1, "diagnose", json!({}))));
+    assert_eq!(v["source"], "engine");
+    assert!(v["recommendations"].is_array());
+    // No engine and no paths: an answer, not an error.
+    let f = Fake::default().failing(
+        "GET /v1/state",
+        ApiError::new(0, "engine_not_running", "Mulchie's engine is not running"),
+    );
+    let v = result(&one(&f, call(2, "diagnose", json!({}))));
+    assert_eq!(v["source"], "none");
+    assert_eq!(v["recommendations"][0]["id"], "start_engine");
+}
+
+#[test]
+fn prompts_and_resources() {
+    let f = Fake::default()
+        .with(
+            "GET /v1/state",
+            json!({ "health": "ok", "snapshot": {}, "actions": [{ "kind": "x" }] }),
+        )
+        .with("GET /v1/sweep", plan_with(&[], &[]));
+    let init = one(
+        &f,
+        req(
+            1,
+            "initialize",
+            json!({ "protocolVersion": "2025-11-25", "capabilities": {} }),
+        ),
+    );
+    let caps = &init["result"]["capabilities"];
+    assert!(caps["prompts"].is_object() && caps["resources"].is_object());
+    let i = init["result"]["instructions"].as_str().unwrap();
+    assert!(
+        i.contains("Start with the diagnose tool")
+            && i.contains("execute_plan")
+            && i.contains("backups")
+    );
+
+    let r = one(&f, req(2, "prompts/list", json!({})));
+    let names: Vec<&str> = r["result"]["prompts"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|p| p["name"].as_str().unwrap())
+        .collect();
+    assert_eq!(names, ["whats-going-on", "optimize"]);
+    let r = one(&f, req(3, "prompts/get", json!({ "name": "optimize" })));
+    let m = &r["result"]["messages"][0];
+    assert_eq!(m["role"], "user");
+    assert!(m["content"]["text"].as_str().unwrap().contains("approv"));
+    assert_eq!(
+        one(&f, req(4, "prompts/get", json!({ "name": "nope" })))["error"]["code"],
+        INVALID_PARAMS
+    );
+
+    let r = one(&f, req(5, "resources/list", json!({})));
+    let uris: Vec<&str> = r["result"]["resources"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|p| p["uri"].as_str().unwrap())
+        .collect();
+    for u in [
+        "mulchie://state",
+        "mulchie://plan/sweep",
+        "mulchie://actions",
+        "mulchie://diagnosis",
+    ] {
+        assert!(uris.contains(&u), "{u}");
+    }
+    let r = one(
+        &f,
+        req(6, "resources/read", json!({ "uri": "mulchie://actions" })),
+    );
+    let c = &r["result"]["contents"][0];
+    assert_eq!(c["mimeType"], "application/json");
+    let v: Value = serde_json::from_str(c["text"].as_str().unwrap()).unwrap();
+    assert_eq!(v, json!([{ "kind": "x" }]));
+    let r = one(
+        &f,
+        req(7, "resources/read", json!({ "uri": "mulchie://nope" })),
+    );
+    assert_eq!(r["error"]["code"], RESOURCE_NOT_FOUND);
+    let mut p = modern_meta();
+    p["uri"] = json!("mulchie://nope");
+    assert_eq!(
+        one(&f, req(8, "resources/read", p))["error"]["code"],
+        INVALID_PARAMS
+    );
 }
 
 #[test]
@@ -445,6 +789,7 @@ fn modern_requests() {
         .unwrap()
         .contains(&json!("2025-06-18")));
     assert!(res["capabilities"]["tools"].is_object());
+    assert!(res["capabilities"]["prompts"].is_object());
     assert_eq!(res["_meta"][META_SERVER]["name"], "mulchie");
 
     // Every modern request works without initialize, and says it completed.
@@ -510,7 +855,7 @@ fn against_a_real_engine() {
                 "acquire_build_slot",
                 json!({ "label": "t", "ttl_secs": 30 }),
             ),
-            call(3, "sweep_worktrees", json!({ "dry_run": true })),
+            call(3, "plan_worktree_sweep", json!({})),
         ],
     );
     assert_eq!(r[1]["result"]["isError"], false, "{}", r[1]);
@@ -520,7 +865,10 @@ fn against_a_real_engine() {
     assert_eq!(engine.snapshot_state().slots.active[0].ttl_secs, Some(30));
     assert_eq!(engine.snapshot_state().slots.active[0].pid, None);
     let plan: Value = serde_json::from_str(&text(&r[2])).unwrap();
-    assert_eq!(plan["items"], json!([]));
+    assert_eq!(plan["ready"], json!([]));
+    let d = one(&api, call(5, "diagnose", json!({})));
+    let d: Value = serde_json::from_str(&text(&d)).unwrap();
+    assert_eq!(d["source"], "engine");
     let r = one(
         &api,
         call(4, "release_build_slot", json!({ "ticket": ticket })),

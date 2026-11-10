@@ -1,0 +1,396 @@
+openapi: 3.1.0
+info:
+  title: Mulchie local API
+  version: 0.3.0
+  summary: The engine's HTTP API on 127.0.0.1, for the CLI, the app, the MCP server and scripts.
+  description: |
+    The engine (the menu bar app or `mulchie serve`) listens on 127.0.0.1 only, on the
+    port in `api_port` (default 47474; `MULCHIE_PORT` overrides it for one process). The
+    port in use is recorded in the engine lock file.
+
+    Authentication: every route except `GET /v1/health` needs `Authorization: Bearer <token>`.
+    - The full token is in `<config dir>/token` (`mulchie token` prints the path).
+    - A read-only token is in `<config dir>/token.read` (`mulchie token --read-only`). It is
+      accepted on every `GET` route and on `POST /v1/clean/plan` and `POST /v1/worktree/plan`;
+      any other route answers 403 `read_only_token`.
+    Both files are mode 0600 in a 0700 directory; a token file with looser permissions is refused.
+
+    Requests must send `Host: 127.0.0.1:<port>` or `localhost:<port>` and no `Origin` header,
+    so web pages cannot drive the API. Limits: request line 8 KB, headers 64 KB, body 1 MB,
+    10 s per request, 64 connections.
+
+    Deleting is plan-then-execute: get a plan (`GET /v1/sweep`, `GET|POST /v1/clean/plan`,
+    `POST /v1/worktree/plan`), show it, then post back the approved items' `request` objects
+    as `{"items": [...]}`. The engine's safety gate re-checks every item when it runs and
+    skips anything that changed.
+
+    This file is checked against the server's route table by
+    `cargo test -p mulchie --test discovery`.
+  license:
+    name: MIT
+servers:
+  - url: http://127.0.0.1:47474
+    description: The default port
+security:
+  - bearer: []
+paths:
+  /v1/health:
+    get:
+      summary: Liveness and a one-line summary
+      description: Needs no token.
+      security: []
+      responses:
+        "200":
+          description: The summary
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  name: { type: string, const: mulchie }
+                  version: { type: string }
+                  health: { $ref: "#/components/schemas/Health" }
+                  stale: { type: boolean }
+                  sample_age_secs: { type: [integer, "null"] }
+                  disk_free: { type: integer }
+                  disk_total: { type: integer }
+                  cpu_pct: { type: number }
+                  load: { type: array, items: { type: number } }
+                  mem_free_pct: { type: number }
+                  agents: { type: integer }
+                  builds: { type: integer }
+                  free_slots: { type: integer }
+                  ok_to_start_heavy_work: { type: boolean }
+                  reclaimable_stale: { type: integer }
+                  restarts: { type: integer }
+  /v1/state:
+    get:
+      summary: Everything the engine knows
+      description: The latest snapshot (machine figures, top processes, workspaces), health, config error, build slots, forecast, last scan, disk map and recent actions.
+      responses:
+        "200": { $ref: "#/components/responses/Json" }
+        default: { $ref: "#/components/responses/Error" }
+  /v1/history:
+    get:
+      summary: Samples from the last 30 minutes, every 3 seconds
+      responses:
+        "200": { $ref: "#/components/responses/Json" }
+        default: { $ref: "#/components/responses/Error" }
+  /v1/advice:
+    get:
+      summary: Whether to start heavy work now, free slots and the suggested job count
+      responses:
+        "200": { $ref: "#/components/responses/Json" }
+        default: { $ref: "#/components/responses/Error" }
+  /v1/scan:
+    post:
+      summary: Queue a scan for build caches and worktrees
+      responses:
+        "200":
+          description: Queued
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  ok: { type: boolean }
+                  queued: { type: boolean }
+        default: { $ref: "#/components/responses/Error" }
+  /v1/clean/plan:
+    get:
+      summary: Plan deleting stale build caches
+      parameters:
+        - name: want_bytes
+          in: query
+          required: false
+          description: Stop once the plan would free this much
+          schema: { type: integer, minimum: 0 }
+      responses:
+        "200": { $ref: "#/components/responses/Plan" }
+        default: { $ref: "#/components/responses/Error" }
+    post:
+      summary: Plan deleting specific caches, or stale ones
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                paths: { type: array, items: { type: string } }
+                stale: { type: boolean }
+                want_bytes: { type: integer }
+      responses:
+        "200": { $ref: "#/components/responses/Plan" }
+        default: { $ref: "#/components/responses/Error" }
+  /v1/clean:
+    post:
+      summary: Delete build caches
+      description: |
+        Send `{"items": [...]}`, the `request` objects of approved plan items (each must be
+        `delete_cache`). `{"paths": [...]}` deletes those cache directories directly (an
+        explicit list is its own approval), and `{"auto": true}` runs the automatic reclaim.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                items: { type: array, items: { $ref: "#/components/schemas/Request" } }
+                paths: { type: array, items: { type: string } }
+                auto: { type: boolean }
+                want_bytes: { type: integer }
+      responses:
+        "200": { $ref: "#/components/responses/Results" }
+        default: { $ref: "#/components/responses/Error" }
+  /v1/sweep:
+    get:
+      summary: Plan removing idle agent worktrees
+      responses:
+        "200": { $ref: "#/components/responses/Plan" }
+        default: { $ref: "#/components/responses/Error" }
+    post:
+      summary: Remove approved idle agent worktrees
+      description: Send `{"items": [...]}` from `GET /v1/sweep` (each `remove_worktree` or `prune_worktree`), or `{"auto": true}`.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/Items" }
+      responses:
+        "200": { $ref: "#/components/responses/Results" }
+        default: { $ref: "#/components/responses/Error" }
+  /v1/worktree/plan:
+    post:
+      summary: Plan removing specific worktrees
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [paths]
+              properties:
+                paths: { type: array, items: { type: string } }
+                allow_dirty: { type: boolean, description: Save uncommitted changes as a patch and remove anyway }
+      responses:
+        "200": { $ref: "#/components/responses/Plan" }
+        default: { $ref: "#/components/responses/Error" }
+  /v1/worktree/remove:
+    post:
+      summary: Remove approved worktrees
+      description: Send `{"items": [...]}` from `POST /v1/worktree/plan`. Each item names the HEAD seen when planning; a worktree whose HEAD moved is skipped.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/Items" }
+      responses:
+        "200": { $ref: "#/components/responses/Results" }
+        default: { $ref: "#/components/responses/Error" }
+  /v1/prune:
+    post:
+      summary: Run a package manager's own prune command
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [key]
+              properties:
+                key: { type: string, description: "npm, bun, pnpm, yarn, uv, pip, homebrew, go or simulators" }
+      responses:
+        "200": { $ref: "#/components/responses/Json" }
+        default: { $ref: "#/components/responses/Error" }
+  /v1/workspace:
+    post:
+      summary: Act on a workspace's processes owned by the current user
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [path, action]
+              properties:
+                path: { type: string }
+                action: { type: string, enum: [pause, resume, deprioritize, stop_builds, kill_all] }
+      responses:
+        "200":
+          description: Done
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  ok: { type: boolean }
+                  processes: { type: integer }
+        default: { $ref: "#/components/responses/Error" }
+  /v1/process:
+    post:
+      summary: Signal or renice one process owned by the current user
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [pid, action]
+              properties:
+                pid: { type: integer }
+                action: { type: string, enum: [term, kill, stop, cont, renice] }
+                nice: { type: integer, description: For renice }
+      responses:
+        "200": { $ref: "#/components/responses/Json" }
+        default: { $ref: "#/components/responses/Error" }
+  /v1/lease:
+    post:
+      summary: Join the build queue, poll a ticket, or renew a slot
+      description: A lease needs a live `pid`, a `ttl_secs`, or both. Poll with the returned `ticket` until `granted`.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                label: { type: string }
+                pid: { type: integer }
+                ticket: { type: integer }
+                ttl_secs: { type: integer, minimum: 1, maximum: 86400 }
+      responses:
+        "200":
+          description: The ticket's state
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  granted: { type: boolean }
+                  ticket: { type: integer }
+                  jobs: { type: integer }
+                  position: { type: integer }
+                  reason: { type: string }
+                  expires_unix: { type: [integer, "null"] }
+        default: { $ref: "#/components/responses/Error" }
+  /v1/release:
+    post:
+      summary: Release a slot or leave the queue
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [ticket]
+              properties:
+                ticket: { type: integer }
+      responses:
+        "200":
+          description: Released
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  released: { type: boolean }
+        default: { $ref: "#/components/responses/Error" }
+components:
+  securitySchemes:
+    bearer:
+      type: http
+      scheme: bearer
+      description: The token from `<config dir>/token`, or the read-only one from `<config dir>/token.read`.
+  responses:
+    Json:
+      description: A JSON object
+      content:
+        application/json:
+          schema: { type: object }
+    Plan:
+      description: A plan; nothing was changed
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Plan" }
+    Results:
+      description: One result per item, in order
+      content:
+        application/json:
+          schema:
+            type: array
+            items: { $ref: "#/components/schemas/ActionResult" }
+    Error:
+      description: "An error: 400 bad body, 401 bad token, 403 refused origin, host or read-only token, 404, 405, 413, 500"
+      content:
+        application/json:
+          schema:
+            type: object
+            required: [error, code]
+            properties:
+              error: { type: string }
+              code: { type: string, description: "A stable code, e.g. unauthorized, read_only_token, items_required, invalid_body" }
+  schemas:
+    Health:
+      type: string
+      enum: [good, busy, strained, critical, stale]
+    Items:
+      type: object
+      properties:
+        items: { type: array, items: { $ref: "#/components/schemas/Request" } }
+        auto: { type: boolean }
+    Request:
+      description: One action, as found in a plan item's `request`. Send it back unchanged.
+      type: object
+      required: [action]
+      properties:
+        action: { type: string, enum: [delete_cache, remove_worktree, prune_worktree, signal] }
+        path: { type: string }
+        require_stale: { type: boolean }
+        expected_head: { type: string }
+        allow_dirty: { type: boolean }
+        require_idle: { type: boolean }
+        repo: { type: string }
+    Plan:
+      type: object
+      properties:
+        created_unix: { type: integer }
+        ready_bytes: { type: integer }
+        items:
+          type: array
+          items:
+            type: object
+            properties:
+              request: { $ref: "#/components/schemas/Request" }
+              target: { type: string }
+              name: { type: string }
+              repo_name: { type: [string, "null"] }
+              head: { type: [string, "null"] }
+              branch: { type: [string, "null"] }
+              bytes: { type: integer }
+              dirty_files: { type: integer }
+              idle_days: { type: [integer, "null"] }
+              ignored_files: { type: integer }
+              ignored_bytes: { type: integer }
+              would_backup: { type: array, items: { type: string } }
+              ready: { type: boolean }
+              reason: { type: [string, "null"] }
+              verdict: { type: string }
+    ActionResult:
+      type: object
+      required: [action, target, status]
+      properties:
+        action: { type: string, enum: [delete_cache, remove_worktree, prune_worktree, signal] }
+        target: { type: string }
+        status: { type: string, enum: [done, skipped] }
+        freed_bytes: { type: integer }
+        backups:
+          type: array
+          items:
+            type: object
+            properties:
+              kind: { type: string, enum: [patch, ignored_archive, branch] }
+              location: { type: string, description: A file path, or a branch name for kind branch }
+        reason: { type: string }
+        detail: { type: string }

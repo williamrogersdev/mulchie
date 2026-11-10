@@ -480,6 +480,65 @@ pub fn serve(paths: &Paths) -> i32 {
     }
 }
 
+// ---------------------------------------------------------------- diagnose
+
+pub fn diagnose(paths: &Paths, json_out: bool) -> i32 {
+    let d = match conn::connect(paths) {
+        Conn::Engine(c) => {
+            let st = match conn::call(&c, "GET", "/v1/state", None) {
+                Ok(v) => v,
+                Err(e) => return fail(conn::describe(&e)),
+            };
+            let adv = conn::call(&c, "GET", "/v1/advice", None).unwrap_or(Value::Null);
+            crate::diagnose::build(&st, &adv, crate::diagnose::Origin::Engine)
+        }
+        other => {
+            other.note_local("looking at this machine locally");
+            crate::mcp_tools::local_diagnosis(paths, &other.why_not())
+        }
+    };
+    if json_out {
+        print_json(&d);
+    } else {
+        print!("{}", crate::diagnose::render(&d));
+    }
+    0
+}
+
+// ------------------------------------------------------------------- token
+
+pub fn token(paths: &Paths, read_only: bool, show: bool) -> i32 {
+    use mulchie_core::api;
+    let path = if read_only {
+        api::read_only_token_path_in(paths)
+    } else {
+        api::token_path_in(paths)
+    };
+    if !show {
+        println!("{}", path.display());
+        if !path.exists() {
+            eprintln!("mulchie: there is no token yet; the engine writes it when it starts");
+        }
+        return 0;
+    }
+    let read = if read_only {
+        api::read_read_only_token(paths)
+    } else {
+        api::read_token(paths)
+    };
+    match read {
+        Ok(t) => {
+            println!("{t}");
+            0
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => fail(format!(
+            "there is no token at {} yet; the engine writes it when it starts",
+            path.display()
+        )),
+        Err(e) => fail(format!("cannot read {}: {e}", path.display())),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

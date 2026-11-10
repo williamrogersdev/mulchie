@@ -264,7 +264,7 @@ pub fn checks(paths: &Paths, env: &Env) -> Vec<Check> {
         "mcp",
         Level::Info,
         format!(
-            "agents connect with `{bin} mcp`; for Claude Code: claude mcp add mulchie -- {bin} mcp"
+            "agents connect with `{bin} mcp`; `{bin} mcp install` sets it up for Claude Code, Claude Desktop, Cursor or Codex"
         ),
     ));
     v

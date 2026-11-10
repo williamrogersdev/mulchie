@@ -425,3 +425,101 @@ fn mcp_over_stdio() {
     let t = lines[1]["result"]["content"][0]["text"].as_str().unwrap();
     assert!(t.contains("mulchie serve"), "{t}");
 }
+
+#[test]
+fn diagnose_without_an_engine() {
+    let h = Home::new();
+    let o = h.run(&["diagnose", "--json"]);
+    assert!(o.status.success(), "{}", text(&o.stderr));
+    let v: serde_json::Value = serde_json::from_slice(&o.stdout).unwrap();
+    assert_eq!(v["source"], "local");
+    assert!(text(&o.stderr).contains("locally"));
+    let o = h.run(&["diagnose"]);
+    assert!(o.status.success());
+    assert!(!text(&o.stdout).is_empty());
+}
+
+#[test]
+fn token_prints_paths_not_secrets() {
+    let h = Home::new();
+    let o = h.run(&["token"]);
+    assert!(o.status.success());
+    assert_eq!(
+        text(&o.stdout).trim(),
+        h.paths().config_dir.join("token").display().to_string()
+    );
+    let o = h.run(&["token", "--read-only", "--show"]);
+    assert_eq!(o.status.code(), Some(1), "no token yet");
+    let (_e, _lk, server) = h.engine();
+    let full = mulchie_core::api::read_token(&h.paths()).unwrap();
+    let ro = mulchie_core::api::read_read_only_token(&h.paths()).unwrap();
+    assert_ne!(full, ro);
+    let o = h.run(&["token", "--read-only"]);
+    assert!(!text(&o.stdout).contains(&ro));
+    assert!(text(&o.stdout).trim().ends_with("token.read"));
+    let o = h.run(&["token", "--read-only", "--show"]);
+    assert_eq!(text(&o.stdout).trim(), ro);
+    server.stop();
+}
+
+#[test]
+fn mcp_install_edits_only_the_temp_home() {
+    let h = Home::new();
+    // A PATH with a stand-in `claude` that records its arguments.
+    let bin = h.home.join("bin");
+    std::fs::create_dir_all(&bin).unwrap();
+    let log = h.home.join("claude-args");
+    let stub = bin.join("claude");
+    std::fs::write(
+        &stub,
+        format!("#!/bin/sh\necho \"$@\" >> '{}'\n", log.display()),
+    )
+    .unwrap();
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o755)).unwrap();
+    std::fs::create_dir_all(h.home.join(".cursor")).unwrap();
+    let run = |args: &[&str]| {
+        h.cmd(args)
+            .env("PATH", format!("{}:/usr/bin:/bin", bin.display()))
+            .env_remove("CODEX_HOME")
+            .output()
+            .unwrap()
+    };
+
+    let o = run(&["mcp", "install"]);
+    assert!(o.status.success(), "{}", text(&o.stderr));
+    let out = text(&o.stdout);
+    assert!(
+        out.contains("claude-code") && out.contains("cursor          found"),
+        "{out}"
+    );
+    assert!(!h.home.join(".cursor/mcp.json").exists());
+
+    let o = run(&["mcp", "install", "--client", "cursor", "--read-only"]);
+    assert!(o.status.success(), "{}", text(&o.stderr));
+    let v: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(h.home.join(".cursor/mcp.json")).unwrap()).unwrap();
+    assert_eq!(
+        v["mcpServers"]["mulchie"]["args"],
+        serde_json::json!(["mcp", "--read-only"])
+    );
+    let exe = v["mcpServers"]["mulchie"]["command"].as_str().unwrap();
+    assert!(std::path::Path::new(exe).is_absolute(), "{exe}");
+
+    let o = run(&["mcp", "install", "--client", "claude-code"]);
+    assert!(o.status.success(), "{}", text(&o.stderr));
+    let logged = std::fs::read_to_string(&log).unwrap();
+    assert!(
+        logged.starts_with("mcp add --scope user mulchie -- /"),
+        "{logged}"
+    );
+    assert!(logged.trim_end().ends_with(" mcp"), "{logged}");
+
+    let o = run(&["mcp", "uninstall", "--client", "cursor", "--dry-run"]);
+    assert!(o.status.success());
+    assert!(text(&o.stdout).contains("would remove"));
+
+    let o = run(&["mcp", "config", "--read-only"]);
+    let v: serde_json::Value = serde_json::from_slice(&o.stdout).unwrap();
+    assert_eq!(v["mcpServers"]["mulchie"]["args"][1], "--read-only");
+}

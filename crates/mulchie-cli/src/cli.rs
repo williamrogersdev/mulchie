@@ -111,14 +111,38 @@ and runs the command straight away, unqueued.",
     )]
     Run(RunArgs),
 
-    /// MCP server on stdio, so agents can query and act
+    /// One prioritised picture of the machine, with recommendations
     #[command(
-        long_about = "Run an MCP server on stdin/stdout (JSON-RPC, one message per line). \
-Agents use it to check machine health, join the build queue, and reclaim space through \
-the same plan-then-execute safety gate as the CLI. It needs a running engine.",
-        after_help = "Examples:\n  claude mcp add mulchie -- mulchie mcp"
+        long_about = "Health and why, what is using CPU, memory and disk by workspace, the build \
+queue, reclaimable space (stale build caches, idle agent worktrees, package caches) with sizes, \
+engine problems, and recommendations with their reason, expected gain, risk and the next \
+command. Changes nothing. Uses the running engine, or a local look when none runs (said on \
+stderr). The same picture as the MCP diagnose tool.",
+        after_help = "Examples:\n  mulchie diagnose\n  mulchie diagnose --json"
     )]
-    Mcp,
+    Diagnose(JsonArg),
+
+    /// MCP server on stdio for agents, and connecting it to agent apps
+    #[command(
+        long_about = "With no subcommand, run an MCP server on stdin/stdout (JSON-RPC, one \
+message per line). Agents start with its diagnose tool; deleting is always two calls, a plan \
+and then execute_plan with items from that plan, re-checked by the same safety gate as the \
+CLI. --read-only (or MULCHIE_MCP_READ_ONLY=1) leaves out every tool that deletes, signals or \
+prunes.\n\nUse `mulchie mcp install` to connect it to Claude Code, Claude Desktop, Cursor \
+or Codex in one step.",
+        args_conflicts_with_subcommands = true,
+        after_help = "Examples:\n  mulchie mcp install                      # list agent apps found\n  mulchie mcp install --client claude-code\n  mulchie mcp install --client cursor --read-only --dry-run\n  mulchie mcp config                       # JSON to paste by hand\n  mulchie mcp --read-only                  # serve on stdio"
+    )]
+    Mcp(McpArgs),
+
+    /// Where the API tokens are; prints a token only with --show
+    #[command(
+        long_about = "Print the path of the local API token. With --read-only, the read-only \
+token, which the API accepts only for GET routes and plan routes. The token itself is printed \
+only with --show. Nothing is created: the engine writes both tokens when it starts.",
+        after_help = "Examples:\n  mulchie token\n  mulchie token --read-only\n  mulchie token --read-only --show"
+    )]
+    Token(TokenArgs),
 
     /// Run the engine (monitor, optimizer, build queue, local API) without the app
     #[command(
@@ -156,6 +180,90 @@ how to add the MCP server. Nothing is changed. Exits 1 if any check fails.",
         /// The shell to generate completions for
         shell: clap_complete::Shell,
     },
+}
+
+#[derive(Args, Debug, Clone, Default)]
+pub struct McpArgs {
+    /// Offer only tools that change nothing (plus build slots)
+    #[arg(long)]
+    pub read_only: bool,
+    #[command(subcommand)]
+    pub action: Option<McpCommand>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
+pub enum McpClient {
+    /// Claude Code, through `claude mcp add --scope user`
+    ClaudeCode,
+    /// Claude Desktop's claude_desktop_config.json
+    ClaudeDesktop,
+    /// Cursor's ~/.cursor/mcp.json
+    Cursor,
+    /// Codex, through `codex mcp add` or ~/.codex/config.toml
+    Codex,
+}
+
+#[derive(Args, Debug, Clone, Default)]
+pub struct McpInstallArgs {
+    /// The agent app; without it, list the apps found and what would be done
+    #[arg(long, value_enum)]
+    pub client: Option<McpClient>,
+    /// Register the read-only server (no deleting, signalling or pruning)
+    #[arg(long)]
+    pub read_only: bool,
+    /// Print the change, change nothing
+    #[arg(long, short = 'n')]
+    pub dry_run: bool,
+    /// Replace an existing, different mulchie entry
+    #[arg(long)]
+    pub force: bool,
+}
+
+#[derive(Args, Debug, Clone, Default)]
+pub struct McpUninstallArgs {
+    /// The agent app
+    #[arg(long, value_enum)]
+    pub client: Option<McpClient>,
+    /// Print the change, change nothing
+    #[arg(long, short = 'n')]
+    pub dry_run: bool,
+}
+
+#[derive(Subcommand, Debug, Clone)]
+pub enum McpCommand {
+    /// Add Mulchie's MCP server to an agent app
+    #[command(
+        long_about = "Add Mulchie's MCP server to an agent app's user-level config. Claude Code \
+and Codex are set up through their own CLI (`claude mcp add`, `codex mcp add`); Claude \
+Desktop, Cursor and (without its CLI) Codex by editing their config file: other entries are \
+kept, the old file is backed up next to it, the new one is written atomically, and a file \
+that cannot be parsed is left alone. Without --client, lists the apps found and what would \
+be done. Restart the app afterwards.",
+        after_help = "Examples:\n  mulchie mcp install\n  mulchie mcp install --client claude-code\n  mulchie mcp install --client claude-desktop --read-only --dry-run"
+    )]
+    Install(McpInstallArgs),
+    /// Remove Mulchie's MCP server from an agent app
+    #[command(
+        after_help = "Examples:\n  mulchie mcp uninstall --client cursor --dry-run\n  mulchie mcp uninstall --client claude-code"
+    )]
+    Uninstall(McpUninstallArgs),
+    /// Print the JSON config snippet to paste into any MCP client
+    #[command(after_help = "Examples:\n  mulchie mcp config\n  mulchie mcp config --read-only")]
+    Config {
+        /// The read-only server
+        #[arg(long)]
+        read_only: bool,
+    },
+}
+
+#[derive(Args, Debug, Clone, Copy, Default)]
+pub struct TokenArgs {
+    /// The read-only token (GET and plan routes only)
+    #[arg(long)]
+    pub read_only: bool,
+    /// Print the token itself, not its path
+    #[arg(long)]
+    pub show: bool,
 }
 
 #[derive(Args, Debug, Clone, Copy, Default)]
@@ -461,7 +569,66 @@ mod tests {
     fn other_commands() {
         assert!(matches!(
             parse(&["mcp"]).unwrap().command,
-            Some(Command::Mcp)
+            Some(Command::Mcp(McpArgs {
+                read_only: false,
+                action: None
+            }))
+        ));
+        assert!(matches!(
+            parse(&["mcp", "--read-only"]).unwrap().command,
+            Some(Command::Mcp(McpArgs {
+                read_only: true,
+                action: None
+            }))
+        ));
+        match parse(&[
+            "mcp",
+            "install",
+            "--client",
+            "claude-desktop",
+            "--read-only",
+            "-n",
+        ])
+        .unwrap()
+        .command
+        {
+            Some(Command::Mcp(McpArgs {
+                action: Some(McpCommand::Install(a)),
+                ..
+            })) => {
+                assert_eq!(a.client, Some(McpClient::ClaudeDesktop));
+                assert!(a.read_only && a.dry_run && !a.force);
+            }
+            other => panic!("{other:?}"),
+        }
+        assert!(parse(&["mcp", "install", "--client", "vim"]).is_err());
+        assert!(parse(&["mcp", "--read-only", "install"]).is_err());
+        assert!(matches!(
+            parse(&["mcp", "uninstall", "--client", "codex"])
+                .unwrap()
+                .command,
+            Some(Command::Mcp(McpArgs {
+                action: Some(McpCommand::Uninstall(_)),
+                ..
+            }))
+        ));
+        assert!(matches!(
+            parse(&["mcp", "config", "--read-only"]).unwrap().command,
+            Some(Command::Mcp(McpArgs {
+                action: Some(McpCommand::Config { read_only: true }),
+                ..
+            }))
+        ));
+        assert!(matches!(
+            parse(&["diagnose", "--json"]).unwrap().command,
+            Some(Command::Diagnose(JsonArg { json: true }))
+        ));
+        assert!(matches!(
+            parse(&["token", "--read-only", "--show"]).unwrap().command,
+            Some(Command::Token(TokenArgs {
+                read_only: true,
+                show: true
+            }))
         ));
         assert!(matches!(
             parse(&["serve"]).unwrap().command,

@@ -52,6 +52,15 @@ jobs:
       - name: Test
         run: cargo test --locked ${{ matrix.packages }}
 
+      # Already part of the run above; repeated by name so a failure is easy to spot.
+      # Builds the binary and drives `mulchie mcp` over real stdio with a temp HOME:
+      # initialize, tools/list, diagnose, a plan call, read-only refusals.
+      - name: MCP smoke test
+        run: cargo test --locked -p mulchie --test mcp_smoke
+
+      - name: Discovery files (openapi.yaml routes, server.json version)
+        run: cargo test --locked -p mulchie --test discovery
+
   scripts:
     name: Scripts and workflows
     runs-on: ubuntu-latest
