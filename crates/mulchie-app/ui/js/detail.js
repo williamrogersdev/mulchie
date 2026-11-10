@@ -8,7 +8,7 @@ import { $, esc, B, BS, P, ago, dur, tilde, toast, kindChip } from './util.js';
 import { planThenExecute, confirmBox, reasonText } from './dialogs.js';
 import { GROUP_ACTIONS, groupAction, signalPids, reniceProc, planAndRun, canLower, sessionNote, resumePaused } from './signals.js';
 import { allProcs, findConsumer, ranked, cores, cpuSummary, memSummary, KIND_TEXT } from './consumers.js';
-import { SEV_LVL, SEV_TEXT, suggestionLabel, watchFindings, CATEGORY, CATEGORY_ORDER, planApi, sessionApi, runCommand } from './findings.js';
+import { SEV_LVL, SEV_TEXT, suggestionLabel, watchFindings, CATEGORY, CATEGORY_ORDER, planApi, sessionApi, runCommand, updateItems } from './findings.js';
 import { act } from './act.js';
 import { coresText } from './views/sessions.js';
 
@@ -213,12 +213,14 @@ function rFinding(id) {
     if (sid) return btn('Show the session →', dl('session', sid));
     return '';
   }).filter(Boolean);
-  const cmds = f.suggested.map(runCommand).filter(Boolean);
+  const ups = updateItems(f);
+  const cmds = ups.length ? [...new Set(ups.map(u => u.command).filter(Boolean))] : f.suggested.map(runCommand).filter(Boolean);
   const html = `<p class="why-s ${SEV_LVL[f.severity] === 'bad' ? 'warn' : ''}">${esc(f.why)}</p>
     ${kv(fmtEvidence(e))}
     ${e.cmd ? `<h3 class="ds-h">Command line</h3><pre class="code">${esc(e.cmd)}</pre>` : ''}
     ${kv([['first seen', when(f.first_seen_unix)], ['last seen', when(f.last_seen_unix)], f.dismissed && ['dismissed', f.dismissed_until ? `until ${esc(until(f.dismissed_until))}` : 'indefinitely']])}
     ${sug.length ? sec('What you can do', `<div class="actions">${sug.join('')}</div><div class="dim">Each action is planned first and shows the processes it affects before anything is sent.</div>`) : ''}
+    ${ups.length ? sec(`Updates (${ups.length})`, `<table class="mini-t"><colgroup><col><col style="width:44%"><col style="width:76px"></colgroup>${ups.map(u => `<tr><td><span class="cell mono" title="${esc(u.package)}">${esc(u.package)}</span></td><td class="wrap">${esc(u.installed || '?')} → ${esc(u.latest || 'no fixed version listed')}</td><td class="dim">${esc(UPDATE_SOURCE[u.source] || u.source)}</td></tr>`).join('')}</table>`) : ''}
     ${cmds.length ? sec('To update', `${cmds.map(c => `<div class="cmdrow"><pre class="code">${esc(c)}</pre><button class="btn sm" data-copy="${esc(c)}">Copy</button></div>`).join('')}<div class="dim">Mulchie does not run these; run them yourself when it suits you.</div>`) : ''}
     ${sec(f.dismissed ? 'Dismissed' : 'Dismiss', f.dismissed
       ? `<div class="actions">${btn('Show again', da('undismiss', f.id))}</div>`
@@ -421,6 +423,9 @@ const STATE_WORDS = { pending: 'waiting to act', done: 'done', partial: 'done fo
 const num = v => v == null ? '—' : Number(v) >= 100 ? Math.round(v).toString() : Number(v).toFixed(1).replace(/\.0$/, '');
 
 // One record event in plain words.
+const UPDATE_SOURCE = { github: 'GitHub', npm: 'npm', homebrew: 'Homebrew', 'osv.dev': 'advisory' };
+const OUTCOME_WORDS = { paused: 'paused', stopped: 'stopped', killed: 'force-quit', deprioritized: 'lowered the priority of', resumed: 'resumed', restored: 'restored the priority of', restore_failed: 'could not restore the priority of', refused: 'did not act on' };
+
 export function eventText(e) {
   const t = e.type || '';
   const cmd = c => c ? `: ${c}` : '';
@@ -432,6 +437,7 @@ export function eventText(e) {
     case 'truncated': return 'The record stops here: it reached its size or event limit';
     case 'limit_breach': return `Over its ${CAP_WORDS[e.cap] || e.cap} limit: ${num(e.value)} against ${num(e.max)}; action ${ACTION_WORDS[e.action] || e.action}, ${STATE_WORDS[e.action_state] || e.action_state}`;
     case 'limit_cleared': return `Back under its ${CAP_WORDS[e.cap] || e.cap} limit`;
+    case 'limit_action': return `Mulchie ${OUTCOME_WORDS[e.outcome] || String(e.outcome || 'acted on').replace(/_/g, ' ')} ${e.outcome === 'refused' || e.outcome === 'restore_failed' ? 'the session’s processes' : 'processes of the session'}${e.cap ? ` (${CAP_WORDS[e.cap] || e.cap} limit, action ${ACTION_WORDS[e.action] || e.action})` : ''}${e.detail ? `: ${e.detail}` : ''}${e.reason ? ` · ${reasonText(e.reason)}` : ''}`;
     case 'hook_session_start': return `The agent reported its session start${e.client ? ` (${e.client})` : ''}`;
     case 'hook_prompt': return 'The agent received a prompt';
     case 'hook_pre_tool': return `About to use ${e.tool || 'a tool'}${cmd(e.command)}${e.decision && e.decision !== 'allow' ? ` · guard: ${e.decision}${e.rule ? ` (${e.rule.replace(/_/g, ' ')})` : ''}` : ''}`;

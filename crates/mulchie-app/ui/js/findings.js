@@ -15,20 +15,33 @@ export function watchFindings(S, dismissed = false) {
 export const CATEGORY = { security: 'Security', limit: 'Limits', hygiene: 'Hygiene', posture: 'Mulchie setup', update: 'Updates', other: 'Other' };
 export const CATEGORY_ORDER = ['security', 'limit', 'hygiene', 'posture', 'update', 'other'];
 
-// A suggestion that names a process plan route (limit findings):
-// `POST /v1/process/plan {"session": …, "action": …}` → that request.
-export function planApi(sg) {
-  const m = /^POST \/v1\/process\/plan (\{.*\})$/.exec(sg?.api || '');
+// The API call a suggestion names: `api_request` ({method, route, body}),
+// or for an engine without it, the same call parsed from the `api` words.
+function apiCall(sg) {
+  const r = sg?.api_request;
+  if (r && typeof r.method === 'string' && typeof r.route === 'string') return { method: r.method, route: r.route, body: r.body ?? null };
+  const m = /^(GET|POST) (\/v1\/\S+)(?: (\{.*\}))?$/.exec(sg?.api || '');
   if (!m) return null;
-  try {
-    const r = JSON.parse(m[1]);
-    return typeof r.session === 'string' && /^s-\d+-\d+$/.test(r.session) && typeof r.action === 'string' ? { session: r.session, action: r.action } : null;
-  } catch (e) { return null; }
+  try { return { method: m[1], route: m[2], body: m[3] ? JSON.parse(m[3]) : null }; } catch (e) { return null; }
+}
+const SID = /^s-\d+-\d+$/;
+// A suggestion that plans an action on a session's processes (limit
+// findings): `POST /v1/process/plan {"session": …, "action": …}`.
+export function planApi(sg) {
+  const c = apiCall(sg), b = c?.body;
+  return c?.method === 'POST' && c.route === '/v1/process/plan' && b && typeof b.session === 'string' && SID.test(b.session) && typeof b.action === 'string'
+    ? { session: b.session, action: b.action } : null;
 }
 // A suggestion to look at a session: `GET /v1/sessions/<id>` → the id.
-export const sessionApi = sg => (/^GET \/v1\/sessions\/(s-\d+-\d+)$/.exec(sg?.api || '') || [])[1] || null;
-// A command the user may run themselves (update findings): "Run: <cmd>".
-export const runCommand = sg => !sg?.request && !sg?.api && /^Run: /.test(sg?.label || '') ? sg.label.slice(5) : null;
+export function sessionApi(sg) {
+  const c = apiCall(sg), m = c?.method === 'GET' && /^\/v1\/sessions\/(s-\d+-\d+)$/.exec(c.route);
+  return m ? m[1] : null;
+}
+// A command the user may run themselves (update findings, engines without
+// `evidence.updates`): "Run: <cmd>".
+export const runCommand = sg => !sg?.request && !sg?.api && !sg?.api_request && /^Run: /.test(sg?.label || '') ? sg.label.slice(5) : null;
+// An update finding's packages (`evidence.updates`), one per row.
+export const updateItems = f => Array.isArray(f?.evidence?.updates) ? f.evidence.updates.filter(u => u && typeof u.package === 'string') : [];
 
 // The short button for a suggestion: what it does, not the whole sentence.
 export function suggestionLabel(sg) {
