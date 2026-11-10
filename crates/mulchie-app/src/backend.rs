@@ -1074,15 +1074,39 @@ impl Backend {
     /// Change some config keys with a JSON merge patch (`PATCH /v1/config`),
     /// applied to the file's current content. Returns the whole config now
     /// in use.
-    pub fn patch_config(&self, patch: Value) -> Result<Value, ConfigFailure> {
+    ///
+    /// With `if_revision` (the `revision` the change was made against),
+    /// nothing is saved when the file is at another revision now: 409
+    /// `config_changed`.
+    pub fn patch_config(
+        &self,
+        patch: Value,
+        if_revision: Option<&str>,
+    ) -> Result<Value, ConfigFailure> {
+        if let Some(r) = if_revision {
+            if r.is_empty() || !r.chars().all(|c| c.is_ascii_alphanumeric()) {
+                return Err(ConfigFailure::new(
+                    "invalid_revision",
+                    format!("{r:?} is not a config revision"),
+                ));
+            }
+        }
         match self.conn() {
-            Conn::Local(e) => match e.patch_config(&patch) {
-                Ok(cfg) => to_value(&cfg).map_err(|m| ConfigFailure::new("internal", m)),
+            Conn::Local(e) => match e.patch_config_if(&patch, if_revision) {
+                Ok((cfg, _)) => to_value(&cfg).map_err(|m| ConfigFailure::new("internal", m)),
                 Err(err) => Err(ConfigFailure::of(&err)),
             },
             Conn::Remote(c) => {
-                let path = "/v1/config";
-                match c.request("PATCH", path, Some(&patch), api::timeout_for("PATCH", path)) {
+                let path = match if_revision {
+                    Some(r) => format!("/v1/config?if_revision={r}"),
+                    None => "/v1/config".to_string(),
+                };
+                match c.request(
+                    "PATCH",
+                    &path,
+                    Some(&patch),
+                    api::timeout_for("PATCH", "/v1/config"),
+                ) {
                     Ok(v) => {
                         self.note_ok();
                         Ok(v["config"].clone())
@@ -1095,6 +1119,18 @@ impl Backend {
                 }
             }
             Conn::Down => Err(ConfigFailure::new("unreachable", self.down_error())),
+        }
+    }
+
+    /// The revision of the settings file the engine in use has now (`None`
+    /// from an engine that does not report one).
+    pub fn config_revision(&self) -> Result<Option<String>, String> {
+        match self.conn() {
+            Conn::Local(e) => Ok(Some(e.config_and_revision().1)),
+            Conn::Remote(c) => self
+                .remote(&c, "GET", "/v1/config", None)
+                .map(|v| v["revision"].as_str().map(String::from)),
+            Conn::Down => Err(self.down_error()),
         }
     }
 
@@ -1138,9 +1174,9 @@ impl ConfigFailure {
             ConfigError::NotLockHolder(_) => "not_lock_holder",
             ConfigError::Io(_) => "config_io",
             ConfigError::UnknownKey(_) => "unknown_key",
+            ConfigError::Changed(_) => "config_changed",
             // PATCH /v1/config answers every other refusal with 400
-            // invalid_config (a patch is applied to the file's current
-            // content, so `Changed` does not occur for it).
+            // invalid_config.
             _ => "invalid_config",
         };
         Self::new(code, err.to_string())

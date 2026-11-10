@@ -979,20 +979,23 @@ fn sessions_limits_and_updates_through_the_engine_and_a_client() {
     // Limits through PATCH: a budget makes the engine enforce; a bad value
     // is refused with the field in the message, from either side.
     let budget = json!({"limits": {"default": {"cpu_cores": {"max": 2.0, "sustain_secs": 30, "action": "pause"}}}});
-    let cfg = b.patch_config(budget).unwrap();
+    let cfg = b.patch_config(budget, None).unwrap();
     assert_eq!(cfg["limits"]["default"]["cpu_cores"]["action"], "pause");
     assert_eq!(a.limits_status().unwrap()["report_only"], false);
     let bad = json!({"limits": {"default": {"cpu_cores": {"max": -1.0}}}});
     for x in [&a, &b] {
-        let e = x.patch_config(bad.clone()).unwrap_err();
+        let e = x.patch_config(bad.clone(), None).unwrap_err();
         assert_eq!(e.code, "invalid_config", "{e:?}");
         assert!(e.message.contains("limits.default.cpu_cores.max"), "{e:?}");
     }
     // `null` removes a key, so the budget goes and the engine only reports.
-    a.patch_config(json!({"limits": {"default": null}}))
+    a.patch_config(json!({"limits": {"default": null}}), None)
         .unwrap();
     assert_eq!(b.limits_status().unwrap()["report_only"], true);
-    assert!(a.patch_config(json!([1])).is_err(), "a patch is an object");
+    assert!(
+        a.patch_config(json!([1]), None).is_err(),
+        "a patch is an object"
+    );
 
     drop(b);
     let _ = child.kill();
@@ -1031,7 +1034,7 @@ fn config_refusals_carry_the_api_codes_on_both_sides() {
     // An engine that does not hold the lock never writes the settings.
     e.set_automation_enabled(false);
     for (who, x) in [("engine", &a), ("client", &b)] {
-        let err = x.patch_config(patch.clone()).unwrap_err();
+        let err = x.patch_config(patch.clone(), None).unwrap_err();
         assert_eq!(err.code, "not_lock_holder", "{who}: {err:?}");
     }
     e.set_automation_enabled(true);
@@ -1041,7 +1044,7 @@ fn config_refusals_carry_the_api_codes_on_both_sides() {
     std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o500)).unwrap();
     let results: Vec<_> = [&a, &b]
         .iter()
-        .map(|x| x.patch_config(patch.clone()))
+        .map(|x| x.patch_config(patch.clone(), None))
         .collect();
     std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).unwrap();
     for (who, r) in ["engine", "client"].iter().zip(results) {
@@ -1052,7 +1055,7 @@ fn config_refusals_carry_the_api_codes_on_both_sides() {
     // A key the engine does not know.
     for (who, x) in [("engine", &a), ("client", &b)] {
         let err = x
-            .patch_config(json!({"limits": {"no_such_key": 1}}))
+            .patch_config(json!({"limits": {"no_such_key": 1}}), None)
             .unwrap_err();
         assert_eq!(err.code, "unknown_key", "{who}: {err:?}");
     }
@@ -1060,14 +1063,30 @@ fn config_refusals_carry_the_api_codes_on_both_sides() {
     // And a bad value is still invalid_config, so the codes are not constant.
     let bad = json!({"updates": {"interval_hours": 1}});
     for (who, x) in [("engine", &a), ("client", &b)] {
-        let err = x.patch_config(bad.clone()).unwrap_err();
+        let err = x.patch_config(bad.clone(), None).unwrap_err();
         assert_eq!(err.code, "invalid_config", "{who}: {err:?}");
         assert!(
             err.message.contains("updates.interval_hours"),
             "{who}: {err:?}"
         );
     }
-    let ok = b.patch_config(patch).unwrap();
+    // A write made against an older revision of the file is refused, from
+    // either side; against the current one it saves.
+    let r0 = a.config_revision().unwrap().expect("a revision");
+    assert_eq!(b.config_revision().unwrap().as_deref(), Some(r0.as_str()));
+    a.patch_config(
+        json!({"guard": {"rules": {"pipe_to_shell": "block"}}}),
+        None,
+    )
+    .unwrap();
+    for (who, x) in [("engine", &a), ("client", &b)] {
+        let err = x.patch_config(patch.clone(), Some(&r0)).unwrap_err();
+        assert_eq!(err.code, "config_changed", "{who}: {err:?}");
+    }
+    assert!(a.patch_config(patch.clone(), Some("not hex!")).is_err());
+    let r1 = b.config_revision().unwrap().unwrap();
+    assert_ne!(r0, r1);
+    let ok = b.patch_config(patch, Some(&r1)).unwrap();
     assert_eq!(ok["guard"]["rules"]["sudo"], "block");
     drop(b);
     a.shutdown();

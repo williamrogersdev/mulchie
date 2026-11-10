@@ -144,13 +144,20 @@ export function diffPatch(before, after) {
   return JSON.stringify(before) === JSON.stringify(after) ? undefined : after;
 }
 
+const CHANGED_HELP = 'The settings file changed elsewhere since this form was drawn, so nothing was saved. Your edits are kept. Save again to apply only the fields you changed on top of the settings as they are now.';
+
 async function save(card, patch, which) {
   const btn = card.querySelector('[data-save]');
   btn.disabled = true;
   try {
-    const cfg = await invoke('patch_config', { patch });
-    st.cfg = { ...(st.cfg || {}), config: cfg };
-    st.cfgRev = null;
+    // Only while the file is still at the revision the form was drawn from
+    // (an engine without revisions writes as before).
+    const ifRevision = drawn[which]?.revision || null;
+    const cfg = await invoke('patch_config', { patch, ifRevision });
+    // The config and revision as saved, so the redrawn form writes against
+    // the new revision.
+    try { st.cfg = await invoke('get_config'); st.cfgRev = st.cfg.rev; }
+    catch (err) { st.cfg = { ...(st.cfg || {}), config: cfg, revision: null }; st.cfgRev = null; }
     dirty[which] = false;
     toast('Saved');
     renderCfgMore(which);
@@ -159,7 +166,12 @@ async function save(card, patch, which) {
     // Not saved: keep the form as the user left it, with the reason.
     dirty[which] = true;
     const code = e?.code || '', msg = e?.message || String(e);
-    if (code === 'not_lock_holder') showErrors(card, '', LOCK_HELP);
+    if (code === 'config_changed') {
+      // The user has now seen that it changed: the next save goes on top
+      // of the file as it is.
+      try { const fresh = await invoke('get_config'); if (drawn[which]) drawn[which].revision = fresh.revision || null; } catch (err) { /* the next save says why */ }
+      showErrors(card, '', CHANGED_HELP);
+    } else if (code === 'not_lock_holder') showErrors(card, '', LOCK_HELP);
     else if (code === 'invalid_config') showErrors(card, msg);
     else showErrors(card, '', `Not saved: ${msg}`);
     toast('Not saved', true);
@@ -432,7 +444,7 @@ export function renderCfgMore(only) {
       card.querySelector('.cform').innerHTML = form(cfg.config || {});
       card.querySelector('.card-err').textContent = '';
       const r = read(card);
-      drawn[id] = { rev: cfg.rev, editable: cfg.editable, config: structuredClone(cfg.config || {}), base: r.errors.length ? null : r.patch };
+      drawn[id] = { rev: cfg.rev, revision: cfg.revision || null, editable: cfg.editable, config: structuredClone(cfg.config || {}), base: r.errors.length ? null : r.patch };
       dirty[id] = false;
     }
     const elsewhere = dirty[id] && drawn[id] && drawn[id].rev !== cfg.rev;

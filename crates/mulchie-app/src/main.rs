@@ -65,6 +65,9 @@ async fn get_config(b: B<'_>) -> Result<Value, String> {
         // engine's PUT /v1/config.
         v["editable"] = json!(b.mode() != Mode::Disconnected);
         v["path"] = json!(b.config_path());
+        // The file revision, for writes that must not overwrite a change
+        // made meanwhile (null from an engine without revisions).
+        v["revision"] = json!(b.config_revision().ok().flatten());
         Ok(v)
     })
     .await
@@ -178,9 +181,13 @@ async fn check_updates(b: B<'_>) -> Result<(), String> {
 
 /// A JSON merge patch of the config. The error is `{code, message}`.
 #[tauri::command]
-async fn patch_config(b: B<'_>, patch: Value) -> Result<Value, backend::ConfigFailure> {
+async fn patch_config(
+    b: B<'_>,
+    patch: Value,
+    if_revision: Option<String>,
+) -> Result<Value, backend::ConfigFailure> {
     let b = b.inner().clone();
-    tauri::async_runtime::spawn_blocking(move || b.patch_config(patch))
+    tauri::async_runtime::spawn_blocking(move || b.patch_config(patch, if_revision.as_deref()))
         .await
         .map_err(|e| backend::ConfigFailure {
             code: "internal".into(),
