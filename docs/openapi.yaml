@@ -918,7 +918,10 @@ paths:
                       binary found), `installed`, `latest`, `outdated`, `command`, `source` and
                       `version_from` (where `installed` was read: `package.json at …` or
                       `install path …`, or why it is unknown; agent tools are never run).
-                      `homebrew_path` is the `brew` that was run, when it was.
+                      `homebrew_path` is the `brew` that was run, when it was. `homebrew_skipped` is present
+                      only when Homebrew was not checked: `off`, `no_brew` or `no_core_tap`; a skipped
+                      check drops any earlier Homebrew result, while a `brew outdated` that ran and
+                      failed keeps the last one and adds an entry to `errors`.
         default: { $ref: "#/components/responses/Error" }
   /v1/updates/check:
     post:

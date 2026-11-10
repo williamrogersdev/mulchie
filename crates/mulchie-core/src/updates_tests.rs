@@ -594,13 +594,139 @@ fn homebrew_needs_local_data() {
         ..FakeRunner::default()
     };
     let mut errs = Vec::new();
-    assert_eq!(homebrew(&run, &[], &mut errs), (None, None));
+    assert_eq!(
+        homebrew(&run, &[], &mut errs),
+        BrewOutcome::Skipped("no_core_tap")
+    );
     assert!(
         run.runs.lock().unwrap().is_empty(),
         "brew not run without its local core tap"
     );
     assert!(parse_brew_outdated("{}").is_err());
     assert!(parse_brew_outdated("garbage").is_err());
+}
+
+fn brew_setup(t: &Path, output: &str) -> FakeRunner {
+    let hb = t.join("hb");
+    std::fs::create_dir_all(hb.join("bin")).unwrap();
+    std::fs::create_dir_all(hb.join("Library/Taps/homebrew/homebrew-core")).unwrap();
+    std::fs::write(hb.join("bin/brew"), "").unwrap();
+    FakeRunner {
+        tools: HashMap::from([("brew".into(), (false, output.to_string()))]),
+        paths: HashMap::from([("brew".into(), hb.join("bin/brew"))]),
+        ..FakeRunner::default()
+    }
+}
+
+fn previous_report() -> Report {
+    Report {
+        homebrew: Some(vec![BrewOutdated {
+            name: "git".into(),
+            installed: "2.44.0".into(),
+            current: "2.45.0".into(),
+            cask: false,
+        }]),
+        advisories: Some(vec![]),
+        packages_checked: 3,
+        ..Report::default()
+    }
+}
+
+/// A skipped Homebrew check drops the previous result; one that ran and
+/// failed keeps it.
+#[test]
+fn skipped_homebrew_drops_the_previous_result_and_a_failure_keeps_it() {
+    let t = tempfile::tempdir().unwrap();
+    let prev = previous_report();
+    let http = FakeHttp::default();
+    let base = UpdatesConfig {
+        mulchie: false,
+        agents: false,
+        advisories: false,
+        ..UpdatesConfig::default()
+    };
+    let go = |cfg: &UpdatesConfig, run: &FakeRunner| {
+        check(&http, run, &input(cfg, &[], Path::new("/h")), Some(&prev))
+    };
+    // Turned off.
+    let off = UpdatesConfig {
+        homebrew: false,
+        ..base.clone()
+    };
+    let r = go(&off, &brew_setup(t.path(), "{}"));
+    assert!(r.homebrew.is_none());
+    assert_eq!(r.homebrew_skipped.as_deref(), Some("off"));
+    assert!(findings(&r).is_empty());
+    // No brew binary.
+    let r = go(&base, &FakeRunner::default());
+    assert!(r.homebrew.is_none());
+    assert_eq!(r.homebrew_skipped.as_deref(), Some("no_brew"));
+    assert!(findings(&r).is_empty());
+    // brew without a local core tap.
+    let run = FakeRunner {
+        tools: HashMap::from([("brew".into(), (true, "{}".into()))]),
+        ..FakeRunner::default()
+    };
+    let r = go(&base, &run);
+    assert!(r.homebrew.is_none());
+    assert_eq!(r.homebrew_skipped.as_deref(), Some("no_core_tap"));
+    // Ran and failed: previous kept, error recorded, not marked skipped.
+    let r = go(&base, &brew_setup(t.path(), "garbage"));
+    assert_eq!(r.homebrew, prev.homebrew);
+    assert!(r.homebrew_skipped.is_none());
+    assert!(r.errors.iter().any(|e| e.starts_with("homebrew:")));
+    assert!(findings(&r)
+        .iter()
+        .any(|f| f.kind == FindingKind::HomebrewOutdated));
+    // Ran and succeeded: replaced.
+    let r = go(
+        &base,
+        &brew_setup(t.path(), "{\"formulae\": [], \"casks\": []}"),
+    );
+    assert_eq!(r.homebrew, Some(vec![]));
+}
+
+/// Advisories turned off drop the previous result; a failed lookup keeps it.
+#[test]
+fn advisories_off_drops_the_previous_result_and_a_failure_keeps_it() {
+    let t = tempfile::tempdir().unwrap();
+    let ws = t.path().join("ws");
+    std::fs::create_dir_all(&ws).unwrap();
+    std::fs::write(
+        ws.join("package-lock.json"),
+        r#"{"lockfileVersion":3,"packages":{"node_modules/lodash":{"version":"4.17.20"}}}"#,
+    )
+    .unwrap();
+    let wss = [ws];
+    let prev = previous_report();
+    let http = FakeHttp::default(); // every request is refused
+    let base = UpdatesConfig {
+        mulchie: false,
+        agents: false,
+        homebrew: false,
+        ..UpdatesConfig::default()
+    };
+    let off = UpdatesConfig {
+        advisories: false,
+        ..base.clone()
+    };
+    let run = FakeRunner::default();
+    let r = check(
+        &http,
+        &run,
+        &input(&off, &wss, Path::new("/h")),
+        Some(&prev),
+    );
+    assert!(r.advisories.is_none());
+    assert_eq!(r.packages_checked, 0);
+    let on = UpdatesConfig {
+        advisories: true,
+        ..base
+    };
+    let r = check(&http, &run, &input(&on, &wss, Path::new("/h")), Some(&prev));
+    assert_eq!(r.advisories, prev.advisories);
+    assert_eq!(r.packages_checked, 3);
+    assert!(r.errors.iter().any(|e| e.starts_with("advisories:")));
 }
 
 #[test]
@@ -720,7 +846,7 @@ fn probes_come_from_safe_places_and_versions_from_metadata() {
     let mut errs = Vec::new();
     assert_eq!(
         homebrew(&run, std::slice::from_ref(&ws), &mut errs),
-        (None, None)
+        BrewOutcome::Skipped("no_brew")
     );
     assert!(run.runs.lock().unwrap().is_empty());
 }

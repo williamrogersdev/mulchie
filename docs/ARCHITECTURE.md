@@ -174,7 +174,7 @@ Update checks produce findings in the `update` category and never install anythi
 | --- | --- | --- |
 | Mulchie itself | GitHub releases API, latest release | on |
 | Installed agent tools | The tool's installed version read from package metadata (never by running it), the latest from the npm registry's dist-tags for Claude Code, Codex and Gemini CLI | on |
-| Homebrew | `brew outdated --json=v2` with a minimal `PATH` and no auto-update, run only when the local `homebrew/core` tap exists | on |
+| Homebrew | `brew outdated --json=v2` with a minimal `PATH` and no auto-update, run only when the local `homebrew/core` tap exists. A skipped check (off, no `brew`, no core tap) drops the earlier result and the report says why in `homebrew_skipped`; a run that fails keeps the last result and adds to `errors` | on |
 | Advisories | OSV.dev, for package names and versions in each workspace's `Cargo.lock`, `package-lock.json` and `go.mod` | **off**; it tells a third party what a project depends on |
 
 Every request is HTTPS with certificate verification, a 15 s timeout, a size cap and the user agent `mulchie/<version>`, behind an `Http` trait so tests use a fake. The first check waits five minutes after the engine starts, then runs every `updates.interval_hours` (sooner after errors, with backoff). Results are cached in `<config dir>/updates.json`. `updates.check: off` makes no request and runs no command.

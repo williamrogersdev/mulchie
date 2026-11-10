@@ -31,7 +31,7 @@ Mulchie looks for the tool in your `PATH` and the usual install places, skipping
 
 ### Homebrew
 
-`brew outdated` runs with a minimal `PATH`, `HOMEBREW_NO_AUTO_UPDATE=1` and `HOMEBREW_NO_INSTALL_FROM_API=1`. Mulchie only runs it when the local core tap exists, because without one and with API installs off Homebrew would fetch the tap. When it is skipped, nothing is run and no new Homebrew result is shown.
+`brew outdated` runs with a minimal `PATH`, `HOMEBREW_NO_AUTO_UPDATE=1` and `HOMEBREW_NO_INSTALL_FROM_API=1`. Mulchie only runs it when the local core tap exists, because without one and with API installs off Homebrew would fetch the tap. When it is skipped (the setting is off, `brew` is not found, or there is no local core tap), nothing is run, the earlier Homebrew result and its findings are dropped, and the report's `homebrew_skipped` says why: `off`, `no_brew` or `no_core_tap`. If `brew outdated` runs and fails, the last result is kept and the error is listed.
 
 ### Advisories (opt-in)
 

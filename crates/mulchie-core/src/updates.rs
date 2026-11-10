@@ -856,7 +856,8 @@ pub struct Report {
     pub checked_unix: u64,
     pub mulchie: Option<ToolVersion>,
     pub agents: Vec<ToolVersion>,
-    /// `None`: not checked (off, no brew, or no local data).
+    /// `None`: not checked (see `homebrew_skipped`) or the last check failed
+    /// with no earlier result.
     pub homebrew: Option<Vec<BrewOutdated>>,
     /// `None`: advisories are off.
     pub advisories: Option<Vec<Advisory>>,
@@ -867,6 +868,11 @@ pub struct Report {
     /// The `brew` that was run, when it was.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub homebrew_path: Option<PathBuf>,
+    /// Why Homebrew was not checked, when it was skipped: `off`
+    /// (`updates.homebrew` is false), `no_brew` or `no_core_tap`. Omitted
+    /// when `brew outdated` ran, even if it failed (see `errors`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub homebrew_skipped: Option<String>,
 }
 
 /// Agent tools: (name, executable, npm package with the latest version,
@@ -1037,10 +1043,21 @@ pub fn check(http: &dyn Http, run: &dyn Runner, inp: &CheckInput, prev: Option<&
             });
         }
     }
-    if inp.cfg.homebrew {
-        let (hb, path) = homebrew(run, inp.avoid_dirs, &mut r.errors);
-        r.homebrew_path = path;
-        r.homebrew = hb.or_else(|| prev.and_then(|p| p.homebrew.clone()));
+    if !inp.cfg.homebrew {
+        r.homebrew_skipped = Some("off".into());
+    } else {
+        match homebrew(run, inp.avoid_dirs, &mut r.errors) {
+            BrewOutcome::Skipped(why) => r.homebrew_skipped = Some(why.into()),
+            BrewOutcome::Failed(path) => {
+                // The check ran and failed: the last known answer stands.
+                r.homebrew_path = Some(path);
+                r.homebrew = prev.and_then(|p| p.homebrew.clone());
+            }
+            BrewOutcome::Checked(v, path) => {
+                r.homebrew_path = Some(path);
+                r.homebrew = Some(v);
+            }
+        }
     }
     if inp.cfg.advisories {
         match advisories(http, inp.workspaces) {
@@ -1131,17 +1148,24 @@ fn core_tap(brew: &Path) -> Option<PathBuf> {
         .find(|t| t.is_dir())
 }
 
-fn homebrew(
-    run: &dyn Runner,
-    avoid: &[PathBuf],
-    errors: &mut Vec<String>,
-) -> (Option<Vec<BrewOutdated>>, Option<PathBuf>) {
+/// What one Homebrew check came to. A skipped check no longer applies, so
+/// its previous result is dropped; a failed one keeps it.
+#[derive(Debug, PartialEq)]
+enum BrewOutcome {
+    /// Not run: `no_brew` or `no_core_tap`.
+    Skipped(&'static str),
+    /// `brew` (at this path) ran or was started and gave no usable answer.
+    Failed(PathBuf),
+    Checked(Vec<BrewOutdated>, PathBuf),
+}
+
+fn homebrew(run: &dyn Runner, avoid: &[PathBuf], errors: &mut Vec<String>) -> BrewOutcome {
     let Some(brew) = run.find_outside("brew", avoid) else {
-        return (None, None);
+        return BrewOutcome::Skipped("no_brew");
     };
     if core_tap(&brew).is_none() {
         // With API installs off and no local core tap, brew would fetch it.
-        return (None, None);
+        return BrewOutcome::Skipped("no_core_tap");
     }
     let env = [
         ("HOMEBREW_NO_AUTO_UPDATE", "1"),
@@ -1159,13 +1183,13 @@ fn homebrew(
         BREW_REPLY,
     ) else {
         errors.push("homebrew: brew outdated did not finish".into());
-        return (None, Some(brew));
+        return BrewOutcome::Failed(brew);
     };
     match parse_brew_outdated(&out) {
-        Ok(v) => (Some(v), Some(brew)),
+        Ok(v) => BrewOutcome::Checked(v, brew),
         Err(e) => {
             errors.push(format!("homebrew: {e}"));
-            (None, Some(brew))
+            BrewOutcome::Failed(brew)
         }
     }
 }
