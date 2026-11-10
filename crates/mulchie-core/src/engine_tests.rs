@@ -1343,3 +1343,61 @@ fn config_writes_detect_changes_on_disk() {
     }
     assert!(on_disk.watch.dismissed.iter().any(|d| d.id == "f1"));
 }
+
+/// A probe whose listeners and signatures a test switches between runs.
+struct SwitchProbe {
+    listeners: Mutex<Option<Vec<crate::watch::Listener>>>,
+    sig: Mutex<Option<crate::watch::SigStatus>>,
+    sig_calls: AtomicU64,
+}
+
+impl crate::watch::WatchProbe for SwitchProbe {
+    fn listeners(&self) -> Option<Vec<crate::watch::Listener>> {
+        self.listeners.lock().unwrap().clone()
+    }
+    fn signature(&self, _: &Path) -> Option<crate::watch::SigStatus> {
+        self.sig_calls.fetch_add(1, Ordering::SeqCst);
+        *self.sig.lock().unwrap()
+    }
+    fn quarantined(&self, _: &Path) -> bool {
+        false
+    }
+}
+
+/// R9 through the engine: an exposed-listener finding survives a run where
+/// listeners are unknown; a failed signature check is tried again next run.
+#[test]
+fn unknown_listeners_keep_findings_and_failed_signatures_are_retried() {
+    use crate::watch::{FindingKind, Listener};
+    let dir = tempfile::tempdir().unwrap();
+    let exe = dir.path().join("server");
+    std::fs::write(&exe, b"x").unwrap();
+    let mut procs = FakeProcesses::empty();
+    let uid = procs.uid;
+    procs
+        .procs
+        .push(fact(10, 5, uid, "server", Some(exe.clone())));
+    let (_t, e) = engine_with_procs(Config::default(), procs);
+    let probe = Arc::new(SwitchProbe {
+        listeners: Mutex::new(Some(vec![Listener {
+            pid: 10,
+            addr: "0.0.0.0".into(),
+            port: 4444,
+        }])),
+        sig: Mutex::new(None),
+        sig_calls: AtomicU64::new(0),
+    });
+    let e = e.with_watch_probe(probe.clone());
+    let has =
+        |f: &[crate::watch::Finding]| f.iter().any(|f| f.kind == FindingKind::ExposedListener);
+    assert!(has(&e.run_watch()));
+    let calls = probe.sig_calls.load(Ordering::SeqCst);
+    *probe.listeners.lock().unwrap() = None;
+    assert!(has(&e.run_watch()), "kept while listeners are unknown");
+    assert!(
+        probe.sig_calls.load(Ordering::SeqCst) > calls,
+        "a failed signature check is not cached"
+    );
+    *probe.listeners.lock().unwrap() = Some(Vec::new());
+    assert!(!has(&e.run_watch()), "gone once known again");
+}

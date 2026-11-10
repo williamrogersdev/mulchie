@@ -467,11 +467,7 @@ impl WatchProbe for SystemProbe {
             let mut cmd = std::process::Command::new("lsof");
             cmd.args(["-nP", "-iTCP", "-sTCP:LISTEN", "-F", "pn"]);
             let out = crate::git::run_with_timeout(cmd, PROBE_TIMEOUT).ok()?;
-            // lsof exits 1 when nothing matches.
-            if !out.success && !out.stdout.is_empty() {
-                return None;
-            }
-            Some(parse_lsof(&String::from_utf8_lossy(&out.stdout)))
+            lsof_result(out.success, &out.stdout)
         }
     }
 
@@ -481,10 +477,7 @@ impl WatchProbe for SystemProbe {
         }
         let mut cmd = std::process::Command::new("/usr/bin/codesign");
         cmd.args(["-dv", "--verbose=2"]).arg(exe);
-        match crate::git::run_with_timeout(cmd, CODESIGN_TIMEOUT) {
-            Ok(o) => Some(parse_codesign(&o.stderr)),
-            Err(_) => Some(SigStatus::Unknown),
-        }
+        codesign_result(crate::git::run_with_timeout(cmd, CODESIGN_TIMEOUT).map(|o| o.stderr))
     }
 
     fn quarantined(&self, exe: &Path) -> bool {
@@ -503,6 +496,42 @@ impl WatchProbe for SystemProbe {
         {
             let _ = exe;
             false
+        }
+    }
+}
+
+/// Listeners from an `lsof` run. Only a successful run counts: lsof also
+/// exits 1 when nothing listens, but a failure looks the same, so a
+/// non-zero exit is "unknown" (`None`) and earlier findings are kept.
+pub fn lsof_result(success: bool, stdout: &[u8]) -> Option<Vec<Listener>> {
+    success.then(|| parse_lsof(&String::from_utf8_lossy(stdout)))
+}
+
+/// The status from a `codesign` run. A timeout or spawn error is `None`,
+/// never [`SigStatus::Unknown`]: it is not cached and is tried again.
+pub fn codesign_result<E>(stderr: Result<String, E>) -> Option<SigStatus> {
+    stderr.ok().map(|e| parse_codesign(&e))
+}
+
+/// While listeners are unknown, keep the listener findings of the last run:
+/// API exposure, and exposed listeners of processes still running (same pid
+/// and start time).
+pub fn carry_listener_findings(
+    raw: &mut Vec<Finding>,
+    prev: &[Finding],
+    alive: &dyn Fn(u32, u64) -> bool,
+) {
+    for f in prev {
+        let keep = match f.kind {
+            FindingKind::ApiExposed => true,
+            FindingKind::ExposedListener => match (f.evidence.pid, f.evidence.start_time) {
+                (Some(p), Some(s)) => alive(p, s),
+                _ => false,
+            },
+            _ => false,
+        };
+        if keep && !raw.iter().any(|r| r.id == f.id) {
+            raw.push(f.clone());
         }
     }
 }

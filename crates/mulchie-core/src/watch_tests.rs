@@ -926,3 +926,57 @@ fn every_kind_has_a_category_and_old_json_still_parses() {
     let (out, _) = finalize(vec![f], &[], &WatchConfig::default(), NOW);
     assert_eq!(out[0].category, FindingCategory::Hygiene);
 }
+
+/// R9: a failed lsof is unknown, not "nothing listens"; a codesign that
+/// timed out or could not start gives no status (so nothing is cached);
+/// listener findings are kept while listeners are unknown.
+#[test]
+fn probe_failures_are_unknown_and_keep_findings() {
+    assert_eq!(lsof_result(false, b""), None, "non-zero exit, empty output");
+    assert_eq!(lsof_result(false, b"p1\nn*:80\n"), None);
+    assert_eq!(lsof_result(true, b"").map(|v| v.len()), Some(0));
+    assert_eq!(lsof_result(true, b"p7\nn*:8080\n").unwrap()[0].port, 8080);
+
+    let timed_out: Result<String, std::io::Error> = Err(std::io::Error::new(
+        std::io::ErrorKind::TimedOut,
+        "timed out",
+    ));
+    assert_eq!(codesign_result(timed_out), None);
+    let spawn: Result<String, &str> = Err("no such file");
+    assert_eq!(codesign_result(spawn), None);
+    assert_eq!(
+        codesign_result::<()>(Ok("x: code object is not signed at all".into())),
+        Some(SigStatus::Unsigned)
+    );
+
+    let mk = |id: &str, kind, pid, st| Finding {
+        id: id.into(),
+        kind,
+        category: FindingCategory::Security,
+        severity: Severity::Medium,
+        title: "t".into(),
+        why: "w".into(),
+        evidence: Evidence {
+            pid,
+            start_time: st,
+            ..Default::default()
+        },
+        suggested: Vec::new(),
+        first_seen_unix: 1,
+        last_seen_unix: 1,
+        dismissed: false,
+        dismissed_until: None,
+    };
+    let prev = vec![
+        mk("l1", FindingKind::ExposedListener, Some(10), Some(100)),
+        mk("l2", FindingKind::ExposedListener, Some(11), Some(110)),
+        mk("api", FindingKind::ApiExposed, None, None),
+        mk("o", FindingKind::OrphanedProcess, Some(10), Some(100)),
+    ];
+    let mut raw = vec![mk("l1", FindingKind::ExposedListener, Some(10), Some(100))];
+    // pid 11 now has another start time (reused): its finding goes.
+    carry_listener_findings(&mut raw, &prev, &|p, s| (p, s) == (10, 100));
+    let mut ids: Vec<&str> = raw.iter().map(|f| f.id.as_str()).collect();
+    ids.sort();
+    assert_eq!(ids, ["api", "l1"]);
+}

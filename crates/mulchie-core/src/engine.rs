@@ -1429,10 +1429,14 @@ impl Engine {
             config_error,
         };
 
-        let raw = {
+        let listeners_unknown = cfg.watch.check_listeners && listeners.is_none();
+        let mut raw = {
             let mut w = lock(&self.watch);
-            w.listeners = listeners.clone();
-            w.listeners_unix = listeners.as_ref().map(|_| now);
+            // Unknown listeners keep the last known list and its time.
+            if !listeners_unknown {
+                w.listeners = listeners.clone();
+                w.listeners_unix = listeners.as_ref().map(|_| now);
+            }
             let input = watch::WatchInput {
                 now,
                 cfg: &cfg.watch,
@@ -1451,6 +1455,10 @@ impl Engine {
             };
             watch::detect(&input)
         };
+        if listeners_unknown {
+            let alive: HashMap<u32, u64> = procs.iter().map(|p| (p.pid, p.start_time)).collect();
+            watch::carry_listener_findings(&mut raw, &prev, &|p, s| alive.get(&p) == Some(&s));
+        }
         let (findings, changes) = watch::finalize(raw, &prev, &cfg.watch, now);
         {
             let mut st = lock(&self.state);
