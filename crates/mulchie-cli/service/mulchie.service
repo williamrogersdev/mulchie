@@ -1,0 +1,27 @@
+# Reference copy of the systemd user unit for `mulchie serve`.
+# `mulchie service install` writes an equivalent file.
+#
+# Manual install:
+#   mkdir -p ~/.config/systemd/user
+#   cp packaging/systemd/mulchie.service ~/.config/systemd/user/
+#   systemctl --user daemon-reload
+#   systemctl --user enable --now mulchie.service
+#
+# ExecStart assumes the binary is in ~/.local/bin (the install.sh default).
+# Change the path if you installed it somewhere else, for example under Homebrew's prefix.
+# To keep it running when you are logged out: loginctl enable-linger "$USER"
+[Unit]
+Description=Mulchie engine (monitor, build queue, reclaim)
+Documentation=https://mulchie.com/docs/
+After=default.target
+
+[Service]
+Type=simple
+ExecStart=%h/.local/bin/mulchie serve
+Restart=on-failure
+RestartSec=5
+Nice=10
+NoNewPrivileges=yes
+
+[Install]
+WantedBy=default.target

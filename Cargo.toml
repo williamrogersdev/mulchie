@@ -1,16 +1,40 @@
 [workspace]
 resolver = "2"
 members = ["crates/mulchie-core", "crates/mulchie-cli", "crates/mulchie-app"]
+# Plain `cargo build` / `cargo check` skip the Tauri app (it needs a sidecar and system webview libraries).
+default-members = ["crates/mulchie-core", "crates/mulchie-cli"]
 
 [workspace.package]
-version = "0.2.0"
+version = "0.3.0"
 edition = "2021"
+rust-version = "1.97"
 license = "MIT"
 repository = "https://github.com/williamrogersdev/mulchie"
 homepage = "https://mulchie.com"
+authors = ["William Rogers"]
+readme = "README.md"
+keywords = ["ai-agents", "monitoring", "system", "disk", "memory"]
+categories = ["command-line-utilities", "development-tools"]
+
+[workspace.dependencies]
+# Members turn on mulchie-core's `network` feature themselves (the CLI behind its
+# own default `network` feature), so `--no-default-features` can build without
+# the HTTPS client, e.g. to cross-check Linux without a C cross-compiler.
+mulchie-core = { version = "0.3.0", path = "crates/mulchie-core", default-features = false }
+serde = { version = "1.0.229", features = ["derive", "rc"] }
+serde_json = "1.0.154"
+libc = "0.2.191"
+sysinfo = "0.40.1"
+tempfile = "3.27.0"
+semver = "1.0.28"
+toml = { version = "1.2.1", default-features = false, features = ["std", "serde", "parse"] }
+ureq = { version = "3.5.0", default-features = false, features = ["rustls"] }
 
 [profile.release]
-strip = "none"
+strip = "symbols"
+lto = "thin"
+codegen-units = 1
 
+# Stripping proc-macro dylibs makes dlopen reject them on recent macOS.
 [profile.release.build-override]
 strip = "none"

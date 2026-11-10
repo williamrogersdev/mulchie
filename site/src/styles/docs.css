@@ -1,0 +1,37 @@
+/* Maps the shared tokens onto Starlight's variables. */
+:root {
+  --sl-font: var(--font-sans);
+  --sl-font-mono: var(--font-mono);
+  --sl-color-accent-low: #d8e7d1;
+  --sl-color-accent: #2a6427;
+  --sl-color-accent-high: #1f4f1d;
+  --sl-color-white: #0f1a12;
+  --sl-color-gray-1: #15201a;
+  --sl-color-gray-2: #2a362d;
+  --sl-color-gray-3: #465048;
+  --sl-color-gray-4: #5c675e;
+  --sl-color-gray-5: #c9d2c3;
+  --sl-color-gray-6: #e8ede2;
+  --sl-color-gray-7: #eef2e9;
+  --sl-color-black: #f3f5ef;
+  --sl-color-bg-nav: #f3f5ef;
+  --sl-content-width: 46rem;
+}
+:root[data-theme='dark'] {
+  --sl-color-accent-low: #1b3a1a;
+  --sl-color-accent: #3f7a36;
+  --sl-color-accent-high: #9ad88a;
+  --sl-color-white: #f2f5ee;
+  --sl-color-gray-1: #e3e8dd;
+  --sl-color-gray-2: #c5cdc0;
+  --sl-color-gray-3: #a5b0a1;
+  --sl-color-gray-4: #8a9686;
+  --sl-color-gray-5: #3b463b;
+  --sl-color-gray-6: #232b23;
+  --sl-color-gray-7: #181e18;
+  --sl-color-black: #101410;
+  --sl-color-bg-nav: #101410;
+}
+.site-title { font-weight: 700; letter-spacing: -0.01em; }
+.sl-markdown-content :not(pre) > code { font-size: 0.875em; }
+.sl-markdown-content h1, .sl-markdown-content h2, .sl-markdown-content h3 { letter-spacing: -0.015em; }

@@ -1,0 +1,149 @@
+name: Publish
+
+# Runs when a person publishes the draft release created by release.yml:
+#   - updates the Homebrew tap (cask and formula)
+#   - publishes mulchie-core and mulchie to crates.io
+# Each job skips with a notice when its secret is missing. Re-running is safe.
+# Secrets: docs/RELEASING.md.
+
+on:
+  release:
+    types: [published]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: publish-${{ github.event.release.tag_name }}
+  cancel-in-progress: false
+
+env:
+  TAG: ${{ github.event.release.tag_name }}
+
+jobs:
+  homebrew:
+    name: Update Homebrew tap
+    if: ${{ !github.event.release.prerelease }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      TAP_REPO: williamrogersdev/homebrew-tap
+      HOMEBREW_TAP_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - name: Check for the tap token
+        id: gate
+        run: |
+          if [[ -z "$HOMEBREW_TAP_TOKEN" ]]; then
+            echo "::notice::HOMEBREW_TAP_TOKEN is not set, so the tap was not updated. See docs/RELEASING.md."
+            echo "enabled=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "enabled=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Check out source
+        if: steps.gate.outputs.enabled == 'true'
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ env.TAG }}
+
+      - name: Check the tag matches the workspace version
+        if: steps.gate.outputs.enabled == 'true'
+        id: version
+        run: echo "version=$(scripts/workspace-version.sh "$TAG")" >> "$GITHUB_OUTPUT"
+
+      - name: Download release assets
+        if: steps.gate.outputs.enabled == 'true'
+        run: |
+          mkdir assets
+          gh release download "$TAG" --repo "$GITHUB_REPOSITORY" --dir assets \
+            --pattern '*.tar.gz.sha256' --pattern 'SHA256SUMS' --pattern '*.dmg'
+          ls -l assets
+
+      - name: Check the DMG against SHA256SUMS
+        if: steps.gate.outputs.enabled == 'true'
+        run: |
+          cd assets
+          grep -F "Mulchie_${VERSION}_universal.dmg" SHA256SUMS | sha256sum -c -
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+
+      - name: Check out the tap
+        if: steps.gate.outputs.enabled == 'true'
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: ${{ env.TAP_REPO }}
+          token: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+          path: tap
+
+      - name: Render cask and formula
+        if: steps.gate.outputs.enabled == 'true'
+        run: scripts/render-homebrew.sh "$VERSION" assets tap
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+
+      - name: Commit and push to the tap
+        if: steps.gate.outputs.enabled == 'true'
+        working-directory: tap
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          git add Casks/mulchie.rb Formula/mulchie-cli.rb
+          if git diff --cached --quiet; then
+            echo "The tap is already at $VERSION."
+            exit 0
+          fi
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git commit -m "mulchie $VERSION"
+          git push origin HEAD
+
+  crates:
+    name: Publish to crates.io
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+    steps:
+      - name: Check for the registry token
+        id: gate
+        run: |
+          if [[ -z "$CARGO_REGISTRY_TOKEN" ]]; then
+            echo "::notice::CARGO_REGISTRY_TOKEN is not set, so nothing was published to crates.io. See docs/RELEASING.md."
+            echo "enabled=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "enabled=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Check out source
+        if: steps.gate.outputs.enabled == 'true'
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ env.TAG }}
+
+      - name: Install Rust
+        if: steps.gate.outputs.enabled == 'true'
+        uses: dtolnay/rust-toolchain@686976e191b89faba57d3206551f0f330d8cb249 # stable
+        with:
+          toolchain: stable
+
+      - name: Check the tag matches the workspace version
+        if: steps.gate.outputs.enabled == 'true'
+        id: version
+        run: echo "version=$(scripts/workspace-version.sh "$TAG")" >> "$GITHUB_OUTPUT"
+
+      # mulchie depends on mulchie-core, so the library goes first. cargo waits for the
+      # new version to show up in the index before it returns.
+      - name: Publish mulchie-core and mulchie
+        if: steps.gate.outputs.enabled == 'true'
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          for crate in mulchie-core mulchie; do
+            code="$(curl -s -o /dev/null -w '%{http_code}' -A 'mulchie-release-workflow' "https://crates.io/api/v1/crates/$crate/$VERSION")"
+            if [[ "$code" == "200" ]]; then
+              echo "::notice::$crate $VERSION is already on crates.io, skipping."
+              continue
+            fi
+            cargo publish --locked -p "$crate"
+          done

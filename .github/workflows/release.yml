@@ -1,0 +1,520 @@
+name: Release
+
+# Push a tag vX.Y.Z (the same version as the workspace Cargo.toml) to build everything
+# and create a DRAFT GitHub Release. A person reviews and publishes the draft;
+# publishing triggers publish.yml (Homebrew tap, crates.io).
+#
+# Manual run (Actions > Release > Run workflow) with dry_run on builds everything but
+# skips signing, notarization and upload, so it works before any secret exists.
+# Secrets and one-time setup: docs/RELEASING.md.
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: "Build only. Skip signing, notarization and the draft release."
+        type: boolean
+        default: true
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  prepare:
+    name: Check version and notes
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+      tag: ${{ steps.version.outputs.tag }}
+      release: ${{ steps.version.outputs.release }}
+    steps:
+      - name: Check out source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      # A real release is a tag push, or a manual run on a tag with dry_run off.
+      - name: Decide mode and check the version
+        id: version
+        env:
+          REF_TYPE: ${{ github.ref_type }}
+          EVENT: ${{ github.event_name }}
+          DRY_RUN: ${{ inputs.dry_run }}
+        run: |
+          RELEASE=false
+          if [[ "$REF_TYPE" == "tag" && ( "$EVENT" == "push" || "$DRY_RUN" == "false" ) ]]; then
+            RELEASE=true
+          fi
+          if [[ "$RELEASE" == "true" ]]; then
+            VERSION="$(scripts/workspace-version.sh "$GITHUB_REF_NAME")"
+            TAG="$GITHUB_REF_NAME"
+          else
+            VERSION="$(scripts/workspace-version.sh)"
+            TAG="v$VERSION"
+          fi
+          echo "Mode: release=$RELEASE, version $VERSION, tag $TAG"
+          {
+            echo "version=$VERSION"
+            echo "tag=$TAG"
+            echo "release=$RELEASE"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Check updater configuration
+        if: steps.version.outputs.release == 'true'
+        run: |
+          jq -e '.bundle.createUpdaterArtifacts == true and ((.plugins.updater.pubkey // "") | length > 0)' \
+            crates/mulchie-app/tauri.conf.json > /dev/null || {
+            echo "::error file=crates/mulchie-app/tauri.conf.json::Updater is not configured. Run scripts/release-setup.sh and commit the result (docs/RELEASING.md)."
+            exit 1
+          }
+
+      - name: Extract release notes from CHANGELOG.md
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+          RELEASE: ${{ steps.version.outputs.release }}
+        run: |
+          if [[ "$RELEASE" == "true" ]]; then
+            scripts/release-notes.sh "$VERSION" --release > release-notes.md
+          elif ! scripts/release-notes.sh "$VERSION" > release-notes.md; then
+            echo "::warning file=CHANGELOG.md::No usable notes for $VERSION yet; a tagged release would fail."
+            echo "Dry run of $VERSION." > release-notes.md
+          fi
+          cat release-notes.md
+
+      - name: Upload release notes
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: release-notes
+          path: release-notes.md
+          if-no-files-found: error
+          retention-days: 14
+
+  # Linux tarballs are built on the oldest runner image we can, for an older glibc.
+  # aarch64 uses GitHub's native ARM runner, so no cross compiler is involved.
+  cli-linux:
+    name: CLI ${{ matrix.target }}
+    needs: prepare
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+            os: ubuntu-22.04
+          - target: aarch64-unknown-linux-gnu
+            os: ubuntu-22.04-arm
+    steps:
+      - name: Check out source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@686976e191b89faba57d3206551f0f330d8cb249 # stable
+        with:
+          toolchain: stable
+          targets: ${{ matrix.target }}
+
+      - name: Cache Cargo
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          key: ${{ matrix.target }}
+
+      - name: Build
+        run: cargo build --locked --release -p mulchie --target ${{ matrix.target }}
+
+      - name: Package
+        run: scripts/package-cli.sh ${{ matrix.target }} dist
+
+      - name: Upload
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: dist-cli-${{ matrix.target }}
+          path: dist/*
+          if-no-files-found: error
+          retention-days: 14
+
+  # macOS binaries are signed with the Developer ID certificate and the hardened
+  # runtime, then notarized. A bare binary cannot be stapled; Gatekeeper looks the
+  # notarization up online. Both Apple targets build on the ARM runner.
+  cli-macos:
+    name: CLI ${{ matrix.target }}
+    needs: prepare
+    runs-on: macos-latest
+    timeout-minutes: 45
+    environment: macos-signing
+    strategy:
+      fail-fast: false
+      matrix:
+        target: [aarch64-apple-darwin, x86_64-apple-darwin]
+    env:
+      RELEASE: ${{ needs.prepare.outputs.release }}
+    steps:
+      - name: Check out source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@686976e191b89faba57d3206551f0f330d8cb249 # stable
+        with:
+          toolchain: stable
+          targets: ${{ matrix.target }}
+
+      - name: Cache Cargo
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          key: ${{ matrix.target }}
+
+      - name: Build
+        run: cargo build --locked --release -p mulchie --target ${{ matrix.target }}
+
+      - name: Check signing secrets
+        if: env.RELEASE == 'true'
+        env:
+          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+          KEYCHAIN_PASSWORD: ${{ secrets.KEYCHAIN_PASSWORD }}
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+        run: |
+          missing=0
+          for name in APPLE_CERTIFICATE APPLE_CERTIFICATE_PASSWORD KEYCHAIN_PASSWORD APPLE_ID APPLE_PASSWORD APPLE_TEAM_ID; do
+            if [[ -z "${!name}" ]]; then
+              echo "::error::Secret $name is not set in the macos-signing environment (docs/RELEASING.md)"
+              missing=1
+            fi
+          done
+          exit $missing
+
+      - name: Import Developer ID certificate
+        if: env.RELEASE == 'true'
+        uses: ./.github/actions/import-certificate
+        with:
+          certificate: ${{ secrets.APPLE_CERTIFICATE }}
+          certificate-password: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+          keychain-password: ${{ secrets.KEYCHAIN_PASSWORD }}
+
+      - name: Sign with the hardened runtime
+        if: env.RELEASE == 'true'
+        run: |
+          BIN="target/${{ matrix.target }}/release/mulchie"
+          codesign --force --options runtime --timestamp --sign "$APPLE_SIGNING_IDENTITY" "$BIN"
+          codesign --verify --strict --verbose=2 "$BIN"
+          codesign -dv "$BIN" 2>&1 | grep -E 'flags=.*runtime' || { echo "::error::Hardened runtime flag is missing"; exit 1; }
+
+      - name: Notarize
+        if: env.RELEASE == 'true'
+        env:
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+        run: |
+          ditto -c -k --keepParent "target/${{ matrix.target }}/release/mulchie" "$RUNNER_TEMP/mulchie-notarize.zip"
+          xcrun notarytool submit "$RUNNER_TEMP/mulchie-notarize.zip" \
+            --apple-id "$APPLE_ID" --password "$APPLE_PASSWORD" --team-id "$APPLE_TEAM_ID" \
+            --wait --timeout 30m --output-format json > "$RUNNER_TEMP/notary.json"
+          cat "$RUNNER_TEMP/notary.json"
+          STATUS="$(jq -r .status "$RUNNER_TEMP/notary.json")"
+          if [[ "$STATUS" != "Accepted" ]]; then
+            ID="$(jq -r .id "$RUNNER_TEMP/notary.json")"
+            xcrun notarytool log "$ID" --apple-id "$APPLE_ID" --password "$APPLE_PASSWORD" --team-id "$APPLE_TEAM_ID" || true
+            echo "::error::Notarization status was '$STATUS'"
+            exit 1
+          fi
+
+      - name: Package
+        run: scripts/package-cli.sh ${{ matrix.target }} dist
+
+      - name: Upload
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: dist-cli-${{ matrix.target }}
+          path: dist/*
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Remove temporary signing material
+        if: always()
+        run: |
+          rm -f "$RUNNER_TEMP"/mulchie-notarize.zip "$RUNNER_TEMP"/notary.json
+          if [[ -n "${SIGNING_KEYCHAIN_PATH:-}" && -f "$SIGNING_KEYCHAIN_PATH" ]]; then
+            security delete-keychain "$SIGNING_KEYCHAIN_PATH"
+          fi
+
+  # Universal app: scripts/bundle.sh builds the CLI for both Apple targets, lipos them
+  # into the sidecar, and runs `tauri build --target universal-apple-darwin`.
+  # Tauri signs the app and the sidecar with APPLE_SIGNING_IDENTITY. Apple credentials
+  # are left out of that step on purpose so Tauri does not notarize the .app;
+  # the DMG is notarized and stapled afterwards as its own step.
+  desktop:
+    name: Desktop app (universal)
+    needs: prepare
+    runs-on: macos-latest
+    timeout-minutes: 90
+    environment: macos-signing
+    env:
+      RELEASE: ${{ needs.prepare.outputs.release }}
+      VERSION: ${{ needs.prepare.outputs.version }}
+    steps:
+      - name: Check out source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Install Bun
+        uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
+        with:
+          bun-version: 1.3.13
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@686976e191b89faba57d3206551f0f330d8cb249 # stable
+        with:
+          toolchain: stable
+          targets: aarch64-apple-darwin,x86_64-apple-darwin
+
+      - name: Cache Cargo
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          key: universal
+
+      - name: Check signing secrets
+        if: env.RELEASE == 'true'
+        env:
+          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+          KEYCHAIN_PASSWORD: ${{ secrets.KEYCHAIN_PASSWORD }}
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+        run: |
+          missing=0
+          for name in APPLE_CERTIFICATE APPLE_CERTIFICATE_PASSWORD KEYCHAIN_PASSWORD APPLE_ID APPLE_PASSWORD APPLE_TEAM_ID TAURI_SIGNING_PRIVATE_KEY; do
+            if [[ -z "${!name}" ]]; then
+              echo "::error::Secret $name is not set in the macos-signing environment (docs/RELEASING.md)"
+              missing=1
+            fi
+          done
+          exit $missing
+
+      - name: Import Developer ID certificate
+        if: env.RELEASE == 'true'
+        uses: ./.github/actions/import-certificate
+        with:
+          certificate: ${{ secrets.APPLE_CERTIFICATE }}
+          certificate-password: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+          keychain-password: ${{ secrets.KEYCHAIN_PASSWORD }}
+
+      # The updater key goes to a file and TAURI_SIGNING_PRIVATE_KEY points at it.
+      # A dry run has no real key, so it uses a throwaway one generated here. That
+      # still exercises the updater artifact path, and the key is never published.
+      - name: Prepare the updater signing key
+        env:
+          UPDATER_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+        run: |
+          KEY_FILE="$RUNNER_TEMP/updater.key"
+          if [[ "$RELEASE" == "true" ]]; then
+            printf '%s' "$UPDATER_KEY" > "$KEY_FILE"
+          else
+            (cd crates/mulchie-app && bun install --frozen-lockfile && bun run tauri signer generate --ci --write-keys "$KEY_FILE")
+          fi
+          chmod 600 "$KEY_FILE"
+          echo "TAURI_SIGNING_PRIVATE_KEY=$KEY_FILE" >> "$GITHUB_ENV"
+
+      - name: Build the universal app and DMG
+        env:
+          # Empty in a dry run, which matches the throwaway key.
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+        run: scripts/bundle.sh --universal --bundles app,dmg
+
+      - name: Verify the app bundle
+        run: |
+          BUNDLE=target/universal-apple-darwin/release/bundle
+          APP="$BUNDLE/macos/Mulchie.app"
+          test -d "$APP"
+          ls -l "$APP/Contents/MacOS"
+          for f in "$APP"/Contents/MacOS/*; do
+            echo "$f: $(lipo -archs "$f")"
+          done
+          [[ "$(lipo -archs "$APP/Contents/MacOS/mulchie")" == *arm64* && "$(lipo -archs "$APP/Contents/MacOS/mulchie")" == *x86_64* ]] || {
+            echo "::error::The sidecar is not universal"; exit 1; }
+          if [[ "$RELEASE" == "true" ]]; then
+            codesign --verify --deep --strict --verbose=2 "$APP"
+            codesign -dv "$APP/Contents/MacOS/mulchie" 2>&1 | grep -E 'flags=.*runtime' || { echo "::error::Sidecar is missing the hardened runtime flag"; exit 1; }
+            codesign -dv "$APP" 2>&1 | grep -E 'flags=.*runtime' || { echo "::error::App is missing the hardened runtime flag"; exit 1; }
+          fi
+
+      - name: Sign the DMG
+        if: env.RELEASE == 'true'
+        run: |
+          DMG="target/universal-apple-darwin/release/bundle/dmg/Mulchie_${VERSION}_universal.dmg"
+          test -f "$DMG"
+          codesign --force --timestamp --sign "$APPLE_SIGNING_IDENTITY" "$DMG"
+          codesign --verify --verbose=2 "$DMG"
+
+      - name: Notarize and staple the DMG
+        if: env.RELEASE == 'true'
+        env:
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+        run: |
+          DMG="target/universal-apple-darwin/release/bundle/dmg/Mulchie_${VERSION}_universal.dmg"
+          xcrun notarytool submit "$DMG" \
+            --apple-id "$APPLE_ID" --password "$APPLE_PASSWORD" --team-id "$APPLE_TEAM_ID" \
+            --wait --timeout 60m --output-format json > "$RUNNER_TEMP/notary.json"
+          cat "$RUNNER_TEMP/notary.json"
+          STATUS="$(jq -r .status "$RUNNER_TEMP/notary.json")"
+          if [[ "$STATUS" != "Accepted" ]]; then
+            ID="$(jq -r .id "$RUNNER_TEMP/notary.json")"
+            xcrun notarytool log "$ID" --apple-id "$APPLE_ID" --password "$APPLE_PASSWORD" --team-id "$APPLE_TEAM_ID" || true
+            echo "::error::Notarization status was '$STATUS'"
+            exit 1
+          fi
+          xcrun stapler staple "$DMG"
+          xcrun stapler validate "$DMG"
+          spctl -a -vvv -t open --context context:primary-signature "$DMG"
+
+      - name: Collect artifacts
+        run: |
+          BUNDLE=target/universal-apple-darwin/release/bundle
+          mkdir dist
+          cp "$BUNDLE/dmg/Mulchie_${VERSION}_universal.dmg" dist/
+          if [[ -f "$BUNDLE/macos/Mulchie.app.tar.gz" ]]; then
+            cp "$BUNDLE/macos/Mulchie.app.tar.gz" "dist/Mulchie_${VERSION}_universal.app.tar.gz"
+            cp "$BUNDLE/macos/Mulchie.app.tar.gz.sig" "dist/Mulchie_${VERSION}_universal.app.tar.gz.sig"
+          elif [[ "$RELEASE" == "true" ]]; then
+            echo "::error::Tauri did not produce the updater archive. Is bundle.createUpdaterArtifacts set?"
+            exit 1
+          else
+            echo "::warning::No updater archive in this dry run (bundle.createUpdaterArtifacts is not set yet)."
+          fi
+          ls -l dist
+
+      - name: Upload
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: dist-desktop
+          path: dist/*
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Remove temporary signing material
+        if: always()
+        run: |
+          rm -f "$RUNNER_TEMP"/notary.json "$RUNNER_TEMP"/updater.key
+          if [[ -n "${SIGNING_KEYCHAIN_PATH:-}" && -f "$SIGNING_KEYCHAIN_PATH" ]]; then
+            security delete-keychain "$SIGNING_KEYCHAIN_PATH"
+          fi
+
+  # Gathers every asset, writes latest.json and SHA256SUMS, and keeps them as one artifact.
+  assemble:
+    name: Assemble release assets
+    needs: [prepare, cli-linux, cli-macos, desktop]
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    env:
+      VERSION: ${{ needs.prepare.outputs.version }}
+      TAG: ${{ needs.prepare.outputs.tag }}
+    steps:
+      - name: Download build outputs
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          pattern: dist-*
+          merge-multiple: true
+          path: release
+
+      - name: Download release notes
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: release-notes
+          path: notes
+
+      - name: Check out source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          path: src
+
+      - name: Write latest.json
+        run: |
+          ARCHIVE="Mulchie_${VERSION}_universal.app.tar.gz"
+          if [[ -f "release/$ARCHIVE.sig" ]]; then
+            src/scripts/make-latest-json.sh "$VERSION" \
+              "https://github.com/${GITHUB_REPOSITORY}/releases/download/${TAG}/${ARCHIVE}" \
+              "release/$ARCHIVE.sig" notes/release-notes.md > release/latest.json
+            jq . release/latest.json
+          else
+            echo "::warning::No updater archive, so no latest.json (dry run without updater config)."
+          fi
+
+      - name: Write SHA256SUMS
+        run: |
+          cd release
+          # The per-file .sha256 and .sig files are inputs, not release subjects of their own.
+          FILES=(*.tar.gz *.dmg)
+          if [[ -f latest.json ]]; then FILES+=(latest.json); fi
+          sha256sum -- "${FILES[@]}" > SHA256SUMS
+          cat SHA256SUMS
+          ls -l
+
+      - name: Upload assembled assets
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: release-assets
+          path: release/*
+          if-no-files-found: error
+          retention-days: 14
+
+  draft-release:
+    name: Create draft GitHub Release
+    needs: [prepare, assemble]
+    if: needs.prepare.outputs.release == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+      id-token: write
+      attestations: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      TAG: ${{ needs.prepare.outputs.tag }}
+      VERSION: ${{ needs.prepare.outputs.version }}
+    steps:
+      - name: Download assets
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: release-assets
+          path: release
+
+      - name: Download release notes
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: release-notes
+          path: notes
+
+      - name: Attest build provenance
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-path: |
+            release/*.tar.gz
+            release/*.dmg
+
+      - name: Create or update the draft release
+        run: |
+          if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" > /dev/null 2>&1; then
+            gh release upload "$TAG" release/* --clobber --repo "$GITHUB_REPOSITORY"
+            gh release edit "$TAG" --notes-file notes/release-notes.md --repo "$GITHUB_REPOSITORY"
+          else
+            gh release create "$TAG" release/* \
+              --repo "$GITHUB_REPOSITORY" \
+              --verify-tag \
+              --draft \
+              --title "Mulchie $VERSION" \
+              --notes-file notes/release-notes.md
+          fi

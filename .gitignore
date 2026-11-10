@@ -2,3 +2,5 @@ target/
 crates/mulchie-app/binaries/
 crates/mulchie-app/gen/
 .DS_Store
+crates/mulchie-app/node_modules/
+node_modules/

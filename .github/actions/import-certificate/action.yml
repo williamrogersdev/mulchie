@@ -1,0 +1,40 @@
+name: Import Developer ID certificate
+description: >
+  Imports a Developer ID Application certificate into a temporary keychain and
+  exports APPLE_SIGNING_IDENTITY and SIGNING_KEYCHAIN_PATH to later steps.
+  Delete the keychain afterwards with `security delete-keychain "$SIGNING_KEYCHAIN_PATH"`.
+inputs:
+  certificate:
+    description: Base64 of the .p12 file (certificate and private key)
+    required: true
+  certificate-password:
+    description: Password of the .p12 file
+    required: true
+  keychain-password:
+    description: Any random string; locks the temporary keychain
+    required: true
+runs:
+  using: composite
+  steps:
+    - name: Import certificate into a temporary keychain
+      shell: bash
+      env:
+        APPLE_CERTIFICATE: ${{ inputs.certificate }}
+        APPLE_CERTIFICATE_PASSWORD: ${{ inputs.certificate-password }}
+        KEYCHAIN_PASSWORD: ${{ inputs.keychain-password }}
+      run: |
+        set -euo pipefail
+        CERTIFICATE_PATH="${RUNNER_TEMP}/developer-id.p12"
+        KEYCHAIN_PATH="${RUNNER_TEMP}/mulchie-signing.keychain-db"
+        printf '%s' "$APPLE_CERTIFICATE" | base64 --decode > "$CERTIFICATE_PATH"
+        security create-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+        security set-keychain-settings -lut 21600 "$KEYCHAIN_PATH"
+        security unlock-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+        security import "$CERTIFICATE_PATH" -P "$APPLE_CERTIFICATE_PASSWORD" -A -t cert -f pkcs12 -k "$KEYCHAIN_PATH"
+        rm -f "$CERTIFICATE_PATH"
+        security list-keychain -d user -s "$KEYCHAIN_PATH"
+        security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+        IDENTITY="$(security find-identity -v -p codesigning "$KEYCHAIN_PATH" | awk -F'"' '/Developer ID Application/ {print $2; exit}')"
+        test -n "$IDENTITY" || { echo "::error::No Developer ID Application identity in the certificate"; exit 1; }
+        echo "APPLE_SIGNING_IDENTITY=$IDENTITY" >> "$GITHUB_ENV"
+        echo "SIGNING_KEYCHAIN_PATH=$KEYCHAIN_PATH" >> "$GITHUB_ENV"

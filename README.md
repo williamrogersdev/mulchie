@@ -1,116 +1,149 @@
 # Mulchie
 
-Mulchie keeps a machine healthy when many AI coding agents run on it at once. It shows what is using CPU, memory, disk I/O and disk space, broken down by repo and worktree. It lets you or the agents themselves act on it: pause, renice or stop processes, queue heavy builds, and reclaim space from build caches and idle worktrees without losing work.
+Mulchie keeps a machine healthy while several AI coding agents work on it. With it you can see what uses CPU, memory, disk I/O and disk space by repo, worktree and agent session, queue heavy builds, find stale caches and idle worktrees, and reclaim space without losing work. You can set budgets for agents, connect agent hooks that warn about risky commands, and see when updates are out. Agents can look at the machine and act on it through an MCP server.
 
-It runs as a menu bar app with a technical dashboard, a CLI, a local HTTP API and an MCP server.
+Mulchie is a supervisor. It is not a sandbox and not an antivirus: an agent that wants to get around it can.
+
+It ships three ways: the `mulchie` command, a macOS menu bar app with a dashboard, and an MCP server (`mulchie mcp`). The engine also serves a local HTTP API for scripts.
+
+Full documentation is at [mulchie.com/docs](https://mulchie.com/docs/).
 
 ## What it does
 
 **Monitor**
-- Samples every 3 seconds: CPU, load average, memory, swap, disk free and per-process disk I/O. Keeps 30 minutes of history.
-- Attributes every process to its git repo or worktree from its working directory, falling back to its parent chain. Build tools that run inside `~/.cargo/registry` still count against the worktree that started them.
-- Classifies processes as agents, builds or runtimes, and flags orphaned workspaces: a deleted worktree, or heavy CPU with no agent attached.
-- Forecasts when the disk will fill from the last 30 minutes of free-space samples.
+- Samples CPU, load, memory, swap, disk free and per-process disk I/O every 3 seconds, and keeps 30 minutes of history.
+- Attributes each process to its git repo or worktree from its working directory, falling back to its parent chain.
+- Groups processes the way you think of them: an app with all its helper processes, an agent workspace, or a single program. `mulchie top` shows the groups.
+- Classifies processes as agents, builds or runtimes.
+- Forecasts when the disk will run low from the recent free-space samples.
+
+**Watch**
+- Reports observations about processes: left over after their parent exited, runaway CPU, steadily growing memory, paused for hours, listening beyond this machine, running from a temporary folder, and similar. These are findings. They come from simple heuristics. They are not malware detection, and Mulchie is not an antivirus. See [findings](https://mulchie.com/docs/watch/).
+
+**Supervise agents**
+- A session is an agent and everything it started, found in the process table by name (Claude Code, Codex, Gemini CLI, Copilot CLI, Cursor's `cursor-agent`, aider, opencode and others; add more with `agents.extra`). `mulchie sessions` shows what each uses. See [sessions and limits](https://mulchie.com/docs/sessions/).
+- Limits are budgets per session for CPU, memory, processes, writes and runtime. The action is `notify` unless you choose `deprioritize`, `pause` or `stop`. `pause` and `stop` spare the agent itself unless the budget sets `include_agent`. A session that only a hook registered is reported, never enforced, and only the engine that holds the lock acts. A pause ends after `resume_after_secs`.
+- Each session has an activity record in `<config dir>/sessions/`. Command lines in it are redacted by pattern, as well as Mulchie can. It is not tamper-proof.
+- Hooks (`mulchie hooks install`) let Claude Code, Codex, Cursor, Gemini CLI and Copilot CLI tell Mulchie about session starts, prompts and shell commands. A hook fails open: with no engine, a slow one (300 ms) or any error, the action is allowed. Prompt text is never sent to the engine. See [hooks and guard rules](https://mulchie.com/docs/hooks/).
+- Guard rules check the text of a shell command for risky shapes (deleting outside the workspace, `curl | sh`, `sudo`, force-pushing a protected branch, disabling Mulchie, reading credentials, writing startup files). Every rule defaults to `warn`. They are a tripwire, not a sandbox, and miss obfuscated commands.
+- Update checks report newer versions of Mulchie and of installed agent tools, and outdated Homebrew packages. They never install anything. Vulnerability lookups against OSV.dev are off unless you turn them on. See [update checks](https://mulchie.com/docs/updates/).
 
 **Optimize**
 - Lowers the priority of build processes when CPU or memory is under pressure.
-- Runs a machine-wide build queue. `mulchie run -- cargo build` waits for a free slot and runs with a fair `CARGO_BUILD_JOBS`. Agents can use the same queue over MCP.
-- Answers "is now a good time for heavy work?" with reasons.
+- Runs a machine-wide build queue. `mulchie run -- cargo build` waits for a free slot and runs with a fair job count. Agents use the same queue over MCP.
+- Answers "is now a good time for heavy work?" with reasons (`mulchie advice`).
 
 **Reclaim**
-- Build caches: Rust `target/`, `.next`, optional `node_modules` and Xcode DerivedData. A cache is stale when it has not been used within the stale window and no process runs in its project. Worktree caches have their own window.
-- Git worktrees: size, idle days, uncommitted files, merged state and a verdict for each. "Idle" is measured from the last file change outside `target/`, `node_modules/` and `.git/`, and from the last commit, not from folder timestamps.
-- Sweep: removes agent worktrees idle past the configured window. Branches are kept. A detached HEAD gets a `backup/<name>` branch first. Uncommitted changes are saved as a patch in `~/.config/mulchie/backups/` before removal.
-- Package and toolchain stores: npm, bun, pnpm, yarn, uv, pip, Homebrew, Go, iOS simulators, Docker, model stores. Prunable stores run the tool's own prune command.
-- Sends a notification when free space drops below a threshold.
+- Build caches: Rust `target/`, `.next`, optionally `node_modules`, and Xcode DerivedData on macOS. A cache is stale when it has not been used within the stale window and no process runs in its project.
+- Git worktrees: size, idle days, uncommitted files and a verdict for each. Idle time comes from the last file change and the last commit, not from folder timestamps. A sweep removes idle agent worktrees.
+- Package and toolchain stores: `mulchie prune` runs the tool's own prune command for npm, bun, pnpm, yarn, uv, pip, Homebrew, Go and iOS simulators. The disk breakdown also lists Docker and model stores, which Mulchie does not prune.
+- Every deletion is a plan you see first. Mulchie then deletes exactly that plan, re-checking each item at the moment it acts.
 
-**Safety**
-- Only recognised build caches under the configured scan roots can be deleted, and only by canonical, non-symlink paths.
-- Nothing in a project with a running process is cleaned or removed.
-- Signals go only to processes owned by the current user, never to pid 1 or Mulchie itself.
-- The API listens on `127.0.0.1` only, needs a bearer token stored with mode `0600`, and refuses any request with a browser `Origin` header.
+**Act on processes**
+- `mulchie signal` signals one process. `mulchie group` quits, pauses, resumes or lowers the priority of an app or workspace. Both show a plan and ask first. Protected processes are refused.
 
 ## Install
 
-Build from source on macOS (Rust and Bun required):
+macOS app (includes the CLI):
 
-```bash
-./scripts/bundle.sh
-open target/release/bundle/macos/Mulchie.app
+```sh
+brew install --cask williamrogersdev/tap/mulchie
 ```
 
-The app bundles the `mulchie` CLI. Use **Agent API → Link mulchie** in the dashboard to put it on your `PATH` at `~/.local/bin/mulchie`, or install it on its own:
+CLI only:
 
-```bash
-cargo install --path crates/mulchie-cli
+```sh
+brew install williamrogersdev/tap/mulchie-cli
+curl -fsSL https://mulchie.com/install.sh | sh
+cargo install mulchie
 ```
 
-On a machine without a menu bar, run the engine and API headless:
+The install script puts the binary in `~/.local/bin` after checking its SHA-256. From a source checkout, `./scripts/bundle.sh` builds the app (Rust and Bun required) and `cargo install --path crates/mulchie-cli` installs the CLI.
 
-```bash
-mulchie serve
+Then check the setup:
+
+```sh
+mulchie doctor
 ```
+
+The app starts the engine. Without the app, run it yourself with `mulchie serve`, or at login with `mulchie service install`.
 
 ## CLI
 
-```
-mulchie status [--json]          disk, memory, CPU and per-workspace usage
-mulchie top [--sort cpu|mem|io] [-n N] [--json]
-mulchie worktrees [--json]       size, idle days, dirty files and verdict for every worktree
-mulchie sweep [--dry-run]        remove idle agent worktrees (patch backup, branches kept)
-mulchie scan [--json]            build caches and their staleness
-mulchie clean --stale [--dry-run]
-mulchie prune <cache>            npm, bun, pnpm, yarn, uv, pip, homebrew, go, simulators
-mulchie signal <pid> <term|kill|stop|cont>
-mulchie advice [--json]          is it OK to start heavy work now?
-mulchie run [--label L] -- <cmd> wait for a build slot, run, release
-mulchie mcp                      MCP server on stdio
-mulchie serve                    headless engine and API
-mulchie config                   config path and current settings
-```
+Run `mulchie --help` or `mulchie <command> --help` for every flag.
 
-Commands use the running app when it is up and fall back to a local scan otherwise.
+| Command | What it does |
+| --- | --- |
+| `status` | Disk, memory, CPU and what each agent workspace uses. Same as running `mulchie` alone. |
+| `diagnose` | One prioritised picture of the machine, with recommendations. Changes nothing. |
+| `top` | What uses CPU and memory, by app and workspace. `--processes` lists single processes. |
+| `inspect <pid>` | Everything known about one process. |
+| `findings` | What the watch noticed. `findings dismiss <id>` hides one; `undismiss` shows it again. |
+| `sessions` | Agent sessions and what each uses. `sessions <id> --events` shows its activity record; `sessions stop <id>` plans stopping it. Needs the engine. |
+| `limits` | Session budgets: who is over, what Mulchie paused, and whether limits act. Needs the engine. |
+| `updates` | The last update check. `updates --check` asks for one now. Needs the engine. |
+| `guard check -- <command>` | Ask the guard rules about a command without running it. Needs the engine. |
+| `hooks install\|uninstall\|status` | Connect Mulchie to an agent's own hooks. |
+| `hook <client> <event>` | Run by an agent's hook system, not by hand. Fails open. |
+| `slots` | List build slots. `slots release <ticket>` ends one whose holder is gone. Needs the engine. |
+| `worktrees` | Every git worktree: size, idle days, dirty files, verdict. |
+| `scan` | Build caches and which are stale. |
+| `clean` | Delete build caches: plan, confirm, delete exactly that plan. |
+| `sweep` | Remove idle agent worktrees: plan, confirm, remove exactly that plan. |
+| `prune <cache>` | Run a package manager's own prune command. |
+| `signal <pid> <signal>` | Signal one of your processes: plan, confirm, signal. Needs the engine. |
+| `group <key> <action>` | Act on an app, workspace, program or agent session as a whole. Needs the engine. |
+| `advice` | Is it OK to start heavy work right now? |
+| `run -- <command>` | Wait for a build slot, run the command, release the slot. |
+| `mcp` | MCP server on stdio. `mcp install` connects it to an agent app. |
+| `token` | Where the API tokens are. |
+| `serve` | Run the engine without the app. |
+| `config` | Show settings. `config set <key> <value>` changes one. |
+| `doctor` | Check the install end to end. |
+| `service` | Install, remove or inspect the background service. |
+| `completions <shell>` | Print a shell completion script. |
+
+Most commands use the running engine. When none is running, read commands, `clean` and `sweep` work locally and say so on stderr. The commands marked as needing the engine say how to start one.
 
 ## MCP
 
-```json
-{ "mcpServers": { "mulchie": { "command": "mulchie", "args": ["mcp"] } } }
+Connect Mulchie to an agent app:
+
+```sh
+mulchie mcp install --client claude-code
 ```
 
-Tools: `get_status`, `can_i_build`, `top_processes`, `list_workspaces`, `get_history`, `disk_breakdown`, `reclaim_candidates`, `clean_caches`, `prune_cache`, `remove_worktrees`, `sweep_worktrees`, `workspace_action`, `process_action`, `acquire_build_slot`, `release_build_slot`.
+Other clients are `claude-desktop`, `cursor` and `codex`. Add `--read-only` to leave out every tool that deletes, signals, prunes or dismisses, and `check_updates`. Without `--client`, the command lists the apps it found and changes nothing.
 
-A snippet for `AGENTS.md` is in the dashboard under **Agent API**.
+Agents start with the `diagnose` tool. Changes are always two calls: a plan tool, then `execute_plan` with items from that plan. Other tools show sessions (`list_sessions`, `get_session`), limits (`limits_status`), updates (`list_updates`, `check_updates`) and ask the guard rules about a command (`check_command`). See [MCP](https://mulchie.com/docs/mcp/) for the tool list.
+
+## Agent hooks
+
+```sh
+mulchie hooks install --client claude-code --dry-run
+mulchie hooks install --client claude-code
+```
+
+Supported clients are `claude-code`, `codex`, `cursor`, `gemini` and `copilot`. The install edits one file (`~/.claude/settings.json`, `~/.codex/hooks.json`, `~/.cursor/hooks.json`, `~/.gemini/settings.json` or `~/.copilot/hooks/mulchie.json`), keeps your other hooks, and first copies the old file to `<file>.mulchie-backup-<unix time>`. Codex runs new hooks only after you trust them with its `/hooks` command. Windsurf, Antigravity, opencode and Aider have no hook support.
 
 ## HTTP API
 
-Base URL `http://127.0.0.1:47474`. Send `Authorization: Bearer $(cat ~/.config/mulchie/token)`.
-
-| Method | Path | Body / returns |
-| --- | --- | --- |
-| GET | `/v1/health` | open; health, disk, load, free slots |
-| GET | `/v1/state` | full snapshot |
-| GET | `/v1/history` | 30 minutes of 3 s samples |
-| GET | `/v1/advice` | `ok_to_start_heavy_work`, `suggested_jobs`, `reasons` |
-| GET | `/v1/sweep` | worktrees a sweep would remove |
-| POST | `/v1/scan` | rescan caches and the disk map |
-| POST | `/v1/clean` | `{paths}` or `{stale: true}` |
-| POST | `/v1/process` | `{pid, action: term\|kill\|stop\|cont\|renice, nice?}` |
-| POST | `/v1/workspace` | `{path, action: pause\|resume\|deprioritize\|stop_builds\|kill_all}` |
-| POST | `/v1/worktree/remove` | `{paths, backup}` |
-| POST | `/v1/sweep` | remove idle agent worktrees |
-| POST | `/v1/prune` | `{key}` |
-| POST | `/v1/lease` | `{label, pid, ticket?}` → `granted, jobs, position` |
-| POST | `/v1/release` | `{ticket}` |
+The engine listens on `127.0.0.1:47474` by default. Every route except `GET /v1/health` needs `Authorization: Bearer <token>`. The token path is printed by `mulchie token`. A second, read-only token (`mulchie token --read-only`) works for `GET` routes and plan routes only. The read-only token also works for `POST /v1/hook` and `POST /v1/guard/check`. The routes are listed in [docs/openapi.yaml](docs/openapi.yaml).
 
 ## Configuration
 
-`~/.config/mulchie/config.json`, also editable in the dashboard under **Settings**. `MULCHIE_PORT` overrides the API port.
+`~/.config/mulchie/config.json` (or under `$XDG_CONFIG_HOME/mulchie`). Print it with `mulchie config` and change one setting with `mulchie config set <key> <value>`. The app has the same settings under **Settings**. `MULCHIE_PORT` overrides the API port for one process. Sections: `watch`, `agents`, `sessions`, `limits`, `guard` and `updates`; see [configuration](https://mulchie.com/docs/configuration/).
+
+The engine contacts the network only for update checks: the GitHub releases API for Mulchie, and the npm registry for installed agent tools. `mulchie config set updates.check off` stops it. A build without the default `network` cargo feature (`--no-default-features`) cannot make requests at all.
 
 ## Layout
 
-- `crates/mulchie-core`: monitor, engine, disk map, reclaim, API
-- `crates/mulchie-cli`: the `mulchie` binary and MCP server
+- `crates/mulchie-core`: engine, monitor, scanners, safety gate, sessions, limits, guard rules, update checks, HTTP API
+- `crates/mulchie-cli`: the `mulchie` binary, MCP server and agent hooks
 - `crates/mulchie-app`: menu bar app and dashboard
+- `docs/ARCHITECTURE.md`: how the pieces fit and the rules the code keeps
+
+See [CONTRIBUTING.md](CONTRIBUTING.md) to build and test.
 
 ## License
 

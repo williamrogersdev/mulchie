@@ -1,10 +1,12 @@
 {
   "identifier": "default",
+  "description": "The UI only calls the app's own commands and listens to its events.",
   "windows": [
     "panel",
     "dashboard"
   ],
   "permissions": [
-    "core:default"
+    "core:event:allow-listen",
+    "core:event:allow-unlisten"
   ]
 }

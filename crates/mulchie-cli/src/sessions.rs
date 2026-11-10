@@ -1,0 +1,1197 @@
+//! `sessions`, `limits`, `updates` and `guard check`: what the engine knows
+//! about agent sessions, their budgets, available updates, and what the guard
+//! rules say about a command. All of it lives in the engine, so each needs
+//! one running; none of it changes anything except `updates --check`, which
+//! asks the engine to check now.
+
+use crate::commands::{fail, print_json};
+use crate::conn::{self, Conn};
+use crate::hooks_install::sh_quote as q;
+use mulchie_core::api::ApiError;
+use mulchie_core::monitor::now_unix;
+use mulchie_core::Paths;
+use serde_json::{json, Value};
+
+/// A call to the engine, or why there is none (said as a whole sentence).
+fn engine(paths: &Paths, what: &str) -> Result<mulchie_core::api::Client, String> {
+    match conn::connect(paths) {
+        Conn::Engine(c) => Ok(c),
+        other => Err(other.explain_required(what)),
+    }
+}
+
+fn get(c: &mulchie_core::api::Client, path: &str) -> Result<Value, String> {
+    conn::call(c, "GET", path, None).map_err(|e| conn::describe(&e))
+}
+
+/// Whether `id` has the shape of a session id: `s-<digits>-<digits>`.
+pub fn valid_session_id(id: &str) -> bool {
+    let Some(rest) = id.strip_prefix("s-") else {
+        return false;
+    };
+    let Some((a, b)) = rest.split_once('-') else {
+        return false;
+    };
+    let digits = |s: &str| !s.is_empty() && s.len() <= 20 && s.bytes().all(|c| c.is_ascii_digit());
+    digits(a) && digits(b)
+}
+
+pub fn check_session_id(id: &str) -> Result<(), String> {
+    if valid_session_id(id) {
+        Ok(())
+    } else {
+        Err(format!(
+            "{id:?} is not a session id (they look like s-1700000000-4242; `mulchie sessions` lists them)"
+        ))
+    }
+}
+
+/// Which events to read: forward from `since`, or backward with `tail`
+/// (the last N) and `before` (a page's `prev_before`).
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct Page {
+    pub since: Option<u64>,
+    pub limit: Option<u64>,
+    pub tail: Option<u64>,
+    pub before: Option<u64>,
+}
+
+impl Page {
+    fn backward(&self) -> bool {
+        self.tail.is_some() || self.before.is_some()
+    }
+}
+
+/// The events path for a session, with the query the engine checks.
+pub fn events_path(id: &str, page: &Page) -> String {
+    let mut qs = Vec::new();
+    for (k, v) in [
+        ("since", page.since),
+        ("limit", page.limit),
+        ("tail", page.tail),
+        ("before", page.before),
+    ] {
+        if let Some(v) = v {
+            qs.push(format!("{k}={v}"));
+        }
+    }
+    let base = format!("/v1/sessions/{id}/events");
+    if qs.is_empty() {
+        base
+    } else {
+        format!("{base}?{}", qs.join("&"))
+    }
+}
+
+// ------------------------------------------------------------------- words
+
+pub fn duration(secs: u64) -> String {
+    match secs {
+        s if s < 60 => format!("{s}s"),
+        s if s < 3600 => format!("{}m", s / 60),
+        s if s < 86_400 => format!("{}h{:02}m", s / 3600, (s % 3600) / 60),
+        s => format!("{}d{:02}h", s / 86_400, (s % 86_400) / 3600),
+    }
+}
+
+fn mb(v: &Value) -> String {
+    match v.as_f64() {
+        Some(m) if m >= 1024.0 => format!("{:.1} GB", m / 1024.0),
+        Some(m) => format!("{m:.0} MB"),
+        None => "-".into(),
+    }
+}
+
+fn st<'a>(v: &'a Value, k: &str) -> &'a str {
+    v[k].as_str().unwrap_or("")
+}
+
+/// The usage of a session: `usage` in the full shape, the fields themselves
+/// in the brief one in `GET /v1/state`.
+fn usage(s: &Value) -> &Value {
+    if s["usage"].is_object() {
+        &s["usage"]
+    } else {
+        s
+    }
+}
+
+fn cap_unit(cap: &str) -> &'static str {
+    match cap {
+        "cpu_cores" => " cores",
+        "memory_mb" => " MB",
+        "processes" => " processes",
+        "write_mb_per_hour" => " MB/h",
+        "runtime_hours" => " h",
+        _ => "",
+    }
+}
+
+fn num(v: &Value) -> String {
+    match v.as_f64() {
+        Some(x) if x.fract() == 0.0 => format!("{x:.0}"),
+        Some(x) => format!("{x:.1}"),
+        None => "?".into(),
+    }
+}
+
+/// One breach in a sentence.
+pub fn breach_line(b: &Value) -> String {
+    let cap = st(b, "cap");
+    let unit = cap_unit(cap);
+    let mut s = format!(
+        "{} {} over its {cap} cap: {}{unit} (max {}{unit}); action {}, {}",
+        st(b, "agent"),
+        st(b, "session_id"),
+        num(&b["value"]),
+        num(&b["max"]),
+        st(b, "action"),
+        st(b, "action_state").replace('_', " "),
+    );
+    if let Some(d) = b["action_detail"].as_str().filter(|d| !d.is_empty()) {
+        s.push_str(&format!(" ({d})"));
+    }
+    if b["cleared_unix"].is_u64() {
+        s.push_str(", cleared");
+    }
+    s
+}
+
+fn paused_line(p: &Value) -> String {
+    format!(
+        "pid {} of {} since {} ago",
+        p["pid"],
+        st(p, "session_id"),
+        duration(now_unix().saturating_sub(p["since_unix"].as_u64().unwrap_or(0)))
+    )
+}
+
+/// Whether this engine acts on a breach of the session's limits, in words.
+pub fn enforcement(x: &Value) -> String {
+    if x["enforced"] == true {
+        return "enforced here: a breach is acted on as its cap says".into();
+    }
+    match x["not_enforced_reason"].as_str() {
+        Some("hook_registered") => {
+            "not enforced: an agent hook reports this session, so Mulchie only reports".into()
+        }
+        Some("not_automating") => {
+            "not enforced: this engine does not hold the engine lock, or its config did not load"
+                .into()
+        }
+        Some("no_budget") => "not enforced: no budget applies to its workspace".into(),
+        Some("notify_only") => "not enforced: every cap of its budget only notifies".into(),
+        Some("ended") => "not enforced: the session ended".into(),
+        Some(r) => format!("not enforced ({r})"),
+        // An engine from before `enforced`.
+        None if x.get("enforced").is_none() => "unknown (this engine does not say)".into(),
+        None => "not enforced".into(),
+    }
+}
+
+/// The same in a word or two, for the list.
+fn enforcement_short(x: &Value) -> &'static str {
+    if x["enforced"] == true {
+        return "enforced";
+    }
+    match x["not_enforced_reason"].as_str() {
+        Some("hook_registered") => "hook: reports",
+        Some("not_automating") => "not here",
+        Some("no_budget") => "no budget",
+        Some("notify_only") => "notify only",
+        Some("ended") => "-",
+        _ if x.get("enforced").is_none() => "?",
+        _ => "no",
+    }
+}
+
+/// A session (or each of a list's) with `limits`: its enforcement in words.
+pub fn with_words(mut v: Value) -> Value {
+    if let Some(list) = v["sessions"].as_array_mut() {
+        for x in list {
+            x["limits"] = json!(enforcement(x));
+        }
+    }
+    if v["session"].is_object() {
+        let w = enforcement(&v["session"]);
+        v["session"]["limits"] = json!(w);
+    }
+    v
+}
+
+// ---------------------------------------------------------------- sessions
+
+pub fn render_list(v: &Value) -> String {
+    let mut s = String::new();
+    if v["enabled"] == false {
+        s.push_str("Session tracking is off (sessions.enabled in `mulchie config`).\n");
+    }
+    let list = v["sessions"].as_array().cloned().unwrap_or_default();
+    let running: Vec<&Value> = list.iter().filter(|x| x["status"] == "running").collect();
+    let ended: Vec<&Value> = list.iter().filter(|x| x["status"] != "running").collect();
+    if list.is_empty() {
+        s.push_str("No agent sessions.\n");
+        return s;
+    }
+    s.push_str(&format!(
+        "{} running, {} ended.\n",
+        running.len(),
+        ended.len()
+    ));
+    s.push_str(&format!(
+        "  {:<22} {:<10} {:<8} {:>6} {:>9} {:>5} {:>8}  {:<13} {}\n",
+        "id", "agent", "status", "cpu", "memory", "procs", "runtime", "limits", "workspace"
+    ));
+    let line = |x: &Value| {
+        let u = usage(x);
+        format!(
+            "  {:<22} {:<10} {:<8} {:>6} {:>9} {:>5} {:>8}  {:<13} {}\n",
+            st(x, "id"),
+            crate::commands::truncate(st(x, "agent"), 10),
+            st(x, "status"),
+            format!("{:.1}", u["cpu_cores"].as_f64().unwrap_or(0.0)),
+            mb(&u["memory_mb"]),
+            u["processes"].as_u64().unwrap_or(0),
+            duration(u["runtime_secs"].as_u64().unwrap_or(0)),
+            enforcement_short(x),
+            x["workspace"].as_str().or(x["cwd"].as_str()).unwrap_or("-"),
+        )
+    };
+    for x in &running {
+        s.push_str(&line(x));
+    }
+    for x in ended.iter().take(10) {
+        s.push_str(&line(x));
+    }
+    if ended.len() > 10 {
+        s.push_str(&format!(
+            "  … and {} more ended (--json lists them)\n",
+            ended.len() - 10
+        ));
+    }
+    if v["write_bytes_available"] == false {
+        s.push_str("Disk writes per session cannot be read on this system.\n");
+    }
+    s.push_str("Details: `mulchie sessions <id>`.\n");
+    s
+}
+
+pub fn render_detail(v: &Value) -> String {
+    let x = &v["session"];
+    let u = usage(x);
+    let id = st(x, "id");
+    let mut s = format!(
+        "{} session {id} ({}, {}), pid {}\n",
+        st(x, "agent"),
+        st(x, "status"),
+        st(x, "source"),
+        x["root_pid"]
+    );
+    if let Some(w) = x["workspace"].as_str().or(x["cwd"].as_str()) {
+        s.push_str(&format!("  workspace: {w}\n"));
+    }
+    if let Some(c) = x["command"].as_str().filter(|c| !c.is_empty()) {
+        s.push_str(&format!("  command:   {c}\n"));
+    }
+    if let Some(p) = x["parent"].as_str() {
+        s.push_str(&format!("  started by session {p}\n"));
+    }
+    s.push_str(&format!(
+        "  using:     {:.1} cores, {}, {} processes, {} build slot(s), running {}\n",
+        u["cpu_cores"].as_f64().unwrap_or(0.0),
+        mb(&u["memory_mb"]),
+        u["processes"].as_u64().unwrap_or(0),
+        u["build_slots"].as_u64().unwrap_or(0),
+        duration(u["runtime_secs"].as_u64().unwrap_or(0)),
+    ));
+    if let Some(w) = u["write_mb_per_hour"].as_f64() {
+        s.push_str(&format!("  writing:   {w:.0} MB/h\n"));
+    }
+    s.push_str(&format!("  limits:    {}\n", enforcement(x)));
+    let pk = &x["peak"];
+    if pk.is_object() {
+        s.push_str(&format!(
+            "  peak:      {:.1} cores, {}, {} processes\n",
+            pk["cpu_cores"].as_f64().unwrap_or(0.0),
+            mb(&pk["memory_mb"]),
+            pk["processes"].as_u64().unwrap_or(0)
+        ));
+    }
+    let ports: Vec<String> = x["listening"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .map(|p| p.to_string())
+        .collect();
+    if !ports.is_empty() {
+        s.push_str(&format!("  listening: {}\n", ports.join(", ")));
+    }
+    let procs = v["processes"].as_array().cloned().unwrap_or_default();
+    if !procs.is_empty() {
+        s.push_str(&format!("Processes ({}):\n", procs.len()));
+        for p in procs.iter().take(30) {
+            s.push_str(&format!(
+                "  {:>7} {:>5.0}% {:>9}  {}{}{}\n",
+                p["pid"],
+                p["cpu_pct"].as_f64().unwrap_or(0.0),
+                mulchie_core::human_bytes(p["mem_bytes"].as_u64().unwrap_or(0)),
+                crate::commands::truncate(
+                    p["cmd"]
+                        .as_str()
+                        .filter(|c| !c.is_empty())
+                        .unwrap_or(st(p, "name")),
+                    70
+                ),
+                if p["root"] == true {
+                    "  (the agent)"
+                } else {
+                    ""
+                },
+                if p["stopped"] == true {
+                    "  (paused)"
+                } else {
+                    ""
+                },
+            ));
+        }
+        if procs.len() > 30 {
+            s.push_str(&format!(
+                "  … and {} more (--json lists them)\n",
+                procs.len() - 30
+            ));
+        }
+    }
+    let br = v["breaches"].as_array().cloned().unwrap_or_default();
+    if !br.is_empty() {
+        s.push_str("Breaches:\n");
+        for b in &br {
+            s.push_str(&format!("  {}\n", breach_line(b)));
+        }
+    }
+    let paused = v["paused_by_mulchie"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default();
+    if !paused.is_empty() {
+        s.push_str("Paused by Mulchie:\n");
+        for p in &paused {
+            s.push_str(&format!("  {}\n", paused_line(p)));
+        }
+    }
+    if x["status"] == "running" {
+        s.push_str(&format!(
+            "Stop it (shows the plan, then asks): mulchie sessions stop {}\n",
+            q(id)
+        ));
+    }
+    s.push_str(&format!("Activity: mulchie sessions {} --events\n", q(id)));
+    s
+}
+
+/// One `limit_action` event in words: what happened, to which cap, and why.
+fn limit_action_words(e: &Value) -> String {
+    let mut w = st(e, "outcome").replace('_', " ");
+    if let Some(cap) = e["cap"].as_str() {
+        w.push_str(&format!(" for the {cap} cap"));
+    }
+    let mut more = Vec::new();
+    if let Some(a) = e["action"].as_str() {
+        more.push(format!("cap action {a}"));
+    }
+    if let Some(x) = e["state"].as_str() {
+        more.push(format!("now {}", x.replace('_', " ")));
+    }
+    if !more.is_empty() {
+        w.push_str(&format!(" ({})", more.join(", ")));
+    }
+    match (e["reason"].as_str(), e["detail"].as_str()) {
+        (Some(r), _) if !r.is_empty() => w.push_str(&format!(": refused because {r}")),
+        (_, Some(d)) if !d.is_empty() => w.push_str(&format!(": {d}")),
+        _ => {}
+    }
+    w
+}
+
+pub fn render_events(v: &Value, page: &Page) -> String {
+    let evs = v["events"].as_array().cloned().unwrap_or_default();
+    let mut s = String::new();
+    if evs.is_empty() {
+        s.push_str("No events.\n");
+    }
+    for e in &evs {
+        let text = if e["type"] == "limit_action" {
+            crate::commands::truncate(&limit_action_words(e), 160)
+        } else {
+            let mut rest: Vec<String> = Vec::new();
+            for k in [
+                "command", "tool", "rule", "decision", "cap", "action", "detail", "reason",
+            ] {
+                if let Some(x) = e[k].as_str().filter(|x| !x.is_empty()) {
+                    rest.push(format!("{k}={}", crate::commands::truncate(x, 80)));
+                }
+            }
+            rest.join(" ")
+        };
+        // A hook call from a caller other than the one the session is bound
+        // to: recorded, but not the agent's own word.
+        let unbound = if e["unbound"] == true {
+            format!(
+                "  [unbound: from {} {}, not the session's own client]",
+                e["client"].as_str().unwrap_or("?"),
+                e["client_session_id"].as_str().unwrap_or("-")
+            )
+        } else {
+            String::new()
+        };
+        s.push_str(&format!(
+            "  {:>5}  {}  {:<16} {text}{unbound}\n",
+            e["seq"],
+            e["t"]
+                .as_u64()
+                .map(|t| format!("{} ago", duration(now_unix().saturating_sub(t))))
+                .unwrap_or_default(),
+            st(e, "type"),
+        ));
+    }
+    let id = v["session_id"].as_str().unwrap_or("<id>");
+    if page.backward() {
+        match v["prev_before"].as_u64() {
+            Some(b) => s.push_str(&format!(
+                "Older: mulchie sessions {} --events --tail {} --before {b}\n",
+                q(id),
+                page.tail.or(page.limit).unwrap_or(200)
+            )),
+            None => s.push_str("This is the start of the record.\n"),
+        }
+    } else {
+        s.push_str(&format!(
+            "Newer: mulchie sessions {} --events --since {}\n",
+            q(id),
+            v["next_since"].as_u64().unwrap_or(0)
+        ));
+    }
+    s
+}
+
+pub fn sessions(paths: &Paths, id: Option<&str>, events: bool, page: &Page, json_out: bool) -> i32 {
+    if let Some(id) = id {
+        if let Err(e) = check_session_id(id) {
+            return fail(e);
+        }
+    }
+    let c = match engine(paths, "`mulchie sessions`") {
+        Ok(c) => c,
+        Err(e) => return fail(e),
+    };
+    let (v, text) = match (id, events) {
+        (None, _) => match get(&c, "/v1/sessions").map(with_words) {
+            Ok(v) => {
+                let t = render_list(&v);
+                (v, t)
+            }
+            Err(e) => return fail(e),
+        },
+        (Some(id), true) => match get(&c, &events_path(id, page)) {
+            Ok(v) => {
+                let t = render_events(&v, page);
+                (v, t)
+            }
+            Err(e) => return fail(e),
+        },
+        (Some(id), false) => match get(&c, &format!("/v1/sessions/{id}")).map(with_words) {
+            Ok(v) => {
+                let t = render_detail(&v);
+                (v, t)
+            }
+            Err(e) => return fail(e),
+        },
+    };
+    if json_out {
+        print_json(&v);
+    } else {
+        print!("{text}");
+    }
+    0
+}
+
+// ------------------------------------------------------------------ limits
+
+fn caps_line(b: &Value) -> String {
+    let mut caps = Vec::new();
+    for cap in [
+        "cpu_cores",
+        "memory_mb",
+        "processes",
+        "write_mb_per_hour",
+        "runtime_hours",
+    ] {
+        let c = &b[cap];
+        if c.is_object() {
+            caps.push(format!(
+                "{cap} {}{} for {}s then {}",
+                num(&c["max"]),
+                cap_unit(cap),
+                c["sustain_secs"].as_u64().unwrap_or(60),
+                c["action"].as_str().unwrap_or("notify")
+            ));
+        }
+    }
+    if caps.is_empty() {
+        "no caps".into()
+    } else {
+        caps.join("; ")
+    }
+}
+
+/// Why this engine does not act on breaches, when it does not.
+pub fn not_enforcing(v: &Value) -> Option<String> {
+    if v["enforcing"] != false {
+        return None;
+    }
+    Some(match v["not_enforcing_reason"].as_str() {
+        Some("not_lock_holder") => "This engine does not act: another engine holds the engine lock (that one acts; this one only reports).".into(),
+        Some("config_error") => "Nothing acts: the config file did not load, so limits stay off until it is fixed (`mulchie doctor`).".into(),
+        Some(r) => format!("This engine does not act ({r})."),
+        None => "This engine does not hold the engine lock, so it reports and never acts.".into(),
+    })
+}
+
+/// Findings that Mulchie's list of paused processes could not be read.
+pub fn paused_list_findings(findings: &Value) -> Vec<Value> {
+    findings["findings"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter(|f| f["kind"] == "paused_list_unreadable" && f["dismissed"] != true)
+        .cloned()
+        .collect()
+}
+
+fn render_paused_list_findings(found: &[Value]) -> String {
+    let mut s = String::new();
+    for f in found {
+        s.push_str(&format!("! {}\n  {}\n", st(f, "title"), st(f, "why")));
+        if let Some(d) = f["evidence"]["detail"].as_str() {
+            s.push_str(&format!("  ({d})\n"));
+        }
+    }
+    s
+}
+
+pub fn render_limits(v: &Value) -> String {
+    let mut s = String::new();
+    let cfg = &v["config"];
+    let has_budget =
+        cfg["default"].is_object() || cfg["workspaces"].as_array().is_some_and(|w| !w.is_empty());
+    if !has_budget {
+        s.push_str("No session budget is set: Mulchie only reports sessions that hog the machine (limits in `mulchie config`).\n");
+    } else if v["report_only"] == true {
+        s.push_str("Report only: every cap only notifies; nothing is paused or stopped.\n");
+    } else {
+        s.push_str(
+            "Enforcing: caps act on sessions over budget (through the safety gate, journaled).\n",
+        );
+    }
+    if let Some(w) = not_enforcing(v) {
+        s.push_str(&format!("{w}\n"));
+    }
+    if cfg["default"].is_object() {
+        s.push_str(&format!("Default budget: {}\n", caps_line(&cfg["default"])));
+    }
+    for w in cfg["workspaces"].as_array().into_iter().flatten() {
+        s.push_str(&format!(
+            "Budget for {}: {}\n",
+            st(w, "path"),
+            caps_line(&w["budget"])
+        ));
+    }
+    if let (Some(p), Some(t)) = (
+        cfg["hog_share_pct"].as_f64(),
+        cfg["hog_sustain_secs"].as_u64(),
+    ) {
+        s.push_str(&format!(
+            "A session using {p:.0}% of CPU or memory for {} while the machine is strained is a hog.\n",
+            duration(t)
+        ));
+    }
+    let br = v["breaches"].as_array().cloned().unwrap_or_default();
+    if br.is_empty() {
+        s.push_str("No session is over its budget.\n");
+    } else {
+        s.push_str(&format!("Breaches ({}):\n", br.len()));
+        for b in &br {
+            s.push_str(&format!("  {}\n", breach_line(b)));
+        }
+    }
+    for h in v["hogs"].as_array().into_iter().flatten() {
+        s.push_str(&format!(
+            "Hog: {} {} uses {:.0}% of the machine's {} (for {})\n",
+            st(h, "agent"),
+            st(h, "session_id"),
+            h["share_pct"].as_f64().unwrap_or(0.0),
+            st(h, "resource"),
+            duration(now_unix().saturating_sub(h["since_unix"].as_u64().unwrap_or(0)))
+        ));
+    }
+    for (k, label) in [
+        ("paused_by_mulchie", "Paused by Mulchie"),
+        ("paused_left", "Paused by an earlier engine and not resumed (resume with `mulchie group session:<id> resume`)"),
+    ] {
+        let list = v[k].as_array().cloned().unwrap_or_default();
+        if !list.is_empty() {
+            s.push_str(&format!("{label}:\n"));
+            for p in &list {
+                s.push_str(&format!("  {}\n", paused_line(p)));
+            }
+        }
+    }
+    s
+}
+
+pub fn limits(paths: &Paths, json_out: bool) -> i32 {
+    let c = match engine(paths, "`mulchie limits`") {
+        Ok(c) => c,
+        Err(e) => return fail(e),
+    };
+    let mut v = match get(&c, "/v1/limits/status") {
+        Ok(v) => v,
+        Err(e) => return fail(e),
+    };
+    let unreadable = get(&c, "/v1/findings")
+        .map(|f| paused_list_findings(&f))
+        .unwrap_or_default();
+    if json_out {
+        v["paused_list_unreadable"] = json!(unreadable);
+        print_json(&v);
+    } else {
+        print!("{}", render_paused_list_findings(&unreadable));
+        print!("{}", render_limits(&v));
+    }
+    0
+}
+
+// ----------------------------------------------------------------- updates
+
+/// Open update findings (category `update`) from a findings reply.
+pub fn update_findings(findings: &Value) -> Vec<Value> {
+    findings["findings"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter(|f| f["category"] == "update")
+        .cloned()
+        .collect()
+}
+
+pub fn render_updates(status: &Value, found: &[Value]) -> String {
+    let now = now_unix();
+    let mut s = String::new();
+    if status["enabled"] == false {
+        s.push_str(
+            "Update checks are off (updates.check in `mulchie config`); nothing is checked.\n",
+        );
+    } else {
+        match status["checked_unix"].as_u64() {
+            Some(t) => s.push_str(&format!(
+                "Last checked {} ago",
+                duration(now.saturating_sub(t))
+            )),
+            None => s.push_str("Not checked yet"),
+        }
+        if status["checking"] == true {
+            s.push_str("; checking now");
+        } else if let Some(n) = status["next_check_unix"].as_u64() {
+            s.push_str(&format!(
+                "; next check in {}",
+                duration(n.saturating_sub(now))
+            ));
+        }
+        s.push_str(".\n");
+    }
+    let failures = status["failures"].as_u64().unwrap_or(0);
+    for e in status["errors"].as_array().into_iter().flatten() {
+        s.push_str(&format!("  ! {}\n", e.as_str().unwrap_or("")));
+    }
+    if failures > 1 {
+        s.push_str(&format!("  ({failures} checks in a row had errors)\n"));
+    }
+    for (name, from) in unknown_versions(&status["report"]) {
+        s.push_str(&format!("  {name}: installed version unknown ({from})\n"));
+    }
+    if let Some(n) = homebrew_note(status) {
+        s.push_str(&format!("  {n}\n"));
+    }
+    if found.is_empty() {
+        let n = status["available"].as_u64().unwrap_or(0);
+        if n == 0 {
+            s.push_str("Nothing to update.\n");
+        } else {
+            s.push_str(&format!(
+                "{n} update(s) available (`mulchie findings` lists them).\n"
+            ));
+        }
+        return s;
+    }
+    let items = update_items(found);
+    s.push_str(&format!("Available ({}):\n", items.len().max(found.len())));
+    for f in found {
+        let pk = f["evidence"]["updates"]
+            .as_array()
+            .cloned()
+            .unwrap_or_default();
+        if pk.is_empty() {
+            // An engine from before evidence.updates: its own words.
+            s.push_str(&format!("  [{}] {}\n", st(f, "severity"), st(f, "title")));
+            continue;
+        }
+        for u in &pk {
+            s.push_str(&format!(
+                "  [{}] {}\n",
+                st(f, "severity"),
+                package_line(f, u)
+            ));
+            if let Some(c) = u["command"].as_str().filter(|c| !c.is_empty()) {
+                s.push_str(&format!("       update: {c}\n"));
+            }
+        }
+    }
+    s.push_str("Mulchie runs none of these; each command is for you to run.\n");
+    s
+}
+
+/// One package of an update finding in words.
+fn package_line(f: &Value, u: &Value) -> String {
+    let installed = u["installed"].as_str().unwrap_or("?");
+    let mut w = if f["kind"] == "advisory" {
+        let fixed = u["latest"]
+            .as_str()
+            .map(|l| format!(", fixed in {l}"))
+            .unwrap_or_else(|| ", no fixed version listed".into());
+        format!("{} {installed} has an advisory{fixed}", st(u, "package"))
+    } else {
+        format!(
+            "{} {installed} -> {}",
+            st(u, "package"),
+            u["latest"].as_str().unwrap_or("?")
+        )
+    };
+    w.push_str(&format!(" ({})", st(u, "source")));
+    w
+}
+
+/// Every package in the update findings, flat: package, installed, latest,
+/// source, command, and the finding it came from.
+pub fn update_items(found: &[Value]) -> Vec<Value> {
+    let mut out = Vec::new();
+    for f in found {
+        for u in f["evidence"]["updates"].as_array().into_iter().flatten() {
+            let mut x = u.clone();
+            x["finding"] = f["id"].clone();
+            x["kind"] = f["kind"].clone();
+            x["severity"] = f["severity"].clone();
+            out.push(x);
+        }
+    }
+    out
+}
+
+/// Tools in the last check whose installed version is unknown, with where
+/// Mulchie looked (`version_from`).
+pub fn unknown_versions(report: &Value) -> Vec<(String, String)> {
+    std::iter::once(&report["mulchie"])
+        .chain(report["agents"].as_array().into_iter().flatten())
+        .filter(|t| t.is_object() && t["installed"].is_null())
+        .map(|t| {
+            (
+                st(t, "name").to_string(),
+                t["version_from"]
+                    .as_str()
+                    .unwrap_or("no reason given")
+                    .to_string(),
+            )
+        })
+        .collect()
+}
+
+/// When the last check ran no `brew`, why that may be.
+pub fn homebrew_note(status: &Value) -> Option<String> {
+    let r = &status["report"];
+    if status["enabled"] == false || !r.is_object() || r.get("homebrew_path").is_some() {
+        return None;
+    }
+    let mut n = "Homebrew was not checked: it is turned off (updates.homebrew), no brew was found, or there is no local homebrew/core tap (without one, brew would fetch from the network, so Mulchie skips it)".to_string();
+    if r["homebrew"].is_array() {
+        n.push_str("; its list is from an earlier check");
+    }
+    n.push('.');
+    Some(n)
+}
+
+pub fn updates(paths: &Paths, check: bool, json_out: bool) -> i32 {
+    let c = match engine(paths, "`mulchie updates`") {
+        Ok(c) => c,
+        Err(e) => return fail(e),
+    };
+    let mut queued = false;
+    if check {
+        match conn::call(&c, "POST", "/v1/updates/check", None) {
+            Ok(_) => queued = true,
+            Err(e) => return fail(explain_check(&e)),
+        }
+    }
+    let status = match get(&c, "/v1/updates") {
+        Ok(v) => v,
+        Err(e) => return fail(e),
+    };
+    let found = get(&c, "/v1/findings")
+        .map(|f| update_findings(&f))
+        .unwrap_or_default();
+    if json_out {
+        print_json(&json!({
+            "status": status,
+            "queued": queued,
+            "updates": found,
+            "packages": update_items(&found),
+        }));
+    } else {
+        if queued {
+            println!(
+                "A check was started; run `mulchie updates` again in a minute for its result."
+            );
+        }
+        print!("{}", render_updates(&status, &found));
+    }
+    0
+}
+
+pub fn explain_check(e: &ApiError) -> String {
+    match e.code.as_str() {
+        "updates_off" => "update checks are off, so nothing was checked [updates_off]; turn them on with `mulchie config set updates.check on`".into(),
+        "read_only_token" => {
+            "only the full API token may start an update check [read_only_token]".into()
+        }
+        _ => conn::describe(e),
+    }
+}
+
+// ------------------------------------------------------------------- guard
+
+/// The command line from `guard check`'s words: one word is taken as the
+/// whole command, several are joined shell-quoted.
+pub fn command_line(words: &[String]) -> String {
+    if words.len() == 1 {
+        words[0].clone()
+    } else {
+        words.iter().map(|w| q(w)).collect::<Vec<_>>().join(" ")
+    }
+}
+
+pub fn render_guard(v: &Value) -> String {
+    let mut s = match st(v, "decision") {
+        "block" => format!("Block: {}", st(v, "reason")),
+        "warn" => format!("Warn: {}", st(v, "reason")),
+        _ => "Allow: no guard rule matches.".into(),
+    };
+    if let Some(r) = v["rule"].as_str() {
+        s.push_str(&format!(" [{r}]"));
+    }
+    s.push('\n');
+    let m = v["matches"].as_array().cloned().unwrap_or_default();
+    if m.len() > 1 {
+        for x in &m {
+            s.push_str(&format!(
+                "  {} {}: {}\n",
+                st(x, "mode"),
+                st(x, "rule"),
+                st(x, "reason")
+            ));
+        }
+    }
+    if let Some(a) = v["advice"].as_str() {
+        s.push_str(&format!("{a}\n"));
+    }
+    s
+}
+
+/// Exit status of `guard check`: 0 allow, 3 block, 4 warn.
+pub fn guard_status(v: &Value) -> i32 {
+    match st(v, "decision") {
+        "block" => 3,
+        "warn" => 4,
+        _ => 0,
+    }
+}
+
+pub fn guard_check(
+    paths: &Paths,
+    words: &[String],
+    cwd: Option<&std::path::Path>,
+    json_out: bool,
+) -> i32 {
+    let cwd = cwd
+        .map(std::path::Path::to_path_buf)
+        .or_else(|| std::env::current_dir().ok())
+        .unwrap_or_else(|| "/".into());
+    let body = json!({ "command": command_line(words), "cwd": cwd });
+    let c = match engine(paths, "`mulchie guard check`") {
+        Ok(c) => c,
+        Err(e) => return fail(e),
+    };
+    let v = match conn::call(&c, "POST", "/v1/guard/check", Some(&body)) {
+        Ok(v) => v,
+        Err(e) => return fail(conn::describe(&e)),
+    };
+    if json_out {
+        print_json(&v);
+    } else {
+        print!("{}", render_guard(&v));
+    }
+    guard_status(&v)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Shapes from the core's `sessions_hooks_and_updates_over_the_api`.
+    fn list() -> Value {
+        json!({"enabled":true,"sessions":[{"agent":"claude","client":null,"client_session_id":null,"command":"claude","cwd":"/code/a","ended_unix":null,"id":"s-500-100","listening":[],"parent":null,"peak":{"cpu_cores":0.1,"memory_mb":2.0,"processes":2,"write_mb_per_hour":null},"root_pid":100,"root_start_time":500,"source":"detected","started_unix":1_794_277_830u64,"status":"running","usage":{"build_slots":0,"bytes_written":null,"cpu_cores":0.1,"memory_mb":2.0,"processes":2,"runtime_secs":3700,"write_mb_per_hour":null},"workspace":"/code/a"}],"write_bytes_available":false})
+    }
+
+    #[test]
+    fn session_ids_are_checked_before_they_go_in_a_path() {
+        assert!(valid_session_id("s-500-100"));
+        for bad in [
+            "s-500",
+            "s-a-1",
+            "500-100",
+            "s-1-2/../x",
+            "s-1-2?x=1",
+            "s--1",
+            "",
+        ] {
+            assert!(!valid_session_id(bad), "{bad}");
+        }
+        let fwd = Page {
+            since: Some(5),
+            limit: Some(10),
+            ..Page::default()
+        };
+        assert_eq!(
+            events_path("s-1-2", &fwd),
+            "/v1/sessions/s-1-2/events?since=5&limit=10"
+        );
+        assert_eq!(
+            events_path("s-1-2", &Page::default()),
+            "/v1/sessions/s-1-2/events"
+        );
+        let back = Page {
+            tail: Some(20),
+            before: Some(300),
+            ..Page::default()
+        };
+        assert_eq!(
+            events_path("s-1-2", &back),
+            "/v1/sessions/s-1-2/events?tail=20&before=300"
+        );
+    }
+
+    #[test]
+    fn the_list_and_detail_read_the_real_shapes() {
+        let t = render_list(&list());
+        assert!(t.contains("1 running, 0 ended"), "{t}");
+        assert!(
+            t.contains("s-500-100") && t.contains("claude") && t.contains("1h01m"),
+            "{t}"
+        );
+        assert!(t.contains("/code/a") && t.contains("2 MB"), "{t}");
+        assert!(t.contains("cannot be read"), "{t}");
+        let detail = json!({"breaches":[{"id":"b1","session_id":"s-500-100","agent":"claude","cap":"memory_mb","max":1000.0,"value":1500.0,"action":"pause","action_state":"done","breached_unix":1}],
+            "paused_by_mulchie":[{"pid":101,"start_time":600,"session_id":"s-500-100","breach_id":"b1","since_unix":1}],
+            "processes":[{"cmd":"claude","cpu_pct":5.0,"mem_bytes":1_048_576,"name":"claude","pid":100,"ppid":1,"root":true,"start_time":500,"stopped":false},{"cmd":"node","cpu_pct":5.0,"mem_bytes":1_048_576,"name":"node","pid":101,"ppid":100,"root":false,"start_time":600,"stopped":true}],
+            "session": list()["sessions"][0]});
+        let t = render_detail(&detail);
+        assert!(
+            t.contains("claude session s-500-100 (running, detected), pid 100"),
+            "{t}"
+        );
+        assert!(t.contains("(the agent)") && t.contains("(paused)"), "{t}");
+        assert!(
+            t.contains("over its memory_mb cap: 1500 MB (max 1000 MB); action pause, done"),
+            "{t}"
+        );
+        assert!(
+            t.contains("Paused by Mulchie:\n  pid 101 of s-500-100"),
+            "{t}"
+        );
+        assert!(t.contains("mulchie sessions stop s-500-100"), "{t}");
+        let ev = json!({"events":[{"agent":"claude","command":"claude","seq":1,"t":1,"type":"session_start"}],"next_since":1,"session_id":"s-500-100"});
+        let t = render_events(&ev, &Page::default());
+        assert!(
+            t.contains("session_start") && t.contains("--since 1"),
+            "{t}"
+        );
+    }
+
+    #[test]
+    fn limits_say_whether_they_act() {
+        let none = json!({"breaches":[],"config":{"default":null,"hog_share_pct":50.0,"hog_sustain_secs":120,"workspaces":[]},"enforcing":true,"hogs":[],"paused_by_mulchie":[],"paused_left":[],"report_only":true});
+        let t = render_limits(&none);
+        assert!(t.contains("No session budget is set"), "{t}");
+        assert!(t.contains("No session is over its budget"), "{t}");
+        let mut on = none.clone();
+        on["report_only"] = json!(false);
+        on["enforcing"] = json!(false);
+        on["config"]["default"] =
+            json!({ "memory_mb": { "max": 4000.0, "sustain_secs": 60, "action": "pause" } });
+        on["hogs"] = json!([{ "session_id": "s-1-2", "agent": "codex", "resource": "cpu", "share_pct": 70.0, "since_unix": 1 }]);
+        on["paused_left"] = json!([{ "pid": 9, "session_id": "s-1-2", "since_unix": 1 }]);
+        let t = render_limits(&on);
+        assert!(
+            t.contains("Enforcing") && t.contains("reports and never acts"),
+            "{t}"
+        );
+        assert!(t.contains("memory_mb 4000 MB for 60s then pause"), "{t}");
+        assert!(t.contains("Hog: codex s-1-2 uses 70%"), "{t}");
+        assert!(t.contains("not resumed") && t.contains("pid 9"), "{t}");
+    }
+
+    #[test]
+    fn updates_and_guard_in_words() {
+        let status = json!({"available":0,"checked_unix":null,"checking":false,"enabled":true,"errors":[],"failures":0,"next_check_unix": now_unix() + 300});
+        let t = render_updates(&status, &[]);
+        assert!(
+            t.contains("Not checked yet; next check in") && t.contains("Nothing to update"),
+            "{t}"
+        );
+        let f = json!({ "findings": [
+            { "id": "a", "category": "update", "severity": "low", "title": "claude 1.0 is out (1.2 installed? no: 0.9)" },
+            { "id": "b", "category": "hygiene", "severity": "low", "title": "other" } ] });
+        let found = update_findings(&f);
+        assert_eq!(found.len(), 1);
+        assert!(render_updates(&status, &found).contains("Available (1)"));
+        let off = json!({ "enabled": false });
+        assert!(render_updates(&off, &[]).contains("Update checks are off"));
+        let e = ApiError::new(409, "updates_off", "update checks are off");
+        assert!(explain_check(&e).contains("mulchie config set updates.check on"));
+
+        let v = json!({"decision":"warn","matches":[{"mode":"warn","reason":"recursively deletes the root directory","rule":"recursive_delete"},{"mode":"warn","reason":"runs a command with elevated privileges (sudo/doas)","rule":"sudo"}],"reason":"recursively deletes the root directory","rule":"recursive_delete"});
+        let t = render_guard(&v);
+        assert!(
+            t.starts_with("Warn: recursively deletes the root directory [recursive_delete]"),
+            "{t}"
+        );
+        assert!(t.contains("warn sudo:"), "{t}");
+        assert_eq!(guard_status(&v), 4);
+        assert_eq!(guard_status(&json!({ "decision": "block" })), 3);
+        assert_eq!(guard_status(&json!({ "decision": "allow" })), 0);
+        assert_eq!(command_line(&["rm -rf /".into()]), "rm -rf /");
+        assert_eq!(
+            command_line(&["rm".into(), "-rf".into(), "it's".into()]),
+            "rm -rf 'it'\\''s'"
+        );
+    }
+
+    #[test]
+    fn enforcement_limit_actions_and_unbound_events_in_words() {
+        let mut l = list();
+        l["sessions"][0]["enforced"] = json!(false);
+        l["sessions"][0]["not_enforced_reason"] = json!("hook_registered");
+        let w = with_words(l);
+        assert!(
+            w["sessions"][0]["limits"]
+                .as_str()
+                .unwrap()
+                .contains("an agent hook reports this session"),
+            "{w}"
+        );
+        assert!(render_list(&w).contains("hook: reports"));
+        for (r, words) in [
+            ("not_automating", "does not hold the engine lock"),
+            ("no_budget", "no budget applies"),
+            ("notify_only", "only notifies"),
+            ("ended", "the session ended"),
+        ] {
+            let x = json!({ "enforced": false, "not_enforced_reason": r });
+            assert!(enforcement(&x).contains(words), "{r}");
+        }
+        let on = json!({ "enforced": true });
+        assert!(enforcement(&on).starts_with("enforced here"));
+        let detail = with_words(json!({ "session": on, "processes": [] }));
+        assert!(render_detail(&detail).contains("limits:    enforced here"));
+
+        let ev = json!({ "session_id": "s-1-2", "next_since": 9, "prev_before": 7, "events": [
+            { "seq": 7, "t": 1, "type": "limit_action", "breach_id": "b1", "cap": "memory_mb", "action": "pause", "outcome": "paused", "state": "done", "detail": "paused 3 processes" },
+            { "seq": 8, "t": 1, "type": "limit_action", "breach_id": "b1", "cap": "memory_mb", "action": "kill", "outcome": "refused", "state": "skipped", "detail": "protected", "reason": "pid 4 is protected" },
+            { "seq": 9, "t": 1, "type": "hook_pre_tool", "client": "cursor", "client_session_id": "x1", "unbound": true, "command": "ls" } ] });
+        let page = Page {
+            tail: Some(3),
+            ..Page::default()
+        };
+        let t = render_events(&ev, &page);
+        assert!(
+            t.contains(
+                "paused for the memory_mb cap (cap action pause, now done): paused 3 processes"
+            ),
+            "{t}"
+        );
+        assert!(
+            t.contains("refused for the memory_mb cap")
+                && t.contains("refused because pid 4 is protected"),
+            "{t}"
+        );
+        assert!(t.contains("[unbound: from cursor x1"), "{t}");
+        assert!(t.contains("--tail 3 --before 7"), "{t}");
+        let mut start = ev.clone();
+        start["prev_before"] = Value::Null;
+        assert!(render_events(&start, &page).contains("start of the record"));
+        // A resume after limits were turned off: no cap, action or state.
+        let gone = json!({ "outcome": "resumed", "cap": null, "action": null, "state": null, "detail": "resumed 2" });
+        assert_eq!(limit_action_words(&gone), "resumed: resumed 2");
+    }
+
+    #[test]
+    fn updates_by_package_and_limits_say_why_they_do_not_act() {
+        let found = vec![
+            json!({ "id": "agent_update:claude", "kind": "agent_update", "category": "update", "severity": "low", "title": "t",
+                "evidence": { "updates": [{ "package": "claude", "installed": "1.0.0", "latest": "1.2.0", "source": "npm", "command": "claude update" }] } }),
+            json!({ "id": "advisory:x", "kind": "advisory", "category": "update", "severity": "high", "title": "t",
+                "evidence": { "updates": [{ "package": "left-pad", "installed": "0.1.0", "source": "osv.dev" }] } }),
+        ];
+        let status = json!({ "enabled": true, "checked_unix": now_unix(), "report": {
+            "mulchie": { "name": "mulchie", "installed": "0.3.0", "version_from": "this binary" },
+            "agents": [{ "name": "codex", "installed": null, "version_from": "no package.json next to /x/codex" }],
+            "homebrew": null } });
+        let t = render_updates(&status, &found);
+        assert!(t.contains("[low] claude 1.0.0 -> 1.2.0 (npm)"), "{t}");
+        assert!(t.contains("update: claude update"), "{t}");
+        assert!(
+            t.contains("left-pad 0.1.0 has an advisory, no fixed version listed (osv.dev)"),
+            "{t}"
+        );
+        assert!(
+            t.contains("codex: installed version unknown (no package.json next to /x/codex)"),
+            "{t}"
+        );
+        assert!(t.contains("no local homebrew/core tap"), "{t}");
+        assert!(!t.contains("mulchie: installed version unknown"), "{t}");
+        assert_eq!(update_items(&found).len(), 2);
+        assert_eq!(update_items(&found)[0]["finding"], "agent_update:claude");
+        let mut ran = status.clone();
+        ran["report"]["homebrew_path"] = json!("/opt/homebrew/bin/brew");
+        assert!(homebrew_note(&ran).is_none());
+
+        let mut v = json!({ "enforcing": false, "not_enforcing_reason": "config_error", "config": {}, "report_only": true });
+        assert!(render_limits(&v).contains("config file did not load"));
+        v["not_enforcing_reason"] = json!("not_lock_holder");
+        assert!(render_limits(&v).contains("another engine holds the engine lock"));
+        let f = json!({ "findings": [{ "kind": "paused_list_unreadable", "title": "Mulchie could not read its list of paused processes (/p)", "why": "Processes may still be stopped.", "evidence": { "detail": "bad json" } }, { "kind": "advisory" }] });
+        let un = paused_list_findings(&f);
+        assert_eq!(un.len(), 1);
+        let t = render_paused_list_findings(&un);
+        assert!(
+            t.contains("could not read its list") && t.contains("bad json"),
+            "{t}"
+        );
+    }
+}
