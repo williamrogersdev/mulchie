@@ -1053,3 +1053,49 @@ fn gitlink_patches_are_refused() {
     let p = b"diff --git a/x b/x\nnew file mode 100644\n+mode 160000 text\n";
     assert!(!patch_has_gitlink(p));
 }
+
+/// C2: skip-worktree and assume-unchanged files with local edits are invisible
+/// to `status` and `add -A`; the gate used to see a clean tree.
+#[test]
+fn hidden_skip_worktree_and_assume_unchanged_edits_block_removal() {
+    let env = Env::new();
+    let repo = env.repo("repo");
+    std::fs::write(repo.join("config.yml"), "a: 1\n").unwrap();
+    std::fs::write(repo.join("local.yml"), "b: 1\n").unwrap();
+    env.git(&repo, &["add", "-A"]);
+    env.git(&repo, &["commit", "-q", "-m", "configs"]);
+    let wt = env.worktree(&repo, "agent-x", false);
+
+    // Flagged but unchanged: no obstacle to the plan.
+    env.git(&wt, &["update-index", "--skip-worktree", "config.yml"]);
+    env.git(&wt, &["update-index", "--assume-unchanged", "local.yml"]);
+    let plan = env.gate().plan(&[env.remove_req(&wt, &env.head(&wt))]);
+    assert!(plan.items[0].ready, "{:?}", plan.items[0]);
+
+    for (file, edit) in [("config.yml", "a: 2\n"), ("local.yml", "b: 2\n")] {
+        std::fs::write(wt.join(file), edit).unwrap();
+        assert!(
+            env.git(&wt, &["status", "--porcelain"]).trim().is_empty(),
+            "git hides it"
+        );
+        let r = env
+            .gate()
+            .execute_one(&env.remove_req(&wt, &env.head(&wt)), "t");
+        assert_eq!(reason(&r), Some(SkipReason::HiddenChanges), "{r:?}");
+        assert!(format!("{r:?}").contains(file), "{r:?}");
+        assert_eq!(std::fs::read_to_string(wt.join(file)).unwrap(), edit);
+        let restored = if file == "config.yml" {
+            "a: 1\n"
+        } else {
+            "b: 1\n"
+        };
+        std::fs::write(wt.join(file), restored).unwrap();
+    }
+
+    // A sparse entry that is not on disk is not a change.
+    std::fs::remove_file(wt.join("config.yml")).unwrap();
+    let r = env
+        .gate()
+        .execute_one(&env.remove_req(&wt, &env.head(&wt)), "t");
+    assert!(done(&r), "{r:?}");
+}

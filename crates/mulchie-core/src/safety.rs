@@ -1031,6 +1031,15 @@ impl<'a> Gate<'a> {
                 ),
             );
         }
+        if let Some((n, first)) = hidden_changes(self.paths, &canon)? {
+            return skip(
+                SkipReason::HiddenChanges,
+                format!(
+                    "{n} file(s) marked skip-worktree or assume-unchanged have local edits \
+                     (first: {first}); git hides them from a backup"
+                ),
+            );
+        }
         let status = git::git(
             self.paths,
             &canon,
@@ -1791,6 +1800,81 @@ fn nested_repo(paths: &Paths, wt: &Path) -> Result<Option<String>, Skip> {
         }
     }
     Ok(None)
+}
+
+/// Files marked skip-worktree (`S`) or assume-unchanged (a lowercase tag) whose
+/// content on disk differs from the index. git hides these from `status`,
+/// `add -A` and `ls-files --others`, so a patch would not hold them. Returns the
+/// count and the first path. A sparse-checkout entry that is not on disk is no
+/// change.
+fn hidden_changes(paths: &Paths, wt: &Path) -> Result<Option<(usize, String)>, Skip> {
+    let out = Git::new(paths, wt)
+        .args(["ls-files", "-z", "-v", "-s"])
+        .run()
+        .map_err(Gate::git_skip)?;
+    // (path, index blob, mode)
+    let mut flagged: Vec<(String, String, String)> = Vec::new();
+    for raw in out.stdout.split(|b| *b == 0) {
+        if raw.is_empty() {
+            continue;
+        }
+        let Ok(line) = std::str::from_utf8(raw) else {
+            // A non-UTF-8 name with a hidden flag cannot be checked: skip.
+            if raw
+                .first()
+                .is_some_and(|t| *t == b'S' || t.is_ascii_lowercase())
+            {
+                return skip(
+                    SkipReason::HiddenChanges,
+                    "a skip-worktree or assume-unchanged file name is not UTF-8",
+                );
+            }
+            continue;
+        };
+        let tag = line.as_bytes()[0];
+        if !(tag == b'S' || tag.is_ascii_lowercase()) {
+            continue;
+        }
+        let Some((meta, path)) = line.split_once('\t') else {
+            continue;
+        };
+        let mut f = meta.split(' ');
+        let (_, mode, blob) = (f.next(), f.next().unwrap_or(""), f.next().unwrap_or(""));
+        if std::fs::symlink_metadata(wt.join(path)).is_err() {
+            continue;
+        }
+        flagged.push((path.to_string(), blob.to_string(), mode.to_string()));
+    }
+    let mut changed = Vec::new();
+    for chunk in flagged.chunks(256) {
+        let (files, links): (Vec<_>, Vec<_>) =
+            chunk.iter().partition(|(_, _, m)| m.starts_with("100"));
+        // A symbolic link, a gitlink or anything not a regular file cannot be
+        // compared by hash-object; it counts as changed.
+        changed.extend(links.iter().map(|(p, _, _)| p.clone()));
+        if files.is_empty() {
+            continue;
+        }
+        let hashed = Git::new(paths, wt)
+            .args(["hash-object", "--"])
+            .args(files.iter().map(|(p, _, _)| p.as_str()))
+            .timeout(BACKUP_TIMEOUT)
+            .text()
+            .map_err(Gate::git_skip)?;
+        let got: Vec<&str> = hashed.lines().collect();
+        if got.len() != files.len() {
+            return skip(
+                SkipReason::HiddenChanges,
+                "could not compare skip-worktree or assume-unchanged files",
+            );
+        }
+        for ((p, blob, _), h) in files.iter().zip(got) {
+            if h.trim() != blob {
+                changed.push(p.clone());
+            }
+        }
+    }
+    Ok(changed.first().cloned().map(|f| (changed.len(), f)))
 }
 
 /// Whether a binary patch records a gitlink (mode 160000): such a patch holds
