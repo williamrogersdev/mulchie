@@ -4,14 +4,14 @@ import { SITE, REPO, RELEASES, VERSION } from '../lib/meta';
 
 const title = 'Mulchie: keep your machine usable while AI agents build';
 const description =
-  'Open source supervisor for machines running many AI coding agents: monitor, build queue, budgets, hooks and safe cleanup. macOS app, CLI, local API, MCP.';
+  'Open source supervisor for machines running many AI coding agents: monitor, build queue, budgets, hooks and safe cleanup. CLI, local API, MCP; app from source.';
 
 const jsonLd = {
   '@context': 'https://schema.org',
   '@type': 'SoftwareApplication',
   name: 'Mulchie',
   description:
-    'A macOS menu bar app, CLI, local HTTP API and MCP server that keeps one machine healthy while many AI coding agents run on it.',
+    'A CLI, local HTTP API and MCP server (with a macOS menu bar app you build from source) that keeps one machine healthy while many AI coding agents run on it.',
   url: `${SITE}/`,
   applicationCategory: 'DeveloperApplication',
   operatingSystem: 'macOS, Linux',
@@ -176,28 +176,20 @@ Not ready (1):
 
   <section class="sec wrap" aria-labelledby="install">
     <h2 id="install">Install</h2>
-    <p class="muted">The app needs macOS 12 or later. The CLI, engine and API run on macOS and Linux.</p>
+    <p class="muted">The CLI, engine and API run on macOS and Linux. The menu bar app is not available as a download yet; build it from source for now.</p>
     <ul class="cmds">
-      <li>
-        <div class="label">Menu bar app<span>Homebrew cask</span></div>
-        <pre tabindex="0"><code>brew install --cask williamrogersdev/tap/mulchie</code></pre>
-      </li>
-      <li>
-        <div class="label">CLI only<span>Homebrew</span></div>
-        <pre tabindex="0"><code>brew install williamrogersdev/tap/mulchie-cli</code></pre>
-      </li>
       <li>
         <div class="label">CLI on macOS or Linux<span>Install script</span></div>
         <pre tabindex="0"><code>curl -fsSL https://mulchie.com/install.sh | sh</code></pre>
       </li>
       <li>
         <div class="label">CLI from source<span>Cargo</span></div>
-        <pre tabindex="0"><code>cargo install mulchie</code></pre>
+        <pre tabindex="0"><code>cargo install --git https://github.com/williamrogersdev/mulchie mulchie</code></pre>
       </li>
     </ul>
     <p class="cta" style="margin-top:2rem">
       <a class="btn primary" href="/install/">All install options</a>
-      <a class="btn ghost" href={RELEASES}>Download the DMG</a>
+      <a class="btn ghost" href={RELEASES}>Latest release</a>
       <a class="btn ghost" href={REPO}>GitHub</a>
     </p>
   </section>
