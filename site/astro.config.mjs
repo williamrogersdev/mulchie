@@ -43,6 +43,7 @@ export default defineConfig({
             { slug: 'docs/mcp' },
             { slug: 'docs/http-api' },
             { slug: 'docs/configuration' },
+            { slug: 'docs/watch' },
           ],
         },
         {
