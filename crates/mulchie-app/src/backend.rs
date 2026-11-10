@@ -976,6 +976,57 @@ impl Backend {
         }
     }
 
+    /// `GET /v1/sessions/{id}/events?tail=N[&before=B]`: the last `tail`
+    /// events (below `before` when given), oldest first, with `prev_before`
+    /// for the page older than this one (null at the start of the record).
+    pub fn session_events_back(
+        &self,
+        id: &str,
+        tail: u64,
+        before: Option<u64>,
+    ) -> Result<Value, String> {
+        if !valid_session_id(id) {
+            return Err(format!("{id} is not a session id"));
+        }
+        if before == Some(0) {
+            return Err("before must be a seq of 1 or more".into());
+        }
+        let tail = tail.clamp(1, 1000);
+        match self.conn() {
+            Conn::Local(e) => {
+                let q = mulchie_core::record::Query::Tail {
+                    n: tail as usize,
+                    before,
+                };
+                let page = e
+                    .session_events_page(id, q)
+                    .map_err(|e| format!("the activity record could not be read: {e}"))?;
+                if page.events.is_empty() && before.is_none() && e.session(id).is_none() {
+                    return Err(format!("no session or record {id}"));
+                }
+                let next = page
+                    .events
+                    .last()
+                    .and_then(|e| e["seq"].as_u64())
+                    .unwrap_or(0);
+                Ok(json!({
+                    "session_id": id,
+                    "events": page.events,
+                    "next_since": next,
+                    "prev_before": page.prev_before,
+                }))
+            }
+            Conn::Remote(c) => {
+                let mut path = format!("/v1/sessions/{id}/events?tail={tail}");
+                if let Some(b) = before {
+                    path.push_str(&format!("&before={b}"));
+                }
+                self.remote(&c, "GET", &path, None)
+            }
+            Conn::Down => Err(self.down_error()),
+        }
+    }
+
     /// `GET /v1/limits/status`.
     pub fn limits_status(&self) -> Result<Value, String> {
         match self.conn() {

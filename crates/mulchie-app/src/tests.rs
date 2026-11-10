@@ -12,16 +12,36 @@ struct Fixture {
     t: tempfile::TempDir,
     paths: Paths,
     root: PathBuf,
+    // Held for the test: shared by most, exclusive for a test that samples
+    // the whole real process table (heavy enough to upset the timing of
+    // the lock and takeover tests).
+    _turn: Box<dyn std::any::Any>,
 }
 
+static HEAVY: std::sync::RwLock<()> = std::sync::RwLock::new(());
+
 fn fixture() -> Fixture {
+    fixture_with(Box::new(HEAVY.read().unwrap_or_else(|e| e.into_inner())))
+}
+
+/// A fixture for a test that runs alone.
+fn fixture_alone() -> Fixture {
+    fixture_with(Box::new(HEAVY.write().unwrap_or_else(|e| e.into_inner())))
+}
+
+fn fixture_with(turn: Box<dyn std::any::Any>) -> Fixture {
     let t = tempfile::tempdir().unwrap();
     let paths = Paths::under(t.path());
     std::fs::create_dir_all(&paths.home).unwrap();
     let root = t.path().join("code");
     std::fs::create_dir_all(&root).unwrap();
     let root = root.canonicalize().unwrap();
-    Fixture { t, paths, root }
+    Fixture {
+        t,
+        paths,
+        root,
+        _turn: turn,
+    }
 }
 
 impl Fixture {
@@ -1083,7 +1103,7 @@ fn wait_stat(pid: u32, stopped: bool) -> bool {
 fn session_plans_record_paging_end_and_unreadable_record() {
     use mulchie_core::engine::SampleCtx;
     use std::os::unix::fs::PermissionsExt;
-    let f = fixture();
+    let f = fixture_alone();
     // The real process table, so the session's members are real processes:
     // a throwaway perl (the "agent") with a sleep it started.
     let opts = Options {
@@ -1120,6 +1140,25 @@ fn session_plans_record_paging_end_and_unreadable_record() {
     }
     let _reap_root = Reap(vec![rpid]);
     assert_eq!(ppid_of(rpid), "1", "the throwaway agent is detached");
+    // Its child, once it runs `sleep` (not the forked perl before exec).
+    let child_sleep = || {
+        let o = std::process::Command::new("pgrep")
+            .args(["-P", &rpid.to_string(), "-x", "sleep"])
+            .output()
+            .unwrap();
+        String::from_utf8_lossy(&o.stdout)
+            .trim()
+            .parse::<u32>()
+            .ok()
+    };
+    let end = std::time::Instant::now() + Duration::from_secs(5);
+    let mut want = child_sleep();
+    while want.is_none() && std::time::Instant::now() < end {
+        std::thread::sleep(Duration::from_millis(50));
+        want = child_sleep();
+    }
+    let want = want.expect("the throwaway agent started its sleep");
+    let _reap_kid = Reap(vec![want]);
     let kill_all = |pids: &[u32]| {
         for p in pids {
             let _ = std::process::Command::new("kill")
@@ -1152,7 +1191,7 @@ fn session_plans_record_paging_end_and_unreadable_record() {
             .as_array()
             .unwrap()
             .iter()
-            .find(|p| p["pid"] != rpid && p["name"] == "sleep")
+            .find(|p| p["pid"] == want)
             .and_then(|p| p["pid"].as_u64())
             .map(|p| p as u32);
         if kid.is_some() {
@@ -1246,6 +1285,37 @@ fn session_plans_record_paging_end_and_unreadable_record() {
             assert!(paged.len() <= all.len(), "{who}: paging never repeats");
         }
         assert_eq!(paged, all, "{who}");
+
+        // Backwards: the tail is the newest event; `prev_before` walks to
+        // the first one and is null there.
+        let mut back = Vec::new();
+        let mut before = None;
+        loop {
+            let r = x.session_events_back(&id, 1, before).unwrap();
+            let ev = r["events"].as_array().unwrap();
+            assert_eq!(ev.len(), 1, "{who} {r}");
+            back.insert(0, ev[0].clone());
+            match r["prev_before"].as_u64() {
+                Some(b) => {
+                    assert_eq!(Some(b), ev[0]["seq"].as_u64(), "{who}: {r}");
+                    before = Some(b);
+                }
+                None => {
+                    assert!(r["prev_before"].is_null(), "{who} {r}");
+                    break;
+                }
+            }
+            assert!(back.len() <= all.len(), "{who}: paging never repeats");
+        }
+        assert_eq!(back, all, "{who}");
+        let tail = x.session_events_back(&id, 2, None).unwrap();
+        assert_eq!(
+            tail["events"].as_array().unwrap()[..],
+            all[all.len() - 2..],
+            "{who}"
+        );
+        assert_eq!(tail["next_since"], all[all.len() - 1]["seq"], "{who}");
+        assert!(x.session_events_back(&id, 1, Some(0)).is_err(), "{who}");
     }
 
     // The session ends with its agent; its record stays readable.

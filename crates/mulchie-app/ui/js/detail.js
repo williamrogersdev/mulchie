@@ -326,16 +326,18 @@ function rSegment(seg) {
 
 // One session from the engine (`GET /v1/sessions/{id}`) and its activity
 // record (`GET /v1/sessions/{id}/events`), refreshed while the drawer shows
-// it. The record pages forward from `next_since` (the engine has no read
-// from the end yet): the first load reads it through once ("catching up",
-// shown as such, never as the newest), then each poll reads only what
-// follows the newest seq. `gen` changes with the session, so a reply for an
+// it. The first read takes the newest events (`tail`); "Show older" pages
+// back with `before`/`prev_before`; each poll reads only what follows the
+// newest seq. An engine without backward reads (no `prev_before` in its
+// reply) is read through from the start once instead, shown as loading and
+// never as the newest. `gen` changes with the session, so a reply for an
 // earlier one is dropped.
-const sd = { gen: 0, id: null, data: undefined, err: null, at: 0, busy: false, events: [], next: 0, evErr: null, show: 100, caught: false, read: 0 };
-const EV_PAGE = 500, EV_KEEP = 5000;
+const SD0 = { data: undefined, err: null, at: 0, busy: false, events: [], next: 0, evErr: null, show: 100, started: false, caught: false, read: 0, back: true, prev: null, olderBusy: false };
+const sd = { gen: 0, id: null, ...SD0 };
+const EV_PAGE = 500, EV_KEEP = 5000, TAIL = 200;
 const renderIfSession = () => { if (st.ui.detail?.type === 'session') renderDetail(); };
 export function loadSession(id, force) {
-  if (sd.id !== id) Object.assign(sd, { gen: sd.gen + 1, id, data: undefined, err: null, at: 0, busy: false, events: [], next: 0, evErr: null, show: 100, caught: false, read: 0 });
+  if (sd.id !== id) Object.assign(sd, { ...SD0, events: [], gen: sd.gen + 1, id });
   if (sd.busy || (!force && Date.now() - sd.at < 3000)) return;
   const g = sd.gen;
   sd.busy = true;
@@ -343,11 +345,28 @@ export function loadSession(id, force) {
     try { const d = await invoke('session_detail', { id }); if (g !== sd.gen) return; sd.data = d; sd.err = null; }
     catch (e) { if (g !== sd.gen) return; sd.err = String(e); }
     try {
+      if (!sd.started) {
+        const r = await invoke('session_events', { id, tail: TAIL });
+        if (g !== sd.gen) return;
+        sd.started = true;
+        sd.events = r.events || [];
+        sd.read = sd.events.length;
+        sd.next = r.next_since ?? 0;
+        sd.evErr = null;
+        if ('prev_before' in r) { sd.prev = r.prev_before; sd.caught = true; }
+        // An older engine ignored `tail` and answered from the start.
+        else { sd.back = false; sd.caught = sd.events.length < TAIL; }
+        if (sd.caught) return;
+      }
       for (;;) {
         const r = await invoke('session_events', { id, since: sd.next, limit: EV_PAGE });
         if (g !== sd.gen) return;
         const ev = r.events || [];
-        sd.events = sd.events.concat(ev).slice(-EV_KEEP);
+        sd.events = sd.events.concat(ev);
+        if (sd.events.length > EV_KEEP) {
+          sd.events = sd.events.slice(-EV_KEEP);
+          if (sd.back) sd.prev = sd.events[0].seq;
+        }
         sd.read += ev.length;
         sd.next = r.next_since ?? sd.next;
         sd.evErr = null;
@@ -363,16 +382,37 @@ export function loadSession(id, force) {
   });
 }
 
-// The activity section: nothing is called newest until the record was read
-// through.
+// "Show older": first what is already here, then the page before it.
+async function olderEvents(id) {
+  const kept = sd.events.length - Math.min(sd.show, sd.events.length);
+  if (kept > 0 || !sd.back || sd.prev == null) { sd.show += 200; return renderIfSession(); }
+  if (sd.olderBusy) return;
+  const g = sd.gen;
+  sd.olderBusy = true;
+  renderIfSession();
+  try {
+    const r = await invoke('session_events', { id, tail: EV_PAGE, before: sd.prev });
+    if (g !== sd.gen) return;
+    const ev = r.events || [];
+    sd.events = ev.concat(sd.events);
+    sd.prev = r.prev_before ?? null;
+    sd.show += ev.length;
+  } catch (e) { if (g === sd.gen) toast(`Could not read older activity: ${e}`, true); }
+  finally { if (g === sd.gen) { sd.olderBusy = false; renderIfSession(); } }
+}
+
+// The activity section: nothing is called newest until it is.
 function activityHtml(id) {
   const evs = sd.id === id ? sd.events : [];
   if (sd.evErr) return `<div class="warn">The record could not be read: ${esc(sd.evErr)}</div>`;
-  if (!sd.caught) return `<div class="dim" role="status">Loading older activity: ${sd.read} event(s) read so far. The newest are shown once the record has been read through.</div>`;
+  if (!sd.started && !evs.length) return '<div class="dim" role="status">Reading the newest activity…</div>';
+  if (!sd.caught) return `<div class="dim" role="status">Loading older activity: ${sd.read} event(s) read so far. This engine reads the record from its start, so the newest are shown once it has been read through.</div>`;
   if (!evs.length) return `<div class="dim">${S().sessions?.enabled === false ? 'Session tracking is off, so nothing is recorded.' : 'Nothing recorded yet. Only the engine that holds the lock writes the record.'}</div>`;
   const shown = evs.slice(-sd.show).reverse();
-  return `<div class="dim">Newest first.${sd.read > evs.length ? ` The newest ${evs.length} of ${sd.read} are kept here.` : ''}</div>
-    <ol class="evlist">${shown.map(e => `<li><span class="dim mono">${esc(new Date(e.t * 1000).toLocaleTimeString())}</span> ${esc(eventText(e))}</li>`).join('')}</ol>${evs.length > shown.length ? actions([btn(`Show older (${evs.length - shown.length})`, da('ev-more', id))]) : ''}`;
+  const here = evs.length - shown.length, more = here > 0 || (sd.back && sd.prev != null);
+  const label = sd.olderBusy ? 'Reading older…' : `Show older${here > 0 ? ` (${here})` : ''}`;
+  return `<div class="dim">Newest first.${!sd.back && sd.read > evs.length ? ` The newest ${evs.length} of ${sd.read} are kept here.` : ''}</div>
+    <ol class="evlist">${shown.map(e => `<li><span class="dim mono">${esc(new Date(e.t * 1000).toLocaleTimeString())}</span> ${esc(eventText(e))}</li>`).join('')}</ol>${more ? actions([btn(label, da('ev-more', id))]) : '<div class="dim">This is the start of the record.</div>'}`;
 }
 
 const CAP_WORDS = { cpu_cores: 'CPU cores', memory_mb: 'MB of memory', processes: 'processes', write_mb_per_hour: 'MB written per hour', runtime_hours: 'hours of runtime' };
@@ -442,7 +482,7 @@ function rSession(id) {
       <label class="chk"><input type="checkbox" id="sIncAgent" ${st.ui.sIncAgent ? 'checked' : ''}> Include the agent itself (pid ${esc(x.root_pid)})</label>
       <div class="dim">Without it, only what the agent started is affected and the agent keeps running. Each action is planned first and lists the processes before anything is sent.</div>`) : ''}
     ${sec(`Processes (${procs.length})`, procs.length ? `<table class="mini-t"><colgroup><col><col style="width:70px"><col style="width:76px"></colgroup>${procs.slice(0, 60).map(p => `<tr class="click" role="button" tabindex="0" ${dl('proc', p.pid)}><td><span class="cell">${esc(p.name)} <span class="dim mono">${p.pid}</span>${p.root ? ' <span class="chip agent">agent</span>' : ''}${p.stopped ? ' <span class="chip warn">paused</span>' : ''}</span></td><td class="n">${esc(cores(p.cpu_pct))}</td><td class="n">${B(p.mem_bytes)}</td></tr>`).join('')}</table>${procs.length > 60 ? `<div class="dim">and ${procs.length - 60} more</div>` : ''}` : `<div class="dim">${running ? (d ? 'None at the last sample.' : 'Reading…') : 'The session has ended.'}</div>`)}
-    ${sec(`Activity${sd.caught && sd.id === id ? ` (${sd.read})` : ''}`, activityHtml(id))}`;
+    ${sec('Activity', activityHtml(id))}`;
   return { title: `${x.agent || 'Session'}${x.workspace ? ` · ${tilde(x.workspace).split('/').pop()}` : ''}`, sub: `<span class="dim mono">${esc(id)}</span>${running ? '' : ' <span class="chip">ended</span>'}${breaches.some(b => b.cleared_unix == null) ? ' <span class="chip bad">over a limit</span>' : ''}`, html,
     copy: { kind: 'session', id, ...pick(x, ['agent', 'source', 'status', 'workspace', 'cwd', 'root_pid', 'started_unix', 'ended_unix']), usage: u, peak: s.peak, breaches: breaches.map(b => pick(b, ['cap', 'max', 'value', 'action', 'action_state', 'cleared_unix'])), hint: 'Act on it with POST /v1/process/plan {"session": id, "action": …} then /v1/process/execute.' } };
 }
@@ -589,7 +629,7 @@ export async function detailAction(t) {
     return planAndRun([{ session: arg, action, include_agent: include }], { title: `${a.verb} ${include ? `${brief?.agent || 'the agent'} and everything it started` : `what ${brief?.agent || 'this agent'} started`}?`, verb: a.verb, note: sessionNote(action, include), danger: a.danger, after: reset });
   }
   switch (name) {
-    case 'ev-more': sd.show += 200; last = ''; return renderDetail();
+    case 'ev-more': last = ''; return olderEvents(arg);
     case 'resume-paused': return resumePaused(arg.split(',').filter(Boolean).map(x => { const [pid, start] = x.split(':'); return { pid: +pid, start_time: +start }; }));
     case 'fcat':
       // Filter in place: the same drawer, focus stays on the pressed button.

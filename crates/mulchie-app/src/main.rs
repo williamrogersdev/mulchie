@@ -143,9 +143,20 @@ async fn session_events(
     id: String,
     since: Option<u64>,
     limit: Option<u64>,
+    tail: Option<u64>,
+    before: Option<u64>,
 ) -> Result<Value, String> {
     blocking(&b, move |b| {
-        b.session_events(&id, since.unwrap_or(0), limit.unwrap_or(200))
+        // `tail`/`before` read backwards; `since` pages forward. They do not
+        // combine (as in the API).
+        if tail.is_some() || before.is_some() {
+            if since.is_some() {
+                return Err("since does not combine with tail or before".into());
+            }
+            b.session_events_back(&id, tail.or(limit).unwrap_or(200), before)
+        } else {
+            b.session_events(&id, since.unwrap_or(0), limit.unwrap_or(200))
+        }
     })
     .await
 }
