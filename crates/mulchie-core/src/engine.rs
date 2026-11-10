@@ -2089,7 +2089,25 @@ impl Engine {
                 return ProcessPlan::refused(now, &target, &action, code, detail)
             }
         };
-        let items = self.plan(&d.requests).items;
+        let mut items = self.plan(&d.requests).items;
+        // A pid or tree plan never signals the caller, its shell, terminal or
+        // agent, nor Mulchie's own ancestors (group plans refuse them above).
+        for item in &mut items {
+            if let Request::Signal { pid, .. } = &item.request {
+                if ancestors.contains(pid) {
+                    let who = if req.caller_pid == Some(*pid) {
+                        "the caller"
+                    } else if req.caller_pid.is_some() {
+                        "an ancestor of the caller or of Mulchie (its shell, terminal or agent)"
+                    } else {
+                        "an ancestor of Mulchie"
+                    };
+                    item.ready = false;
+                    item.reason = Some(crate::safety::SkipReason::ProtectedProcess);
+                    item.verdict = format!("pid {pid} is {who}; it is never signalled");
+                }
+            }
+        }
         let ready = items.iter().any(|i| i.ready);
         ProcessPlan {
             created_unix: now,

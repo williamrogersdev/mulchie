@@ -1228,3 +1228,52 @@ fn no_secret_no_lease() {
         .release_secret
         .is_some());
 }
+
+/// R5: a pid or tree plan marks the caller and its ancestors (its shell,
+/// terminal, agent) as blocked, with a reason.
+#[test]
+fn pid_and_tree_plans_block_the_callers_ancestors() {
+    let mut child = std::process::Command::new("/bin/sleep")
+        .arg("30")
+        .spawn()
+        .unwrap();
+    let pid = child.id();
+    // child (the agent) -> 4_000_001 (its shell) -> 4_000_002 (the caller).
+    let mut procs = FakeProcesses::empty().with(pid, "agent", None, 777);
+    procs.procs[0].ppid = 1;
+    let mut shell = procs.procs[0].clone();
+    shell.pid = 4_000_001;
+    shell.ppid = pid;
+    shell.name = "zsh".into();
+    let mut caller = shell.clone();
+    caller.pid = 4_000_002;
+    caller.ppid = 4_000_001;
+    caller.name = "mulchie".into();
+    procs.procs.push(shell);
+    procs.procs.push(caller);
+    let (_t, e) = engine_with_procs(Config::default(), procs);
+    let req = |tree| crate::procplan::ProcessPlanRequest {
+        pid: Some(pid),
+        tree,
+        caller_pid: Some(4_000_002),
+        ..Default::default()
+    };
+    for tree in [false, true] {
+        let p = e.process_plan(&req(tree));
+        assert!(!p.ready, "tree={tree}: {p:?}");
+        assert!(!p.items.is_empty());
+        for i in &p.items {
+            assert!(!i.ready, "{i:?}");
+            assert_eq!(i.reason, Some(SkipReason::ProtectedProcess), "{i:?}");
+            assert!(i.verdict.contains("never signalled"), "{}", i.verdict);
+        }
+    }
+    // Without a caller the same pid can be planned.
+    let p = e.process_plan(&crate::procplan::ProcessPlanRequest {
+        pid: Some(pid),
+        ..Default::default()
+    });
+    assert!(p.ready, "{p:?}");
+    let _ = child.kill();
+    let _ = child.wait();
+}
