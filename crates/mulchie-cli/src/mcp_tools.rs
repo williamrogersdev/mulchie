@@ -196,13 +196,13 @@ pub fn tool_list() -> Vec<Tool> {
         read(
             "limits_status",
             "Session budgets",
-            "Whether session budgets only report or act (report_only, enforcing), the budgets, sessions over a cap and what was done, sessions hogging the machine, and processes Mulchie paused (paused_left: paused by an earlier engine and not resumed; resume them with plan_process_action). Changes nothing.",
+            "Whether session budgets only report or act (report_only, enforcing, and not_enforcing in words with not_enforcing_reason), the budgets, sessions over a cap and what was done, sessions hogging the machine, and processes Mulchie paused (paused_left: paused by an earlier engine and not resumed; resume them with plan_process_action). paused_list_unreadable lists findings that Mulchie could not read its list of paused processes: some may still be stopped. Changes nothing.",
             json!({}),
         ),
         read(
             "list_updates",
             "Available updates",
-            "The engine's last update check (Mulchie itself, agent tools, Homebrew, and advisories for lockfile packages when turned on) and the update findings it raised, with the command that updates each where known. Changes nothing; check_updates asks for a new check.",
+            "The engine's last update check (Mulchie itself, agent tools, Homebrew, and advisories for lockfile packages when turned on) and the update findings it raised. packages lists each package (package, installed, latest, source, command: what the user may run; Mulchie runs nothing); unknown_versions says where an unknown installed version was looked for; homebrew says why Homebrew was not checked, when it was not. Changes nothing; check_updates asks for a new check.",
             json!({}),
         ),
         Tool {
@@ -1189,13 +1189,32 @@ pub fn call_tool(cx: &mut Ctx, name: &str, a: &Map<String, Value>) -> ToolResult
             }
             Ok(v)
         }
-        "limits_status" => get("/v1/limits/status"),
+        "limits_status" => {
+            let mut v = get("/v1/limits/status")?;
+            if let Some(w) = crate::sessions::not_enforcing(&v) {
+                v["not_enforcing"] = json!(w);
+            }
+            v["paused_list_unreadable"] = json!(get("/v1/findings")
+                .map(|f| crate::sessions::paused_list_findings(&f))
+                .unwrap_or_default());
+            Ok(v)
+        }
         "list_updates" => {
             let status = get("/v1/updates")?;
             let found = get("/v1/findings")
                 .map(|f| crate::sessions::update_findings(&f))
                 .unwrap_or_default();
-            Ok(json!({ "status": status, "updates": found }))
+            let unknown: Vec<Value> = crate::sessions::unknown_versions(&status["report"])
+                .into_iter()
+                .map(|(name, from)| json!({ "name": name, "version_from": from }))
+                .collect();
+            Ok(json!({
+                "status": status,
+                "packages": crate::sessions::update_items(&found),
+                "unknown_versions": unknown,
+                "homebrew": crate::sessions::homebrew_note(&status),
+                "updates": found,
+            }))
         }
         "check_updates" => match api.call("POST", "/v1/updates/check", None) {
             Ok(v) => Ok(json!({ "queued": v["queued"], "next": "The check runs on the engine; call list_updates in a minute for its result." })),

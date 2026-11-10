@@ -1510,11 +1510,14 @@ fn sessions_limits_updates_and_guard_tools() {
             "GET /v1/sessions/s-500-100/events?since=3&limit=5",
             json!({ "events": [{ "seq": 4, "t": 1, "type": "hook_pre_tool" }], "next_since": 4, "session_id": "s-500-100" }),
         )
-        .with("GET /v1/limits/status", json!({ "report_only": true, "enforcing": true, "breaches": [] }))
+        .with("GET /v1/limits/status", json!({ "report_only": true, "enforcing": false, "not_enforcing_reason": "not_lock_holder", "breaches": [] }))
         .with("GET /v1/updates", json!({ "enabled": true, "available": 1 }))
         .with(
             "GET /v1/findings",
-            json!({ "findings": [{ "id": "u", "category": "update", "title": "claude 2 is out" }, { "id": "x", "category": "hygiene" }] }),
+            json!({ "findings": [{ "id": "u", "kind": "agent_update", "category": "update", "title": "claude 2 is out",
+                "evidence": { "updates": [{ "package": "claude", "installed": "1", "latest": "2", "source": "npm", "command": "claude update" }] } },
+                { "id": "x", "category": "hygiene" },
+                { "id": "p", "kind": "paused_list_unreadable", "category": "limit", "title": "unreadable" }] }),
         )
         .with("POST /v1/guard/check", json!({ "decision": "warn", "rule": "sudo", "reason": "elevated" }))
         .with("POST /v1/process/plan", process_plan(true));
@@ -1563,12 +1566,20 @@ fn sessions_limits_updates_and_guard_tools() {
         call(3, "get_session", json!({ "id": "s-1-2/../../v1/config" })),
     );
     assert_eq!(r["result"]["isError"], true);
-    assert_eq!(
-        result(&one(&f, call(4, "limits_status", json!({}))))["report_only"],
-        true
+    let v = result(&one(&f, call(4, "limits_status", json!({}))));
+    assert_eq!(v["report_only"], true);
+    assert!(
+        v["not_enforcing"]
+            .as_str()
+            .unwrap()
+            .contains("another engine holds"),
+        "{v}"
     );
+    assert_eq!(v["paused_list_unreadable"][0]["id"], "p", "{v}");
     let v = result(&one(&f, call(5, "list_updates", json!({}))));
     assert_eq!(v["updates"].as_array().unwrap().len(), 1, "{v}");
+    assert_eq!(v["packages"][0]["package"], "claude", "{v}");
+    assert_eq!(v["packages"][0]["command"], "claude update", "{v}");
     let v = result(&one(
         &f,
         call(

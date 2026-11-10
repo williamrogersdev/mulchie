@@ -543,6 +543,41 @@ fn caps_line(b: &Value) -> String {
     }
 }
 
+/// Why this engine does not act on breaches, when it does not.
+pub fn not_enforcing(v: &Value) -> Option<String> {
+    if v["enforcing"] != false {
+        return None;
+    }
+    Some(match v["not_enforcing_reason"].as_str() {
+        Some("not_lock_holder") => "This engine does not act: another engine holds the engine lock (that one acts; this one only reports).".into(),
+        Some("config_error") => "Nothing acts: the config file did not load, so limits stay off until it is fixed (`mulchie doctor`).".into(),
+        Some(r) => format!("This engine does not act ({r})."),
+        None => "This engine does not hold the engine lock, so it reports and never acts.".into(),
+    })
+}
+
+/// Findings that Mulchie's list of paused processes could not be read.
+pub fn paused_list_findings(findings: &Value) -> Vec<Value> {
+    findings["findings"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter(|f| f["kind"] == "paused_list_unreadable" && f["dismissed"] != true)
+        .cloned()
+        .collect()
+}
+
+fn render_paused_list_findings(found: &[Value]) -> String {
+    let mut s = String::new();
+    for f in found {
+        s.push_str(&format!("! {}\n  {}\n", st(f, "title"), st(f, "why")));
+        if let Some(d) = f["evidence"]["detail"].as_str() {
+            s.push_str(&format!("  ({d})\n"));
+        }
+    }
+    s
+}
+
 pub fn render_limits(v: &Value) -> String {
     let mut s = String::new();
     let cfg = &v["config"];
@@ -557,8 +592,8 @@ pub fn render_limits(v: &Value) -> String {
             "Enforcing: caps act on sessions over budget (through the safety gate, journaled).\n",
         );
     }
-    if v["enforcing"] == false {
-        s.push_str("This engine does not hold the engine lock, so it reports and never acts.\n");
+    if let Some(w) = not_enforcing(v) {
+        s.push_str(&format!("{w}\n"));
     }
     if cfg["default"].is_object() {
         s.push_str(&format!("Default budget: {}\n", caps_line(&cfg["default"])));
@@ -614,13 +649,22 @@ pub fn render_limits(v: &Value) -> String {
 }
 
 pub fn limits(paths: &Paths, json_out: bool) -> i32 {
-    let v = match engine(paths, "`mulchie limits`").and_then(|c| get(&c, "/v1/limits/status")) {
+    let c = match engine(paths, "`mulchie limits`") {
+        Ok(c) => c,
+        Err(e) => return fail(e),
+    };
+    let mut v = match get(&c, "/v1/limits/status") {
         Ok(v) => v,
         Err(e) => return fail(e),
     };
+    let unreadable = get(&c, "/v1/findings")
+        .map(|f| paused_list_findings(&f))
+        .unwrap_or_default();
     if json_out {
+        v["paused_list_unreadable"] = json!(unreadable);
         print_json(&v);
     } else {
+        print!("{}", render_paused_list_findings(&unreadable));
         print!("{}", render_limits(&v));
     }
     0
@@ -671,6 +715,12 @@ pub fn render_updates(status: &Value, found: &[Value]) -> String {
     if failures > 1 {
         s.push_str(&format!("  ({failures} checks in a row had errors)\n"));
     }
+    for (name, from) in unknown_versions(&status["report"]) {
+        s.push_str(&format!("  {name}: installed version unknown ({from})\n"));
+    }
+    if let Some(n) = homebrew_note(status) {
+        s.push_str(&format!("  {n}\n"));
+    }
     if found.is_empty() {
         let n = status["available"].as_u64().unwrap_or(0);
         if n == 0 {
@@ -680,16 +730,101 @@ pub fn render_updates(status: &Value, found: &[Value]) -> String {
                 "{n} update(s) available (`mulchie findings` lists them).\n"
             ));
         }
-    } else {
-        s.push_str(&format!("Available ({}):\n", found.len()));
-        for f in found {
+        return s;
+    }
+    let items = update_items(found);
+    s.push_str(&format!("Available ({}):\n", items.len().max(found.len())));
+    for f in found {
+        let pk = f["evidence"]["updates"]
+            .as_array()
+            .cloned()
+            .unwrap_or_default();
+        if pk.is_empty() {
+            // An engine from before evidence.updates: its own words.
             s.push_str(&format!("  [{}] {}\n", st(f, "severity"), st(f, "title")));
-            if let Some(c) = f["evidence"]["detail"].as_str().filter(|c| !c.is_empty()) {
-                s.push_str(&format!("       {c}\n"));
+            continue;
+        }
+        for u in &pk {
+            s.push_str(&format!(
+                "  [{}] {}\n",
+                st(f, "severity"),
+                package_line(f, u)
+            ));
+            if let Some(c) = u["command"].as_str().filter(|c| !c.is_empty()) {
+                s.push_str(&format!("       update: {c}\n"));
             }
         }
     }
+    s.push_str("Mulchie runs none of these; each command is for you to run.\n");
     s
+}
+
+/// One package of an update finding in words.
+fn package_line(f: &Value, u: &Value) -> String {
+    let installed = u["installed"].as_str().unwrap_or("?");
+    let mut w = if f["kind"] == "advisory" {
+        let fixed = u["latest"]
+            .as_str()
+            .map(|l| format!(", fixed in {l}"))
+            .unwrap_or_else(|| ", no fixed version listed".into());
+        format!("{} {installed} has an advisory{fixed}", st(u, "package"))
+    } else {
+        format!(
+            "{} {installed} -> {}",
+            st(u, "package"),
+            u["latest"].as_str().unwrap_or("?")
+        )
+    };
+    w.push_str(&format!(" ({})", st(u, "source")));
+    w
+}
+
+/// Every package in the update findings, flat: package, installed, latest,
+/// source, command, and the finding it came from.
+pub fn update_items(found: &[Value]) -> Vec<Value> {
+    let mut out = Vec::new();
+    for f in found {
+        for u in f["evidence"]["updates"].as_array().into_iter().flatten() {
+            let mut x = u.clone();
+            x["finding"] = f["id"].clone();
+            x["kind"] = f["kind"].clone();
+            x["severity"] = f["severity"].clone();
+            out.push(x);
+        }
+    }
+    out
+}
+
+/// Tools in the last check whose installed version is unknown, with where
+/// Mulchie looked (`version_from`).
+pub fn unknown_versions(report: &Value) -> Vec<(String, String)> {
+    std::iter::once(&report["mulchie"])
+        .chain(report["agents"].as_array().into_iter().flatten())
+        .filter(|t| t.is_object() && t["installed"].is_null())
+        .map(|t| {
+            (
+                st(t, "name").to_string(),
+                t["version_from"]
+                    .as_str()
+                    .unwrap_or("no reason given")
+                    .to_string(),
+            )
+        })
+        .collect()
+}
+
+/// When the last check ran no `brew`, why that may be.
+pub fn homebrew_note(status: &Value) -> Option<String> {
+    let r = &status["report"];
+    if status["enabled"] == false || !r.is_object() || r.get("homebrew_path").is_some() {
+        return None;
+    }
+    let mut n = "Homebrew was not checked: it is turned off (updates.homebrew), no brew was found, or there is no local homebrew/core tap (without one, brew would fetch from the network, so Mulchie skips it)".to_string();
+    if r["homebrew"].is_array() {
+        n.push_str("; its list is from an earlier check");
+    }
+    n.push('.');
+    Some(n)
 }
 
 pub fn updates(paths: &Paths, check: bool, json_out: bool) -> i32 {
@@ -712,7 +847,12 @@ pub fn updates(paths: &Paths, check: bool, json_out: bool) -> i32 {
         .map(|f| update_findings(&f))
         .unwrap_or_default();
     if json_out {
-        print_json(&json!({ "status": status, "queued": queued, "updates": found }));
+        print_json(&json!({
+            "status": status,
+            "queued": queued,
+            "updates": found,
+            "packages": update_items(&found),
+        }));
     } else {
         if queued {
             println!(
@@ -1008,5 +1148,50 @@ mod tests {
         // A resume after limits were turned off: no cap, action or state.
         let gone = json!({ "outcome": "resumed", "cap": null, "action": null, "state": null, "detail": "resumed 2" });
         assert_eq!(limit_action_words(&gone), "resumed: resumed 2");
+    }
+
+    #[test]
+    fn updates_by_package_and_limits_say_why_they_do_not_act() {
+        let found = vec![
+            json!({ "id": "agent_update:claude", "kind": "agent_update", "category": "update", "severity": "low", "title": "t",
+                "evidence": { "updates": [{ "package": "claude", "installed": "1.0.0", "latest": "1.2.0", "source": "npm", "command": "claude update" }] } }),
+            json!({ "id": "advisory:x", "kind": "advisory", "category": "update", "severity": "high", "title": "t",
+                "evidence": { "updates": [{ "package": "left-pad", "installed": "0.1.0", "source": "osv.dev" }] } }),
+        ];
+        let status = json!({ "enabled": true, "checked_unix": now_unix(), "report": {
+            "mulchie": { "name": "mulchie", "installed": "0.3.0", "version_from": "this binary" },
+            "agents": [{ "name": "codex", "installed": null, "version_from": "no package.json next to /x/codex" }],
+            "homebrew": null } });
+        let t = render_updates(&status, &found);
+        assert!(t.contains("[low] claude 1.0.0 -> 1.2.0 (npm)"), "{t}");
+        assert!(t.contains("update: claude update"), "{t}");
+        assert!(
+            t.contains("left-pad 0.1.0 has an advisory, no fixed version listed (osv.dev)"),
+            "{t}"
+        );
+        assert!(
+            t.contains("codex: installed version unknown (no package.json next to /x/codex)"),
+            "{t}"
+        );
+        assert!(t.contains("no local homebrew/core tap"), "{t}");
+        assert!(!t.contains("mulchie: installed version unknown"), "{t}");
+        assert_eq!(update_items(&found).len(), 2);
+        assert_eq!(update_items(&found)[0]["finding"], "agent_update:claude");
+        let mut ran = status.clone();
+        ran["report"]["homebrew_path"] = json!("/opt/homebrew/bin/brew");
+        assert!(homebrew_note(&ran).is_none());
+
+        let mut v = json!({ "enforcing": false, "not_enforcing_reason": "config_error", "config": {}, "report_only": true });
+        assert!(render_limits(&v).contains("config file did not load"));
+        v["not_enforcing_reason"] = json!("not_lock_holder");
+        assert!(render_limits(&v).contains("another engine holds the engine lock"));
+        let f = json!({ "findings": [{ "kind": "paused_list_unreadable", "title": "Mulchie could not read its list of paused processes (/p)", "why": "Processes may still be stopped.", "evidence": { "detail": "bad json" } }, { "kind": "advisory" }] });
+        let un = paused_list_findings(&f);
+        assert_eq!(un.len(), 1);
+        let t = render_paused_list_findings(&un);
+        assert!(
+            t.contains("could not read its list") && t.contains("bad json"),
+            "{t}"
+        );
     }
 }
