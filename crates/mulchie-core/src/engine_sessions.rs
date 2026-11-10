@@ -882,6 +882,16 @@ impl Engine {
                 failed += 1;
             }
         }
+        if ok + failed > 0 {
+            let mut text =
+                format!("Restored the priority of {ok} process(es) after limit breach {breach_id}");
+            if failed > 0 {
+                text.push_str(&format!(
+                    "; {failed} keep the lower priority (raising priority needs privilege)"
+                ));
+            }
+            self.log("limit", text, 0, None, "limits");
+        }
         let mut sup = lock(&self.sup);
         if let Some(b) = sup.limits.get_mut(breach_id) {
             b.restored = failed == 0;

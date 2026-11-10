@@ -1666,3 +1666,77 @@ fn config_patches_merge_into_the_files_content() {
     assert!(a.patch_config(&json!([1])).is_err());
     assert_eq!(Config::load_from(&paths).config.watch.interval_secs, 120);
 }
+
+/// N6: renicing from `POST /v1/process` and a workspace's deprioritize go
+/// through the gate: a protected process is refused and the attempt is
+/// journaled; an ordinary own process is reniced.
+#[test]
+fn renice_requests_go_through_the_gate() {
+    let mut child = std::process::Command::new("/bin/sleep")
+        .arg("30")
+        .spawn()
+        .unwrap();
+    let pid = child.id();
+    let before = crate::engine::nice_of(pid).unwrap();
+    let mut procs = FakeProcesses::empty().with(pid, "Finder", None, 777);
+    procs.procs[0].exe =
+        Some("/System/Library/CoreServices/Finder.app/Contents/MacOS/Finder".into());
+    let (_t, e) = engine_with_procs(Config::default(), procs);
+    let ws = crate::monitor::Workspace {
+        path: PathBuf::from("/code/r"),
+        label: "r".into(),
+        repo: "r".into(),
+        name: "r".into(),
+        branch: None,
+        is_worktree: false,
+        exists: true,
+        paused: false,
+        throttled: 0,
+        agents: 0,
+        builds: 1,
+        cpu_pct: 0.0,
+        mem_bytes: 0,
+        read_bps: 0,
+        write_bps: 0,
+        orphan: None,
+        procs: vec![info(pid, 777, ProcKind::Build)],
+    };
+    e.state_mut().snapshot = Arc::new(Snapshot {
+        workspaces: vec![ws],
+        ..Default::default()
+    });
+    let journaled = e.snapshot_state().actions.len();
+    let err = e
+        .process_action(pid, ProcAction::Renice { nice: 19 }, "t")
+        .unwrap_err();
+    assert!(
+        err.to_lowercase().contains("protect") || err.contains("Finder"),
+        "{err}"
+    );
+    assert_eq!(
+        e.workspace_action(Path::new("/code/r"), WorkspaceAction::Deprioritize, "t")
+            .unwrap(),
+        0
+    );
+    assert_eq!(crate::engine::nice_of(pid), Some(before), "never reniced");
+    assert!(
+        e.snapshot_state().actions.len() >= journaled + 2,
+        "both refusals are journaled"
+    );
+    // Not protected: reniced through the gate.
+    let plain = FakeProcesses::empty().with(pid, "sleep", None, 777);
+    let (_t2, e2) = engine_with_procs(Config::default(), plain);
+    e2.state_mut().snapshot = e.snapshot_state().snapshot.clone();
+    if before < 19 {
+        e2.process_action(pid, ProcAction::Renice { nice: 19 }, "t")
+            .unwrap();
+        assert_eq!(crate::engine::nice_of(pid), Some(19));
+        assert!(e2
+            .snapshot_state()
+            .actions
+            .iter()
+            .any(|a| a.kind == "throttle"));
+    }
+    let _ = child.kill();
+    let _ = child.wait();
+}

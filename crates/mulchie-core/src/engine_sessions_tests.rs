@@ -271,6 +271,12 @@ fn deprioritize_lowers_priority_and_restores_it_after_clearing() {
     } else {
         assert!(!b.restored && d.contains("needs privilege"), "{d}");
     }
+    // N6: the restore (or the attempt) is journaled.
+    assert!(e
+        .snapshot_state()
+        .actions
+        .iter()
+        .any(|a| a.detail.contains("Restored the priority of")));
 }
 
 /// paused.json left by an engine that crashed: the next engine that

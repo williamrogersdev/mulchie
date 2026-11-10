@@ -1344,6 +1344,11 @@ impl Engine {
             if rn.contains_key(&k.pid) {
                 continue;
             }
+            // Read now, just before renicing: a pid reused since the sample
+            // is not touched.
+            if !self.same_own_process(k.pid, k.start_time) {
+                continue;
+            }
             if let Some(original) = lower_priority(k.pid, nice) {
                 rn.insert(
                     k.pid,
@@ -2265,20 +2270,21 @@ impl Engine {
             .filter(|p| p.own && p.pid != me && p.pid > 1)
             .collect();
         if action == WorkspaceAction::Deprioritize {
-            let done = targets
+            // Through the gate: it re-reads each process (owner, start time),
+            // refuses protected ones, only lowers, and journals each.
+            let reqs: Vec<Request> = targets
                 .iter()
-                .filter(|p| {
-                    self.same_own_process(p.pid, p.start_time)
-                        && lower_priority(p.pid, nice.max(10)).is_some()
+                .map(|p| Request::Renice {
+                    pid: p.pid,
+                    nice: nice.max(10),
+                    expected_start_time: p.start_time,
                 })
+                .collect();
+            let done = self
+                .execute(&reqs, source)
+                .iter()
+                .filter(|r| r.is_done())
                 .count();
-            self.log(
-                "throttle",
-                format!("Lowered priority of {done} process(es)"),
-                0,
-                Some(ws.label.clone()),
-                source,
-            );
             return Ok(done);
         }
         let mut reqs = Vec::new();
@@ -2608,24 +2614,19 @@ impl Engine {
             ProcAction::Stop => Signal::Stop,
             ProcAction::Cont => Signal::Cont,
             ProcAction::Renice { nice } => {
-                // Only our own process (checked above) whose start time still
-                // matches, so a reused pid is never touched.
-                match self.procs.get(pid) {
-                    Some(p)
-                        if p.uid == Some(self.procs.current_uid())
-                            && p.start_time == info.start_time => {}
-                    _ => return Err("the pid now belongs to a different process".into()),
-                }
-                let nice = nice.clamp(0, 20);
-                set_nice(pid, nice).map_err(|e| e.to_string())?;
-                self.log(
-                    "throttle",
-                    format!("renice {nice} → {} ({pid})", info.name),
-                    0,
-                    Some(info.group),
-                    source,
-                );
-                return Ok(());
+                // Through the gate: owner, start time and protected checks,
+                // lowering only, journaled.
+                let req = Request::Renice {
+                    pid,
+                    nice: nice.clamp(0, 20),
+                    expected_start_time: info.start_time,
+                };
+                let r = self.execute(std::slice::from_ref(&req), source);
+                return match r.first().map(|r| &r.outcome) {
+                    Some(Outcome::Done { .. }) => Ok(()),
+                    Some(Outcome::Skipped { detail, .. }) => Err(detail.clone()),
+                    None => Err("no result".into()),
+                };
             }
         };
         let req = Request::Signal {
