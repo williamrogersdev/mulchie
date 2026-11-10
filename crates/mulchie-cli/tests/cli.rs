@@ -1000,6 +1000,27 @@ fn a_hook_this_build_cannot_read_still_allows() {
 }
 
 #[test]
+fn hook_logs_why_the_engine_was_not_used_and_drains_big_input() {
+    let h = Home::new();
+    // An engine holds the lock but has no listener yet.
+    let paths = h.paths();
+    let engine = Engine::new(paths.clone(), safe_config(&paths));
+    let lk = engine.acquire_lock().unwrap();
+    let ev = r#"{"session_id":"s","tool_name":"Bash","tool_input":{"command":"ls"}}"#;
+    let (code, _, _, _) = hook(&h, &["hook", "claude-code", "pre_tool"], Some(ev));
+    assert_eq!(code, Some(0));
+    let log = std::fs::read_to_string(paths.config_dir.join("hook.log")).unwrap();
+    assert!(log.contains("no API listener"), "{log}");
+    assert!(!log.contains("no engine is running"), "{log}");
+    drop(lk);
+    // Over 1 MiB: refused and allowed, and the writer never sees a closed
+    // pipe (the helper's write_all would fail).
+    let big = format!("{{\"pad\":\"{}\"}}", "x".repeat(3 << 20));
+    let (code, out, _, _) = hook(&h, &["hook", "claude-code", "pre_tool"], Some(&big));
+    assert_eq!((code, out.as_str()), (Some(0), ""));
+}
+
+#[test]
 fn hooks_install_uses_only_the_temp_home() {
     let h = Home::new();
     let o = h.run(&["hooks", "install", "--client", "cursor", "--dry-run"]);

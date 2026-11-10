@@ -431,13 +431,20 @@ pub fn command(paths: &Paths, client: HookClient, event: &str, guard: Option<Gua
     let pid = unsafe { libc::getppid() } as u32;
     let r = with_budget(BUDGET, move || {
         let mut input = Vec::new();
-        std::io::stdin()
+        let mut stdin = std::io::stdin().lock();
+        (&mut stdin)
             .take(MAX_INPUT + 1)
             .read_to_end(&mut input)
             .map_err(|e| format!("cannot read stdin: {e}"))?;
+        if input.len() as u64 > MAX_INPUT {
+            // Read the rest and drop it, so the client is not left writing
+            // into a closed pipe; the budget still bounds the time.
+            let _ = std::io::copy(&mut stdin, &mut std::io::sink());
+        }
         let call = |req: &HookRequest| -> Result<Value, String> {
-            let Conn::Engine(c) = conn::connect_as(&p, true) else {
-                return Err("no engine is running".into());
+            let c = match conn::connect_as(&p, true) {
+                Conn::Engine(c) => c,
+                other => return Err(other.why_not()),
             };
             let body = serde_json::to_value(req).map_err(|e| e.to_string())?;
             conn::call(&c, "POST", ROUTE, Some(&body)).map_err(|e| conn::describe(&e))
