@@ -214,8 +214,8 @@ stderr). The same picture as the MCP diagnose tool.",
         long_about = "With no subcommand, run an MCP server on stdin/stdout (JSON-RPC, one \
 message per line). Agents start with its diagnose tool; deleting is always two calls, a plan \
 and then execute_plan with items from that plan, re-checked by the same safety gate as the \
-CLI. --read-only (or MULCHIE_MCP_READ_ONLY=1) leaves out every tool that deletes, signals or \
-prunes.\n\nUse `mulchie mcp install` to connect it to Claude Code, Claude Desktop, Cursor \
+CLI. --read-only (or MULCHIE_MCP_READ_ONLY=1) leaves out every tool that deletes, signals, \
+prunes or dismisses findings, and check_updates.\n\nUse `mulchie mcp install` to connect it to Claude Code, Claude Desktop, Cursor \
 or Codex in one step.",
         args_conflicts_with_subcommands = true,
         after_help = "Examples:\n  mulchie mcp install                      # list agent apps found\n  mulchie mcp install --client claude-code\n  mulchie mcp install --client cursor --read-only --dry-run\n  mulchie mcp config                       # JSON to paste by hand\n  mulchie mcp --read-only                  # serve on stdio"
@@ -305,7 +305,7 @@ pre_tool, post_tool, stop or session_end (the client's own event names work too)
 
 #[derive(Args, Debug, Clone, Default)]
 pub struct McpArgs {
-    /// Offer only tools that change nothing (plus build slots)
+    /// Offer only tools that change nothing: leave out every tool that deletes, signals, prunes or dismisses findings, and check_updates (build slots stay)
     #[arg(long)]
     pub read_only: bool,
     #[command(subcommand)]
@@ -329,7 +329,7 @@ pub struct McpInstallArgs {
     /// The agent app; without it, list the apps found and what would be done
     #[arg(long, value_enum)]
     pub client: Option<McpClient>,
-    /// Register the read-only server (no deleting, signalling or pruning)
+    /// Register the read-only server (no tool that deletes, signals, prunes or dismisses findings, and no check_updates)
     #[arg(long)]
     pub read_only: bool,
     /// Print the change, change nothing

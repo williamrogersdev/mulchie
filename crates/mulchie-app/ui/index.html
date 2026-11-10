@@ -168,7 +168,7 @@
         <h3>Connect an agent</h3>
         <div class="muted">One command registers Mulchie’s MCP server with the agent apps it finds (Claude Code, Claude Desktop, Cursor and others):</div>
         <div class="cmdrow"><pre class="code" id="connectCmd">mulchie mcp install</pre><button class="btn sm" data-copy-el="connectCmd">Copy</button></div>
-        <div class="muted" style="margin-top:8px"><b>Read-only</b> for agents that should look but not act (no deleting, signalling or pruning):</div>
+        <div class="muted" style="margin-top:8px"><b>Read-only</b> for agents that should look but not act (no tool that deletes, signals, prunes or dismisses findings, and no check_updates):</div>
         <div class="cmdrow"><pre class="code" id="connectRo">mulchie mcp install --read-only</pre><button class="btn sm" data-copy-el="connectRo">Copy</button></div>
         <div class="muted" style="margin-top:8px">To add it by hand, <span class="mono">mulchie mcp config</span> prints the JSON below. Scripts can use the read-only API token from <span class="mono">mulchie token --read-only</span>: it allows the GET and plan routes only.</div>
         <div id="connectNote" class="warn" style="margin-top:6px"></div>
