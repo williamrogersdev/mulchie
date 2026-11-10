@@ -612,14 +612,108 @@ fn leases_over_the_api() {
         )
         .unwrap();
     assert!(g["ticket"].as_u64().is_some());
+    let secret = g["release_secret"]
+        .as_str()
+        .expect("a release secret")
+        .to_string();
+    assert!(secret.len() >= 32);
+    // The secret never appears in state.
+    let st = c.call("GET", "/v1/state", None).unwrap().to_string();
+    assert!(!st.contains(&secret));
+    // A renewal does not hand it out again.
+    let again = c
+        .call("POST", "/v1/lease", Some(&json!({ "ticket": g["ticket"] })))
+        .unwrap();
+    assert!(again.get("release_secret").is_none(), "{again}");
+    let e = c
+        .request(
+            "POST",
+            "/v1/release",
+            Some(&json!({ "ticket": g["ticket"] })),
+            DEFAULT_TIMEOUT,
+        )
+        .unwrap_err();
+    assert_eq!(
+        (e.status, e.code.as_str()),
+        (403, "release_secret_required")
+    );
+    let e = c
+        .request(
+            "POST",
+            "/v1/release",
+            Some(&json!({ "ticket": g["ticket"], "secret": "0".repeat(32) })),
+            DEFAULT_TIMEOUT,
+        )
+        .unwrap_err();
+    assert_eq!(e.code, "wrong_release_secret");
     let rel = c
         .call(
             "POST",
             "/v1/release",
-            Some(&json!({ "ticket": g["ticket"] })),
+            Some(&json!({ "ticket": g["ticket"], "secret": secret })),
         )
         .unwrap();
     assert_eq!(rel["released"], true);
+    // Unknown tickets are simply not released.
+    let rel = c
+        .call("POST", "/v1/release", Some(&json!({ "ticket": 999_999 })))
+        .unwrap();
+    assert_eq!(rel["released"], false);
+}
+
+/// The read-only token may queue its own TTL build slot and release it with
+/// the secret; it may not bind a lease to a pid.
+#[test]
+fn the_read_only_token_takes_and_releases_ttl_leases() {
+    let r = running(Limits::default());
+    let ro = format!("Bearer {}", read_read_only_token(r.engine.paths()).unwrap());
+    let (code, v) = send(
+        r.port,
+        "POST",
+        "/v1/lease",
+        Some(&ro),
+        r#"{"label":"agent build","ttl_secs":600}"#,
+    );
+    assert_eq!(code, 200, "{v}");
+    let secret = v["release_secret"].as_str().unwrap().to_string();
+    let ticket = v["ticket"].as_u64().unwrap();
+    let body = format!(r#"{{"pid": {}, "ttl_secs": 60}}"#, std::process::id());
+    let (code, v) = send(r.port, "POST", "/v1/lease", Some(&ro), &body);
+    assert_eq!((code, v["code"].as_str()), (403, Some("read_only_token")));
+    let (code, v) = send(
+        r.port,
+        "POST",
+        "/v1/release",
+        Some(&ro),
+        &format!(r#"{{"ticket": {ticket}}}"#),
+    );
+    assert_eq!(
+        (code, v["code"].as_str()),
+        (403, Some("release_secret_required"))
+    );
+    let (code, v) = send(
+        r.port,
+        "POST",
+        "/v1/release",
+        Some(&ro),
+        &format!(r#"{{"ticket": {ticket}, "secret": "{secret}"}}"#),
+    );
+    assert_eq!((code, v["released"].as_bool()), (200, Some(true)));
+}
+
+/// Lease labels are redacted before they reach state.
+#[test]
+fn lease_labels_are_redacted() {
+    let (_t, e) = engine();
+    e.acquire(&LeaseRequest {
+        label: "deploy --token ghp_ABCDEFGHIJKLMNOPQRSTUVWX".into(),
+        ttl_secs: Some(60),
+        ..Default::default()
+    })
+    .unwrap();
+    let st = serde_json::to_string(&e.snapshot_state()).unwrap();
+    assert!(!st.contains("ghp_ABCDEFGHIJKLMNOPQRSTUVWX"), "{st}");
+    assert!(st.contains("deploy --token [redacted]"));
 }
 
 // -------------------------------------------------------- read-only token
@@ -672,6 +766,8 @@ fn read_only_route_list() {
     assert!(read_only_allowed("POST", "/v1/clean/plan"));
     assert!(read_only_allowed("POST", "/v1/worktree/plan"));
     assert!(read_only_allowed("POST", "/v1/process/plan"));
+    assert!(read_only_allowed("POST", "/v1/lease"));
+    assert!(read_only_allowed("POST", "/v1/release"));
     for p in [
         "/v1/process/execute",
         "/v1/clean",
@@ -680,8 +776,6 @@ fn read_only_route_list() {
         "/v1/prune",
         "/v1/process",
         "/v1/workspace",
-        "/v1/lease",
-        "/v1/release",
         "/v1/scan",
     ] {
         assert!(!read_only_allowed("POST", p), "{p}");
@@ -786,4 +880,39 @@ fn process_plans_and_execution_over_http() {
     let bad = json!({ "items": [{"action": "delete_cache", "path": "/tmp/x"}] }).to_string();
     let (code, v) = send(r.port, "POST", "/v1/process/execute", Some(&full), &bad);
     assert_eq!((code, v["code"].as_str()), (400, Some("invalid_item")));
+}
+
+/// With expected_start_time, /v1/process answers a skip with 200 and a reason;
+/// without it, the old shape (400 action_refused) is unchanged.
+#[test]
+fn process_route_takes_an_expected_start_time() {
+    let r = running(Limits::default());
+    let full = format!("Bearer {}", r.token);
+    let (code, v) = send(
+        r.port,
+        "POST",
+        "/v1/process",
+        Some(&full),
+        r#"{"pid": 4000321, "action": "term", "expected_start_time": 5}"#,
+    );
+    assert_eq!(code, 200, "{v}");
+    assert_eq!(v["ok"], false);
+    assert_eq!(v["result"]["status"], "skipped");
+    assert_eq!(v["result"]["reason"], "process_gone");
+    let (code, v) = send(
+        r.port,
+        "POST",
+        "/v1/process",
+        Some(&full),
+        r#"{"pid": 4000321, "action": "term"}"#,
+    );
+    assert_eq!((code, v["code"].as_str()), (400, Some("action_refused")));
+    let (code, v) = send(
+        r.port,
+        "POST",
+        "/v1/workspace",
+        Some(&full),
+        r#"{"path": "/nope", "action": "pause", "pids": [{"pid": 4000321, "expected_start_time": 5}]}"#,
+    );
+    assert_eq!((code, v["code"].as_str()), (400, Some("action_refused")));
 }

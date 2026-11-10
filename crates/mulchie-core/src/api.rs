@@ -99,9 +99,17 @@ pub fn read_only_token_path_in(paths: &Paths) -> PathBuf {
 /// only plan.
 pub const READ_ONLY_POSTS: &[&str] = &["/v1/clean/plan", "/v1/worktree/plan", "/v1/process/plan"];
 
+/// Build-slot routes the read-only token may also call, within limits: it may
+/// take a lease only with a `ttl_secs` and no `pid`, and release only with the
+/// lease's release secret. A read-only agent that cannot queue its builds
+/// would make the machine worse, not safer.
+pub const READ_ONLY_LEASE_POSTS: &[&str] = &["/v1/lease", "/v1/release"];
+
 /// Whether the read-only token may call `method path`.
 pub fn read_only_allowed(method: &str, path: &str) -> bool {
-    method == "GET" || (method == "POST" && READ_ONLY_POSTS.contains(&path))
+    method == "GET"
+        || (method == "POST"
+            && (READ_ONLY_POSTS.contains(&path) || READ_ONLY_LEASE_POSTS.contains(&path)))
 }
 
 /// The token file for this user's environment.
@@ -779,10 +787,12 @@ fn dispatch(req: &Req, engine: &Engine, token: &str, read_token: &str, port: u16
     if req.method == "GET" && req.path == "/v1/health" {
         return ok(&engine.health_summary());
     }
+    let mut read_only = false;
     if !bearer_ok(req.auth.as_deref(), token) {
         if !bearer_ok(req.auth.as_deref(), read_token) {
             return fail(401, "unauthorized", "missing or invalid bearer token");
         }
+        read_only = true;
         if !read_only_allowed(&req.method, &req.path) {
             return fail(
                 403,
@@ -794,7 +804,7 @@ fn dispatch(req: &Req, engine: &Engine, token: &str, read_token: &str, port: u16
             );
         }
     }
-    route(req, engine)
+    route(req, engine, read_only)
 }
 
 fn body<T: serde::de::DeserializeOwned>(req: &Req) -> Result<T, Resp> {
@@ -844,11 +854,17 @@ struct WorktreePlanBody {
 struct WorkspaceBody {
     path: PathBuf,
     action: WorkspaceAction,
+    /// The previewed processes; when given, only these are acted on.
+    #[serde(default)]
+    pids: Option<Vec<crate::engine::PidRef>>,
 }
 
 #[derive(Deserialize)]
 struct ProcessBody {
     pid: u32,
+    /// The start time the caller saw; a mismatch is skipped (200), not an error.
+    #[serde(default)]
+    expected_start_time: Option<u64>,
     #[serde(flatten)]
     action: ProcAction,
 }
@@ -861,6 +877,9 @@ struct PruneBody {
 #[derive(Deserialize)]
 struct ReleaseBody {
     ticket: u64,
+    /// The `release_secret` from the reply that created the ticket.
+    #[serde(default)]
+    secret: Option<String>,
 }
 
 fn is_cache(r: &Request) -> bool {
@@ -898,7 +917,7 @@ fn run_items(
     ok(&engine.execute(items, "api"))
 }
 
-fn route(req: &Req, engine: &Engine) -> Resp {
+fn route(req: &Req, engine: &Engine, read_only: bool) -> Resp {
     let r = (|| -> Result<Resp, Resp> {
         Ok(match (req.method.as_str(), req.path.as_str()) {
             ("GET", "/v1/state") => ok(&engine.snapshot_state()),
@@ -984,6 +1003,18 @@ fn route(req: &Req, engine: &Engine) -> Resp {
             }
             ("POST", "/v1/workspace") => {
                 let b: WorkspaceBody = body(req)?;
+                if let Some(pids) = &b.pids {
+                    return Ok(
+                        match engine.workspace_action_on(&b.path, b.action, pids, "api") {
+                            Ok(results) => ok(&serde_json::json!({
+                                "ok": true,
+                                "processes": results.iter().filter(|r| r.is_done()).count(),
+                                "results": results,
+                            })),
+                            Err(e) => fail(400, "action_refused", e),
+                        },
+                    );
+                }
                 match engine.workspace_action(&b.path, b.action, "api") {
                     Ok(n) => ok(&serde_json::json!({ "ok": true, "processes": n })),
                     Err(e) => fail(400, "action_refused", e),
@@ -991,6 +1022,10 @@ fn route(req: &Req, engine: &Engine) -> Resp {
             }
             ("POST", "/v1/process") => {
                 let b: ProcessBody = body(req)?;
+                if let Some(st) = b.expected_start_time {
+                    let r = engine.process_action_expecting(b.pid, b.action, st, "api");
+                    return Ok(ok(&serde_json::json!({ "ok": r.is_done(), "result": r })));
+                }
                 match engine.process_action(b.pid, b.action, "api") {
                     Ok(()) => ok(&serde_json::json!({ "ok": true })),
                     Err(e) => fail(400, "action_refused", e),
@@ -1013,6 +1048,13 @@ fn route(req: &Req, engine: &Engine) -> Resp {
             }
             ("POST", "/v1/lease") => {
                 let b: LeaseRequest = body(req)?;
+                if read_only && b.pid.is_some() {
+                    return Ok(fail(
+                        403,
+                        "read_only_token",
+                        "the read-only token may take a build slot only with ttl_secs and no pid",
+                    ));
+                }
                 match engine.acquire(&b) {
                     Ok(r) => ok(&r),
                     Err(e) => fail(400, e.code(), e.to_string()),
@@ -1020,7 +1062,14 @@ fn route(req: &Req, engine: &Engine) -> Resp {
             }
             ("POST", "/v1/release") => {
                 let b: ReleaseBody = body(req)?;
-                ok(&serde_json::json!({ "released": engine.release(b.ticket) }))
+                match engine.release_with(b.ticket, b.secret.as_deref()) {
+                    Ok(released) => ok(&serde_json::json!({ "released": released })),
+                    Err(e) => fail(
+                        403,
+                        e.code(),
+                        "this lease has a release secret; send the release_secret from the reply that created the ticket",
+                    ),
+                }
             }
             (m, p) => {
                 if ROUTES.iter().any(|(_, rp)| *rp == p) {

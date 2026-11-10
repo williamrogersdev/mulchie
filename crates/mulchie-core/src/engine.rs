@@ -115,6 +115,10 @@ pub struct Lease {
     /// table knows it; a reused pid does not keep the lease.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub pid_start_time: Option<u64>,
+    /// Returned once, to the acquirer; `/v1/release` must present it. Never
+    /// serialized into state.
+    #[serde(skip)]
+    pub release_secret: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -127,6 +131,10 @@ pub struct Waiter {
     pub ttl_secs: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub pid_start_time: Option<u64>,
+    /// Returned once, to the acquirer; `/v1/release` must present it. Never
+    /// serialized into state.
+    #[serde(skip)]
+    pub release_secret: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Default)]
@@ -145,6 +153,36 @@ pub struct LeaseReply {
     pub position: usize,
     pub reason: String,
     pub expires_unix: Option<u64>,
+    /// Only in the reply that created the ticket: present it to release the
+    /// lease (`POST /v1/release {ticket, secret}`). Keep it private.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub release_secret: Option<String>,
+}
+
+/// Why a release was refused.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReleaseError {
+    /// The lease has a release secret and none was sent.
+    SecretRequired,
+    /// The secret sent is not the lease's.
+    WrongSecret,
+}
+
+impl ReleaseError {
+    pub fn code(self) -> &'static str {
+        match self {
+            ReleaseError::SecretRequired => "release_secret_required",
+            ReleaseError::WrongSecret => "wrong_release_secret",
+        }
+    }
+}
+
+/// A process the caller previewed: act on it only while it is still the
+/// process that started at `expected_start_time`.
+#[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq)]
+pub struct PidRef {
+    pub pid: u32,
+    pub expected_start_time: u64,
 }
 
 /// A build-slot request. A lease needs a live `pid`, a `ttl_secs`, or both.
@@ -1239,6 +1277,70 @@ impl Engine {
 
     // -------------------------------------------------------------- processes
 
+    /// A workspace action on exactly the processes the caller previewed: each
+    /// `{pid, expected_start_time}` must still be in the workspace and still
+    /// be that process (the gate rechecks); anything else is skipped, never
+    /// widened to the workspace's current processes.
+    pub fn workspace_action_on(
+        &self,
+        path: &Path,
+        action: WorkspaceAction,
+        pids: &[PidRef],
+        source: &str,
+    ) -> Result<Vec<ActionResult>, String> {
+        let (ws, nice) = {
+            let st = lock(&self.state);
+            let ws = st
+                .snapshot
+                .workspaces
+                .iter()
+                .find(|w| w.path == path)
+                .cloned()
+                .ok_or("workspace has no running processes")?;
+            (ws, st.config.build_nice.max(10))
+        };
+        let mut out = Vec::new();
+        let mut reqs = Vec::new();
+        for r in pids {
+            let Some(p) = ws.procs.iter().find(|p| p.pid == r.pid) else {
+                out.push(ActionResult {
+                    action: crate::safety::ActionKind::Signal,
+                    target: format!("pid {}", r.pid),
+                    outcome: Outcome::Skipped {
+                        reason: crate::safety::SkipReason::UnknownTarget,
+                        detail: "not a process of this workspace in the latest sample".into(),
+                    },
+                    journal_error: None,
+                });
+                continue;
+            };
+            let sigs: &[Signal] = match action {
+                WorkspaceAction::Pause => &[Signal::Stop],
+                WorkspaceAction::Resume => &[Signal::Cont],
+                WorkspaceAction::StopBuilds if p.kind == ProcKind::Build => &[Signal::Term],
+                WorkspaceAction::StopBuilds => &[],
+                WorkspaceAction::KillAll => &[Signal::Cont, Signal::Term],
+                WorkspaceAction::Deprioritize => {
+                    reqs.push(Request::Renice {
+                        pid: r.pid,
+                        nice,
+                        expected_start_time: r.expected_start_time,
+                    });
+                    &[]
+                }
+            };
+            for s in sigs {
+                reqs.push(Request::Signal {
+                    pid: r.pid,
+                    signal: *s,
+                    expected_start_time: r.expected_start_time,
+                });
+            }
+        }
+        out.extend(self.execute(&reqs, source));
+        Ok(out)
+    }
+
     pub fn workspace_action(
         &self,
         path: &Path,
@@ -1448,6 +1550,46 @@ impl Engine {
         }
     }
 
+    /// One action on `pid` only if it is still the process started at
+    /// `expected_start_time`; a mismatch is a skipped result, not an error.
+    pub fn process_action_expecting(
+        &self,
+        pid: u32,
+        action: ProcAction,
+        expected_start_time: u64,
+        source: &str,
+    ) -> ActionResult {
+        let req = match action {
+            ProcAction::Renice { nice } => Request::Renice {
+                pid,
+                nice: nice.clamp(0, 20),
+                expected_start_time,
+            },
+            a => Request::Signal {
+                pid,
+                signal: match a {
+                    ProcAction::Kill => Signal::Kill,
+                    ProcAction::Stop => Signal::Stop,
+                    ProcAction::Cont => Signal::Cont,
+                    _ => Signal::Term,
+                },
+                expected_start_time,
+            },
+        };
+        self.execute(std::slice::from_ref(&req), source)
+            .into_iter()
+            .next()
+            .unwrap_or(ActionResult {
+                action: req.action(),
+                target: req.target(),
+                outcome: Outcome::Skipped {
+                    reason: crate::safety::SkipReason::UnknownTarget,
+                    detail: "no result".into(),
+                },
+                journal_error: None,
+            })
+    }
+
     pub fn process_action(&self, pid: u32, action: ProcAction, source: &str) -> Result<(), String> {
         if pid <= 1 || pid == std::process::id() {
             return Err("refusing to signal this process".into());
@@ -1571,11 +1713,13 @@ impl Engine {
                 pid_start_time = Some(f.start_time);
             }
         }
+        // Labels leave the engine (state, journal): no secrets, bounded.
         let label = if req.label.is_empty() {
             pid.map(|p| format!("pid {p}"))
                 .unwrap_or_else(|| "lease".into())
         } else {
-            req.label.clone()
+            let l = crate::redact::redact_command_line(&req.label);
+            l.chars().take(200).collect()
         };
         let mut st = lock(&self.state);
         expire_leases(&mut st.slots, now, &|p, s| self.lease_pid_alive(p, s));
@@ -1601,12 +1745,15 @@ impl Engine {
                 position: 0,
                 reason: "renewed".into(),
                 expires_unix: l.expires_unix,
+                release_secret: None,
             });
         }
+        let mut new_secret = None;
         let id = match ticket.filter(|t| st.slots.waiting.iter().any(|w| w.id == *t)) {
             Some(t) => t,
             None => {
                 let id = self.next_id.fetch_add(1, Ordering::SeqCst);
+                new_secret = crate::paths::random_hex(16).ok();
                 st.slots.waiting.push(Waiter {
                     id,
                     label,
@@ -1615,6 +1762,7 @@ impl Engine {
                     last_poll: now,
                     ttl_secs: req.ttl_secs,
                     pid_start_time,
+                    release_secret: new_secret.clone(),
                 });
                 id
             }
@@ -1647,6 +1795,7 @@ impl Engine {
                 ttl_secs: w.ttl_secs,
                 expires_unix,
                 pid_start_time: w.pid_start_time,
+                release_secret: w.release_secret,
             });
             let reason = format!("slot {}/{}", st.slots.active.len(), cap);
             return Ok(LeaseReply {
@@ -1656,6 +1805,7 @@ impl Engine {
                 position: 0,
                 reason,
                 expires_unix,
+                release_secret: new_secret,
             });
         }
         let reason = if !mem_ok {
@@ -1672,9 +1822,47 @@ impl Engine {
             position,
             reason,
             expires_unix: None,
+            release_secret: new_secret,
         })
     }
 
+    /// Release `ticket` when `secret` matches the lease's release secret (a
+    /// lease or waiter that has one cannot be released without it).
+    /// `Ok(false)` when there is no such ticket.
+    pub fn release_with(&self, ticket: u64, secret: Option<&str>) -> Result<bool, ReleaseError> {
+        let mut st = lock(&self.state);
+        let held = st
+            .slots
+            .active
+            .iter()
+            .find(|l| l.id == ticket)
+            .map(|l| l.release_secret.clone())
+            .or_else(|| {
+                st.slots
+                    .waiting
+                    .iter()
+                    .find(|w| w.id == ticket)
+                    .map(|w| w.release_secret.clone())
+            });
+        let Some(want) = held else {
+            return Ok(false);
+        };
+        if let Some(want) = want {
+            match secret {
+                None => return Err(ReleaseError::SecretRequired),
+                Some(got) if !crate::api::constant_time_eq(got.as_bytes(), want.as_bytes()) => {
+                    return Err(ReleaseError::WrongSecret)
+                }
+                Some(_) => {}
+            }
+        }
+        st.slots.active.retain(|l| l.id != ticket);
+        st.slots.waiting.retain(|w| w.id != ticket);
+        Ok(true)
+    }
+
+    /// Release `ticket` without a secret: for in-process callers (the app,
+    /// the CLI's own engine). The HTTP route uses [`Engine::release_with`].
     pub fn release(&self, ticket: u64) -> bool {
         let mut st = lock(&self.state);
         let before = st.slots.active.len() + st.slots.waiting.len();

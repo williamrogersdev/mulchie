@@ -410,14 +410,14 @@ impl Monitor {
                 mem_bytes: p.memory(),
                 start_time: p.start_time(),
             });
-            let cmd = shorten_cmd(
-                &p.cmd()
-                    .iter()
-                    .map(|a| a.to_string_lossy())
-                    .collect::<Vec<_>>()
-                    .join(" "),
-                &home,
-            );
+            // Command lines leave the engine (state, API, agents): secrets
+            // are redacted before they are kept.
+            let args: Vec<String> = p
+                .cmd()
+                .iter()
+                .map(|a| a.to_string_lossy().to_string())
+                .collect();
+            let cmd = shorten_cmd(&crate::redact::redact_args(&args).join(" "), &home);
             let info = ProcInfo {
                 pid: pid.as_u32(),
                 ppid: p.parent().map(|x| x.as_u32()).unwrap_or(0),

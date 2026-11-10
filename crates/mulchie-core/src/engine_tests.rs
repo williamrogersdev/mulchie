@@ -849,3 +849,100 @@ fn group_plans_refuse_ancestors_and_execute_through_the_gate() {
     });
     assert_eq!(p.refused.as_deref(), Some("unknown_group"));
 }
+
+fn info(pid: u32, start_time: u64, kind: ProcKind) -> crate::monitor::ProcInfo {
+    crate::monitor::ProcInfo {
+        pid,
+        ppid: 1,
+        name: "sleep".into(),
+        kind,
+        group: "r".into(),
+        workspace: Some(PathBuf::from("/code/r")),
+        own: true,
+        cpu_pct: 0.0,
+        mem_bytes: 0,
+        read_bps: 0,
+        write_bps: 0,
+        nice: 0,
+        stopped: false,
+        run_secs: 1,
+        start_time,
+        cmd: "sleep 30".into(),
+    }
+}
+
+/// CLI review 1: process and workspace actions act on what the caller
+/// previewed (pid + start time), not on the latest snapshot.
+#[test]
+fn actions_take_the_previewed_start_times() {
+    let mut a = std::process::Command::new("/bin/sleep")
+        .arg("30")
+        .spawn()
+        .unwrap();
+    let mut b = std::process::Command::new("/bin/sleep")
+        .arg("30")
+        .spawn()
+        .unwrap();
+    let procs = FakeProcesses::empty()
+        .with(a.id(), "sleep", None, 777)
+        .with(b.id(), "sleep", None, 888);
+    let (_t, e) = engine_with_procs(Config::default(), procs);
+
+    let r = e.process_action_expecting(a.id(), ProcAction::Term, 776, "t");
+    assert_eq!(r.reason(), Some(SkipReason::StartTimeMismatch), "{r:?}");
+    assert!(a.try_wait().unwrap().is_none(), "still running");
+
+    let ws = crate::monitor::Workspace {
+        path: PathBuf::from("/code/r"),
+        label: "r".into(),
+        repo: "r".into(),
+        name: "r".into(),
+        branch: None,
+        is_worktree: false,
+        exists: true,
+        paused: false,
+        throttled: 0,
+        agents: 0,
+        builds: 2,
+        cpu_pct: 0.0,
+        mem_bytes: 0,
+        read_bps: 0,
+        write_bps: 0,
+        orphan: None,
+        procs: vec![
+            info(a.id(), 777, ProcKind::Build),
+            info(b.id(), 888, ProcKind::Build),
+        ],
+    };
+    e.state_mut().snapshot = Arc::new(Snapshot {
+        workspaces: vec![ws],
+        ..Default::default()
+    });
+    let only_a = [
+        PidRef {
+            pid: a.id(),
+            expected_start_time: 777,
+        },
+        PidRef {
+            pid: 4_000_999,
+            expected_start_time: 1,
+        },
+    ];
+    let res = e
+        .workspace_action_on(
+            Path::new("/code/r"),
+            WorkspaceAction::StopBuilds,
+            &only_a,
+            "t",
+        )
+        .unwrap();
+    assert_eq!(res[0].reason(), Some(SkipReason::UnknownTarget));
+    assert!(res[1].is_done(), "{res:?}");
+    assert!(!a.wait().unwrap().success(), "a was stopped");
+    assert!(
+        b.try_wait().unwrap().is_none(),
+        "b was not in the previewed set"
+    );
+    let _ = b.kill();
+    let _ = b.wait();
+}
