@@ -76,6 +76,9 @@ pub enum FindingKind {
     HomebrewOutdated,
     /// A package in a workspace lockfile has a known vulnerability (OSV.dev).
     Advisory,
+    /// `paused.json` could not be read at start: processes paused by an
+    /// earlier engine may still be stopped.
+    PausedListUnreadable,
 }
 
 impl FindingKind {
@@ -106,7 +109,7 @@ impl FindingKind {
             InsecurePermissions | ApiExposed | EngineLockNotHeld | ConfigNotLoaded => {
                 FindingCategory::Posture
             }
-            LimitExceeded | SessionHog => FindingCategory::Limit,
+            LimitExceeded | SessionHog | PausedListUnreadable => FindingCategory::Limit,
             MulchieUpdate | AgentUpdate | HomebrewOutdated | Advisory => FindingCategory::Update,
         }
     }

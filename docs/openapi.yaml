@@ -995,6 +995,7 @@ components:
         - agent_update
         - homebrew_outdated
         - advisory
+        - paused_list_unreadable
     FindingCounts:
       type: object
       properties:
@@ -1106,3 +1107,4 @@ components:
         session_id: { type: string }
         breach_id: { type: string }
         since_unix: { type: integer }
+        pausing: { type: boolean, description: "Recorded before SIGSTOP was sent and not yet confirmed; absent once it was" }

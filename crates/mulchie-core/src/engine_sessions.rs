@@ -32,6 +32,10 @@ pub struct PausedProc {
     pub session_id: String,
     pub breach_id: String,
     pub since_unix: u64,
+    /// Recorded before SIGSTOP is sent; false once it was. A crash in
+    /// between leaves the entry, so the next engine resumes it.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub pausing: bool,
 }
 
 /// Work for the limits worker.
@@ -127,6 +131,8 @@ pub(crate) struct Supervision {
     lowered: HashMap<String, Vec<(u32, u64, i32)>>,
     record_limits: Option<RecordLimits>,
     last_sweep: u64,
+    /// Why `paused.json` could not be read at start; shown as a finding.
+    pub(crate) paused_file_error: Option<String>,
 }
 
 /// One session in [`State`]: the figures, not the history.
@@ -490,7 +496,10 @@ impl Engine {
                     SessionEvent::ProcessStarted { .. } => {}
                 }
             }
-            let findings = limit_findings(&sup.limits, &sup.tracker, now);
+            let mut findings = limit_findings(&sup.limits, &sup.tracker, now);
+            if let Some(e) = &sup.paused_file_error {
+                findings.push(paused_file_finding(&self.paths, e, now));
+            }
             let rl = RecordLimits::from_config(&cfg.sessions);
             let limits_changed = sup.record_limits.replace(rl) != Some(rl);
             let sweep = records && now >= sup.last_sweep.saturating_add(SWEEP_SECS);
@@ -728,26 +737,53 @@ impl Engine {
         let (state, detail, verb) = match b.action {
             LimitAction::Notify => return,
             LimitAction::Pause => {
+                // Shutdown takes this lock before it resumes everything, so
+                // a pause either finishes first (and is resumed) or never
+                // starts.
+                let _pausing = lock(&self.pause_lock);
+                if self.is_shut_down() {
+                    self.set_action(
+                        breach_id,
+                        ActionState::Skipped,
+                        Some("the engine is shutting down".into()),
+                    );
+                    return;
+                }
+                // Recorded (and saved) before SIGSTOP: a crash in between
+                // still leaves them to resume.
+                {
+                    let mut sup = lock(&self.sup);
+                    for (pid, st) in &targets {
+                        sup.paused.push(PausedProc {
+                            pid: *pid,
+                            start_time: *st,
+                            session_id: b.session_id.clone(),
+                            breach_id: b.id.clone(),
+                            since_unix: now,
+                            pausing: true,
+                        });
+                    }
+                }
+                self.persist_paused();
                 let results = self.execute(&sig(Signal::Stop), source);
                 let mut done = 0;
                 {
                     let mut sup = lock(&self.sup);
                     for (r, (pid, st)) in results.iter().zip(&targets) {
+                        let Some(i) = sup.paused.iter().position(|p| {
+                            p.pausing && p.pid == *pid && p.start_time == *st && p.breach_id == b.id
+                        }) else {
+                            continue;
+                        };
                         if r.is_done() {
                             done += 1;
-                            sup.paused.push(PausedProc {
-                                pid: *pid,
-                                start_time: *st,
-                                session_id: b.session_id.clone(),
-                                breach_id: b.id.clone(),
-                                since_unix: now,
-                            });
+                            sup.paused[i].pausing = false;
+                        } else {
+                            sup.paused.remove(i);
                         }
                     }
                 }
-                if done > 0 {
-                    self.persist_paused();
-                }
+                self.persist_paused();
                 (
                     state_of(done, total),
                     self.detail(done, total, &results),
@@ -951,9 +987,12 @@ impl Engine {
         let results = self.execute(&reqs, source);
         let resumed = results.iter().filter(|r| r.is_done()).count();
         {
+            let keys: HashSet<(u32, u64)> = entries.iter().map(|p| (p.pid, p.start_time)).collect();
             let mut sup = lock(&self.sup);
-            sup.paused.retain(|p| !entries.contains(p));
-            sup.paused_left.retain(|p| !entries.contains(p));
+            sup.paused
+                .retain(|p| !keys.contains(&(p.pid, p.start_time)));
+            sup.paused_left
+                .retain(|p| !keys.contains(&(p.pid, p.start_time)));
         }
         self.persist_paused();
         let failed = skipped_words(&results);
@@ -1017,6 +1056,7 @@ impl Engine {
                     None,
                     "limits",
                 );
+                lock(&self.sup).paused_file_error = Some(e);
                 return;
             }
         };
@@ -1299,6 +1339,38 @@ fn limit_findings(limits: &Limits, tracker: &Tracker, now: u64) -> Vec<Finding> 
         });
     }
     out
+}
+
+/// `paused.json` could not be read at start: processes an earlier engine
+/// paused may still be stopped.
+fn paused_file_finding(paths: &Paths, error: &str, now: u64) -> Finding {
+    let file = paused_path(paths);
+    Finding {
+        id: format!("paused_list_unreadable:{}", file.display()),
+        kind: FindingKind::PausedListUnreadable,
+        category: FindingCategory::Limit,
+        severity: Severity::High,
+        title: format!(
+            "Mulchie could not read its list of paused processes ({})",
+            file.display()
+        ),
+        why: "Processes an earlier Mulchie paused for a limit may still be stopped, and this engine cannot tell which. Look for stopped processes (state T in ps) and continue them, then fix or remove the file.".into(),
+        evidence: Evidence {
+            path: Some(file),
+            detail: Some(error.to_string()),
+            ..Evidence::default()
+        },
+        suggested: vec![Suggestion {
+            label: "List stopped processes".into(),
+            request: None,
+            api: Some("GET /v1/state".into()),
+            reversible: true,
+        }],
+        first_seen_unix: now,
+        last_seen_unix: now,
+        dismissed: false,
+        dismissed_until: None,
+    }
 }
 
 /// Most severe first, then kind and id (as [`watch::finalize`] sorts).

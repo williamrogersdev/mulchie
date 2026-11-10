@@ -296,6 +296,7 @@ fn processes_paused_before_a_restart_are_resumed_or_reported() {
         session_id: "s-500-77777".into(),
         breach_id: "b-1".into(),
         since_unix: 900,
+        pausing: false,
     };
 
     // Not automating: reported, left alone.
@@ -589,4 +590,116 @@ fn paused_processes_are_resumed_when_their_pause_no_longer_applies() {
     e.observe_sessions(1_003, &[], M, &off(&c));
     e.shutdown(Duration::from_millis(10));
     assert!(!work.stopped(), "shutdown resumes");
+}
+
+/// N7: a pause records its targets as `pausing` before SIGSTOP and keeps
+/// only those it stopped; an entry a crash left `pausing` is resumed on
+/// start; a pause after shutdown began never starts, and one in flight
+/// when shutdown begins is finished, then resumed; an unreadable
+/// paused.json is a finding naming the file.
+#[test]
+fn pause_windows_are_closed() {
+    // A target the gate skips (pid reused) is not left listed; the stopped
+    // one is listed without `pausing`.
+    let mut work = Child::sleep();
+    let mut other = Child::sleep();
+    let (w, o) = (work.pid(), other.pid());
+    let c = cfg(LimitAction::Pause, false);
+    let (_t, e) = engine(&c, &[(w, 1000), (o, 4242)]);
+    let busy = [
+        proc(77_777, 1, 500, Some("claude"), 0.0),
+        proc(w, 77_777, 1000, None, 300.0),
+        proc(o, 77_777, 1001, None, 0.0),
+    ];
+    e.observe_sessions(1_000, &busy, M, &c);
+    e.run_limit_jobs(1_000);
+    assert!(work.stopped() && !other.stopped());
+    let saved = load_paused(e.paths()).unwrap();
+    assert_eq!(saved.len(), 1, "{saved:?}");
+    assert!(!saved[0].pausing);
+    let text = std::fs::read_to_string(paused_path(e.paths())).unwrap();
+    assert!(!text.contains("pausing"), "{text}");
+    e.shutdown(Duration::from_millis(10));
+    assert!(!work.stopped());
+
+    // A crash between recording and SIGSTOP: the next engine resumes it.
+    unsafe { libc::kill(w as i32, libc::SIGSTOP) };
+    std::thread::sleep(Duration::from_millis(100));
+    let (_t, e) = engine(&c, &[(w, 1000)]);
+    let crashed = PausedProc {
+        pid: w,
+        start_time: 1000,
+        session_id: "s-500-77777".into(),
+        breach_id: "b-1".into(),
+        since_unix: 900,
+        pausing: true,
+    };
+    save_paused(e.paths(), &[crashed]).unwrap();
+    e.recover_paused();
+    assert!(!work.stopped(), "resumed on start");
+
+    // After shutdown began: the pause is skipped.
+    let (_t, e) = engine(&c, &[(w, 1000)]);
+    let one = [
+        proc(77_777, 1, 500, Some("claude"), 0.0),
+        proc(w, 77_777, 1000, None, 300.0),
+    ];
+    e.observe_sessions(1_000, &one, M, &c);
+    e.shutdown(Duration::from_millis(10));
+    e.run_limit_jobs(1_000);
+    assert!(!work.stopped(), "no pause after shutdown");
+    let b = only_breach(&e);
+    assert_eq!(b.action_state, ActionState::Skipped);
+    assert!(b.action_detail.unwrap().contains("shutting down"));
+
+    // In flight when shutdown begins: shutdown waits for it, then resumes.
+    let (_t, e) = engine(&c, &[(w, 1000)]);
+    let (tx, rx) = std::sync::mpsc::channel();
+    let e2 = e.clone();
+    let h = std::thread::spawn(move || {
+        let _g = lock(&e2.pause_lock);
+        tx.send(()).unwrap();
+        std::thread::sleep(Duration::from_millis(300));
+        lock(&e2.sup).paused.push(PausedProc {
+            pid: w,
+            start_time: 1000,
+            session_id: "s-500-77777".into(),
+            breach_id: "b-1".into(),
+            since_unix: 900,
+            pausing: false,
+        });
+        e2.execute(
+            &[Request::Signal {
+                pid: w,
+                signal: Signal::Stop,
+                expected_start_time: 1000,
+            }],
+            "limits",
+        );
+    });
+    rx.recv().unwrap();
+    e.shutdown(Duration::from_millis(10));
+    h.join().unwrap();
+    assert!(!work.stopped(), "the in-flight pause was resumed");
+
+    // Unreadable paused.json: a finding naming the file.
+    let (_t, e) = engine(&c, &[]);
+    let f = paused_path(e.paths());
+    std::fs::create_dir_all(f.parent().unwrap()).unwrap();
+    std::fs::write(&f, "{not json").unwrap();
+    e.recover_paused();
+    e.observe_sessions(1_000, &[], M, &c);
+    let st = e.snapshot_state();
+    let found = st
+        .findings
+        .iter()
+        .find(|x| x.kind == FindingKind::PausedListUnreadable)
+        .expect("finding");
+    assert_eq!(found.category, FindingCategory::Limit);
+    assert!(
+        found.title.contains(&f.display().to_string()),
+        "{}",
+        found.title
+    );
+    let _ = (work.0.kill(), other.0.kill());
 }

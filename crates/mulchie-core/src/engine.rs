@@ -714,6 +714,9 @@ pub struct Engine {
     sup: Arc<Mutex<Supervision>>,
     /// Wakes the limits worker.
     limit_wake: Arc<Condvar>,
+    /// Held across a limit pause (record, SIGSTOP, update) and by shutdown
+    /// before it resumes everything.
+    pause_lock: Arc<Mutex<()>>,
     /// The activity record writer, started on first use.
     record: Arc<std::sync::OnceLock<crate::record::Record>>,
     /// Update checks: sources, cache and the worker's state.
@@ -792,6 +795,7 @@ impl Engine {
             config_checked: Arc::new(Mutex::new(None)),
             sup: Arc::new(Mutex::new(Supervision::default())),
             limit_wake: Arc::new(Condvar::new()),
+            pause_lock: Arc::new(Mutex::new(())),
             record: Arc::new(std::sync::OnceLock::new()),
             updates: Arc::new(update_sources(home_for_runner)),
         }
@@ -1121,7 +1125,11 @@ impl Engine {
             }
         }
         self.restore_priorities("shutdown");
-        self.resume_all_paused("shutdown");
+        {
+            // A pause still running finishes first; none starts after.
+            let _pausing = lock(&self.pause_lock);
+            self.resume_all_paused("shutdown");
+        }
         self.flush_record();
     }
 
