@@ -299,7 +299,7 @@ paths:
                 action: { type: string, enum: [quit, force_quit, pause, resume, lower_priority, stop_builds, restart] }
                 caller_pid: { type: integer }
                 session: { type: string, description: A session id; plans its processes }
-                include_agent: { type: boolean, description: With `session`, also the agent process at its root }
+                include_agent: { type: boolean, description: "With `session`, also the agent process at its root" }
       responses:
         "200":
           description: The plan; nothing was changed
@@ -1057,7 +1057,7 @@ components:
         workspace: { type: [string, "null"] }
         started_unix: { type: integer }
         ended_unix: { type: [integer, "null"] }
-        listening: { type: array, items: { type: integer }, description: Ports the session's processes listen on, from the last watch run }
+        listening: { type: array, items: { type: integer }, description: "Ports the session's processes listen on, from the last watch run" }
         usage: { $ref: "#/components/schemas/SessionUsage" }
         peak: { type: object, properties: { cpu_cores: { type: number }, memory_mb: { type: number }, processes: { type: integer }, write_mb_per_hour: { type: [number, "null"] } } }
     SessionUsage:
