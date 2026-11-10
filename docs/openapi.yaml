@@ -1081,6 +1081,18 @@ components:
             path: { type: string }
             mode: { type: string }
             detail: { type: string }
+            updates:
+              type: array
+              description: Update findings only. One item per package.
+              items:
+                type: object
+                required: [package, source]
+                properties:
+                  package: { type: string }
+                  installed: { type: string }
+                  latest: { type: string, description: "The latest release; for an advisory, the first fixed version (absent when none is listed)" }
+                  source: { type: string, description: "github, npm, homebrew, osv.dev, …" }
+                  command: { type: string, description: What the user may run to update it; Mulchie runs nothing }
         suggested:
           type: array
           items:
@@ -1088,7 +1100,15 @@ components:
             properties:
               label: { type: string }
               request: { $ref: "#/components/schemas/Request" }
-              api: { type: string, description: "Another route to call, e.g. the dismiss route" }
+              api: { type: string, description: "Another route to call, in words, e.g. the dismiss route" }
+              api_request:
+                type: object
+                description: The same call as `api`, as data
+                required: [method, route]
+                properties:
+                  method: { type: string, enum: [GET, POST] }
+                  route: { type: string, description: "With path parameters filled in, e.g. /v1/sessions/s-1730000000-4242" }
+                  body: { type: object, description: The JSON body of a POST }
               reversible: { type: boolean }
         first_seen_unix: { type: integer }
         last_seen_unix: { type: integer }

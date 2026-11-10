@@ -37,7 +37,7 @@ use std::time::Duration;
 
 use crate::config::UpdatesConfig;
 use crate::consumers::Severity;
-use crate::watch::{Evidence, Finding, FindingCategory, FindingKind, Suggestion};
+use crate::watch::{Evidence, Finding, FindingCategory, FindingKind, Suggestion, UpdateItem};
 
 pub const USER_AGENT: &str = concat!("mulchie/", env!("CARGO_PKG_VERSION"));
 pub const MULCHIE_RELEASE_URL: &str =
@@ -1298,6 +1298,7 @@ fn suggestion(cmd: &str) -> Suggestion {
         label: format!("Run: {cmd}"),
         request: None,
         api: None,
+        api_request: None,
         reversible: false,
     }
 }
@@ -1348,6 +1349,13 @@ pub fn findings(r: &Report) -> Vec<Finding> {
             Evidence {
                 exe: t.path.clone(),
                 detail: Some(format!("latest from {}; update with: {cmd}", t.source)),
+                updates: vec![UpdateItem {
+                    package: t.name.clone(),
+                    installed: Some(i.clone()),
+                    latest: Some(l.clone()),
+                    source: t.source.clone(),
+                    command: t.command.clone(),
+                }],
                 ..Evidence::default()
             },
             &[cmd],
@@ -1367,6 +1375,20 @@ pub fn findings(r: &Report) -> Vec<Finding> {
             "From Homebrew's local data (no update was fetched). Mulchie only reports this.",
             Evidence {
                 detail: Some(names.join(", ")),
+                updates: b
+                    .iter()
+                    .map(|p| UpdateItem {
+                        package: p.name.clone(),
+                        installed: Some(p.installed.clone()),
+                        latest: Some(p.current.clone()),
+                        source: "homebrew".into(),
+                        command: Some(if p.cask {
+                            format!("brew upgrade --cask {}", p.name)
+                        } else {
+                            format!("brew upgrade {}", p.name)
+                        }),
+                    })
+                    .collect(),
                 ..Evidence::default()
             },
             &["brew upgrade".to_string()],
@@ -1409,6 +1431,18 @@ pub fn findings(r: &Report) -> Vec<Finding> {
             Evidence {
                 workspace: Some(a.workspace.clone()),
                 detail: Some(format!("https://osv.dev/vulnerability/{}", a.id)),
+                updates: a
+                    .packages
+                    .iter()
+                    .enumerate()
+                    .map(|(n, p)| UpdateItem {
+                        package: p.name.clone(),
+                        installed: Some(p.version.clone()),
+                        latest: a.fixed.get(n).cloned().flatten(),
+                        source: "osv.dev".into(),
+                        command: a.commands.get(n).cloned(),
+                    })
+                    .collect(),
                 ..Evidence::default()
             },
             &cmds,

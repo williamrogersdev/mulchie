@@ -452,6 +452,28 @@ fn notify_and_hogs_raise_limit_findings() {
         .collect();
     assert_eq!(f.len(), 1);
     assert_eq!(f[0].category, FindingCategory::Limit);
+    // A2: each suggestion carries the API call as data, the same as `api`.
+    let id = Session::id_for(77_777, 500);
+    let reqs: Vec<serde_json::Value> = f[0]
+        .suggested
+        .iter()
+        .map(|s| {
+            let r = s.api_request.as_ref().expect("api_request");
+            assert_eq!(s.api.as_deref(), Some(r.words().as_str()));
+            serde_json::to_value(r).unwrap()
+        })
+        .collect();
+    assert_eq!(
+        reqs,
+        [
+            serde_json::json!({"method": "GET", "route": format!("/v1/sessions/{id}")}),
+            serde_json::json!({
+                "method": "POST",
+                "route": "/v1/process/plan",
+                "body": {"session": id, "action": "pause"},
+            }),
+        ]
+    );
     assert_eq!(st.sessions.breaches_active, 1);
     assert_eq!(st.sessions.breaches_undelivered, 1);
     assert!(st.actions.iter().any(|a| a.kind == "limit"));

@@ -227,11 +227,33 @@ pub struct Evidence {
     /// Anything else, in words.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub detail: Option<String>,
+    /// Update findings: each package with its versions, where the latest
+    /// came from and the command to update it.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub updates: Vec<UpdateItem>,
+}
+
+/// One package an update finding is about.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
+pub struct UpdateItem {
+    pub package: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub installed: Option<String>,
+    /// The latest release, or for an advisory the first fixed version
+    /// (`None` when none is listed).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub latest: Option<String>,
+    /// `github`, `npm`, `homebrew`, `osv.dev`, …
+    pub source: String,
+    /// What the user may run to update it; Mulchie runs nothing.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub command: Option<String>,
 }
 
 /// Something the caller can do about a finding. `request` goes to a plan
 /// route (`POST /v1/process/plan` or straight to the gate through
-/// `POST /v1/process/execute` after review); `api` names another route.
+/// `POST /v1/process/execute` after review); `api` names another route, in
+/// words, and `api_request` is the same call as data.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct Suggestion {
     pub label: String,
@@ -239,8 +261,59 @@ pub struct Suggestion {
     pub request: Option<Request>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub api: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub api_request: Option<ApiRequest>,
     /// Whether it can be undone (SIGSTOP can, SIGTERM cannot).
     pub reversible: bool,
+}
+
+/// One call to the local API: `method` and `route` (with any path
+/// parameters filled in), and the JSON `body` for a POST.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ApiRequest {
+    pub method: String,
+    pub route: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub body: Option<serde_json::Value>,
+}
+
+impl ApiRequest {
+    pub fn get(route: impl Into<String>) -> Self {
+        Self {
+            method: "GET".into(),
+            route: route.into(),
+            body: None,
+        }
+    }
+
+    pub fn post(route: impl Into<String>, body: serde_json::Value) -> Self {
+        Self {
+            method: "POST".into(),
+            route: route.into(),
+            body: Some(body),
+        }
+    }
+
+    /// `METHOD /route {body}`, as `api` writes it.
+    pub fn words(&self) -> String {
+        match &self.body {
+            Some(b) => format!("{} {} {b}", self.method, self.route),
+            None => format!("{} {}", self.method, self.route),
+        }
+    }
+}
+
+impl Suggestion {
+    /// A suggestion that is one API call: `api` in words and `api_request`.
+    pub fn call(label: impl Into<String>, req: ApiRequest, reversible: bool) -> Self {
+        Self {
+            label: label.into(),
+            request: None,
+            api: Some(req.words()),
+            api_request: Some(req),
+            reversible,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -1115,6 +1188,7 @@ fn quit(p: &ProcFacts) -> Suggestion {
             expected_start_time: p.start_time,
         }),
         api: None,
+        api_request: None,
         reversible: false,
     }
 }
@@ -1128,6 +1202,7 @@ fn pause(p: &ProcFacts) -> Suggestion {
             expected_start_time: p.start_time,
         }),
         api: None,
+        api_request: None,
         reversible: true,
     }
 }
@@ -1141,6 +1216,7 @@ fn resume(p: &ProcFacts) -> Suggestion {
             expected_start_time: p.start_time,
         }),
         api: None,
+        api_request: None,
         reversible: true,
     }
 }
@@ -1154,20 +1230,18 @@ fn lower(p: &ProcFacts) -> Suggestion {
             expected_start_time: p.start_time,
         }),
         api: None,
+        api_request: None,
         // Raising priority again needs privilege.
         reversible: false,
     }
 }
 
 fn dismiss(id_hint: &str) -> Suggestion {
-    Suggestion {
-        label: "Dismiss this finding for 30 days".into(),
-        request: None,
-        api: Some(format!(
-            "POST /v1/findings/dismiss {{\"id\": \"{id_hint}\"}}"
-        )),
-        reversible: true,
-    }
+    Suggestion::call(
+        "Dismiss this finding for 30 days",
+        ApiRequest::post("/v1/findings/dismiss", serde_json::json!({ "id": id_hint })),
+        true,
+    )
 }
 
 /// Run every detector. The result is raw: allow-lists and dismissals are

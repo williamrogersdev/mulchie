@@ -15,7 +15,7 @@ use crate::consumers::Severity;
 use crate::limits::{ActionState, Breach, Hog, LimitEvent, Limits, Machine};
 use crate::record::{Record, RecordLimits, SWEEP_SECS};
 use crate::session::{RootSource, Session, SessionEvent, SessionProc, SessionStatus, Tracker};
-use crate::watch::{Evidence, FindingCategory, FindingKind, Suggestion};
+use crate::watch::{ApiRequest, Evidence, FindingCategory, FindingKind, Suggestion};
 
 /// Sessions listed in [`State`] (running first, then the latest ended).
 pub const STATE_SESSIONS_KEPT: usize = 50;
@@ -1377,19 +1377,22 @@ impl Engine {
 /// Findings for active breaches and hogs.
 fn limit_findings(limits: &Limits, tracker: &Tracker, now: u64) -> Vec<Finding> {
     let mut out = Vec::new();
-    let plan = |sid: &str| Suggestion {
-        label: "Plan an action on the session's processes".into(),
-        request: None,
-        api: Some(format!(
-            "POST /v1/process/plan {{\"session\": \"{sid}\", \"action\": \"pause\"}}"
-        )),
-        reversible: true,
+    let plan = |sid: &str| {
+        Suggestion::call(
+            "Plan an action on the session's processes",
+            ApiRequest::post(
+                "/v1/process/plan",
+                json!({"session": sid, "action": "pause"}),
+            ),
+            true,
+        )
     };
-    let show = |sid: &str| Suggestion {
-        label: "Show the session".into(),
-        request: None,
-        api: Some(format!("GET /v1/sessions/{sid}")),
-        reversible: true,
+    let show = |sid: &str| {
+        Suggestion::call(
+            "Show the session",
+            ApiRequest::get(format!("/v1/sessions/{sid}")),
+            true,
+        )
     };
     let evidence = |sid: &str, detail: String| {
         let s = tracker.get(sid);
@@ -1481,12 +1484,11 @@ fn paused_file_finding(paths: &Paths, error: &str, now: u64) -> Finding {
             detail: Some(error.to_string()),
             ..Evidence::default()
         },
-        suggested: vec![Suggestion {
-            label: "List stopped processes".into(),
-            request: None,
-            api: Some("GET /v1/state".into()),
-            reversible: true,
-        }],
+        suggested: vec![Suggestion::call(
+            "List stopped processes",
+            ApiRequest::get("/v1/state"),
+            true,
+        )],
         first_seen_unix: now,
         last_seen_unix: now,
         dismissed: false,

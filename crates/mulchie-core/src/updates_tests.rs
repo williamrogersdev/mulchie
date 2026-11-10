@@ -533,6 +533,42 @@ fn a_full_check_reports_outdated_tools_and_advisories() {
         .label
         .contains("npm install lodash@4.17.21"));
     assert!(f.iter().all(|f| f.category == FindingCategory::Update));
+    // A3: every update finding carries its packages as data.
+    let item = |k: FindingKind, name: &str| {
+        f.iter()
+            .filter(|f| f.kind == k)
+            .flat_map(|f| f.evidence.updates.clone())
+            .find(|u| u.package == name)
+            .unwrap_or_else(|| panic!("{name}: {f:?}"))
+    };
+    let u = item(FindingKind::AgentUpdate, "claude");
+    assert_eq!(u.installed.as_deref(), Some("2.0.14"));
+    assert_eq!(u.latest, claude.latest);
+    assert_eq!(u.source, claude.source);
+    assert_eq!(u.command.as_deref(), Some("claude update"));
+    let u = item(FindingKind::MulchieUpdate, "mulchie");
+    assert_eq!(
+        u.command.as_deref(),
+        Some("brew upgrade williamrogersdev/tap/mulchie-cli")
+    );
+    let brew = &r.homebrew.as_ref().unwrap()[0];
+    let u = item(FindingKind::HomebrewOutdated, &brew.name);
+    assert_eq!(u.installed.as_deref(), Some(brew.installed.as_str()));
+    assert_eq!(u.latest.as_deref(), Some(brew.current.as_str()));
+    assert_eq!(u.source, "homebrew");
+    assert!(u.command.unwrap().starts_with("brew upgrade "));
+    let u = item(FindingKind::Advisory, "lodash");
+    assert_eq!(
+        (
+            u.installed.as_deref(),
+            u.latest.as_deref(),
+            u.source.as_str()
+        ),
+        (Some("4.17.20"), Some("4.17.21"), "osv.dev")
+    );
+    assert!(u.command.unwrap().contains("npm install lodash@4.17.21"));
+    let v = serde_json::to_value(&adv.evidence).unwrap();
+    assert!(v["updates"][0]["package"].is_string(), "{v}");
     // Every request carried no secret and went to the known hosts.
     for c in http.calls.lock().unwrap().iter() {
         assert!(

@@ -894,6 +894,7 @@ fn finding_json_shape() {
                 expected_start_time: 5,
             }),
             api: None,
+            api_request: None,
             reversible: false,
         }],
         first_seen_unix: 1,
