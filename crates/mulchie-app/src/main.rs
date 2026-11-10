@@ -128,6 +128,56 @@ async fn undismiss_finding(b: B<'_>, id: String) -> Result<bool, String> {
 }
 
 #[tauri::command]
+async fn sessions(b: B<'_>) -> Result<Value, String> {
+    blocking(&b, |b| b.sessions()).await
+}
+
+#[tauri::command]
+async fn session_detail(b: B<'_>, id: String) -> Result<Option<Value>, String> {
+    blocking(&b, move |b| b.session_detail(&id)).await
+}
+
+#[tauri::command]
+async fn session_events(
+    b: B<'_>,
+    id: String,
+    since: Option<u64>,
+    limit: Option<u64>,
+) -> Result<Value, String> {
+    blocking(&b, move |b| {
+        b.session_events(&id, since.unwrap_or(0), limit.unwrap_or(200))
+    })
+    .await
+}
+
+#[tauri::command]
+async fn limits_status(b: B<'_>) -> Result<Value, String> {
+    blocking(&b, |b| b.limits_status()).await
+}
+
+#[tauri::command]
+async fn updates_status(b: B<'_>) -> Result<Value, String> {
+    blocking(&b, |b| b.updates_status()).await
+}
+
+#[tauri::command]
+async fn check_updates(b: B<'_>) -> Result<(), String> {
+    blocking(&b, |b| b.check_updates()).await
+}
+
+/// A JSON merge patch of the config. The error is `{code, message}`.
+#[tauri::command]
+async fn patch_config(b: B<'_>, patch: Value) -> Result<Value, backend::ConfigFailure> {
+    let b = b.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || b.patch_config(patch))
+        .await
+        .map_err(|e| backend::ConfigFailure {
+            code: "internal".into(),
+            message: format!("the request failed inside Mulchie: {e}"),
+        })?
+}
+
+#[tauri::command]
 async fn set_config(b: B<'_>, config: Value) -> Result<(), String> {
     blocking(&b, move |b| b.set_config(config)).await
 }
@@ -542,6 +592,13 @@ fn main() {
             dismiss_finding,
             undismiss_finding,
             set_config,
+            sessions,
+            session_detail,
+            session_events,
+            limits_status,
+            updates_status,
+            check_updates,
+            patch_config,
             integration,
             install_cli,
             reveal,

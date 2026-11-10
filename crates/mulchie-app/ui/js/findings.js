@@ -11,9 +11,30 @@ export function watchFindings(S, dismissed = false) {
   return (S?.findings || []).filter(f => !!f.dismissed === dismissed);
 }
 
+// Finding categories (`Finding.category`), in the order lists show them.
+export const CATEGORY = { security: 'Security', limit: 'Limits', hygiene: 'Hygiene', posture: 'Mulchie setup', update: 'Updates', other: 'Other' };
+export const CATEGORY_ORDER = ['security', 'limit', 'hygiene', 'posture', 'update', 'other'];
+
+// A suggestion that names a process plan route (limit findings):
+// `POST /v1/process/plan {"session": …, "action": …}` → that request.
+export function planApi(sg) {
+  const m = /^POST \/v1\/process\/plan (\{.*\})$/.exec(sg?.api || '');
+  if (!m) return null;
+  try {
+    const r = JSON.parse(m[1]);
+    return typeof r.session === 'string' && /^s-\d+-\d+$/.test(r.session) && typeof r.action === 'string' ? { session: r.session, action: r.action } : null;
+  } catch (e) { return null; }
+}
+// A suggestion to look at a session: `GET /v1/sessions/<id>` → the id.
+export const sessionApi = sg => (/^GET \/v1\/sessions\/(s-\d+-\d+)$/.exec(sg?.api || '') || [])[1] || null;
+// A command the user may run themselves (update findings): "Run: <cmd>".
+export const runCommand = sg => !sg?.request && !sg?.api && /^Run: /.test(sg?.label || '') ? sg.label.slice(5) : null;
+
 // The short button for a suggestion: what it does, not the whole sentence.
 export function suggestionLabel(sg) {
   const r = sg.request;
+  const pr = planApi(sg);
+  if (pr) return { pause: 'Pause what it started…', resume: 'Resume…', lower_priority: 'Lower its priority…', quit: 'Quit what it started…' }[pr.action] || 'Plan an action…';
   if (!r) return sg.api ? 'Dismiss…' : sg.label;
   if (r.action === 'signal') return { term: 'Quit…', kill: 'Force quit…', stop: 'Pause…', cont: 'Resume…' }[r.signal] || sg.label;
   if (r.action === 'renice') return 'Lower priority…';
@@ -23,7 +44,7 @@ export function suggestionLabel(sg) {
 // A watch finding as a "needs attention" row: opens its detail, and its
 // first suggestion with a request is the primary action.
 function fromWatch(f) {
-  const i = f.suggested.findIndex(sg => sg.request);
+  const i = f.suggested.findIndex(sg => sg.request || planApi(sg));
   return {
     lvl: SEV_LVL[f.severity] || 'info', t: f.title, d: f.why, open: ['finding', f.id],
     act: i >= 0 ? { label: suggestionLabel(f.suggested[i]), run: `fx:${i}:${f.id}` } : { label: 'Details', run: `d:finding:${f.id}` },
@@ -62,9 +83,10 @@ export function findings() {
 // Where a finding leads when its text is clicked: a detail or a view.
 const target = f => f.open ? `data-d="${esc(f.open[0])}" data-dk="${esc(f.open[1])}"` : `data-go="${esc(f.go || 'overview')}"`;
 
+// `compact`: the tray panel's short list, at most that many (true: 3).
 export function findingsHtml(list, compact) {
   if (!list.length) return '<div class="empty" style="padding:12px">Nothing needs attention.</div>';
-  return list.slice(0, compact ? 3 : 99).map(f =>
+  return list.slice(0, compact ? (compact === true ? 3 : compact) : 99).map(f =>
     `<div class="finding"><span class="ic" style="background:var(--${f.lvl})"></span><div class="t" role="button" tabindex="0" ${target(f)}><div>${esc(f.t)}</div>${compact ? '' : `<div class="muted">${esc(f.d)}</div>`}</div>${f.act ? `<button class="btn sm" data-run="${esc(f.act.run)}">${esc(f.act.label)}</button>` : ''}</div>`).join('');
 }
 

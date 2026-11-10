@@ -858,3 +858,111 @@ fn panel_height_stays_within_limits() {
     assert_eq!(panel_height(5000.0), 760.0);
     assert_eq!(panel_height(f64::NAN), 620.0);
 }
+
+#[test]
+fn sessions_limits_and_updates_through_the_engine_and_a_client() {
+    use mulchie_core::config::{UpdateCheck, UpdatesConfig};
+    let f = fixture();
+    let mut child = std::process::Command::new("sleep")
+        .arg("30")
+        .spawn()
+        .unwrap();
+    let pid = child.id();
+    let procs = FakeProcesses::empty().with(pid, "claude", Some(f.root.clone()), 1000);
+    let opts = Options {
+        procs: Some(Arc::new(procs)),
+        config: Some(Config {
+            scan_roots: vec![f.root.clone()],
+            throttle_builds: false,
+            // No update worker may reach the network from a test.
+            updates: UpdatesConfig {
+                check: UpdateCheck::Off,
+                ..UpdatesConfig::default()
+            },
+            ..Config::default()
+        }),
+        ..f.opts()
+    };
+    let a = Backend::start(f.paths.clone(), opts.clone());
+    let b = client_of(&f, opts);
+    // An agent hook registers the session, as `mulchie hook` would.
+    let api = mulchie_core::api::Client::connect_in(&f.paths, a.info().port.unwrap()).unwrap();
+    let hook = api
+        .call(
+            "POST",
+            "/v1/hook",
+            Some(&json!({"client": "claude", "event": "session_start", "pid": pid, "cwd": f.root})),
+        )
+        .unwrap();
+    let id = hook["session_id"].as_str().expect("a session").to_string();
+    assert_eq!(id, format!("s-1000-{pid}"));
+
+    for (who, x) in [("engine", &a), ("client", &b)] {
+        let list = x.sessions().unwrap();
+        assert_eq!(list["enabled"], true, "{who} {list}");
+        assert!(list["write_bytes_available"].is_boolean(), "{who}");
+        assert!(
+            list["sessions"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|s| s["id"] == id && s["source"] == "hook"),
+            "{who} {list}"
+        );
+        let d = x.session_detail(&id).unwrap().expect("known");
+        assert_eq!(d["session"]["id"], id, "{who}");
+        assert!(
+            d["breaches"].is_array() && d["paused_by_mulchie"].is_array(),
+            "{who} {d}"
+        );
+        assert_eq!(x.session_detail("s-1-1").unwrap(), None, "{who}");
+        assert!(
+            x.session_detail("../config").is_err(),
+            "{who}: checked before the URL"
+        );
+        let ev = x.session_events(&id, 0, 50).unwrap();
+        assert!(
+            ev["events"].is_array() && ev["next_since"].is_u64(),
+            "{who} {ev}"
+        );
+        assert!(x.session_events("s-1-1", 0, 50).is_err(), "{who}");
+        let lim = x.limits_status().unwrap();
+        assert_eq!(lim["report_only"], true, "{who} {lim}");
+        assert!(
+            lim["enforcing"].is_boolean() && lim["breaches"].is_array(),
+            "{who}"
+        );
+        let up = x.updates_status().unwrap();
+        assert_eq!(up["enabled"], false, "{who} {up}");
+        let off = x.check_updates().unwrap_err();
+        assert!(off.contains("off"), "{who}: {off}");
+        // A session plan goes through the same plan book as the others.
+        let req: ProcessPlanRequest =
+            serde_json::from_value(json!({"session": id, "action": "pause"})).unwrap();
+        let plan = x.process_plans(vec![req]).unwrap();
+        assert_eq!(plan["plans"].as_array().unwrap().len(), 1, "{who} {plan}");
+    }
+
+    // Limits through PATCH: a budget makes the engine enforce; a bad value
+    // is refused with the field in the message, from either side.
+    let budget = json!({"limits": {"default": {"cpu_cores": {"max": 2.0, "sustain_secs": 30, "action": "pause"}}}});
+    let cfg = b.patch_config(budget).unwrap();
+    assert_eq!(cfg["limits"]["default"]["cpu_cores"]["action"], "pause");
+    assert_eq!(a.limits_status().unwrap()["report_only"], false);
+    let bad = json!({"limits": {"default": {"cpu_cores": {"max": -1.0}}}});
+    for x in [&a, &b] {
+        let e = x.patch_config(bad.clone()).unwrap_err();
+        assert_eq!(e.code, "invalid_config", "{e:?}");
+        assert!(e.message.contains("limits.default.cpu_cores.max"), "{e:?}");
+    }
+    // `null` removes a key, so the budget goes and the engine only reports.
+    a.patch_config(json!({"limits": {"default": null}}))
+        .unwrap();
+    assert_eq!(b.limits_status().unwrap()["report_only"], true);
+    assert!(a.patch_config(json!([1])).is_err(), "a patch is an object");
+
+    drop(b);
+    let _ = child.kill();
+    let _ = child.wait();
+    a.shutdown();
+}

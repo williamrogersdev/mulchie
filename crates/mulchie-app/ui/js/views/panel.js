@@ -47,7 +47,14 @@ export function renderPanel() {
     $('#pMemTop').innerHTML = barsHtml(S, 'mem_bytes', 3);
     const f = findings(), c = S.finding_counts;
     $('#pFindW').style.display = f.length || c?.high || c?.medium || c?.low ? '' : 'none';
-    $('#pFind').innerHTML = findingsHtml(f, true);
+    // Sessions over a limit and available updates, each a link to its view.
+    const nb = S.sessions?.breaches_active || 0, nu = S.updates?.available || 0;
+    $('#pLim').innerHTML = [
+      nb && `<a class="lnk" role="button" tabindex="0" data-v="sessions" title="Open the agent sessions"><span class="bad">${nb} session limit(s) exceeded</span></a>`,
+      nu && `<a class="lnk" role="button" tabindex="0" data-d="findings" data-dk="update" title="Open the available updates"><span class="info">${nu} update(s) available</span></a>`,
+    ].filter(Boolean).join(' · ');
+    // One finding fewer while that line shows, so the panel fits its cap.
+    $('#pFind').innerHTML = findingsHtml(f, nb || nu ? 2 : 3);
     $('#pWatch').innerHTML = c && (c.high + c.medium + c.low + c.info) ? `<a class="lnk" role="button" tabindex="0" data-d="findings" data-dk="" title="Open the list of observations">Observations: ${[['high', c.high, 'bad'], ['medium', c.medium, 'warn'], ['low', c.low, 'info'], ['info', c.info, 'info']].filter(x => x[1]).map(([l, n, k]) => `<span class="${k}">${n} ${l}</span>`).join(' · ')}</a>` : '';
   }
   fit();

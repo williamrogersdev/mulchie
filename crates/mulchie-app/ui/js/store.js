@@ -22,6 +22,7 @@ export const st = {
     wtF: 'all', wtSel: new Set(), wtSort: ['bytes', -1],
     bcF: 'stale', bcSel: new Set(),
     aSrc: '', cfgDirty: false,
+    sSort: ['cpu_cores', -1], sIncAgent: false, limDirty: false,
   },
 };
 

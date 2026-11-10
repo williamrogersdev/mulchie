@@ -28,6 +28,7 @@
       <div><h3>Using memory</h3><div class="cbars" id="pMemTop"></div></div>
     </div>
     <div id="pFindW"><h3>Needs attention</h3><div id="pFind"></div><div id="pWatch" class="more"></div></div>
+    <div id="pLim" class="more"></div>
   </div>
   <div class="pf">
     <button class="btn pri" data-open="overview">Open dashboard</button>
@@ -43,6 +44,7 @@
     <a role="button" tabindex="0" data-v="overview">Overview</a>
     <a role="button" tabindex="0" data-v="processes">Processes <span class="count" id="nProc"></span></a>
     <a role="button" tabindex="0" data-v="workspaces">Workspaces <span class="count" id="nWs"></span></a>
+    <a role="button" tabindex="0" data-v="sessions">Sessions <span class="count" id="nSess"></span></a>
     <a role="button" tabindex="0" data-v="disk">Disk <span class="count" id="nDisk"></span></a>
     <a role="button" tabindex="0" data-v="activity">Activity <span class="count" id="nAct"></span></a>
     <a role="button" tabindex="0" data-v="agents">Agent API</a>
@@ -108,6 +110,18 @@
         <span class="dim c-md">every repo or worktree with a running process</span>
       </div>
       <div class="tbl-wrap"><table id="wss"></table></div>
+    </section>
+
+    <section class="view fill" id="v-sessions">
+      <div class="toolbar">
+        <input type="text" id="sFilter" placeholder="Filter by agent, workspace or id" class="grow-in" aria-label="Filter sessions">
+        <div class="sp"></div>
+        <span class="dim" id="sCount"></span>
+      </div>
+      <div class="notices" id="sNote"></div>
+      <div class="tbl-wrap"><table id="sess" aria-label="Running agent sessions"></table>
+        <h3 class="form-h" id="sEndedH">Ended</h3>
+        <table id="sessEnded" aria-label="Ended agent sessions"></table></div>
     </section>
 
     <section class="view" id="v-disk">
@@ -197,6 +211,7 @@ mulchie run --label "web build" -- cargo build --release</pre>
 
     <section class="view" id="v-settings">
       <div class="card"><div class="notices" id="cfgNote" style="margin-bottom:10px"></div><div class="form" id="form"></div><div class="actions"><button class="btn pri" id="saveCfg">Save</button></div></div>
+      <div id="cfgMore"></div>
     </section>
     <aside id="drawer" class="drawer" role="dialog" aria-labelledby="dTitle" aria-hidden="true">
       <div class="dh"><div class="dt"><h2 id="dTitle"></h2><span id="dSub"></span></div><button class="btn sm" id="dCopy" title="Copy what this panel shows, for pasting to an agent">Copy for agent</button><button class="btn sm" id="dClose" aria-label="Close details">×</button></div>

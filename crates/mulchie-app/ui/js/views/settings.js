@@ -11,6 +11,7 @@ import { invoke } from '../ipc.js';
 import { $, esc, tilde, toast } from '../util.js';
 import { act } from '../act.js';
 import { noticesHtml } from '../findings.js';
+import { renderCfgMore } from './settings_more.js';
 
 const CFG = [
   ['scan_roots', 'Scan roots', 'list', 'Folders searched for repos, worktrees and build caches. One per line; empty means the defaults under your home folder.'],
@@ -82,6 +83,7 @@ function notes(cfg, changedElsewhere) {
 export function renderSettings(force) {
   const ui = st.ui, cfg = st.cfg;
   if (!cfg) return;
+  renderCfgMore();
   if (ui.cfgDirty && !force) {
     $('#cfgNote').innerHTML = notes(cfg, ui.cfgFormRev != null && cfg.rev !== ui.cfgFormRev);
     return;

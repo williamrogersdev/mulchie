@@ -24,6 +24,7 @@ export function renderTop() {
   $('#tTime').textContent = s.at_unix ? clock(s.at_unix) : '';
   $('#nProc').textContent = s.proc_count;
   $('#nWs').textContent = s.workspaces.length;
+  $('#nSess').textContent = S.sessions?.running || '';
   $('#nDisk').textContent = S.diskmap ? B(S.diskmap.worktree_bytes, 0) : '';
   $('#nAct').textContent = S.actions_count || '';
   $('#ver').textContent = 'v' + S.version;

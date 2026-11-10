@@ -887,6 +887,161 @@ impl Backend {
         }
     }
 
+    // -------------------------------------------------- sessions and limits
+
+    /// `GET /v1/sessions`: `{enabled, write_bytes_available, sessions}`.
+    pub fn sessions(&self) -> Result<Value, String> {
+        match self.conn() {
+            Conn::Local(e) => {
+                let st = e.snapshot_state();
+                Ok(json!({
+                    "enabled": st.sessions.enabled,
+                    "write_bytes_available": st.sessions.write_bytes_available,
+                    "sessions": to_value(&e.sessions())?,
+                }))
+            }
+            Conn::Remote(c) => self.remote(&c, "GET", "/v1/sessions", None),
+            Conn::Down => Err(self.down_error()),
+        }
+    }
+
+    /// `GET /v1/sessions/{id}`: the session, its processes, breaches and
+    /// what Mulchie paused. `Ok(None)` when the engine does not know it.
+    pub fn session_detail(&self, id: &str) -> Result<Option<Value>, String> {
+        if !valid_session_id(id) {
+            return Err(format!("{id} is not a session id"));
+        }
+        match self.conn() {
+            Conn::Local(e) => e.session(id).as_ref().map(to_value).transpose(),
+            Conn::Remote(c) => {
+                let path = format!("/v1/sessions/{id}");
+                match c.request("GET", &path, None, api::timeout_for("GET", &path)) {
+                    Ok(v) => {
+                        self.note_ok();
+                        Ok(Some(v))
+                    }
+                    Err(e) if e.status == 404 && e.code == "unknown_session" => {
+                        self.note_ok();
+                        Ok(None)
+                    }
+                    Err(e) => {
+                        self.note_failure(&e);
+                        Err(e.message)
+                    }
+                }
+            }
+            Conn::Down => Err(self.down_error()),
+        }
+    }
+
+    /// `GET /v1/sessions/{id}/events`: events after `since`, oldest first,
+    /// at most `limit` (1 to 1000): `{session_id, events, next_since}`.
+    pub fn session_events(&self, id: &str, since: u64, limit: u64) -> Result<Value, String> {
+        if !valid_session_id(id) {
+            return Err(format!("{id} is not a session id"));
+        }
+        let limit = limit.clamp(1, 1000);
+        match self.conn() {
+            Conn::Local(e) => {
+                let ev = e
+                    .session_events(id, since, limit as usize)
+                    .map_err(|e| format!("the activity record could not be read: {e}"))?;
+                if ev.is_empty() && e.session(id).is_none() {
+                    return Err(format!("no session or record {id}"));
+                }
+                let next = ev.last().and_then(|e| e["seq"].as_u64()).unwrap_or(since);
+                Ok(json!({ "session_id": id, "events": ev, "next_since": next }))
+            }
+            Conn::Remote(c) => self.remote(
+                &c,
+                "GET",
+                &format!("/v1/sessions/{id}/events?since={since}&limit={limit}"),
+                None,
+            ),
+            Conn::Down => Err(self.down_error()),
+        }
+    }
+
+    /// `GET /v1/limits/status`.
+    pub fn limits_status(&self) -> Result<Value, String> {
+        match self.conn() {
+            Conn::Local(e) => to_value(&e.limits_status()),
+            Conn::Remote(c) => self.remote(&c, "GET", "/v1/limits/status", None),
+            Conn::Down => Err(self.down_error()),
+        }
+    }
+
+    /// `GET /v1/updates`, with the last report.
+    pub fn updates_status(&self) -> Result<Value, String> {
+        match self.conn() {
+            Conn::Local(e) => to_value(&e.updates_status(true)),
+            Conn::Remote(c) => self.remote(&c, "GET", "/v1/updates", None),
+            Conn::Down => Err(self.down_error()),
+        }
+    }
+
+    /// `POST /v1/updates/check`: queue a check now. Refused while
+    /// `updates.check` is off.
+    pub fn check_updates(&self) -> Result<(), String> {
+        match self.conn() {
+            Conn::Local(e) => e.request_update_check().map_err(|(_, m)| m),
+            Conn::Remote(c) => {
+                let path = "/v1/updates/check";
+                match c.request("POST", path, None, api::timeout_for("POST", path)) {
+                    Ok(_) => {
+                        self.note_ok();
+                        Ok(())
+                    }
+                    Err(e) if e.code == "updates_off" => {
+                        self.note_ok();
+                        Err("Update checks are off in Settings (updates.check), so nothing was checked.".into())
+                    }
+                    Err(e) => {
+                        self.note_failure(&e);
+                        Err(e.message)
+                    }
+                }
+            }
+            Conn::Down => Err(self.down_error()),
+        }
+    }
+
+    /// Change some config keys with a JSON merge patch (`PATCH /v1/config`),
+    /// applied to the file's current content. Returns the whole config now
+    /// in use.
+    pub fn patch_config(&self, patch: Value) -> Result<Value, ConfigFailure> {
+        use mulchie_core::config::ConfigError;
+        match self.conn() {
+            Conn::Local(e) => match e.patch_config(&patch) {
+                Ok(cfg) => to_value(&cfg).map_err(|m| ConfigFailure::new("internal", m)),
+                Err(err) => Err(ConfigFailure::new(
+                    match &err {
+                        ConfigError::NotLockHolder(_) => "not_lock_holder",
+                        ConfigError::Io(_) => "config_io",
+                        ConfigError::Changed(_) => "config_changed",
+                        _ => "invalid_config",
+                    },
+                    err.to_string(),
+                )),
+            },
+            Conn::Remote(c) => {
+                let path = "/v1/config";
+                match c.request("PATCH", path, Some(&patch), api::timeout_for("PATCH", path)) {
+                    Ok(v) => {
+                        self.note_ok();
+                        Ok(v["config"].clone())
+                    }
+                    Err(e) => {
+                        self.note_failure(&e);
+                        let code = if e.code.is_empty() { "failed" } else { &e.code };
+                        Err(ConfigFailure::new(code, e.message))
+                    }
+                }
+            }
+            Conn::Down => Err(ConfigFailure::new("unreachable", self.down_error())),
+        }
+    }
+
     /// The settings file of the engine in use. As a client, the running
     /// engine's (from `GET /v1/config`), which may be under another home.
     pub fn config_path(&self) -> PathBuf {
@@ -901,6 +1056,29 @@ impl Backend {
         }
         self.paths.config_file()
     }
+}
+
+/// Why a config patch was refused: the engine's code (`invalid_config`,
+/// `not_lock_holder`, `config_io`, …) and its message.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct ConfigFailure {
+    pub code: String,
+    pub message: String,
+}
+
+impl ConfigFailure {
+    fn new(code: &str, message: impl Into<String>) -> Self {
+        Self {
+            code: code.into(),
+            message: message.into(),
+        }
+    }
+}
+
+/// A session id as the engine issues them: `s-<start time>-<pid>`. Checked
+/// before it goes into a URL.
+pub fn valid_session_id(id: &str) -> bool {
+    mulchie_core::session::Session::parse_id(id).is_some()
 }
 
 /// The body of `PUT /v1/config`: the config exactly as given.

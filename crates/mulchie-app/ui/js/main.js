@@ -7,6 +7,7 @@ import { act } from './act.js';
 import { renderTop, renderOverview } from './views/overview.js';
 import { renderProcs, procBulk } from './views/processes.js';
 import { renderWss } from './views/workspaces.js';
+import { renderSessions } from './views/sessions.js';
 import { renderDisk, removeSelectedWorktrees, sweep, clearSelectedCaches, clearStale } from './views/disk.js';
 import { renderActs } from './views/activity.js';
 import { renderAgents, loadIntegration } from './views/agents.js';
@@ -18,8 +19,8 @@ import { cpuSummary, memSummary, ranked } from './consumers.js';
 import { groupAction } from './signals.js';
 
 const POLL_MS = 3000;
-const VIEWS = ['overview', 'processes', 'workspaces', 'disk', 'activity', 'agents', 'settings'];
-const TEXT_KEYS = ['name', 'group', 'label', 'branch', 'repo_name', 'kind'];
+const VIEWS = ['overview', 'processes', 'workspaces', 'sessions', 'disk', 'activity', 'agents', 'settings'];
+const TEXT_KEYS = ['name', 'group', 'label', 'branch', 'repo_name', 'kind', 'agent', 'workspace'];
 
 document.body.classList.add(MODE === 'panel' ? 'panel' : 'dashboard');
 
@@ -31,6 +32,7 @@ function render() {
   if (v === 'overview') renderOverview();
   else if (v === 'processes') renderProcs();
   else if (v === 'workspaces') renderWss();
+  else if (v === 'sessions') renderSessions();
   else if (v === 'disk') renderDisk();
   else if (v === 'activity') renderActs();
   else if (v === 'agents') renderAgents();
@@ -113,8 +115,8 @@ function go(v, opts = {}) {
   if (v.startsWith('d:')) {
     const [, type, ...key] = v.split(':');
     const k = key.join(':');
-    const home = { wt: 'disk', cache: 'disk', cat: 'disk', seg: 'disk', act: 'activity', proc: 'processes', ws: 'workspaces' }[type];
-    if (home && st.view !== home && !(type === 'proc' || type === 'ws')) go(home);
+    const home = { wt: 'disk', cache: 'disk', cat: 'disk', seg: 'disk', act: 'activity', proc: 'processes', ws: 'workspaces', session: 'sessions' }[type];
+    if (home && st.view !== home && !(type === 'proc' || type === 'ws' || type === 'session')) go(home);
     return openDetail(type, k);
   }
   if (v.startsWith('ws:')) return openDetail('ws', v.slice(3));
@@ -200,7 +202,7 @@ document.addEventListener('click', async e => {
   }
   if (d.gproc != null) return MODE === 'panel' ? toDash('proc:' + d.gproc) : go('processes', { group: d.gproc });
   if (d.go) { if (modalOpen()) dismissModal(); return MODE === 'panel' ? toDash(d.go) : go(d.go); }
-  if (d.v) return go(d.v);
+  if (d.v) return MODE === 'panel' ? toDash(d.v) : go(d.v);
   if (d.reveal) return act(() => invoke('reveal', { path: d.reveal, terminal: false }));
   if (d.term) return act(() => invoke('reveal', { path: d.term, terminal: true }));
   if (d.da) return detailAction(t);
@@ -222,7 +224,8 @@ document.addEventListener('click', async e => {
     return openDetail(d.d, d.dk);
   }
   if (d.sort) {
-    const [tbl, k] = d.sort.split(':'), key = { p: 'pSort', w: 'wSort', wt: 'wtSort' }[tbl];
+    const [tbl, k] = d.sort.split(':'), key = { p: 'pSort', w: 'wSort', wt: 'wtSort', s: 'sSort' }[tbl];
+    if (!key) return;
     ui[key] = ui[key][0] === k ? [k, -ui[key][1]] : [k, TEXT_KEYS.includes(k) ? 1 : -1];
     return render();
   }
@@ -236,6 +239,8 @@ document.addEventListener('click', async e => {
 const on = (sel, ev, fn) => { const el = $(sel); if (el) el.addEventListener(ev, fn); };
 on('#pFilter', 'input', render);
 on('#wFilter', 'input', render);
+on('#sFilter', 'input', render);
+document.addEventListener('change', e => { if (e.target.id === 'sIncAgent') st.ui.sIncAgent = e.target.checked; });
 on('#pMine', 'change', render);
 on('#pClear', 'click', () => { st.ui.pSel.clear(); render(); });
 on('#wtClear', 'click', () => { st.ui.wtSel.clear(); render(); });
@@ -266,7 +271,7 @@ document.addEventListener('keydown', e => {
   }
   if (MODE === 'panel') return;
   if ((e.metaKey || e.ctrlKey) && e.key === 'f' && st.view === 'processes') { e.preventDefault(); $('#pFilter').focus(); }
-  if ((e.metaKey || e.ctrlKey) && /^[1-7]$/.test(e.key)) { e.preventDefault(); go(VIEWS[+e.key - 1]); }
+  if ((e.metaKey || e.ctrlKey) && /^[1-8]$/.test(e.key)) { e.preventDefault(); go(VIEWS[+e.key - 1]); }
 });
 window.addEventListener('resize', () => { if (!modalOpen()) render(); });
 document.addEventListener('visibilitychange', () => { if (!document.hidden) refresh(true); });
