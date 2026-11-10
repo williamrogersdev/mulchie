@@ -647,18 +647,6 @@ fn leases_over_the_api() {
         .request(
             "POST",
             "/v1/release",
-            Some(&json!({ "ticket": g["ticket"] })),
-            DEFAULT_TIMEOUT,
-        )
-        .unwrap_err();
-    assert_eq!(
-        (e.status, e.code.as_str()),
-        (403, "release_secret_required")
-    );
-    let e = c
-        .request(
-            "POST",
-            "/v1/release",
             Some(&json!({ "ticket": g["ticket"], "secret": "0".repeat(32) })),
             DEFAULT_TIMEOUT,
         )
@@ -672,6 +660,32 @@ fn leases_over_the_api() {
         )
         .unwrap();
     assert_eq!(rel["released"], true);
+    assert!(rel.get("admin").is_none(), "{rel}");
+    // R14: the full token releases a lease without its secret (its holder
+    // crashed); the release is journaled as an admin release.
+    let g = c
+        .call(
+            "POST",
+            "/v1/lease",
+            Some(&json!({ "label": "crashed agent", "ttl_secs": 600 })),
+        )
+        .unwrap();
+    let rel = c
+        .call(
+            "POST",
+            "/v1/release",
+            Some(&json!({ "ticket": g["ticket"] })),
+        )
+        .unwrap();
+    assert_eq!(
+        (rel["released"].as_bool(), rel["admin"].as_bool()),
+        (Some(true), Some(true))
+    );
+    let st = c.call("GET", "/v1/state", None).unwrap();
+    assert!(st["slots"]["active"].as_array().unwrap().is_empty());
+    assert!(st["actions"].as_array().unwrap().iter().any(|a| a["detail"]
+        .as_str()
+        .is_some_and(|d| d.starts_with("Admin release"))));
     // Unknown tickets are simply not released.
     let rel = c
         .call("POST", "/v1/release", Some(&json!({ "ticket": 999_999 })))

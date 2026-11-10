@@ -2708,6 +2708,46 @@ impl Engine {
     /// Release `ticket` when `secret` matches the lease's release secret (a
     /// lease or waiter that has one cannot be released without it).
     /// `Ok(false)` when there is no such ticket.
+    /// Release `ticket` without its secret: an admin release (full API token
+    /// only), for a lease whose holder crashed and took its secret with it.
+    /// Journaled as such. Returns whether a lease or waiter was released.
+    pub fn release_admin(&self, ticket: u64, source: &str) -> bool {
+        let label = {
+            let mut st = lock(&self.state);
+            let label = st
+                .slots
+                .active
+                .iter()
+                .find(|l| l.id == ticket)
+                .map(|l| l.label.clone())
+                .or_else(|| {
+                    st.slots
+                        .waiting
+                        .iter()
+                        .find(|w| w.id == ticket)
+                        .map(|w| w.label.clone())
+                });
+            if label.is_some() {
+                st.slots.active.retain(|l| l.id != ticket);
+                st.slots.waiting.retain(|w| w.id != ticket);
+            }
+            label
+        };
+        let Some(label) = label else {
+            return false;
+        };
+        self.log(
+            "lease",
+            format!(
+                "Admin release of build slot ticket {ticket} ({label}) without its release secret"
+            ),
+            0,
+            None,
+            source,
+        );
+        true
+    }
+
     pub fn release_with(&self, ticket: u64, secret: Option<&str>) -> Result<bool, ReleaseError> {
         let mut st = lock(&self.state);
         let held = st

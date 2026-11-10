@@ -1186,6 +1186,15 @@ fn route(req: &Req, engine: &Engine, read_only: bool) -> Resp {
             }
             ("POST", "/v1/release") => {
                 let b: ReleaseBody = body(req)?;
+                // The full token may release any lease without its secret
+                // (a crashed holder takes its secret with it); the read-only
+                // token always needs it. A secret that is sent must match.
+                if !read_only && b.secret.is_none() {
+                    let released = engine.release_admin(b.ticket, "api");
+                    return Ok(ok(
+                        &serde_json::json!({ "released": released, "admin": released }),
+                    ));
+                }
                 match engine.release_with(b.ticket, b.secret.as_deref()) {
                     Ok(released) => ok(&serde_json::json!({ "released": released })),
                     Err(e) => fail(

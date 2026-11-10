@@ -527,7 +527,7 @@ paths:
                 pid: { type: integer }
                 ticket: { type: integer }
                 ttl_secs: { type: integer, minimum: 1, maximum: 86400 }
-                secret: { type: string, description: With `ticket`, the `release_secret` from the reply that created it }
+                secret: { type: string, description: "With `ticket`, the `release_secret` from the reply that created it" }
       responses:
         "200":
           description: The ticket's state
@@ -547,7 +547,11 @@ paths:
   /v1/release:
     post:
       summary: Release a slot or leave the queue
-      description: A lease with a release secret needs it; without it the reply is 403 `release_secret_required`, with a wrong one 403 `wrong_release_secret`.
+      description: >-
+        With the read-only token, a lease with a release secret needs it; without it the reply is
+        403 `release_secret_required`. With the full token and no `secret`, any lease or waiter is
+        released (an admin release, for a holder that crashed with its secret); it is journaled as
+        such and the reply has `admin: true`. A wrong secret is always 403 `wrong_release_secret`.
       requestBody:
         required: true
         content:
@@ -567,6 +571,7 @@ paths:
                 type: object
                 properties:
                   released: { type: boolean }
+                  admin: { type: boolean, description: "Released by the full token without the secret (present only when no secret was sent with the full token)" }
         default: { $ref: "#/components/responses/Error" }
 components:
   securitySchemes:
@@ -669,7 +674,7 @@ components:
             type: object
             properties:
               kind: { type: string, enum: [patch, ignored_archive, branch] }
-              location: { type: string, description: A file path, or a branch name for kind branch }
+              location: { type: string, description: "A file path, or a branch name for kind branch" }
         reason: { type: string }
         detail: { type: string }
         journal_error: { type: string, description: Set when the action ran but could not be written to the journal }
@@ -708,7 +713,7 @@ components:
         id: { type: string, description: "Stable while the cause lasts: <kind>:<pid>:<start_time>, or <kind>:<path or name>" }
         kind: { $ref: "#/components/schemas/FindingKind" }
         severity: { type: string, enum: [info, low, medium, high] }
-        title: { type: string, description: One sentence, an observation }
+        title: { type: string, description: "One sentence, an observation" }
         why: { type: string }
         evidence:
           type: object
@@ -738,7 +743,7 @@ components:
             properties:
               label: { type: string }
               request: { $ref: "#/components/schemas/Request" }
-              api: { type: string, description: Another route to call, e.g. the dismiss route }
+              api: { type: string, description: "Another route to call, e.g. the dismiss route" }
               reversible: { type: boolean }
         first_seen_unix: { type: integer }
         last_seen_unix: { type: integer }
