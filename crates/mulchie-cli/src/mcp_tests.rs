@@ -1592,3 +1592,20 @@ fn sessions_limits_updates_and_guard_tools() {
     assert_eq!(r["result"]["isError"], true);
     assert!(text(&r).contains("Only the user"), "{r}");
 }
+
+#[test]
+fn a_plan_marked_not_ready_gets_no_plan_id_even_with_a_ready_item() {
+    let mut p = process_plan(true);
+    p["ready"] = json!(false);
+    let f = Fake::default().with("POST /v1/process/plan", p);
+    let mut s = Session::new(&f);
+    let v = result(
+        &s.handle(call(1, "plan_process_action", json!({ "pid": 42 })))
+            .unwrap(),
+    );
+    assert!(v.get("plan_id").is_none(), "{v}");
+    assert!(
+        v["next"].as_str().unwrap().contains("nothing to execute"),
+        "{v}"
+    );
+}
