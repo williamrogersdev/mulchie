@@ -1122,9 +1122,17 @@ fn orphans_exclude_services_and_include_the_user_subreaper() {
 
 /// The real session check: this test process was started by cargo, not by
 /// the service manager; pid 1 counts as started by it (sid 1 or itself).
+/// A CI runner is itself a systemd service, so there the test process does
+/// sit in a `.service` cgroup and the answer is rightly "yes".
 #[test]
 fn session_check_on_the_real_system() {
-    assert!(!started_by_service_manager(std::process::id()) || unsafe { libc::getsid(0) } == 1);
+    let in_service_cgroup = std::fs::read_to_string("/proc/self/cgroup")
+        .is_ok_and(|cg| cg.lines().any(|l| l.trim().ends_with(".service")));
+    assert!(
+        !started_by_service_manager(std::process::id())
+            || unsafe { libc::getsid(0) } == 1
+            || in_service_cgroup
+    );
     assert!(started_by_service_manager(1));
     assert!(
         started_by_service_manager(u32::MAX),
