@@ -2367,11 +2367,14 @@ fn nested_repo(paths: &Paths, wt: &Path) -> Result<Option<String>, Skip> {
 /// Nested repositories verified per worktree; more is a skip.
 const MAX_NESTED_REPOS: usize = 32;
 
-/// A nested repository is disposable only when nothing in it exists anywhere
-/// else would be lost: a clean working tree (no changes, no untracked files),
-/// no stashes, and every commit reachable from one of its remotes' refs.
-/// Anything that cannot be checked (a `.git` file pointing elsewhere, git
-/// failing) is not disposable.
+/// A nested repository is disposable only when nothing in it that exists
+/// nowhere else would be lost: a clean working tree (no changes, no untracked
+/// files), no ignored files apart from its own known cache directories, no
+/// skip-worktree or assume-unchanged edits, no stashes, and every commit
+/// reachable from its refs or its reflogs also reachable from one of its
+/// remotes' refs. Anything that cannot be checked (a `.git` file pointing
+/// elsewhere, git failing) is not disposable. Such a repository blocks the
+/// removal; it is never archived instead.
 fn nested_disposable(paths: &Paths, repo: &Path) -> Result<(), String> {
     let git = |args: &[&str]| -> Result<Vec<u8>, String> {
         let o = Git::new(paths, repo)
@@ -2398,6 +2401,32 @@ fn nested_disposable(paths: &Paths, repo: &Path) -> Result<(), String> {
     }
     if !git(&["rev-list", "--all", "--not", "--remotes", "--max-count=1"])?.is_empty() {
         return Err("it has commits that are on none of its remotes".into());
+    }
+    if !git(&[
+        "rev-list",
+        "--reflog",
+        "--not",
+        "--remotes",
+        "--max-count=1",
+    ])?
+    .is_empty()
+    {
+        return Err(
+            "its reflog holds commits that are on none of its remotes (reset or amended away)"
+                .into(),
+        );
+    }
+    let (ignored, _) = ignored_to_archive(paths, repo).map_err(|s| s.detail)?;
+    if let Some(first) = ignored.first() {
+        return Err(format!(
+            "it has {} ignored file(s) or folder(s) that are not build caches, e.g. {first}",
+            ignored.len()
+        ));
+    }
+    if let Some((n, first)) = hidden_changes(paths, repo).map_err(|s| s.detail)? {
+        return Err(format!(
+            "it has {n} skip-worktree or assume-unchanged file(s) with local edits, e.g. {first}"
+        ));
     }
     Ok(())
 }

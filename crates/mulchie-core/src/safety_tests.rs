@@ -1077,6 +1077,40 @@ fn nested_repositories_block_removal() {
     assert_eq!(reason(&r), Some(SkipReason::NestedRepo), "{r:?}");
     assert!(format!("{r:?}").contains("on none of its remotes"), "{r:?}");
     env.git(&dep, &["reset", "-q", "--hard", "origin/main"]);
+    // N2: the reset commit lives on in the reflog only: still blocks.
+    let r = env
+        .gate()
+        .execute_one(&env.remove_req(&wt, &env.head(&wt)), "t");
+    assert_eq!(reason(&r), Some(SkipReason::NestedRepo), "{r:?}");
+    assert!(format!("{r:?}").contains("reflog"), "{r:?}");
+    env.git(&dep, &["reflog", "expire", "--expire=now", "--all"]);
+    // N2: an ignored file that is not a build cache blocks...
+    std::fs::write(dep.join(".gitignore"), ".env\ndist/\n").unwrap();
+    env.git(&dep, &["add", ".gitignore"]);
+    env.git(&dep, &["commit", "-q", "-m", "ignore"]);
+    env.git(&dep, &["push", "-q", "origin", "HEAD:refs/heads/ignore"]);
+    env.git(&dep, &["fetch", "-q"]);
+    std::fs::write(dep.join(".env"), "SECRET=local").unwrap();
+    let r = env
+        .gate()
+        .execute_one(&env.remove_req(&wt, &env.head(&wt)), "t");
+    assert_eq!(reason(&r), Some(SkipReason::NestedRepo), "{r:?}");
+    assert!(format!("{r:?}").contains(".env"), "{r:?}");
+    assert!(dep.join(".env").exists());
+    // ...its own build cache does not.
+    std::fs::remove_file(dep.join(".env")).unwrap();
+    std::fs::create_dir_all(dep.join("dist")).unwrap();
+    std::fs::write(dep.join("dist/out.js"), "built").unwrap();
+    // N2: a skip-worktree edit blocks.
+    env.git(&dep, &["update-index", "--skip-worktree", "index.js"]);
+    std::fs::write(dep.join("index.js"), "hidden local edit").unwrap();
+    let r = env
+        .gate()
+        .execute_one(&env.remove_req(&wt, &env.head(&wt)), "t");
+    assert_eq!(reason(&r), Some(SkipReason::NestedRepo), "{r:?}");
+    assert!(format!("{r:?}").contains("skip-worktree"), "{r:?}");
+    env.git(&dep, &["update-index", "--no-skip-worktree", "index.js"]);
+    env.git(&dep, &["checkout", "-q", "--", "index.js"]);
     // Clean, no stash, everything on the remote: removable.
     let r = env
         .gate()
