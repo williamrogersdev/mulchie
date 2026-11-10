@@ -14,6 +14,7 @@ pub mod paths;
 pub mod process;
 pub mod procplan;
 pub mod reclaim;
+pub mod record;
 pub mod redact;
 pub mod safety;
 pub mod session;
