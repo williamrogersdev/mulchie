@@ -236,16 +236,52 @@ pub fn hook_command(
     spec: &EventSpec,
     guard: Option<GuardMode>,
 ) -> String {
+    command_for(exe, c, spec.neutral, guard)
+}
+
+/// The command for a client-neutral event name.
+fn command_for(exe: &Path, c: HookClient, neutral: &str, guard: Option<GuardMode>) -> String {
     let mut s = format!(
         "{} hook {} {}",
         sh_quote(&exe.to_string_lossy()),
         c.name(),
-        spec.neutral
+        neutral
     );
-    if let (Some(g), "pre_tool") = (guard, spec.neutral) {
+    if let (Some(g), "pre_tool") = (guard, neutral) {
         s.push_str(&format!(" --guard {}", g.as_str()));
     }
     s
+}
+
+/// The executable of `cmd` when `cmd` is exactly a command Mulchie writes for
+/// client `c` (any event it has registered for, any guard), and nothing else:
+/// a user's own command that starts the same way is not ours.
+pub fn ours_exe(cmd: &str, c: HookClient) -> Option<String> {
+    let guards = [
+        None,
+        Some(GuardMode::Off),
+        Some(GuardMode::Warn),
+        Some(GuardMode::Block),
+    ];
+    for w in sh_words(cmd) {
+        if Path::new(&w).file_name().and_then(|n| n.to_str()) != Some("mulchie") {
+            continue;
+        }
+        let exe = Path::new(&w);
+        for ev in crate::hook_wire::EVENTS {
+            for g in guards {
+                if forms(exe, c, ev, g).iter().any(|f| f == cmd) {
+                    return Some(w);
+                }
+            }
+        }
+    }
+    None
+}
+
+/// Every command text Mulchie has written for one event.
+fn forms(exe: &Path, c: HookClient, neutral: &str, guard: Option<GuardMode>) -> Vec<String> {
+    vec![command_for(exe, c, neutral, guard)]
 }
 
 fn command_of(handler: &Value) -> Option<&str> {
@@ -257,14 +293,31 @@ fn command_of(handler: &Value) -> Option<&str> {
 
 /// Whether `handler` is one Mulchie added for client `c`.
 pub fn is_ours(handler: &Value, c: HookClient) -> bool {
-    let Some(cmd) = command_of(handler) else {
-        return false;
-    };
-    let w = sh_words(cmd);
-    w.len() >= 3
-        && Path::new(&w[0]).file_name().and_then(|n| n.to_str()) == Some("mulchie")
-        && w[1] == "hook"
-        && w[2] == c.name()
+    command_of(handler).is_some_and(|cmd| ours_exe(cmd, c).is_some())
+}
+
+/// The fields of a handler Mulchie owns: its command and its timeout. On an
+/// update only these change; a handler's other fields and its group's
+/// matcher stay as they are.
+const OWNED: [&str; 4] = ["command", "bash", "timeout", "timeoutSec"];
+
+fn owned_differ(have: &Value, want: &Value) -> bool {
+    OWNED.iter().any(|k| have.get(*k) != want.get(*k))
+}
+
+fn set_owned(have: &mut Value, want: &Value) {
+    if let (Some(h), Some(w)) = (have.as_object_mut(), want.as_object()) {
+        for k in OWNED {
+            match w.get(k) {
+                Some(v) => {
+                    h.insert(k.into(), v.clone());
+                }
+                None => {
+                    h.shift_remove(k);
+                }
+            }
+        }
+    }
 }
 
 /// The handler object for one event.
@@ -426,17 +479,12 @@ pub fn plan_install(
                 what.push(format!("add {}: {}", spec.native, want_h));
             }
             Some(&(i, j)) => {
-                let same = match j {
-                    Some(j) => arr[i]["hooks"][j] == want_h && arr[i]["matcher"] == want["matcher"],
-                    None => arr[i] == want_h,
+                let have = match j {
+                    Some(j) => &mut arr[i]["hooks"][j],
+                    None => &mut arr[i],
                 };
-                if !same {
-                    let alone = j.is_none() || arr[i]["hooks"].as_array().map_or(0, Vec::len) == 1;
-                    if alone {
-                        arr[i] = want;
-                    } else if let Some(j) = j {
-                        arr[i]["hooks"][j] = want_h.clone();
-                    }
+                if owned_differ(have, &want_h) {
+                    set_owned(have, &want_h);
                     what.push(format!("update {}: {}", spec.native, want_h));
                 }
                 // A second copy of Mulchie's hook on one event is removed.
@@ -449,6 +497,7 @@ pub fn plan_install(
                         idx += 1;
                         if grouped(c) {
                             if let Some(hs) = e.get_mut("hooks").and_then(Value::as_array_mut) {
+                                let before = hs.len();
                                 let mut k = 0;
                                 hs.retain(|h| {
                                     let pos = k;
@@ -460,7 +509,8 @@ pub fn plan_install(
                                     }
                                     !drop
                                 });
-                                return !hs.is_empty();
+                                // A group goes only when this emptied it.
+                                return !(hs.is_empty() && before > 0);
                             }
                             true
                         } else {
@@ -730,8 +780,8 @@ pub fn status_in(env: &HookEnv) -> Value {
                                     Some(j) => &arr[i]["hooks"][j],
                                     None => &arr[i],
                                 };
-                                if let Some(w) = command_of(h).map(sh_words) {
-                                    exes.push(w[0].clone());
+                                if let Some(e) = command_of(h).and_then(|cmd| ours_exe(cmd, c)) {
+                                    exes.push(e);
                                 }
                             }
                         }

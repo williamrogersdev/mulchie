@@ -347,3 +347,93 @@ fn status_lists_each_client() {
         "{text}"
     );
 }
+
+#[test]
+fn only_exactly_our_commands_are_ours() {
+    for (cmd, ours) in [
+        (format!("{EXE} hook claude-code pre_tool"), true),
+        (
+            format!("{EXE} hook claude-code pre_tool --guard warn"),
+            true,
+        ),
+        ("mulchie hook claude-code stop".to_string(), true),
+        (
+            format!("{EXE} hook claude-code pre_tool && ~/bin/my-audit"),
+            false,
+        ),
+        (
+            format!("{EXE} hook claude-code pre_tool; rm -rf /tmp/x"),
+            false,
+        ),
+        (
+            format!("{EXE} hook claude-code pre_tool --guard bogus"),
+            false,
+        ),
+        (format!("{EXE} hook claude-code nosuch"), false),
+        (format!("{EXE} hook claude-code pre_tool extra"), false),
+        (format!("{EXE} hook cursor pre_tool"), false),
+    ] {
+        assert_eq!(
+            is_ours(&json!({ "command": cmd }), ClaudeCode),
+            ours,
+            "{cmd}"
+        );
+    }
+}
+
+#[test]
+fn a_users_own_mulchie_command_and_its_group_are_left_alone() {
+    let t = t();
+    let f = t.env.file(ClaudeCode);
+    std::fs::create_dir_all(f.parent().unwrap()).unwrap();
+    let theirs = format!("{EXE} hook claude-code pre_tool && ~/bin/my-audit");
+    let group =
+        json!({ "matcher": "Bash|Edit", "hooks": [{ "type": "command", "command": theirs }] });
+    std::fs::write(
+        &f,
+        serde_json::to_string_pretty(&json!({ "hooks": { "PreToolUse": [group.clone()] } }))
+            .unwrap(),
+    )
+    .unwrap();
+    install_in(&t.env, ClaudeCode, false, None).unwrap();
+    let pre = read(&f)["hooks"]["PreToolUse"].clone();
+    assert_eq!(pre[0], group, "theirs untouched");
+    assert_eq!(
+        pre.as_array().unwrap().len(),
+        2,
+        "ours added beside it: {pre}"
+    );
+    uninstall_in(&t.env, ClaudeCode, false).unwrap();
+    assert_eq!(read(&f)["hooks"]["PreToolUse"], json!([group]));
+}
+
+#[test]
+fn an_update_changes_only_our_handler_in_a_shared_group() {
+    let t = t();
+    let f = t.env.file(ClaudeCode);
+    std::fs::create_dir_all(f.parent().unwrap()).unwrap();
+    let old = json!({ "hooks": { "PreToolUse": [{ "matcher": "Bash|Edit", "hooks": [
+        { "type": "command", "command": "/old/bin/mulchie hook claude-code pre_tool", "timeout": 9, "note": "kept" },
+        { "type": "command", "command": "~/bin/mine.sh" }
+    ] }] } });
+    std::fs::write(&f, serde_json::to_string_pretty(&old).unwrap()).unwrap();
+    let msg = install_in(&t.env, ClaudeCode, false, None).unwrap();
+    assert!(msg.contains("update PreToolUse"), "{msg}");
+    let pre = read(&f)["hooks"]["PreToolUse"].clone();
+    assert_eq!(pre.as_array().unwrap().len(), 1, "{pre}");
+    assert_eq!(pre[0]["matcher"], "Bash|Edit", "matcher kept");
+    let new_cmd = hook_command(&t.env.exe, ClaudeCode, &events_for(ClaudeCode)[2], None);
+    assert_eq!(pre[0]["hooks"][0]["command"], new_cmd.as_str());
+    assert_eq!(pre[0]["hooks"][0]["timeout"], 5);
+    assert_eq!(pre[0]["hooks"][0]["note"], "kept");
+    assert_eq!(pre[0]["hooks"][1]["command"], "~/bin/mine.sh");
+    // Idempotent with the shared group.
+    let again = install_in(&t.env, ClaudeCode, false, None).unwrap();
+    assert!(again.contains("already set up"), "{again}");
+    // Uninstall takes our handler and keeps the group with theirs.
+    uninstall_in(&t.env, ClaudeCode, false).unwrap();
+    assert_eq!(
+        read(&f)["hooks"]["PreToolUse"],
+        json!([{ "matcher": "Bash|Edit", "hooks": [{ "type": "command", "command": "~/bin/mine.sh" }] }])
+    );
+}
