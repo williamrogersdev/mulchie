@@ -13,6 +13,9 @@ use serde_json::{json, Map, Value};
 
 // ---------------------------------------------------------------- findings
 
+/// Said when findings come from one local look instead of the engine.
+pub const LOCAL_NOTE: &str = "This was one look, taken now: patterns that need time (runaway CPU, growing memory, stale or stopped processes) are seen only by a running engine.";
+
 /// `GET /v1/findings`, or a one-off local watch run when no engine runs.
 fn findings_value(
     paths: &Paths,
@@ -61,7 +64,13 @@ fn findings_value(
                 })
                 .transpose()?;
             let list = engine.findings(sev, k, all);
-            Ok(json!({ "findings": list, "local": true }))
+            let enabled = engine.config().watch.enabled;
+            Ok(json!({
+                "findings": list,
+                "enabled": enabled,
+                "local": true,
+                "local_note": LOCAL_NOTE,
+            }))
         }
     }
 }
@@ -92,6 +101,9 @@ pub fn render_findings(v: &Value) -> String {
     let mut out = String::new();
     if v["enabled"] == false {
         out.push_str("The watch is turned off (watch.enabled in `mulchie config`).\n");
+    }
+    if let Some(n) = v["local_note"].as_str() {
+        out.push_str(&format!("{n}\n"));
     }
     if list.is_empty() {
         out.push_str("Nothing noticed.\n");
@@ -127,48 +139,123 @@ pub fn render_findings(v: &Value) -> String {
     out
 }
 
+/// Refuse an id that is not among `known` findings (a `/v1/findings` reply),
+/// naming the closest ones.
+pub fn check_finding_id(id: &str, known: &Value) -> Result<(), String> {
+    let ids: Vec<&str> = known["findings"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|f| f["id"].as_str())
+        .collect();
+    if ids.contains(&id) {
+        return Ok(());
+    }
+    let common = |a: &str| {
+        a.chars()
+            .zip(id.chars())
+            .take_while(|(x, y)| x == y)
+            .count()
+    };
+    let mut close: Vec<&str> = ids
+        .iter()
+        .copied()
+        .filter(|k| common(k) >= 3 || k.contains(id) || id.contains(*k))
+        .collect();
+    close.sort_by_key(|k| std::cmp::Reverse(common(k)));
+    close.truncate(5);
+    Err(if close.is_empty() {
+        format!(
+            "{id:?} is not a current or dismissed finding ({} known); check the id, or force it",
+            ids.len()
+        )
+    } else {
+        format!(
+            "{id:?} is not a current or dismissed finding; did you mean {}? Or force it",
+            close
+                .iter()
+                .map(|k| format!("{k:?}"))
+                .collect::<Vec<_>>()
+                .join(", ")
+        )
+    })
+}
+
 pub fn findings_action(paths: &Paths, action: &FindingsCommand) -> i32 {
     let (id, json_out) = match action {
         FindingsCommand::Dismiss { id, out, .. } | FindingsCommand::Undismiss { id, out } => {
             (id.as_str(), out.json)
         }
     };
-    let r = match conn::connect(paths) {
-        Conn::Engine(c) => {
-            let (path, body) = match action {
-                FindingsCommand::Dismiss { days, .. } => {
-                    let mut b = json!({ "id": id });
-                    if let Some(d) = days {
-                        b["days"] = json!(d);
+    let force = matches!(action, FindingsCommand::Dismiss { force: true, .. });
+    let check = matches!(action, FindingsCommand::Dismiss { .. }) && !force;
+    // Twice at most: an engine that starts while we look is used instead.
+    let mut r = None;
+    for _ in 0..2 {
+        match conn::connect(paths) {
+            Conn::Engine(c) => {
+                if check {
+                    let known = match conn::call(&c, "GET", "/v1/findings?dismissed=1", None) {
+                        Ok(v) => v,
+                        Err(e) => return fail(conn::describe(&e)),
+                    };
+                    if let Err(e) = check_finding_id(id, &known) {
+                        return fail(e.replace("force it", "pass --force"));
                     }
-                    ("/v1/findings/dismiss", b)
                 }
-                FindingsCommand::Undismiss { .. } => {
-                    ("/v1/findings/undismiss", json!({ "id": id }))
+                let (path, body) = match action {
+                    FindingsCommand::Dismiss { days, .. } => {
+                        let mut b = json!({ "id": id });
+                        if let Some(d) = days {
+                            b["days"] = json!(d);
+                        }
+                        ("/v1/findings/dismiss", b)
+                    }
+                    FindingsCommand::Undismiss { .. } => {
+                        ("/v1/findings/undismiss", json!({ "id": id }))
+                    }
+                };
+                match conn::call(&c, "POST", path, Some(&body)) {
+                    Ok(v) => r = Some(v),
+                    Err(e) => return fail(conn::describe(&e)),
                 }
-            };
-            match conn::call(&c, "POST", path, Some(&body)) {
-                Ok(v) => v,
-                Err(e) => return fail(conn::describe(&e)),
+                break;
             }
-        }
-        Conn::NotRunning => {
-            Conn::NotRunning.note_local("saving it in the config file");
-            let engine = Engine::new(paths.clone(), Config::load_from(paths));
-            let r = match action {
-                FindingsCommand::Dismiss { days, .. } => engine
-                    .dismiss_finding(id, days.map(u64::from))
-                    .map(|until| json!({ "ok": true, "id": id, "until_unix": until })),
-                FindingsCommand::Undismiss { .. } => engine
-                    .undismiss_finding(id)
-                    .map(|was| json!({ "ok": true, "id": id, "was_dismissed": was })),
-            };
-            match r {
-                Ok(v) => v,
-                Err((code, m)) => return fail(format!("{m} [{code}]")),
+            Conn::NotRunning => {
+                let engine = Engine::new(paths.clone(), Config::load_from(paths));
+                // Hold the engine lock while rewriting the config, so an
+                // engine cannot start and write it at the same time.
+                let Ok(_lock) = engine.acquire_lock() else {
+                    continue;
+                };
+                Conn::NotRunning.note_local("saving it in the config file");
+                if check {
+                    engine.set_snapshot(crate::commands::sample());
+                    engine.run_watch();
+                    let known = json!({ "findings": engine.findings(None, None, true) });
+                    if let Err(e) = check_finding_id(id, &known) {
+                        return fail(e.replace("force it", "pass --force"));
+                    }
+                }
+                let res = match action {
+                    FindingsCommand::Dismiss { days, .. } => engine
+                        .dismiss_finding(id, days.map(u64::from))
+                        .map(|until| json!({ "ok": true, "id": id, "until_unix": until })),
+                    FindingsCommand::Undismiss { .. } => engine
+                        .undismiss_finding(id)
+                        .map(|was| json!({ "ok": true, "id": id, "was_dismissed": was })),
+                };
+                match res {
+                    Ok(v) => r = Some(v),
+                    Err((code, m)) => return fail(format!("{m} [{code}]")),
+                }
+                break;
             }
+            other => return fail(other.explain_required("`mulchie findings dismiss`")),
         }
-        other => return fail(other.explain_required("`mulchie findings dismiss`")),
+    }
+    let Some(r) = r else {
+        return fail("an engine is starting; try again in a moment");
     };
     if json_out {
         print_json(&r);
@@ -453,85 +540,118 @@ pub fn config_show(paths: &Paths, json_out: bool) -> i32 {
 }
 
 /// Set `key` (dotted) in a config value to `raw` (JSON, or a bare string).
-pub fn set_key(cfg: &Value, key: &str, raw: &str) -> Result<Config, String> {
+/// Returns the edited JSON itself, so keys this build does not know (from a
+/// newer engine) are kept; this build's typed parse is only a check.
+pub fn set_key(cfg: &Value, key: &str, raw: &str) -> Result<Value, String> {
     let value: Value = serde_json::from_str(raw).unwrap_or_else(|_| Value::String(raw.to_string()));
     let parts: Vec<&str> = key.split('.').collect();
     if key.is_empty() || parts.iter().any(|p| p.is_empty()) {
         return Err(format!("{key:?} is not a setting name"));
     }
+    let unknown = || format!("unknown setting {key} (see `mulchie config`)");
+    let known_here = cfg_has_path(cfg, &parts);
     let mut new = cfg.clone();
     let mut at = &mut new;
     for p in &parts[..parts.len() - 1] {
         at = match at.get_mut(*p) {
             Some(v @ Value::Object(_)) => v,
-            _ => return Err(format!("unknown setting {key} (see `mulchie config`)")),
+            _ => return Err(unknown()),
         };
     }
     let Some(obj) = at.as_object_mut() else {
-        return Err(format!("unknown setting {key}"));
+        return Err(unknown());
     };
     obj.insert(parts[parts.len() - 1].to_string(), value.clone());
-    let parsed: Config =
-        serde_json::from_value(new).map_err(|e| format!("{key} = {raw} does not fit: {e}"))?;
-    // A misspelt key would be dropped by the parse: check it survived.
+    let parsed: Config = serde_json::from_value(new.clone())
+        .map_err(|e| format!("{key} = {raw} does not fit: {e}"))?;
+    // A key neither the engine's config nor this build knows is a typo.
     let back = serde_json::to_value(&parsed).unwrap_or(Value::Null);
-    let mut got = &back;
-    for p in &parts {
-        got = &got[*p];
-    }
-    if got.is_null() && !value.is_null() {
-        return Err(format!("unknown setting {key} (see `mulchie config`)"));
+    if !known_here && !cfg_has_path(&back, &parts) {
+        return Err(unknown());
     }
     parsed
         .validate()
         .map_err(|e| format!("{key} = {raw} is not allowed: {}", e.join("; ")))?;
-    Ok(parsed)
+    Ok(new)
+}
+
+/// Whether every part of `parts` is a key, object by object, in `v`.
+fn cfg_has_path(v: &Value, parts: &[&str]) -> bool {
+    let mut at = v;
+    for p in parts {
+        match at.as_object().and_then(|o| o.get(*p)) {
+            Some(x) => at = x,
+            None => return false,
+        }
+    }
+    true
 }
 
 pub fn config_set(paths: &Paths, key: &str, raw: &str, json_out: bool) -> i32 {
-    let (saved, how) = match conn::connect(paths) {
-        Conn::Engine(c) => {
-            let cur = match conn::call(&c, "GET", "/v1/config", None) {
-                Ok(v) => v,
-                Err(e) => return fail(conn::describe(&e)),
-            };
-            if let Some(e) = cur["config_error"].as_str() {
-                return fail(format!(
-                    "the config file was not used ({e}); fix or remove {} first",
-                    s(&cur, "path")
+    let mut done = None;
+    // Twice at most: an engine that starts while we look is used instead.
+    for _ in 0..2 {
+        match conn::connect(paths) {
+            Conn::Engine(c) => {
+                let cur = match conn::call(&c, "GET", "/v1/config", None) {
+                    Ok(v) => v,
+                    Err(e) => return fail(conn::describe(&e)),
+                };
+                if let Some(e) = cur["config_error"].as_str() {
+                    return fail(format!(
+                        "the config file was not used ({e}); fix or remove {} first",
+                        s(&cur, "path")
+                    ));
+                }
+                let edited = match set_key(&cur["config"], key, raw) {
+                    Ok(c) => c,
+                    Err(e) => return fail(e),
+                };
+                match conn::call(&c, "PUT", "/v1/config", Some(&json!({ "config": edited }))) {
+                    Ok(v) => {
+                        done = Some((v["config"].clone(), "through the engine; in effect now"))
+                    }
+                    Err(e) => return fail(conn::describe(&e)),
+                }
+                break;
+            }
+            Conn::NotRunning => {
+                let loaded = Config::load_from(paths);
+                if let Some(e) = loaded.error {
+                    return fail(format!(
+                        "{} was not used ({e}); fix or remove it first",
+                        paths.config_file().display()
+                    ));
+                }
+                // Hold the engine lock while writing, so an engine cannot
+                // start and write the file at the same time.
+                let cur = serde_json::to_value(&loaded.config).unwrap_or(Value::Null);
+                let engine = Engine::new(paths.clone(), loaded);
+                let Ok(_lock) = engine.acquire_lock() else {
+                    continue;
+                };
+                let edited = match set_key(&cur, key, raw) {
+                    Ok(c) => c,
+                    Err(e) => return fail(e),
+                };
+                let cfg: Config = match serde_json::from_value(edited) {
+                    Ok(c) => c,
+                    Err(e) => return fail(e),
+                };
+                if let Err(e) = cfg.save_to(paths, mulchie_core::monitor::now_unix()) {
+                    return fail(e);
+                }
+                done = Some((
+                    serde_json::to_value(&cfg).unwrap_or(Value::Null),
+                    "in the file (no engine is running; it applies when one starts)",
                 ));
+                break;
             }
-            let cfg = match set_key(&cur["config"], key, raw) {
-                Ok(c) => c,
-                Err(e) => return fail(e),
-            };
-            match conn::call(&c, "PUT", "/v1/config", Some(&json!({ "config": cfg }))) {
-                Ok(v) => (v["config"].clone(), "through the engine; in effect now"),
-                Err(e) => return fail(conn::describe(&e)),
-            }
+            other => return fail(other.explain_required("`mulchie config set`")),
         }
-        Conn::NotRunning => {
-            let loaded = Config::load_from(paths);
-            if let Some(e) = loaded.error {
-                return fail(format!(
-                    "{} was not used ({e}); fix or remove it first",
-                    paths.config_file().display()
-                ));
-            }
-            let cur = serde_json::to_value(&loaded.config).unwrap_or(Value::Null);
-            let cfg = match set_key(&cur, key, raw) {
-                Ok(c) => c,
-                Err(e) => return fail(e),
-            };
-            if let Err(e) = cfg.save_to(paths, mulchie_core::monitor::now_unix()) {
-                return fail(e);
-            }
-            (
-                serde_json::to_value(&cfg).unwrap_or(Value::Null),
-                "in the file (no engine is running; it applies when one starts)",
-            )
-        }
-        other => return fail(other.explain_required("`mulchie config set`")),
+    }
+    let Some((saved, how)) = done else {
+        return fail("an engine is starting; try again in a moment");
     };
     let mut got = &saved;
     for p in key.split('.') {
@@ -558,7 +678,7 @@ mod tests {
     fn set_key_checks_names_types_and_ranges() {
         let cur = serde_json::to_value(Config::default()).unwrap();
         let c = set_key(&cur, "worktree_idle_days", "21").unwrap();
-        assert_eq!(c.worktree_idle_days, 21);
+        assert_eq!(c["worktree_idle_days"], 21);
         assert!(set_key(&cur, "worktree_idle_dayz", "21")
             .unwrap_err()
             .contains("unknown setting"));
@@ -571,7 +691,75 @@ mod tests {
         assert!(set_key(&cur, "nope.deeper", "1").is_err());
         assert!(set_key(&cur, "", "1").is_err());
         let c = set_key(&cur, "watch.enabled", "false").unwrap();
-        assert!(!c.watch.enabled);
+        assert_eq!(c["watch"]["enabled"], false);
+    }
+
+    #[test]
+    fn set_key_keeps_keys_from_a_newer_engine() {
+        let mut cur = serde_json::to_value(Config::default()).unwrap();
+        cur["from_a_newer_engine"] = json!({ "knob": 3 });
+        // A key this build does not know, but the engine's config has.
+        let c = set_key(&cur, "from_a_newer_engine.knob", "4").unwrap();
+        assert_eq!(c["from_a_newer_engine"]["knob"], 4);
+        // Setting a known key keeps the unknown one in what is sent.
+        let c = set_key(&cur, "worktree_idle_days", "9").unwrap();
+        assert_eq!(c["from_a_newer_engine"]["knob"], 3);
+        assert_eq!(c["worktree_idle_days"], 9);
+    }
+
+    #[test]
+    fn every_key_in_the_config_help_is_accepted() {
+        use clap::CommandFactory;
+        let mut cmd = crate::cli::Cli::command();
+        let config = cmd.find_subcommand_mut("config").expect("config command");
+        let mut help = String::new();
+        for sub in config.get_subcommands_mut() {
+            help.push_str(&sub.render_long_help().to_string());
+        }
+        help.push_str(&config.render_long_help().to_string());
+        let cur = serde_json::to_value(Config::default()).unwrap();
+        let mut seen = 0;
+        for line in help.lines() {
+            let Some(at) = line.find("mulchie config set ") else {
+                continue;
+            };
+            let words = crate::hooks_install::sh_words(&line[at..]);
+            if words.len() != 5 {
+                continue;
+            }
+            set_key(&cur, &words[3], &words[4])
+                .unwrap_or_else(|e| panic!("help example {:?} fails: {e}", &line[at..]));
+            seen += 1;
+        }
+        assert!(
+            seen >= 3,
+            "expected at least three examples in the help, found {seen}:\n{help}"
+        );
+    }
+
+    #[test]
+    fn local_findings_say_when_the_watch_is_off_and_what_one_look_misses() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = Paths::under(tmp.path());
+        let mut cfg = Config::default();
+        cfg.watch.enabled = false;
+        cfg.save_to(&paths, 1).unwrap();
+        let v = findings_value(&paths, None, None, false).unwrap();
+        assert_eq!(v["enabled"], false);
+        assert_eq!(v["local"], true);
+        let t = render_findings(&v);
+        assert!(t.contains("The watch is turned off"), "{t}");
+        assert!(t.contains("only by a running engine"), "{t}");
+    }
+
+    #[test]
+    fn unknown_finding_ids_are_refused_with_close_ones() {
+        let known = json!({ "findings": [
+            { "id": "runaway_cpu:42:7" }, { "id": "runaway_cpu:43:1" }, { "id": "stale_worktree:/a" } ] });
+        assert!(check_finding_id("runaway_cpu:42:7", &known).is_ok());
+        let e = check_finding_id("runaway_cpu:42", &known).unwrap_err();
+        assert!(e.contains("runaway_cpu:42:7"), "{e}");
+        assert!(check_finding_id("zzz", &known).is_err());
     }
 
     #[test]

@@ -38,6 +38,9 @@ impl Job {
 }
 
 /// Where plans come from and go to.
+/// Said when the engine took a plan but gave no usable answer.
+pub const MAY_HAVE_ACTED: &str = "The engine may have acted on some of the plan: check `mulchie status` or the action journal before trying again";
+
 pub enum Backend {
     Engine(Client),
     Local(Engine),
@@ -81,9 +84,10 @@ impl Backend {
                     _ => "/v1/clean",
                 };
                 let v = conn::call(c, "POST", route, Some(&json!({ "items": items })))
-                    .map_err(|e| conn::describe(&e))?;
-                serde_json::from_value(v)
-                    .map_err(|e| format!("unexpected results from the engine: {e}"))
+                    .map_err(|e| format!("{}. {MAY_HAVE_ACTED}", conn::describe(&e)))?;
+                serde_json::from_value(v).map_err(|e| {
+                    format!("unexpected reply from the engine; versions may differ ({e}). {MAY_HAVE_ACTED}")
+                })
             }
             Backend::Local(e) => {
                 // Hold the engine lock while acting, so an engine (the app

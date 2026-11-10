@@ -6,6 +6,7 @@
 //! It is built from the engine's `/v1/state` and `/v1/advice` JSON, so the
 //! CLI and MCP produce the same thing. Lists are capped; totals are given.
 
+use crate::hooks_install::sh_quote as q;
 use mulchie_core::human_bytes;
 use serde_json::{json, Value};
 
@@ -99,7 +100,7 @@ pub fn finding_brief(f: &Value) -> Value {
         if r["action"] == "signal" {
             if let (Some(p), Some(sig)) = (r["pid"].as_u64(), r["signal"].as_str()) {
                 next.push(json!({ "label": sug["label"], "name": "plan_process_action", "arguments": { "pid": p, "signal": sig } }));
-                cli.push(format!("mulchie signal {p} {sig}"));
+                cli.push(format!("mulchie signal {p} {}", q(sig)));
             }
         }
     }
@@ -109,7 +110,7 @@ pub fn finding_brief(f: &Value) -> Value {
     }
     if let Some(id) = f["id"].as_str() {
         next.push(json!({ "label": "Hide it if the user says it is expected", "name": "dismiss_finding", "arguments": { "id": id } }));
-        cli.push(format!("mulchie findings dismiss '{id}'"));
+        cli.push(format!("mulchie findings dismiss {}", q(id)));
     }
     let mut evidence = serde_json::Map::new();
     for k in [
@@ -333,7 +334,7 @@ pub fn build(state: &Value, advice: &Value, origin: Origin) -> Value {
                     "plan_process_action",
                     json!({ "group": ws_key(w), "action": "quit" }),
                 ),
-                command: Some(format!("mulchie group '{}' quit", ws_key(w))),
+                command: Some(format!("mulchie group {} quit", q(&ws_key(w)))),
             });
         }
         if w["paused"] == true {
@@ -352,7 +353,7 @@ pub fn build(state: &Value, advice: &Value, origin: Origin) -> Value {
                     "plan_process_action",
                     json!({ "group": ws_key(w), "action": "resume" }),
                 ),
-                command: Some(format!("mulchie group '{}' resume", ws_key(w))),
+                command: Some(format!("mulchie group {} resume", q(&ws_key(w)))),
             });
         }
     }
@@ -372,7 +373,7 @@ pub fn build(state: &Value, advice: &Value, origin: Origin) -> Value {
                 gain: "a more responsive machine; builds take longer".into(),
                 risk: "low",
                 next_call: call("plan_process_action", json!({ "group": ws_key(w), "action": "lower_priority" })),
-                command: Some(format!("mulchie group '{}' lower-priority", ws_key(w))),
+                command: Some(format!("mulchie group {} lower-priority", q(&ws_key(w)))),
             });
         }
     }
@@ -494,7 +495,7 @@ pub fn build(state: &Value, advice: &Value, origin: Origin) -> Value {
             risk: "low",
             // A preview: nothing runs until prune_cache is called again with execute=true.
             next_call: call("prune_cache", json!({ "key": c["key"] })),
-            command: Some(format!("mulchie prune {}", c["key"].as_str().unwrap_or(""))),
+            command: Some(format!("mulchie prune {}", q(c["key"].as_str().unwrap_or("")))),
         });
     }
     if !scanned && running {
@@ -910,6 +911,41 @@ mod tests {
         // Small enough for a context window.
         assert!(d.to_string().len() < 12_000, "{}", d.to_string().len());
         assert!(render(&d).contains("Recommendations:"));
+    }
+
+    #[test]
+    fn suggested_commands_survive_quotes_in_paths_and_ids() {
+        let mut st = state();
+        st["snapshot"]["workspaces"][3]["path"] = json!("/r/it's here");
+        let d = build(&st, &json!({}), Origin::Engine);
+        let cmds: Vec<String> = d["recommendations"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|r| r["cli"].as_str().map(String::from))
+            .collect();
+        let group = cmds
+            .iter()
+            .find(|c| c.starts_with("mulchie group"))
+            .unwrap_or_else(|| panic!("no group command in {cmds:?}"));
+        let words = crate::hooks_install::sh_words(group);
+        assert_eq!(words[2], "workspace:/r/it's here", "{group}");
+        let f = json!({ "id": "odd:it's:1", "kind": "x", "severity": "low", "evidence": { "pid": 7 },
+            "suggested": [{ "label": "Stop", "request": { "action": "signal", "pid": 7, "signal": "term" } }] });
+        let b = finding_brief(&f);
+        let dismiss = b["cli"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(Value::as_str)
+            .find(|c| c.contains("dismiss"))
+            .unwrap()
+            .to_string();
+        assert_eq!(
+            crate::hooks_install::sh_words(&dismiss)[3],
+            "odd:it's:1",
+            "{dismiss}"
+        );
     }
 
     #[test]

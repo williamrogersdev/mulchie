@@ -22,7 +22,7 @@ use mulchie_core::Paths;
 use serde_json::{json, Map, Value};
 use std::collections::HashMap;
 use std::io::{BufRead, Write};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 pub const MODERN_VERSION: &str = "2026-07-28";
 /// Newest first.
@@ -189,7 +189,33 @@ pub struct Session<'a> {
     /// execute_plan needs one.
     pub plans: Plans,
     /// Build-slot release secrets by ticket; never shown to the client.
-    secrets: HashMap<u64, String>,
+    /// Shared with the signal thread, which releases them on SIGTERM.
+    secrets: Secrets,
+}
+
+/// Release secrets by ticket.
+pub type Secrets = Arc<Mutex<HashMap<u64, String>>>;
+
+/// Release every slot in `secrets` and forget them. Errors are ignored: the
+/// engine also ends the slots when their TTL passes.
+pub fn release_all(api: &dyn Api, secrets: &Secrets) -> usize {
+    let held: Vec<(u64, String)> = tools::lock_secrets(secrets).drain().collect();
+    for (ticket, secret) in &held {
+        let _ = api.call(
+            "POST",
+            "/v1/release",
+            Some(&json!({ "ticket": ticket, "secret": secret })),
+        );
+    }
+    held.len()
+}
+
+/// A session that ends (end of input, an error, a panic) gives back the
+/// build slots it still holds.
+impl Drop for Session<'_> {
+    fn drop(&mut self) {
+        release_all(self.api, &self.secrets);
+    }
 }
 
 fn capabilities() -> Value {
@@ -203,15 +229,14 @@ impl<'a> Session<'a> {
             negotiated: None,
             read_only: false,
             plans: Plans::default(),
-            secrets: HashMap::new(),
+            secrets: Secrets::default(),
         }
     }
 
     pub fn read_only(api: &'a dyn Api) -> Self {
-        Self {
-            read_only: true,
-            ..Self::new(api)
-        }
+        let mut s = Self::new(api);
+        s.read_only = true;
+        s
     }
 
     fn instructions(&self) -> String {
@@ -422,7 +447,7 @@ impl<'a> Session<'a> {
                     api: self.api,
                     plans: &mut self.plans,
                     read_only: self.read_only,
-                    secrets: &mut self.secrets,
+                    secrets: &self.secrets,
                 };
                 let outcome = tools::validate(&tool.schema(), &args)
                     .and_then(|()| tools::call_tool(&mut cx, name, &args));
@@ -469,7 +494,7 @@ impl<'a> Session<'a> {
                 .map_err(|e| failed(tools::api_err(e)))
         };
         let v = match uri {
-            "mulchie://diagnosis" => tools::diagnosis(self.api).map_err(failed)?,
+            "mulchie://diagnosis" => tools::diagnosis(self.api, self.read_only).map_err(failed)?,
             "mulchie://state" => get("/v1/state")?,
             "mulchie://plan/sweep" => get("/v1/sweep")?,
             "mulchie://actions" => get("/v1/state")?["actions"].clone(),
@@ -597,6 +622,7 @@ pub fn command(paths: &Paths, read_only: bool) -> i32 {
     } else {
         Session::new(&api)
     };
+    release_on_signals(paths.clone(), read_only, session.secrets.clone());
     let stdin = std::io::stdin();
     match serve_session(stdin.lock(), std::io::stdout().lock(), session) {
         Ok(()) => 0,
@@ -605,6 +631,36 @@ pub fn command(paths: &Paths, read_only: bool) -> i32 {
             eprintln!("mulchie mcp: {e}");
             1
         }
+    }
+}
+
+/// On SIGTERM, SIGINT or SIGHUP, release the slots this server holds, then
+/// exit with 128 + the signal. The signals are blocked in every thread and
+/// taken by one waiting thread, so the release runs outside a signal
+/// handler.
+fn release_on_signals(paths: Paths, read_only: bool, secrets: Secrets) {
+    // SAFETY: plain libc signal-mask calls on a zeroed sigset_t.
+    unsafe {
+        let mut set: libc::sigset_t = std::mem::zeroed();
+        libc::sigemptyset(&mut set);
+        for sig in [libc::SIGTERM, libc::SIGINT, libc::SIGHUP] {
+            libc::sigaddset(&mut set, sig);
+        }
+        if libc::pthread_sigmask(libc::SIG_BLOCK, &set, std::ptr::null_mut()) != 0 {
+            return;
+        }
+        std::thread::spawn(move || {
+            let mut sig: libc::c_int = 0;
+            if libc::sigwait(&set, &mut sig) == 0 {
+                let api = if read_only {
+                    EngineApi::read_only(paths)
+                } else {
+                    EngineApi::new(paths)
+                };
+                release_all(&api, &secrets);
+                std::process::exit(128 + sig);
+            }
+        });
     }
 }
 

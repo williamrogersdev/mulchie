@@ -338,3 +338,57 @@ fn diagnose_without_an_engine_looks_locally() {
     );
     s.finish();
 }
+
+/// Wait until `f` holds, for at most five seconds.
+fn eventually(f: impl Fn() -> bool) -> bool {
+    for _ in 0..100 {
+        if f() {
+            return true;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    false
+}
+
+#[test]
+fn a_server_releases_its_slots_when_it_ends() {
+    let h = Home::new();
+    let (engine, _lk, server) = h.engine();
+    let held = || engine.snapshot_state().slots.active.len();
+    // Ended by EOF on stdin.
+    let mut s = h.server(&["mcp"], &[]);
+    s.initialize();
+    let (err, slot) = s.call("acquire_build_slot", json!({ "ttl_secs": 600 }));
+    assert!(!err, "{slot}");
+    assert_eq!(held(), 1);
+    s.finish();
+    assert!(eventually(|| held() == 0), "slot kept after EOF");
+    // Ended by SIGTERM, as a client does when it closes.
+    let mut s = h.server(&["mcp"], &[]);
+    s.initialize();
+    let (err, slot) = s.call("acquire_build_slot", json!({ "ttl_secs": 600 }));
+    assert!(!err, "{slot}");
+    assert_eq!(held(), 1);
+    assert_eq!(unsafe { libc::kill(s.child.id() as i32, libc::SIGTERM) }, 0);
+    let status = s.child.wait().unwrap();
+    assert_eq!(status.code(), Some(128 + libc::SIGTERM), "{status:?}");
+    assert!(eventually(|| held() == 0), "slot kept after SIGTERM");
+    server.stop();
+}
+
+#[test]
+fn a_read_only_server_without_the_read_only_token_says_how_to_fix_it() {
+    let h = Home::new();
+    let (_engine, _lk, server) = h.engine();
+    let token = api::read_only_token_path_in(&h.paths());
+    let _ = std::fs::remove_file(&token);
+    let mut s = h.server(&["mcp", "--read-only"], &[]);
+    s.initialize();
+    let (err, d) = s.call("diagnose", json!({}));
+    let t = d.to_string();
+    assert!(t.contains("restart the engine"), "{err} {t}");
+    // No silent local look while an engine runs.
+    assert_ne!(d["source"], "local", "{t}");
+    s.finish();
+    server.stop();
+}

@@ -39,6 +39,16 @@ pub fn connect_as(paths: &Paths, read_only: bool) -> Conn {
         };
     };
     let c = if read_only {
+        let token = mulchie_core::api::read_only_token_path_in(paths);
+        if !token.exists() {
+            return Conn::Unreachable {
+                pid: holder.pid,
+                reason: format!(
+                    "the engine has no read-only token yet ({}); restart the engine to create it",
+                    token.display()
+                ),
+            };
+        }
         Client::connect_read_only_in(paths, port)
     } else {
         Client::connect_in(paths, port)

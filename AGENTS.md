@@ -77,7 +77,7 @@ Other clients are `claude-desktop`, `cursor` and `codex`. Add `--read-only` to l
    - `plan_process_action`: one pid with a signal, or a consumer group (`app:…`, `workspace:…`, `process:…`) with an action. Protected processes and the agent's own app and terminal come back blocked, with the reason.
 3. Show the user the plan.
 4. Call `execute_plan` with the `plan_id` and only the items the user approved. The result lists every backup and how to restore it. Processes are re-checked by start time.
-5. Wrap heavy builds in `acquire_build_slot` and `release_build_slot`. The release secret stays inside the MCP server.
+5. Wrap heavy builds in `acquire_build_slot` and `release_build_slot`. A slot lasts at most an hour per renewal, and the server releases the slots it still holds when it exits. `mulchie slots` lists slots; `mulchie slots release <ticket>` ends one whose holder is gone. The release secret stays inside the MCP server.
 
 Findings (`list_findings`, `mulchie://findings`) are observations from heuristics, not verdicts; never call them malware. `inspect_process` shows one process with secrets in its command line redacted. `dismiss_finding` hides one the user says is expected.
 

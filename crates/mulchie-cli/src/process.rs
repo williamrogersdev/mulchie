@@ -87,9 +87,10 @@ pub fn command(paths: &Paths, target: Target, confirm: Confirm, json_out: bool) 
 
 /// Plan, show, confirm, execute exactly the ready items, report.
 ///
-/// Exit status as for `sweep`: 0 when everything approved was done (or a dry
-/// run, declined, or blocked with its reason shown), 1 when an item was
-/// skipped or a call failed, 2 when confirmation was needed and impossible.
+/// Exit status: 0 when everything approved was done, or for a dry run or a
+/// declined plan; 1 when an item was skipped or a call failed; 2 when
+/// confirmation was needed and impossible; 3 when the plan is refused or no
+/// item in it is ready (with or without --dry-run), so nothing could be done.
 pub fn run(call: &Call, target: &Target, ui: &mut Ui) -> i32 {
     let plan = match call("POST", "/v1/process/plan", Some(&target.body())) {
         Ok(p) => p,
@@ -130,9 +131,9 @@ pub fn run(call: &Call, target: &Target, ui: &mut Ui) -> i32 {
         if ui.json {
             emit_json(ui, None);
         }
-        // A blocked plan is an answer, not a failure: its reason is shown
-        // above (or in the JSON), as for a sweep with nothing to do.
-        return 0;
+        // The reason a plan is blocked is shown above (or in the JSON); the
+        // status lets a script tell it from a plan that could be carried out.
+        return if doable { 0 } else { 3 };
     }
     if !ui.confirm.yes {
         if !ui.interactive {
@@ -163,9 +164,17 @@ pub fn run(call: &Call, target: &Target, ui: &mut Ui) -> i32 {
         "/v1/process/execute",
         Some(&json!({ "items": ready })),
     ) {
-        Ok(r) => r,
+        Ok(r) if r.is_array() => r,
+        Ok(_) => {
+            let _ = writeln!(
+                ui.err,
+                "mulchie: unexpected reply from the engine; versions may differ. {}",
+                crate::plan::MAY_HAVE_ACTED
+            );
+            return 1;
+        }
         Err(e) => {
-            let _ = writeln!(ui.err, "mulchie: {e}");
+            let _ = writeln!(ui.err, "mulchie: {e}. {}", crate::plan::MAY_HAVE_ACTED);
             return 1;
         }
     };
@@ -302,11 +311,17 @@ mod tests {
     struct Rig {
         calls: RefCell<Vec<(String, Option<Value>)>>,
         plan: Value,
+        reply: Option<Result<Value, String>>,
     }
 
     impl Rig {
         fn call(&self, _m: &str, p: &str, b: Option<&Value>) -> Result<Value, String> {
             self.calls.borrow_mut().push((p.into(), b.cloned()));
+            if p == "/v1/process/execute" {
+                if let Some(r) = &self.reply {
+                    return r.clone();
+                }
+            }
             Ok(match p {
                 "/v1/process/plan" => self.plan.clone(),
                 _ => {
@@ -367,6 +382,7 @@ mod tests {
         let rig = Rig {
             calls: RefCell::default(),
             plan: plan(true, None),
+            reply: None,
         };
         let (code, out, _) = go(&rig, yes(), false, false, false);
         assert_eq!(code, 0, "{out}");
@@ -386,6 +402,7 @@ mod tests {
         let rig = Rig {
             calls: RefCell::default(),
             plan: plan(true, None),
+            reply: None,
         };
         let (code, _, _) = go(
             &rig,
@@ -418,17 +435,81 @@ mod tests {
         let rig = Rig {
             calls: RefCell::default(),
             plan: plan(false, Some("protected")),
+            reply: None,
         };
         let (code, out, _) = go(&rig, yes(), false, false, false);
-        assert_eq!(code, 0);
+        assert_eq!(code, 3);
         assert!(
             out.contains("Blocked: Ask node (42) to stop. [protected]"),
             "{out}"
         );
         assert!(rig.executed().is_empty());
-        let (_, out, _) = go(&rig, yes(), true, false, false);
+        let (code, out, _) = go(&rig, yes(), true, false, false);
+        assert_eq!(code, 3);
         let v: Value = serde_json::from_str(&out).unwrap();
         assert_eq!(v["plan"]["refused"], "protected");
         assert_eq!(v["executed"], false);
+        // A dry run of a refused plan says so too.
+        let dry = Confirm {
+            yes: false,
+            dry_run: true,
+        };
+        assert_eq!(go(&rig, dry, true, false, false).0, 3);
+    }
+
+    #[test]
+    fn a_plan_marked_not_ready_is_not_executed_even_with_a_ready_item() {
+        let mut p = plan(true, None);
+        p["ready"] = json!(false);
+        let rig = Rig {
+            calls: RefCell::default(),
+            plan: p,
+            reply: None,
+        };
+        let (code, out, _) = go(&rig, yes(), false, false, false);
+        assert_eq!(code, 3, "{out}");
+        assert!(rig.executed().is_empty());
+    }
+
+    #[test]
+    fn a_skipped_result_exits_1() {
+        let rig = Rig {
+            calls: RefCell::default(),
+            plan: plan(true, None),
+            reply: Some(Ok(
+                json!([{ "action": "signal", "target": "pid 42", "status": "skipped",
+                "reason": "process_changed", "detail": "it is a different process now" }]),
+            )),
+        };
+        let (code, out, _) = go(&rig, yes(), false, false, false);
+        assert_eq!(code, 1);
+        assert!(out.contains("skipped  pid 42"), "{out}");
+    }
+
+    #[test]
+    fn a_failed_or_odd_execute_says_the_engine_may_have_acted() {
+        for reply in [
+            Err("the engine did not answer in time [timeout]".to_string()),
+            Ok(json!({ "ok": true })),
+        ] {
+            let odd = reply.is_ok();
+            let rig = Rig {
+                calls: RefCell::default(),
+                plan: plan(true, None),
+                reply: Some(reply),
+            };
+            let (code, _, err) = go(&rig, yes(), false, false, false);
+            assert_eq!(code, 1);
+            assert!(
+                err.contains("may have acted") && err.contains("mulchie status"),
+                "{err}"
+            );
+            if odd {
+                assert!(
+                    err.contains("unexpected reply from the engine; versions may differ"),
+                    "{err}"
+                );
+            }
+        }
     }
 }

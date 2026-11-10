@@ -124,6 +124,17 @@ raised and what to look at next. Dismiss one you know is expected.",
     )]
     Findings(FindingsArgs),
 
+    /// List the build slots, or release one whose holder is gone (needs the engine)
+    #[command(
+        long_about = "List the build slots the engine has handed out: ticket, label, holder \
+pid, age and expiry. `mulchie slots release <ticket>` ends one, for a holder that crashed or \
+an agent session that ended without releasing it. It uses this user's full API token, so no \
+release secret is needed; it asks first unless --yes is given.",
+        args_conflicts_with_subcommands = true,
+        after_help = "Examples:\n  mulchie slots\n  mulchie slots --json\n  mulchie slots release 17\n  mulchie slots release 17 --yes"
+    )]
+    Slots(SlotsArgs),
+
     /// Everything known about one process (secrets in its command line redacted)
     #[command(after_help = "Examples:\n  mulchie inspect 4242\n  mulchie inspect 4242 --json")]
     Inspect(InspectArgs),
@@ -194,11 +205,13 @@ or SIGTERM. The port is `api_port` from the config, or MULCHIE_PORT for this pro
     #[command(
         long_about = "Print the config path, any config error, and the current settings. \
 `mulchie config set <key> <value>` changes one setting (a dotted key, e.g. \
-`stale_after_days` or `queue.max_slots`; the value is TOML, e.g. 3, true or '\"text\"'). When \
+`worktree_idle_days` or `guard.rules.sudo`). The value is JSON: a number (21), true or \
+false, a string ('\"block\"', or just block: a value that is not JSON is taken as a \
+string), or a list ('[\"/Users/me/dev\"]'). When \
 an engine runs, both go through it, so a change takes effect without a restart; otherwise \
 the file is read or edited directly, and Mulchie says so.",
         args_conflicts_with_subcommands = true,
-        after_help = "Examples:\n  mulchie config\n  mulchie config --json\n  mulchie config set stale_after_days 21"
+        after_help = "Examples:\n  mulchie config\n  mulchie config --json\n  mulchie config set worktree_idle_days 21\n  mulchie config set guard.rules.sudo '\"block\"'\n  mulchie config set scan_roots '[\"/Users/me/dev\", \"/Users/me/src\"]'\n  mulchie config set watch.enabled false"
     )]
     Config(ConfigArgs),
 
@@ -487,9 +500,9 @@ pub struct ConfigArgs {
 pub enum ConfigCommand {
     /// Change one setting
     Set {
-        /// A dotted key, e.g. stale_after_days or queue.max_slots
+        /// A dotted key, e.g. worktree_idle_days or guard.rules.sudo
         key: String,
-        /// The value, in TOML: 3, true, "text", [1, 2]
+        /// The value, as JSON: 21, true, '"block"' (or a bare word), '["/a", "/b"]'
         value: String,
         #[command(flatten)]
         out: JsonArg,
@@ -541,6 +554,9 @@ pub enum FindingsCommand {
         /// For this many days (default 30)
         #[arg(long, value_parser = clap::value_parser!(u32).range(1..=3650))]
         days: Option<u32>,
+        /// Dismiss it even if no current or dismissed finding has this id
+        #[arg(long)]
+        force: bool,
         #[command(flatten)]
         out: JsonArg,
     },
@@ -548,6 +564,28 @@ pub enum FindingsCommand {
     Undismiss {
         /// The finding id
         id: String,
+        #[command(flatten)]
+        out: JsonArg,
+    },
+}
+
+#[derive(Args, Debug)]
+pub struct SlotsArgs {
+    #[command(flatten)]
+    pub out: JsonArg,
+    #[command(subcommand)]
+    pub action: Option<SlotsCommand>,
+}
+
+#[derive(Subcommand, Debug, Clone)]
+pub enum SlotsCommand {
+    /// End one build slot now
+    Release {
+        /// The ticket, from `mulchie slots`
+        ticket: u64,
+        /// Do not ask for confirmation (required when stdin is not a terminal)
+        #[arg(long, short = 'y')]
+        yes: bool,
         #[command(flatten)]
         out: JsonArg,
     },
@@ -924,14 +962,14 @@ mod tests {
         assert_eq!(i.pid, 42);
         assert!(parse(&["inspect"]).is_err());
 
-        let Some(Command::Config(c)) = parse(&["config", "set", "stale_after_days", "21"])
+        let Some(Command::Config(c)) = parse(&["config", "set", "worktree_idle_days", "21"])
             .unwrap()
             .command
         else {
             panic!()
         };
         assert!(
-            matches!(c.action, Some(ConfigCommand::Set { ref key, ref value, .. }) if key == "stale_after_days" && value == "21")
+            matches!(c.action, Some(ConfigCommand::Set { ref key, ref value, .. }) if key == "worktree_idle_days" && value == "21")
         );
         assert!(parse(&["config", "set", "x"]).is_err());
 

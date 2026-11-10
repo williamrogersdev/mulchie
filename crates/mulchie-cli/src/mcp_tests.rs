@@ -518,8 +518,7 @@ fn sweep_plans_then_executes_only_approved_items() {
     assert_eq!(out["results"][0]["backups"][0]["location"], "/b/a.patch");
     let restore = out["results"][0]["restore"].as_str().unwrap();
     assert!(
-        restore.contains("git worktree add '/w/a' backup/a")
-            && restore.contains("apply '/b/a.patch'"),
+        restore.contains("git worktree add /w/a backup/a") && restore.contains("apply /b/a.patch"),
         "{restore}"
     );
 
@@ -756,8 +755,9 @@ fn findings_and_process_detail() {
         .with("GET /v1/findings", findings.clone())
         .with(
             "GET /v1/findings?severity=medium&kind=runaway_cpu&dismissed=1",
-            findings,
+            findings.clone(),
         )
+        .with("GET /v1/findings?dismissed=1", findings.clone())
         .with("POST /v1/findings/dismiss", json!({ "ok": true }))
         .with("POST /v1/findings/undismiss", json!({ "ok": true }))
         .with(
@@ -1090,6 +1090,23 @@ fn against_a_real_engine() {
     // The release secret stays inside the server.
     assert!(lease.get("release_secret").is_none(), "{lease}");
     assert!(!text(&r[1]).contains("secret"), "{}", r[1]);
+    // The exchange ended (EOF), so the server released the slot it held.
+    assert!(
+        engine.snapshot_state().slots.active.is_empty(),
+        "{:?}",
+        engine.snapshot_state().slots.active
+    );
+    // A session that is still open keeps its slot.
+    let mut held = Session::new(&api);
+    let lease = result(
+        &held
+            .handle(call(
+                1,
+                "acquire_build_slot",
+                json!({ "label": "t", "ttl_secs": 30 }),
+            ))
+            .unwrap(),
+    );
     let ticket = lease["ticket"].as_u64().unwrap();
     assert_eq!(engine.snapshot_state().slots.active[0].ttl_secs, Some(30));
     assert_eq!(engine.snapshot_state().slots.active[0].pid, None);
@@ -1115,6 +1132,8 @@ fn against_a_real_engine() {
     } else {
         assert_eq!(engine.snapshot_state().slots.active.len(), 1);
     }
+    drop(held);
+    assert!(engine.snapshot_state().slots.active.is_empty());
     // The session that took a slot releases it with the stored secret.
     // Tickets are numbered from 1, so the next one is ticket + 1.
     let next = ticket + 1;
@@ -1219,4 +1238,243 @@ fn read_only_mode_uses_the_read_only_token() {
     )
     .unwrap();
     server.stop();
+}
+
+#[test]
+fn slots_are_released_when_the_session_ends() {
+    let f = Fake::default()
+        .with(
+            "POST /v1/lease",
+            json!({ "granted": true, "ticket": 11, "release_secret": "s11" }),
+        )
+        .with("POST /v1/release", json!({ "released": true }));
+    // The client takes a slot and goes away (EOF) without releasing it.
+    let r = exchange(&f, &[call(1, "acquire_build_slot", json!({}))]);
+    assert_eq!(result(&r[0])["ticket"], 11);
+    assert_eq!(
+        f.posted("/v1/release"),
+        vec![json!({ "ticket": 11, "secret": "s11" })]
+    );
+    // A slot released by the client is not released again.
+    let f = Fake::default()
+        .with(
+            "POST /v1/lease",
+            json!({ "granted": true, "ticket": 12, "release_secret": "s12" }),
+        )
+        .with("POST /v1/release", json!({ "released": true }));
+    exchange(
+        &f,
+        &[
+            call(1, "acquire_build_slot", json!({})),
+            call(2, "release_build_slot", json!({ "ticket": 12 })),
+        ],
+    );
+    assert_eq!(f.posted("/v1/release").len(), 1);
+}
+
+#[test]
+fn a_slot_lasts_at_most_an_hour_per_renewal() {
+    let f = Fake::default().with("POST /v1/lease", json!({ "granted": true, "ticket": 1 }));
+    let r = one(
+        &f,
+        call(1, "acquire_build_slot", json!({ "ttl_secs": 7200 })),
+    );
+    assert_eq!(r["result"]["isError"], true, "{r}");
+    assert!(f.posted("/v1/lease").is_empty());
+    let tools = one(&f, req(2, "tools/list", json!({})));
+    let t = tools["result"]["tools"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|t| t["name"] == "acquire_build_slot")
+        .unwrap()
+        .clone();
+    assert_eq!(t["inputSchema"]["properties"]["ttl_secs"]["maximum"], 3600);
+    let d = t["description"].as_str().unwrap();
+    assert!(
+        d.contains("3600") && d.contains("released when it exits"),
+        "{d}"
+    );
+}
+
+#[test]
+fn a_renewal_that_gets_a_new_ticket_forgets_the_old_secret() {
+    // The engine expired ticket 5 and handed out 6 on the renewal.
+    let f = Fake::default()
+        .with("POST /v1/lease", json!({ "granted": true, "ticket": 6 }))
+        .with("POST /v1/release", json!({ "released": true }));
+    {
+        let mut s = Session::new(&f);
+        crate::mcp_tools::lock_secrets(&s.secrets).insert(5, "old".into());
+        result(
+            &s.handle(call(1, "acquire_build_slot", json!({ "ticket": 5 })))
+                .unwrap(),
+        );
+        assert_eq!(f.posted("/v1/lease")[0]["secret"], "old");
+        assert!(crate::mcp_tools::lock_secrets(&s.secrets).is_empty());
+    }
+    // Nothing held, so nothing released at the end.
+    assert!(f.posted("/v1/release").is_empty());
+    // A release the engine answers (even "not released") forgets the secret.
+    let f = Fake::default().with("POST /v1/release", json!({ "released": false }));
+    {
+        let mut s = Session::new(&f);
+        crate::mcp_tools::lock_secrets(&s.secrets).insert(5, "old".into());
+        result(
+            &s.handle(call(1, "release_build_slot", json!({ "ticket": 5 })))
+                .unwrap(),
+        );
+        assert!(crate::mcp_tools::lock_secrets(&s.secrets).is_empty());
+    }
+    assert_eq!(f.posted("/v1/release").len(), 1);
+}
+
+#[test]
+fn an_execute_without_an_answer_says_the_engine_may_have_acted() {
+    let f = Fake::default()
+        .with("POST /v1/process/plan", process_plan(true))
+        .failing(
+            "POST /v1/process/execute",
+            ApiError::new(0, "timeout", "the engine did not answer in time"),
+        );
+    let mut s = Session::new(&f);
+    let shown = result(
+        &s.handle(call(1, "plan_process_action", json!({ "pid": 42 })))
+            .unwrap(),
+    );
+    let id = shown["plan_id"].as_str().unwrap().to_string();
+    let r = s
+        .handle(call(
+            2,
+            "execute_plan",
+            json!({ "plan_id": id, "items": ["pid 42"] }),
+        ))
+        .unwrap();
+    assert_eq!(r["result"]["isError"], true);
+    let t = text(&r);
+    assert!(
+        t.contains("may have acted") && t.contains("make a new plan"),
+        "{t}"
+    );
+}
+
+#[test]
+fn an_execute_reply_that_is_not_a_list_is_an_error() {
+    let f = Fake::default()
+        .with("POST /v1/process/plan", process_plan(true))
+        .with("POST /v1/process/execute", json!({ "ok": true }));
+    let mut s = Session::new(&f);
+    let shown = result(
+        &s.handle(call(1, "plan_process_action", json!({ "pid": 42 })))
+            .unwrap(),
+    );
+    let id = shown["plan_id"].as_str().unwrap().to_string();
+    let r = s
+        .handle(call(
+            2,
+            "execute_plan",
+            json!({ "plan_id": id, "items": ["pid 42"] }),
+        ))
+        .unwrap();
+    assert_eq!(r["result"]["isError"], true, "{r}");
+    assert!(text(&r).contains("different versions"), "{r}");
+}
+
+#[test]
+fn a_group_plan_is_all_or_nothing() {
+    let mut p = process_plan(true);
+    p["items"] = json!([
+        { "ready": true, "target": "pid 42", "verdict": "ok",
+          "request": { "action": "signal", "pid": 42, "signal": "term", "expected_start_time": 777 } },
+        { "ready": true, "target": "pid 43", "verdict": "ok",
+          "request": { "action": "signal", "pid": 43, "signal": "term", "expected_start_time": 778 } }
+    ]);
+    let f = Fake::default().with("POST /v1/process/plan", p).with(
+        "POST /v1/process/execute",
+        json!([{ "target": "pid 42", "status": "done" }, { "target": "pid 43", "status": "done" }]),
+    );
+    let mut s = Session::new(&f);
+    let shown = result(
+        &s.handle(call(
+            1,
+            "plan_process_action",
+            json!({ "group": "app:/Applications/Slack.app", "action": "quit" }),
+        ))
+        .unwrap(),
+    );
+    assert_eq!(shown["all_or_nothing"], true);
+    let id = shown["plan_id"].as_str().unwrap().to_string();
+    let r = s
+        .handle(call(
+            2,
+            "execute_plan",
+            json!({ "plan_id": id, "items": ["pid 42"] }),
+        ))
+        .unwrap();
+    assert_eq!(r["result"]["isError"], true);
+    assert!(text(&r).contains("all"), "{r}");
+    assert!(f.posted("/v1/process/execute").is_empty());
+    // The plan is kept, and all of it can be executed.
+    result(
+        &s.handle(call(
+            3,
+            "execute_plan",
+            json!({ "plan_id": id, "items": ["pid 42", "pid 43"] }),
+        ))
+        .unwrap(),
+    );
+    assert_eq!(
+        f.posted("/v1/process/execute")[0]["items"]
+            .as_array()
+            .unwrap()
+            .len(),
+        2
+    );
+}
+
+#[test]
+fn dismissing_an_unknown_finding_is_refused_unless_forced() {
+    let f = Fake::default()
+        .with(
+            "GET /v1/findings?dismissed=1",
+            json!({ "findings": [{ "id": "runaway_cpu:42:777" }] }),
+        )
+        .with("POST /v1/findings/dismiss", json!({ "ok": true }));
+    let r = one(
+        &f,
+        call(1, "dismiss_finding", json!({ "id": "runaway_cpu:42" })),
+    );
+    assert_eq!(r["result"]["isError"], true);
+    assert!(text(&r).contains("runaway_cpu:42:777"), "{r}");
+    assert!(f.posted("/v1/findings/dismiss").is_empty());
+    result(&one(
+        &f,
+        call(
+            2,
+            "dismiss_finding",
+            json!({ "id": "runaway_cpu:42", "force": true }),
+        ),
+    ));
+    assert_eq!(f.posted("/v1/findings/dismiss").len(), 1);
+}
+
+#[test]
+fn read_only_diagnose_suggests_only_tools_it_offers() {
+    let f = Fake::default()
+        .with(
+            "GET /v1/state",
+            json!({ "health": "ok", "snapshot": { "disk_free": 1_000_000_000u64, "disk_total": 500_000_000_000u64 },
+                "diskmap": { "categories": [{ "key": "npm", "name": "npm", "bytes": 4_000_000_000u64, "prunable": true }] } }),
+        )
+        .with("GET /v1/advice", json!({ "ok_to_start_heavy_work": true }));
+    let full = result(&one(&f, call(1, "diagnose", json!({}))));
+    assert!(full.to_string().contains("\"prune_cache\""), "{full}");
+    let mut s = Session::read_only(&f);
+    let v = result(&s.handle(call(2, "diagnose", json!({}))).unwrap());
+    let t = v.to_string();
+    for refused in ["\"prune_cache\"", "\"dismiss_finding\"", "\"execute_plan\""] {
+        assert!(!t.contains(refused), "{refused} in {t}");
+    }
+    // The CLI command is kept: the user may run it.
+    assert!(t.contains("mulchie prune npm"), "{t}");
 }

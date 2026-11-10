@@ -14,6 +14,7 @@ mod plan;
 mod process;
 mod run;
 mod service;
+mod slots;
 
 use clap::{CommandFactory, Parser};
 use cli::{Cli, Command, ConfigCommand, HooksCommand, McpCommand};
@@ -73,6 +74,12 @@ fn dispatch(paths: &Paths, cmd: Command) -> i32 {
             None => observe::findings(paths, f.severity, f.kind.as_deref(), f.all, f.out.json),
         },
         Command::Inspect(i) => observe::inspect(paths, i.pid, i.out.json),
+        Command::Slots(a) => match &a.action {
+            Some(cli::SlotsCommand::Release { ticket, yes, out }) => {
+                slots::release(paths, *ticket, *yes, out.json)
+            }
+            None => slots::list(paths, a.out.json),
+        },
         Command::Advice(j) => commands::advice(paths, j.json),
         Command::Run(r) => run::run(paths, &r),
         Command::Diagnose(j) => commands::diagnose(paths, j.json),

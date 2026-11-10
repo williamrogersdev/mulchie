@@ -5,11 +5,13 @@
 //! it was not first shown in a plan.
 
 use crate::diagnose::{self, Origin};
+use crate::hooks_install::sh_quote as q;
 use crate::mcp::Api;
 use mulchie_core::api::ApiError;
 use mulchie_core::{human_bytes, Paths};
 use serde_json::{json, Map, Value};
 use std::collections::HashMap;
+use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 /// How long a plan can be executed after it was made.
@@ -209,11 +211,12 @@ pub fn tool_list() -> Vec<Tool> {
         Tool {
             name: "dismiss_finding",
             title: "Dismiss or restore a finding",
-            description: "Hide a finding the user has looked at and does not want to see again, for days (default 30), or show it again with undo=true. Saved in Mulchie's config. Ask the user first; it changes nothing on the machine.",
+            description: "Hide a finding the user has looked at and does not want to see again, for days (default 30), or show it again with undo=true. Saved in Mulchie's config. Ask the user first; it changes nothing on the machine. An id that is not a current or dismissed finding is refused with the closest ids, unless force=true (to hide one that is not showing yet).",
             props: json!({
                 "id": { "type": "string", "description": "The finding id from list_findings or diagnose" },
                 "days": { "type": "integer", "minimum": 1, "maximum": 3650 },
-                "undo": { "type": "boolean", "description": "Show a dismissed finding again" }
+                "undo": { "type": "boolean", "description": "Show a dismissed finding again" },
+                "force": { "type": "boolean", "description": "Dismiss an id that is not a current finding" }
             }),
             required: &["id"],
             read_only: false,
@@ -223,11 +226,11 @@ pub fn tool_list() -> Vec<Tool> {
         Tool {
             name: "acquire_build_slot",
             title: "Join the build queue",
-            description: "Join the machine-wide build queue before heavy work. Call it, then keep calling it with the returned ticket (every few seconds) until granted is true; then run with the returned job count. A granted slot lasts ttl_secs (default 900): call again with the same ticket before ttl_secs passes to renew it during long work, or the slot expires and goes to someone else. Always call release_build_slot as soon as the work ends.",
+            description: "Join the machine-wide build queue before heavy work. Call it, then keep calling it with the returned ticket (every few seconds) until granted is true; then run with the returned job count. A granted slot lasts ttl_secs (default 900, at most 3600): for a longer build, call again with the same ticket before ttl_secs passes to renew it, or the slot expires and goes to someone else. Always call release_build_slot as soon as the work ends; slots this server still holds are released when it exits.",
             props: json!({
                 "label": { "type": "string", "description": "What the slot is for, shown to the user" },
                 "ticket": { "type": "integer", "minimum": 1, "description": "The ticket from an earlier call: poll or renew" },
-                "ttl_secs": { "type": "integer", "minimum": 1, "maximum": 86400, "description": "How long the slot lasts without renewal (default 900)" }
+                "ttl_secs": { "type": "integer", "minimum": 1, "maximum": 3600, "description": "How long the slot lasts without renewal (default 900, at most 3600; renew for longer work)" }
             }),
             required: &[],
             read_only: false,
@@ -365,6 +368,9 @@ struct StoredPlan {
     kind: PlanKind,
     created: Instant,
     items: Vec<Value>,
+    /// Carried out whole or not at all: a group or tree action, whose
+    /// parts (a restart's quit, a parent's children) belong together.
+    whole: bool,
 }
 
 /// Plans shown by this server process, by id (in memory only). Execution needs one of these.
@@ -376,6 +382,10 @@ pub struct Plans {
 
 impl Plans {
     fn insert(&mut self, kind: PlanKind, items: Vec<Value>) -> String {
+        self.insert_as(kind, items, false)
+    }
+
+    fn insert_as(&mut self, kind: PlanKind, items: Vec<Value>, whole: bool) -> String {
         let id = mulchie_core::paths::random_hex(8).unwrap_or_else(|_| {
             format!(
                 "{:x}",
@@ -388,6 +398,7 @@ impl Plans {
                 kind,
                 created: Instant::now(),
                 items,
+                whole,
             },
         );
         self.order.push(id.clone());
@@ -533,7 +544,12 @@ fn present_process(plans: &mut Plans, plan: Value, read_only: bool) -> Value {
     } else if read_only {
         out["next"] = json!("This server is read-only, so the plan cannot be executed here. Show it to the user; they can carry it out with `mulchie signal` or `mulchie group`, or through a read-write MCP server.");
     } else {
-        let id = plans.insert(PlanKind::Process, items);
+        // More than one ready target means a group or a tree: all or none.
+        let whole = ready.len() > 1;
+        let id = plans.insert_as(PlanKind::Process, items, whole);
+        if whole {
+            out["all_or_nothing"] = json!(true);
+        }
         out["plan_id"] = json!(id);
         out["expires_in_secs"] = json!(PLAN_TTL.as_secs());
         out["next"] = json!("Show the user what would happen to each affected process. If they agree, call execute_plan with this plan_id and items set to the ready targets (all of them for the whole action). Each process is re-checked by its start time first.");
@@ -577,20 +593,29 @@ fn restore_hint(result: &Value, item: Option<&Value>) -> Option<String> {
             let branch =
                 of("branch").or_else(|| item.and_then(|i| i["branch"].as_str()).map(String::from));
             let mut s = match branch {
-                Some(b) => format!("From the repository, run `git worktree add '{target}' {b}`"),
+                Some(b) => format!(
+                    "From the repository, run `git worktree add {} {}`",
+                    q(target),
+                    q(&b)
+                ),
                 None => format!(
-                    "From the repository, run `git worktree add '{target}' {}`",
-                    item.and_then(|i| i["head"].as_str()).unwrap_or("<commit>")
+                    "From the repository, run `git worktree add {} {}`",
+                    q(target),
+                    q(item.and_then(|i| i["head"].as_str()).unwrap_or("<commit>"))
                 ),
             };
             if let Some(p) = of("patch") {
                 s.push_str(&format!(
-                    ", then `git -C '{target}' apply '{p}'` for the uncommitted changes"
+                    ", then `git -C {} apply {}` for the uncommitted changes",
+                    q(target),
+                    q(&p)
                 ));
             }
             if let Some(a) = of("ignored_archive") {
                 s.push_str(&format!(
-                    ", then `tar -xzf '{a}' -C '{target}'` for the ignored files"
+                    ", then `tar -xzf {} -C {}` for the ignored files",
+                    q(&a),
+                    q(target)
                 ));
             }
             s.push('.');
@@ -641,13 +666,38 @@ fn execute(api: &dyn Api, plans: &mut Plans, a: &Map<String, Value>) -> ToolResu
             requests.push(item["request"].clone());
         }
     }
+    if plan.whole {
+        let ready = plan.items.iter().filter(|i| i["ready"] == true).count();
+        if chosen.len() != ready {
+            plans_restore(plans, id, plan);
+            return Err(format!(
+                "plan {id} is a group or tree action and is carried out whole: pass all {ready} ready targets, or none. Part of it (a restart without its quit, a parent without its children) is not what the user reviewed; make a new plan for a smaller action."
+            ));
+        }
+    }
+    // From here the plan is used: whatever happens, a retry needs a new one.
+    let check = "It may have acted on some items: check get_status or the mulchie://actions resource before anything else. This plan has been used; make a new plan if more is needed.";
     let results = api
         .call(
             "POST",
             plan.kind.route(),
             Some(&json!({ "items": requests })),
         )
-        .map_err(api_err)?;
+        .map_err(|e| {
+            if e.status == 0 {
+                format!("The engine did not answer ({}). {check}", api_err(e))
+            } else {
+                format!(
+                    "{}. This plan has been used; make a new plan if more is needed.",
+                    api_err(e)
+                )
+            }
+        })?;
+    if !results.is_array() {
+        return Err(format!(
+            "Unexpected reply from the engine; this server and the engine may be different versions. {check}"
+        ));
+    }
     let mut freed = 0u64;
     let mut done = 0;
     let mut out = Vec::new();
@@ -697,22 +747,50 @@ pub fn api_err(e: ApiError) -> String {
 }
 
 /// The diagnosis, from the engine or, when none runs, a local look.
-pub fn diagnosis(api: &dyn Api) -> ToolResult {
+pub fn diagnosis(api: &dyn Api, read_only: bool) -> ToolResult {
     let state = api.call("GET", "/v1/state", None);
-    match state {
+    let mut d = match state {
         Ok(st) => {
             let adv = api.call("GET", "/v1/advice", None).unwrap_or(Value::Null);
-            Ok(diagnose::build(&st, &adv, Origin::Engine))
+            diagnose::build(&st, &adv, Origin::Engine)
         }
-        Err(e) if matches!(e.code.as_str(), "engine_not_running" | "engine_unreachable") => {
-            Ok(match api.paths() {
-                Some(p) => local_diagnosis(p, &e.message),
-                None => {
-                    diagnose::build(&Value::Null, &Value::Null, Origin::Unavailable(&e.message))
-                }
-            })
+        // A local look only when no engine runs; one that runs but cannot
+        // be used is reported as such, not replaced by a different picture.
+        Err(e) if e.code == "engine_not_running" => match api.paths() {
+            Some(p) => local_diagnosis(p, &e.message),
+            None => diagnose::build(&Value::Null, &Value::Null, Origin::Unavailable(&e.message)),
+        },
+        Err(e) if e.code == "engine_unreachable" => {
+            diagnose::build(&Value::Null, &Value::Null, Origin::Unavailable(&e.message))
         }
-        Err(e) => Err(api_err(e)),
+        Err(e) => return Err(api_err(e)),
+    };
+    if read_only {
+        strip_refused(&mut d);
+    }
+    Ok(d)
+}
+
+/// Whether a read-only server offers the tool `name`.
+pub fn offered_read_only(name: &str) -> bool {
+    tool_list()
+        .iter()
+        .any(|t| t.name == name && allowed(t, true))
+}
+
+/// Drop suggested tool calls a read-only server refuses, keeping the CLI
+/// commands (the user can run those).
+pub fn strip_refused(d: &mut Value) {
+    let keep = |c: &Value| c["name"].as_str().is_some_and(offered_read_only);
+    for r in d["recommendations"].as_array_mut().into_iter().flatten() {
+        if !r["next_call"].is_null() && !keep(&r["next_call"]) {
+            r["next_call"] = Value::Null;
+        }
+    }
+    for f in d["findings"]["top"].as_array_mut().into_iter().flatten() {
+        if let Some(calls) = f["next_calls"].as_array_mut() {
+            calls.retain(keep);
+        }
     }
 }
 
@@ -723,12 +801,19 @@ pub fn local_diagnosis(paths: &Paths, why: &str) -> Value {
     diagnose::build(&st, &adv, Origin::Local(why))
 }
 
+/// The secrets map, usable even if a thread panicked holding it.
+pub fn lock_secrets(
+    m: &Mutex<HashMap<u64, String>>,
+) -> std::sync::MutexGuard<'_, HashMap<u64, String>> {
+    m.lock().unwrap_or_else(|e| e.into_inner())
+}
+
 pub struct Ctx<'a> {
     pub api: &'a dyn Api,
     pub plans: &'a mut Plans,
     pub read_only: bool,
     /// Release secrets by ticket, from the lease replies. Never shown.
-    pub secrets: &'a mut HashMap<u64, String>,
+    pub secrets: &'a Mutex<HashMap<u64, String>>,
 }
 
 /// The core's consumer groups, short, for people and models.
@@ -772,7 +857,7 @@ pub fn call_tool(cx: &mut Ctx, name: &str, a: &Map<String, Value>) -> ToolResult
     let arg = |k: &str| a.get(k).cloned().unwrap_or(Value::Null);
     let flag = |k: &str| a.get(k).and_then(Value::as_bool).unwrap_or(false);
     match name {
-        "diagnose" => diagnosis(api),
+        "diagnose" => diagnosis(api, cx.read_only),
         "get_status" => {
             let st = get("/v1/state")?;
             let snap = &st["snapshot"];
@@ -987,7 +1072,12 @@ pub fn call_tool(cx: &mut Ctx, name: &str, a: &Map<String, Value>) -> ToolResult
             if flag("undo") {
                 post("/v1/findings/undismiss", json!({ "id": arg("id") }))
             } else {
-                let mut b = json!({ "id": arg("id") });
+                let id = a.get("id").and_then(Value::as_str).unwrap_or("");
+                if !flag("force") {
+                    let known = get("/v1/findings?dismissed=1")?;
+                    crate::observe::check_finding_id(id, &known)?;
+                }
+                let mut b = json!({ "id": id });
                 if let Some(d) = a.get("days") {
                     b["days"] = d.clone();
                 }
@@ -1009,20 +1099,21 @@ pub fn call_tool(cx: &mut Ctx, name: &str, a: &Map<String, Value>) -> ToolResult
             });
             // Renewing or polling a ticket sends its secret, which the
             // engine may require on any call that names a ticket.
-            if let Some(sec) = a
-                .get("ticket")
-                .and_then(Value::as_u64)
-                .and_then(|t| cx.secrets.get(&t))
-            {
+            let sent = a.get("ticket").and_then(Value::as_u64);
+            if let Some(sec) = sent.and_then(|t| lock_secrets(cx.secrets).get(&t).cloned()) {
                 body["secret"] = json!(sec);
             }
             let mut r = post("/v1/lease", body)?;
+            let mut secrets = lock_secrets(cx.secrets);
             if let Some(o) = r.as_object_mut() {
-                if let (Some(Value::String(secret)), Some(t)) = (
-                    o.remove("release_secret"),
-                    o.get("ticket").and_then(Value::as_u64),
-                ) {
-                    cx.secrets.insert(t, secret);
+                let got = o.get("ticket").and_then(Value::as_u64);
+                if let (Some(Value::String(secret)), Some(t)) = (o.remove("release_secret"), got) {
+                    secrets.insert(t, secret);
+                }
+                // The engine no longer knows the ticket sent (it expired and
+                // a new one was made): its secret is useless now.
+                if let Some(old) = sent.filter(|s| Some(*s) != got) {
+                    secrets.remove(&old);
                 }
             }
             Ok(r)
@@ -1030,12 +1121,17 @@ pub fn call_tool(cx: &mut Ctx, name: &str, a: &Map<String, Value>) -> ToolResult
         "release_build_slot" => {
             let ticket = a.get("ticket").and_then(Value::as_u64).unwrap_or(0);
             let mut b = json!({ "ticket": ticket });
-            if let Some(s) = cx.secrets.get(&ticket) {
+            if let Some(s) = lock_secrets(cx.secrets).get(&ticket) {
                 b["secret"] = json!(s);
             }
-            let r = post("/v1/release", b)?;
-            cx.secrets.remove(&ticket);
-            Ok(r)
+            let r = api.call("POST", "/v1/release", Some(&b));
+            // Forget the secret once the engine has answered about the
+            // ticket, released or unknown; keep it only when the engine
+            // could not be reached, so the release on exit can retry.
+            if !matches!(&r, Err(e) if e.status == 0) {
+                lock_secrets(cx.secrets).remove(&ticket);
+            }
+            r.map_err(api_err)
         }
         other => Err(format!("unknown tool {other}")),
     }

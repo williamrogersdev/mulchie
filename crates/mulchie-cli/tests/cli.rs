@@ -600,10 +600,41 @@ fn signal_plans_then_acts_through_the_engine() {
     let v: serde_json::Value = serde_json::from_slice(&o.stdout).unwrap();
     assert_eq!(v["results"][0]["status"], "done", "{v}");
     assert!(!child.wait().unwrap().success());
-    // Groups are planned the same way; an unknown group is refused.
+    // Groups are planned the same way; an unknown group is refused, and
+    // the status says nothing could be done.
     let o = h.run(&["group", "app:/Nope.app", "quit", "--yes"]);
-    assert!(o.status.success(), "{}", text(&o.stderr));
+    assert_eq!(o.status.code(), Some(3), "{}", text(&o.stderr));
     assert!(text(&o.stdout).contains("Blocked:"), "{}", text(&o.stdout));
+    server.stop();
+}
+
+/// The help promises that the terminal running `mulchie` and its parents
+/// are never signalled; the shell that runs it is such a parent.
+#[test]
+fn the_calling_shell_is_never_signalled() {
+    let h = Home::new();
+    let (_engine, _lk, server) = h.engine();
+    let o = Command::new("/bin/sh")
+        .arg("-c")
+        .arg("\"$0\" signal $$ term --dry-run --json; :")
+        .arg(env!("CARGO_BIN_EXE_mulchie"))
+        .env("HOME", &h.home)
+        .env_remove("XDG_CONFIG_HOME")
+        .env("MULCHIE_PORT", h.port.to_string())
+        .stdin(Stdio::null())
+        .output()
+        .unwrap();
+    let v: serde_json::Value = serde_json::from_slice(&o.stdout)
+        .unwrap_or_else(|_| panic!("{} {}", text(&o.stdout), text(&o.stderr)));
+    let ready = v["plan"]["items"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .any(|i| i["ready"] == true);
+    assert!(
+        v["plan"]["ready"] == false && !ready,
+        "the calling shell would be signalled: {v}"
+    );
     server.stop();
 }
 
@@ -625,6 +656,11 @@ fn top_findings_and_config() {
     let v: serde_json::Value = serde_json::from_slice(&o.stdout).unwrap();
     assert!(v["findings"].is_array());
     assert!(v["note"].as_str().unwrap().contains("not verdicts"));
+    assert_eq!(v["enabled"], true, "{v}");
+    assert!(
+        v["local_note"].as_str().unwrap().contains("running engine"),
+        "{v}"
+    );
     assert!(!text(&o.stdout).contains("hunter2"));
     assert_eq!(
         h.run(&["findings", "--kind", "Bad Kind"]).status.code(),
@@ -652,14 +688,33 @@ fn top_findings_and_config() {
             .code(),
         Some(1)
     );
-    // Dismissing locally lands in the config too.
+    // An id that matches no finding is refused unless forced.
     let o = h.run(&["findings", "dismiss", "runaway_cpu:1:1", "--days", "2"]);
+    assert_eq!(o.status.code(), Some(1));
+    assert!(text(&o.stderr).contains("--force"), "{}", text(&o.stderr));
+    assert!(Config::load_from(&h.paths())
+        .config
+        .watch
+        .dismissed
+        .is_empty());
+    // Dismissing locally lands in the config too.
+    let o = h.run(&[
+        "findings",
+        "dismiss",
+        "runaway_cpu:1:1",
+        "--days",
+        "2",
+        "--force",
+    ]);
     assert!(o.status.success(), "{}", text(&o.stderr));
     assert_eq!(
         Config::load_from(&h.paths()).config.watch.dismissed.len(),
         1
     );
 
+    // The local edits took the engine lock and gave it back.
+    let o = h.run(&["config", "set", "guard.rules.sudo", "block"]);
+    assert!(o.status.success(), "{}", text(&o.stderr));
     // With an engine, through it: in effect at once.
     let (engine, _lk, server) = h.engine();
     let o = h.run(&["config", "set", "worktree_idle_days", "9"]);
@@ -674,6 +729,12 @@ fn top_findings_and_config() {
     let v: serde_json::Value = serde_json::from_slice(&o.stdout).unwrap();
     assert_eq!(v["source"], "engine");
     assert_eq!(v["config"]["worktree_idle_days"], 9);
+    // While an engine holds the lock, an edit never goes to the file alone.
+    let before = std::fs::read(h.paths().config_file()).unwrap();
+    let o = h.run(&["config", "set", "watch.enabled", "false"]);
+    assert!(o.status.success(), "{}", text(&o.stderr));
+    assert!(!engine.config().watch.enabled);
+    assert_ne!(before, std::fs::read(h.paths().config_file()).unwrap());
     let o = h.run(&["findings", "undismiss", "runaway_cpu:1:1"]);
     assert!(o.status.success(), "{}", text(&o.stderr));
     assert!(engine.config().watch.dismissed.is_empty());
