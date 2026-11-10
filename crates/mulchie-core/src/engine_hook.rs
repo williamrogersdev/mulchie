@@ -14,12 +14,17 @@ use super::*;
 use crate::guard::{self, Decision as GuardDecision, Verdict};
 use crate::limits::Breach;
 use crate::redact::redact_command_line;
-use crate::session::{agent_of, SessionStatus};
+use crate::session::{agent_of, RootSource, SessionStatus};
 
 /// Ancestors walked to map a hook pid to a session.
 const HOOK_ANCESTRY: usize = 16;
 /// Command and detail text kept in the activity record, at most.
 const RECORD_TEXT: usize = 2_000;
+/// Live sessions registered by hook calls, at most. Past it a hook call
+/// still gets a guard decision, with no session.
+pub const MAX_HOOK_SESSIONS: usize = 64;
+/// A hook's `cwd` is kept only up to this many bytes.
+const MAX_CWD_BYTES: usize = 4096;
 
 /// What the hook reports.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -263,10 +268,23 @@ impl Engine {
                     !SHELLS.contains(&n.trim_start_matches('-'))
                 })
             })?;
-        let cwd = req.cwd.clone().or_else(|| root.cwd.clone());
+        let cwd = req
+            .cwd
+            .clone()
+            .or_else(|| root.cwd.clone())
+            .filter(|c| c.as_os_str().len() <= MAX_CWD_BYTES);
         let ws = cwd.as_deref().and_then(|c| checkout_of(c).0);
         let command = shorten_command(&root.cmd, &self.paths.home);
-        let id = lock(&self.sup).tracker.register(
+        let mut sup = lock(&self.sup);
+        let hook_live = sup
+            .tracker
+            .sessions()
+            .filter(|s| s.source == RootSource::Hook && s.status == SessionStatus::Running)
+            .count();
+        if hook_live >= MAX_HOOK_SESSIONS {
+            return None;
+        }
+        let id = sup.tracker.register(
             now,
             root.pid,
             root.start_time,
@@ -277,6 +295,7 @@ impl Engine {
             cwd.clone(),
             ws.clone(),
         );
+        drop(sup);
         if self.records_on(cfg) {
             self.record_writer().event(
                 &id,

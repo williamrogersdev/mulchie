@@ -190,3 +190,54 @@ fn write_failures_surface_as_an_error() {
     assert_eq!(r.error(), None);
     assert_eq!(r.read(S, 0, 10).unwrap().len(), 1);
 }
+
+/// N5: the directory cap holds at write time, live sessions included: a
+/// session whose next event would take the total past `max_total_bytes`
+/// gets one `truncated` event and nothing more. Long strings are cut.
+#[test]
+fn the_total_cap_holds_at_write_time_and_strings_are_cut() {
+    let t = tempfile::tempdir().unwrap();
+    let dir = t.path().join("sessions");
+    std::fs::create_dir_all(&dir).unwrap();
+    // Another live session already holds most of the room.
+    std::fs::write(file_of(&dir, "s-1-1"), vec![b'x'; 9_000]).unwrap();
+    let r = Record::new(
+        dir.clone(),
+        RecordLimits {
+            max_total_bytes: 10_000,
+            ..limits()
+        },
+    );
+    for i in 0..50 {
+        r.event(
+            S,
+            1000 + i,
+            "hook",
+            json!({ "i": i, "pad": "y".repeat(100) }),
+        );
+    }
+    r.flush();
+    let ev = r.read(S, 0, 1000).unwrap();
+    let last = ev.last().unwrap();
+    assert_eq!(last["type"], "truncated", "{ev:?}");
+    assert!(last["detail"].as_str().unwrap().contains("max_total_mb"));
+    assert_eq!(ev.iter().filter(|v| v["type"] == "truncated").count(), 1);
+    let total: u64 = std::fs::read_dir(&dir)
+        .unwrap()
+        .flatten()
+        .map(|e| e.metadata().unwrap().len())
+        .sum();
+    assert!(total <= 10_000 + 200, "total {total}");
+    // Strings are cut at MAX_FIELD_BYTES.
+    let r2 = Record::new(t.path().join("other"), limits());
+    r2.event(
+        "s-2-2",
+        1,
+        "hook_prompt",
+        json!({ "cwd": "/a".repeat(5_000), "nested": { "detail": ["z".repeat(9_000)] } }),
+    );
+    r2.flush();
+    let ev = r2.read("s-2-2", 0, 10).unwrap();
+    assert!(ev[0]["cwd"].as_str().unwrap().len() <= MAX_FIELD_BYTES + 3);
+    assert!(ev[0]["nested"]["detail"][0].as_str().unwrap().len() <= MAX_FIELD_BYTES + 3);
+}

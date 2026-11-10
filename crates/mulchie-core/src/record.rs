@@ -7,8 +7,11 @@
 //! `type`. Caps: per session `max_record_mb` and `max_events` (then one
 //! `truncated` event and nothing more), process starts at most
 //! `process_events_per_minute` per session (the rest summed up in a
-//! `process_starts_summarised` event), and `max_total_mb` for the directory
-//! (the oldest records of ended sessions go first). Records older than
+//! `process_starts_summarised` event), and `max_total_mb` for the directory:
+//! the oldest records of ended sessions go first on each sweep, and at write
+//! time a session whose next event would take the directory past the cap gets
+//! one `truncated` event and nothing more. Every string in an event is cut at
+//! 4096 bytes. Records older than
 //! `retain_days` are removed. Anything stored here has been redacted by the
 //! caller.
 
@@ -22,6 +25,26 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use crate::config::{create_private_dir, SessionsConfig};
+
+/// Any string in a stored event is cut at this many bytes.
+pub const MAX_FIELD_BYTES: usize = 4096;
+
+/// Cut every string in `v` at [`MAX_FIELD_BYTES`].
+fn cap_strings(v: &mut Value) {
+    match v {
+        Value::String(s) if s.len() > MAX_FIELD_BYTES => {
+            let mut end = MAX_FIELD_BYTES;
+            while !s.is_char_boundary(end) {
+                end -= 1;
+            }
+            s.truncate(end);
+            s.push('…');
+        }
+        Value::Array(a) => a.iter_mut().for_each(cap_strings),
+        Value::Object(m) => m.values_mut().for_each(cap_strings),
+        _ => {}
+    }
+}
 
 /// Events the queue holds before it drops.
 pub const QUEUE: usize = 4096;
@@ -97,6 +120,7 @@ impl Record {
             files: HashMap::new(),
             minutes: HashMap::new(),
             error: error.clone(),
+            total: None,
         };
         let _ = std::thread::Builder::new()
             .name("mulchie-record".into())
@@ -242,6 +266,9 @@ struct Writer {
     files: HashMap<String, FileState>,
     minutes: HashMap<String, Minute>,
     error: Arc<Mutex<Option<String>>>,
+    /// Bytes of every record in the directory, live sessions included;
+    /// read once, then kept up to date by writes (a sweep re-reads it).
+    total: Option<u64>,
 }
 
 impl Writer {
@@ -307,12 +334,24 @@ impl Writer {
         })
     }
 
-    fn append(&mut self, session: &str, t: u64, ty: &str, fields: Value) {
+    /// Bytes of the records in the directory.
+    fn total_bytes(&mut self) -> u64 {
+        if let Some(t) = self.total {
+            return t;
+        }
+        let t = record_files(&self.dir).iter().map(|f| f.1).sum();
+        self.total = Some(t);
+        t
+    }
+
+    fn append(&mut self, session: &str, t: u64, ty: &str, mut fields: Value) {
         let limits = self.limits;
-        let st = self.state_of(session);
-        if st.truncated {
+        if self.state_of(session).truncated {
             return;
         }
+        let total = self.total_bytes();
+        let st = self.state_of(session);
+        cap_strings(&mut fields);
         let mut obj = match fields {
             Value::Object(m) => m,
             _ => serde_json::Map::new(),
@@ -325,15 +364,22 @@ impl Writer {
         line.push(b'\n');
         // Room is kept for the marker; past either cap, write it instead.
         let marker_room = 160;
-        let over = st.events + 2 > limits.max_events
+        let own_cap = st.events + 2 > limits.max_events
             || st.bytes + line.len() as u64 + marker_room > limits.max_bytes;
+        let all_cap = total + line.len() as u64 + marker_room > limits.max_total_bytes;
+        let over = own_cap || all_cap;
         let line = if over {
             st.truncated = true;
+            let detail = if own_cap {
+                "the record reached its size or event cap; later events are not kept"
+            } else {
+                "the session records together reached sessions.max_total_mb; later events are not kept"
+            };
             let mut m = serde_json::to_vec(&json!({
                 "seq": seq,
                 "t": t,
                 "type": "truncated",
-                "detail": "the record reached its size or event cap; later events are not kept",
+                "detail": detail,
             }))
             .unwrap_or_default();
             m.push(b'\n');
@@ -348,6 +394,7 @@ impl Writer {
             Ok(()) => {
                 st.bytes += line.len() as u64;
                 st.events = seq;
+                self.total = Some(total + line.len() as u64);
                 self.set_error(None);
             }
             Err(e) => {
@@ -421,36 +468,12 @@ impl Writer {
     /// Remove records past the retention, then the oldest records of
     /// sessions not in `live` until the directory fits its cap.
     fn sweep(&mut self, now: u64, live: &[String]) {
-        let Ok(rd) = std::fs::read_dir(&self.dir) else {
-            return;
-        };
+        self.total = None;
         let live: HashSet<&str> = live.iter().map(String::as_str).collect();
-        let mut files: Vec<(u64, u64, PathBuf, String)> = Vec::new();
-        for e in rd.flatten() {
-            let p = e.path();
-            let Some(stem) = p
-                .file_name()
-                .and_then(|n| n.to_str())
-                .and_then(|n| n.strip_suffix(".jsonl"))
-                .map(String::from)
-            else {
-                continue;
-            };
-            if crate::session::Session::parse_id(&stem).is_none() {
-                continue;
-            }
-            let Ok(m) = e.metadata() else { continue };
-            if !m.is_file() {
-                continue;
-            }
-            let mtime = m
-                .modified()
-                .ok()
-                .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-                .map(|d| d.as_secs())
-                .unwrap_or(now);
-            files.push((mtime, m.len(), p, stem));
-        }
+        let mut files: Vec<(u64, u64, PathBuf, String)> = record_files(&self.dir)
+            .into_iter()
+            .map(|(m, len, p, stem)| (m.unwrap_or(now), len, p, stem))
+            .collect();
         files.sort();
         let mut total: u64 = files.iter().map(|f| f.1).sum();
         for (mtime, len, path, stem) in &files {
@@ -465,6 +488,40 @@ impl Writer {
             }
         }
     }
+}
+
+/// The record files in `dir`: (mtime, bytes, path, session id). Only
+/// regular files named after a session id.
+fn record_files(dir: &Path) -> Vec<(Option<u64>, u64, PathBuf, String)> {
+    let Ok(rd) = std::fs::read_dir(dir) else {
+        return Vec::new();
+    };
+    let mut files = Vec::new();
+    for e in rd.flatten() {
+        let p = e.path();
+        let Some(stem) = p
+            .file_name()
+            .and_then(|n| n.to_str())
+            .and_then(|n| n.strip_suffix(".jsonl"))
+            .map(String::from)
+        else {
+            continue;
+        };
+        if crate::session::Session::parse_id(&stem).is_none() {
+            continue;
+        }
+        let Ok(m) = e.metadata() else { continue };
+        if !m.is_file() {
+            continue;
+        }
+        let mtime = m
+            .modified()
+            .ok()
+            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+            .map(|d| d.as_secs());
+        files.push((mtime, m.len(), p, stem));
+    }
+    files
 }
 
 fn write_line(dir: &Path, path: &Path, line: &[u8]) -> std::io::Result<()> {
