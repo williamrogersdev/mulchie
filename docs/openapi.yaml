@@ -1,7 +1,7 @@
 openapi: 3.1.0
 info:
   title: Mulchie local API
-  version: 0.3.0
+  version: 0.3.0-rc.1
   summary: The engine's HTTP API on 127.0.0.1, for the CLI, the app, the MCP server and scripts.
   description: |
     The engine (the menu bar app or `mulchie serve`) listens on 127.0.0.1 only, on the
