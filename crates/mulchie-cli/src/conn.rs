@@ -120,6 +120,9 @@ pub fn describe(e: &ApiError) -> String {
             "this engine does not hold the engine lock (another one does), so it cannot save the config; `mulchie doctor` shows which engine runs"
         }
         "invalid_config" => "the engine kept the config as it was; nothing changed",
+        "unknown_key" => "the engine's config has no such key, so nothing was saved; check the spelling with `mulchie config`, or update the engine if the key is new",
+        "config_changed" => "the config file changed since it was read, so nothing was saved; read it again and retry",
+        "invalid_query" => "`since` does not combine with `tail` or `before`",
         "unknown_session" => "`mulchie sessions` lists the sessions the engine knows",
         "invalid_session_id" => "a session id looks like s-<start time>-<pid>, from `mulchie sessions`",
                 "not_found" | "method_not_allowed" => {

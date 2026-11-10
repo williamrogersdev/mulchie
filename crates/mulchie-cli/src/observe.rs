@@ -591,6 +591,76 @@ pub fn saved_value<'a>(saved: &'a Value, key: &str) -> Result<&'a Value, String>
     Ok(got)
 }
 
+/// The config path for a write, carrying the revision it was read at, so
+/// the engine saves only while the file is still at it. The query form of
+/// `If-Match`: the core's client sends no custom headers.
+pub fn config_write_path(revision: Option<&str>) -> String {
+    match revision.filter(|r| !r.is_empty() && r.bytes().all(|b| b.is_ascii_alphanumeric())) {
+        Some(r) => format!("/v1/config?if_revision={r}"),
+        None => "/v1/config".into(),
+    }
+}
+
+/// A `config set` error from the engine, in words.
+pub fn explain_config_error(e: &mulchie_core::api::ApiError, key: &str) -> String {
+    match e.code.as_str() {
+        "unknown_key" => format!(
+            "the engine has no setting {} ({}), so nothing was saved [unknown_key]; `mulchie config` shows the settings, and a setting newer than the engine needs the engine updated",
+            if e.message.contains(key) { format!("`{key}`") } else { "in this change".into() },
+            e.message
+        ),
+        _ => conn::describe(e),
+    }
+}
+
+type Call<'a> =
+    dyn Fn(&str, &str, Option<&Value>) -> Result<Value, mulchie_core::api::ApiError> + 'a;
+
+/// `config set` through a running engine: read the config and its revision,
+/// check the edit, send only the change at that revision. When the file
+/// changed in between (409 `config_changed`), read it again and retry once.
+fn set_through_engine(call: &Call, key: &str, raw: &str) -> Result<(Value, String), String> {
+    let mut retried = false;
+    loop {
+        let cur = call("GET", "/v1/config", None).map_err(|e| conn::describe(&e))?;
+        if let Some(e) = cur["config_error"].as_str() {
+            return Err(format!(
+                "the config file was not used ({e}); fix or remove {} first",
+                s(&cur, "path")
+            ));
+        }
+        // The edit is checked against the engine's config here; what is
+        // sent is only the change, as a JSON merge patch.
+        let edited = set_key(&cur["config"], key, raw)?;
+        let path = config_write_path(cur["revision"].as_str());
+        let r = match call("PATCH", &path, Some(&merge_patch(key, &edited))) {
+            // An engine from before PATCH: send the whole edited config.
+            Err(e) if e.code == "method_not_allowed" || e.code == "not_found" => {
+                call("PUT", &path, Some(&json!({ "config": edited })))
+            }
+            r => r,
+        };
+        match r {
+            Ok(v) => {
+                let how = if retried {
+                    "through the engine; in effect now (the file changed while saving, so it was read again and the change applied to the new content)"
+                } else {
+                    "through the engine; in effect now"
+                };
+                return Ok((v["config"].clone(), how.to_string()));
+            }
+            Err(e) if e.code == "config_changed" && !retried => retried = true,
+            Err(e) if e.code == "config_changed" => {
+                return Err(format!(
+                    "the config file changed again while saving, twice in a row, so nothing was saved [config_changed]; something else is editing it, try again when it is done ({})",
+                    e.message
+                ))
+            }
+            Err(e) => return Err(explain_config_error(&e, key)),
+        }
+    }
+}
+
 /// How often, and how far apart, `config set` tries for the engine lock.
 const LOCK_TRIES: usize = 15;
 const LOCK_WAIT: std::time::Duration = std::time::Duration::from_millis(200);
@@ -648,35 +718,10 @@ fn config_set_with(
         }
         match connect(paths) {
             Conn::Engine(c) => {
-                let cur = match conn::call(&c, "GET", "/v1/config", None) {
-                    Ok(v) => v,
-                    Err(e) => return fail(conn::describe(&e)),
-                };
-                if let Some(e) = cur["config_error"].as_str() {
-                    return fail(format!(
-                        "the config file was not used ({e}); fix or remove {} first",
-                        s(&cur, "path")
-                    ));
-                }
-                // The edit is checked against the engine's config here; what
-                // is sent is only the change, as a JSON merge patch.
-                let edited = match set_key(&cur["config"], key, raw) {
-                    Ok(c) => c,
+                let call = |m: &str, p: &str, b: Option<&Value>| conn::call(&c, m, p, b);
+                match set_through_engine(&call, key, raw) {
+                    Ok(d) => done = Some(d),
                     Err(e) => return fail(e),
-                };
-                let patch = merge_patch(key, &edited);
-                let r = match conn::call(&c, "PATCH", "/v1/config", Some(&patch)) {
-                    // An engine from before PATCH: send the whole edited config.
-                    Err(e) if e.code == "method_not_allowed" || e.code == "not_found" => {
-                        conn::call(&c, "PUT", "/v1/config", Some(&json!({ "config": edited })))
-                    }
-                    r => r,
-                };
-                match r {
-                    Ok(v) => {
-                        done = Some((v["config"].clone(), "through the engine; in effect now"))
-                    }
-                    Err(e) => return fail(conn::describe(&e)),
                 }
                 break;
             }
@@ -706,7 +751,8 @@ fn config_set_with(
                     Ok(cfg) => {
                         done = Some((
                             serde_json::to_value(&cfg).unwrap_or(Value::Null),
-                            "in the file (no engine is running; it applies when one starts)",
+                            "in the file (no engine is running; it applies when one starts)"
+                                .to_string(),
                         ))
                     }
                     Err(e) => return fail(e),
@@ -805,6 +851,111 @@ mod tests {
         );
         // The engine saved it; a direct write would not have reached it.
         assert_ne!(std::fs::read(paths.config_file()).unwrap(), before);
+        server.stop();
+    }
+
+    /// A6: the write carries the revision it read; a file changed in
+    /// between is read again once, and a second change is an error.
+    #[test]
+    fn config_set_writes_at_the_revision_it_read_and_retries_once() {
+        use mulchie_core::api::ApiError;
+        let cfg = serde_json::to_value(Config::default()).unwrap();
+        let run = |conflicts: usize| {
+            let seen = std::cell::RefCell::new(Vec::<String>::new());
+            let gets = std::cell::Cell::new(0);
+            let call = |m: &str, p: &str, b: Option<&Value>| -> Result<Value, ApiError> {
+                seen.borrow_mut().push(format!("{m} {p}"));
+                match m {
+                    "GET" => {
+                        gets.set(gets.get() + 1);
+                        Ok(json!({ "config": cfg, "revision": format!("{:016x}", gets.get()) }))
+                    }
+                    _ if seen
+                        .borrow()
+                        .iter()
+                        .filter(|x| !x.starts_with("GET"))
+                        .count()
+                        <= conflicts =>
+                    {
+                        Err(ApiError::new(409, "config_changed", "the file changed"))
+                    }
+                    _ => {
+                        let mut c = cfg.clone();
+                        c["worktree_idle_days"] = b.unwrap()["worktree_idle_days"].clone();
+                        Ok(json!({ "ok": true, "config": c }))
+                    }
+                }
+            };
+            let r = set_through_engine(&call, "worktree_idle_days", "12");
+            (r, seen.into_inner())
+        };
+        let (r, seen) = run(0);
+        assert_eq!(r.unwrap().0["worktree_idle_days"], 12);
+        assert_eq!(
+            seen,
+            [
+                "GET /v1/config",
+                "PATCH /v1/config?if_revision=0000000000000001"
+            ]
+        );
+        let (r, seen) = run(1);
+        assert!(r.unwrap().1.contains("read again"));
+        assert_eq!(seen.len(), 4);
+        assert_eq!(seen[3], "PATCH /v1/config?if_revision=0000000000000002");
+        let (r, seen) = run(2);
+        let e = r.unwrap_err();
+        assert!(
+            e.contains("twice in a row") && e.contains("nothing was saved"),
+            "{e}"
+        );
+        assert_eq!(seen.len(), 4, "only one retry");
+        // A revision that is not plain hex never goes in the path.
+        assert_eq!(config_write_path(Some("a&b=c")), "/v1/config");
+        assert_eq!(config_write_path(None), "/v1/config");
+        let e = ApiError::new(400, "unknown_key", "unknown key `guard.rulez`");
+        let t = explain_config_error(&e, "guard.rulez");
+        assert!(
+            t.contains("no setting `guard.rulez`") && t.contains("[unknown_key]"),
+            "{t}"
+        );
+    }
+
+    /// The same against a real engine: the file is edited on disk between
+    /// the read and the write, the engine refuses the stale revision, and
+    /// the retry keeps both edits.
+    #[test]
+    fn config_set_through_a_real_engine_keeps_an_edit_made_in_between() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = Paths::under(tmp.path());
+        std::fs::create_dir_all(&paths.home).unwrap();
+        let engine = Engine::new(paths.clone(), crate::commands::safe_test_config(&paths));
+        let mut lk = engine.acquire_lock().unwrap();
+        let server = mulchie_core::api::serve(engine.clone(), 0).unwrap();
+        lk.set_port(Some(server.port())).unwrap();
+        let Conn::Engine(c) = conn::connect(&paths) else {
+            panic!("no engine")
+        };
+        let codes = std::cell::RefCell::new(Vec::<String>::new());
+        let call = |m: &str, p: &str, b: Option<&Value>| {
+            if m == "PATCH" && codes.borrow().is_empty() {
+                // Someone else edits the file after our read.
+                let mut other = Config::load_from(&paths).config;
+                other.worktree_idle_days = 21;
+                other.save_to(&paths, 0).unwrap();
+            }
+            let r = conn::call(&c, m, p, b);
+            if m == "PATCH" {
+                codes
+                    .borrow_mut()
+                    .push(r.as_ref().err().map(|e| e.code.clone()).unwrap_or_default());
+            }
+            r
+        };
+        let (saved, how) = set_through_engine(&call, "guard.rules.sudo", "block").unwrap();
+        assert_eq!(codes.into_inner(), ["config_changed", ""]);
+        assert!(how.contains("read again"), "{how}");
+        assert_eq!(saved["guard"]["rules"]["sudo"], "block");
+        assert_eq!(saved["worktree_idle_days"], 21, "the other edit is kept");
         server.stop();
     }
 
