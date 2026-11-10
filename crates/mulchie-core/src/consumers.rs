@@ -47,6 +47,8 @@ pub struct ProcSample {
     /// Resident memory in bytes.
     pub mem_bytes: u64,
     pub start_time: u64,
+    /// Stopped (SIGSTOP / `T` state).
+    pub stopped: bool,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]

@@ -35,6 +35,109 @@ pub struct Config {
     /// Gitignored files in a worktree (other than known caches) are archived
     /// before removal. Above this size the worktree is skipped instead.
     pub backup_ignored_max_mb: u64,
+    /// What `watch` looks for and how loudly (see [`WatchConfig`]).
+    pub watch: WatchConfig,
+}
+
+/// A finding id kept quiet until `until_unix` (`None`: until undismissed).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct Dismissal {
+    pub id: String,
+    #[serde(default)]
+    pub until_unix: Option<u64>,
+}
+
+/// Settings for the read-only detectors in [`crate::watch`]. Detectors only
+/// report; nothing here makes Mulchie act.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(default)]
+pub struct WatchConfig {
+    pub enabled: bool,
+    /// Seconds between runs on the scan loop.
+    pub interval_secs: u64,
+    /// An agent or build process older than this, idle over the history
+    /// window, is reported as stale.
+    pub stale_process_hours: u64,
+    /// "Idle" for the stale check: average CPU below this percent of one core.
+    pub stale_idle_cpu_pct: f32,
+    /// A process stopped (SIGSTOP) longer than this is reported.
+    pub stopped_hours: u64,
+    /// The window for runaway CPU and growing memory.
+    pub runaway_minutes: u64,
+    /// Average CPU (percent of one core) over the window to count as runaway.
+    pub runaway_cpu_pct: f32,
+    /// Memory growth over the window to report.
+    pub memory_growth_mb: u64,
+    /// Look for listening sockets (one bounded `lsof` or `/proc/net` read per run).
+    pub check_listeners: bool,
+    /// macOS code signatures and quarantine flags of running executables.
+    pub check_signatures: bool,
+    /// Executables never reported (exact paths).
+    pub allow_exes: Vec<PathBuf>,
+    /// Finding ids never reported.
+    pub allow_ids: Vec<String>,
+    /// Findings kept quiet for a while (`POST /v1/findings/dismiss`).
+    pub dismissed: Vec<Dismissal>,
+}
+
+impl Default for WatchConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            interval_secs: 60,
+            stale_process_hours: 72,
+            stale_idle_cpu_pct: 1.0,
+            stopped_hours: 6,
+            runaway_minutes: 30,
+            runaway_cpu_pct: 90.0,
+            memory_growth_mb: 1024,
+            check_listeners: true,
+            check_signatures: true,
+            allow_exes: Vec::new(),
+            allow_ids: Vec::new(),
+            dismissed: Vec::new(),
+        }
+    }
+}
+
+impl WatchConfig {
+    pub fn validate(&self, e: &mut Vec<String>) {
+        if !(10..=3600).contains(&self.interval_secs) {
+            e.push("watch.interval_secs must be between 10 and 3600".into());
+        }
+        if !(1..=8760).contains(&self.stale_process_hours) {
+            e.push("watch.stale_process_hours must be between 1 and 8760".into());
+        }
+        if !(0.0..=100.0).contains(&self.stale_idle_cpu_pct) {
+            e.push("watch.stale_idle_cpu_pct must be between 0 and 100".into());
+        }
+        if !(1..=8760).contains(&self.stopped_hours) {
+            e.push("watch.stopped_hours must be between 1 and 8760".into());
+        }
+        if !(5..=120).contains(&self.runaway_minutes) {
+            e.push("watch.runaway_minutes must be between 5 and 120".into());
+        }
+        if !(1.0..=10_000.0).contains(&self.runaway_cpu_pct) {
+            e.push("watch.runaway_cpu_pct must be between 1 and 10000".into());
+        }
+        if !(16..=1_048_576).contains(&self.memory_growth_mb) {
+            e.push("watch.memory_growth_mb must be between 16 and 1048576".into());
+        }
+        if let Some(p) = self.allow_exes.iter().find(|p| !p.is_absolute()) {
+            e.push(format!("watch.allow_exes entry {} is not absolute", p.display()));
+        }
+        if self.allow_ids.len() + self.dismissed.len() > 10_000 {
+            e.push("watch.allow_ids and watch.dismissed hold at most 10000 ids".into());
+        }
+        if self
+            .allow_ids
+            .iter()
+            .chain(self.dismissed.iter().map(|d| &d.id))
+            .any(|i| i.is_empty() || i.len() > 512)
+        {
+            e.push("finding ids must be 1 to 512 characters".into());
+        }
+    }
 }
 
 impl Default for Config {
@@ -60,6 +163,7 @@ impl Default for Config {
             auto_sweep_worktrees: false,
             alert_below_gb: 50,
             backup_ignored_max_mb: 200,
+            watch: WatchConfig::default(),
         }
     }
 }
@@ -156,6 +260,7 @@ impl Config {
         if let Some(r) = self.scan_roots.iter().find(|r| !r.is_absolute()) {
             e.push(format!("scan root {} is not absolute", r.display()));
         }
+        self.watch.validate(&mut e);
         if e.is_empty() {
             Ok(())
         } else {

@@ -15,6 +15,7 @@ pub mod reclaim;
 pub mod redact;
 pub mod safety;
 pub mod shutdown;
+pub mod watch;
 
 pub use config::{Config, ConfigError, LoadedConfig};
 pub use engine::{Engine, Health, LeaseRequest, State, WorkspaceAction};

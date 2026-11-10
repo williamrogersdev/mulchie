@@ -409,6 +409,7 @@ impl Monitor {
                 cpu_pct: p.cpu_usage(),
                 mem_bytes: p.memory(),
                 start_time: p.start_time(),
+                stopped: matches!(p.status(), ProcessStatus::Stop),
             });
             // Command lines leave the engine (state, API, agents): secrets
             // are redacted before they are kept.

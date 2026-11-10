@@ -782,6 +782,7 @@ fn member(f: &crate::process::ProcFacts, kind: ProcKind) -> crate::consumers::Pr
         cpu_pct: 50.0,
         mem_bytes: 1,
         start_time: f.start_time,
+        stopped: false,
     }
 }
 

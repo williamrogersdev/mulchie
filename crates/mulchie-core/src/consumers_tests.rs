@@ -16,6 +16,7 @@ fn p(pid: u32, ppid: u32, name: &str, exe: Option<&str>) -> ProcSample {
         cpu_pct: 0.0,
         mem_bytes: 0,
         start_time: 1000 + pid as u64,
+        stopped: false,
     }
 }
 
