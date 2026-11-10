@@ -17,6 +17,12 @@
 //!   `docker login -p X`, `redis-cli -a X`);
 //! - a token used as URL user info (`https://ghp_…@github.com`).
 //!
+//! - the script after a shell's `-c` (`sh -c "curl -H 'Authorization: …'"`,
+//!   `bash -lc …`), redacted as a command line of its own;
+//! - header values inside any argument holding several words;
+//! - `curl --user=…`, `aws configure set <secret name> VALUE`, npm-style
+//!   `//registry/:_authToken=…`, and `authorization:bearer X` split in two.
+//!
 //! It is a best effort: a secret passed positionally with no telling flag
 //! (`tool SECRET`) is not recognised unless it has a known token shape.
 
@@ -180,6 +186,27 @@ const SHORT_SECRETS: &[ShortSecret] = &[
     },
 ];
 
+/// Shells whose `-c` argument is a script.
+const SHELLS: &[&str] = &[
+    "sh", "bash", "zsh", "dash", "ksh", "mksh", "ash", "fish", "yash", "busybox",
+];
+
+/// `-c`, or combined short flags holding `c` (`-lc`, `-ic`, `-euc`), or
+/// fish's `--command`: the next argument is a script.
+fn is_script_flag(arg: &str) -> bool {
+    if arg == "--command" {
+        return true;
+    }
+    let Some(f) = arg.strip_prefix('-') else {
+        return false;
+    };
+    !f.is_empty()
+        && !f.starts_with('-')
+        && f.len() <= 6
+        && f.chars().all(|c| c.is_ascii_alphabetic())
+        && f.contains('c')
+}
+
 fn program_name(arg: &str) -> &str {
     let a = arg.trim_matches(|c| c == '"' || c == '\'');
     a.rsplit('/').next().unwrap_or(a)
@@ -204,6 +231,10 @@ fn short_secret(program: &str, args: &[String], arg: &str) -> Option<bool> {
         for f in s.flags {
             if arg == *f {
                 return Some(false);
+            }
+            // `--user=VALUE`.
+            if f.starts_with("--") && arg.len() > f.len() + 1 && arg.starts_with(&format!("{f}=")) {
+                return Some(true);
             }
             // Attached values only for single-letter flags (`-ppass`).
             if f.len() == 2 && arg.len() > 2 && arg.starts_with(f) && !arg.starts_with("--") {
@@ -283,6 +314,14 @@ fn redact_one_at(arg: &str, depth: u8) -> Option<String> {
         if !v.is_empty() && !k.contains('/') && is_secret_name(k) {
             return Some(format!("{k}={REDACTED}"));
         }
+        // npm style: `//registry.npmjs.org/:_authToken=VALUE`.
+        if !v.is_empty() && k.contains('/') {
+            if let Some((_, name)) = k.rsplit_once(':') {
+                if name.starts_with('_') && !name.contains('/') && is_secret_name(name) {
+                    return Some(format!("{k}={REDACTED}"));
+                }
+            }
+        }
         // The value after `=` gets the same checks as a lone argument:
         // `--jwt=eyJ…`, `--header=Authorization:Bearer …`, `DB=postgres://u:p@h`.
         if depth < 4 && !v.is_empty() {
@@ -296,10 +335,33 @@ fn redact_one_at(arg: &str, depth: u8) -> Option<String> {
 
 /// Redact secrets in an argument vector.
 pub fn redact_args(args: &[String]) -> Vec<String> {
+    redact_args_at(args, 0)
+}
+
+fn redact_args_at(args: &[String], depth: u8) -> Vec<String> {
     let mut out = Vec::with_capacity(args.len());
     let mut hide_next = false;
+    let mut script_next = false;
     let mut program = args.first().map(|a| program_name(a)).unwrap_or("");
+    let mut shell = args
+        .first()
+        .is_some_and(|a| SHELLS.contains(&program_name(a)));
+    let aws_set = program == "aws"
+        && args.iter().any(|a| a == "configure")
+        && args.iter().any(|a| a == "set");
     for (i, a) in args.iter().enumerate() {
+        // The script as one argument (argv). In a command line split on
+        // whitespace its first word is just the next word: normal rules.
+        if script_next && a.contains([' ', '\t', '\n']) {
+            script_next = false;
+            out.push(if depth < 4 {
+                redact_command_line_at(a, depth + 1)
+            } else {
+                REDACTED.to_string()
+            });
+            continue;
+        }
+        script_next = false;
         if hide_next {
             hide_next = false;
             if !a.starts_with('-') || a.len() == 1 {
@@ -318,10 +380,38 @@ pub fn redact_args(args: &[String]) -> Vec<String> {
         if i > 0 && !a.starts_with('-') && is_short_program(program_name(a)) {
             program = program_name(a);
         }
+        if i > 0 && !a.starts_with('-') && SHELLS.contains(&program_name(a)) {
+            shell = true;
+        }
+        if shell && i > 0 && is_script_flag(a) {
+            out.push(a.clone());
+            script_next = true;
+            continue;
+        }
+        // `aws configure set aws_secret_access_key VALUE`.
+        if aws_set && i > 0 && args[i - 1] == "set" && is_secret_name(a) {
+            out.push(a.clone());
+            hide_next = true;
+            continue;
+        }
+        // `authorization:bearer` with the credential in the next argument.
+        if let Some(n) = header_prefix(a) {
+            let v = a[n + 1..].trim().to_ascii_lowercase();
+            if AUTH_SCHEMES.contains(&v.as_str()) {
+                out.push(format!("{}: {REDACTED}", &a[..n]));
+                hide_next = true;
+                continue;
+            }
+        }
         if i > 0 {
             match short_secret(program, args, a) {
                 Some(true) => {
-                    out.push(format!("{}{REDACTED}", &a[..2]));
+                    let keep = if a.starts_with("--") {
+                        a.find('=').map_or(2, |k| k + 1)
+                    } else {
+                        2
+                    };
+                    out.push(format!("{}{REDACTED}", &a[..keep]));
                     continue;
                 }
                 Some(false) => {
@@ -335,6 +425,15 @@ pub fn redact_args(args: &[String]) -> Vec<String> {
         if let Some(r) = redact_one(a) {
             out.push(r);
             continue;
+        }
+        // An argument of several words (a script, a message, a header list):
+        // header values anywhere in it.
+        if a.contains([' ', '\t', '\n']) {
+            let h = redact_headers(a);
+            if h != *a {
+                out.push(h);
+                continue;
+            }
         }
         let lower = a.to_ascii_lowercase();
         // A header name or `Bearer` on its own: the credential follows.
@@ -422,9 +521,13 @@ fn redact_headers(cmd: &str) -> String {
 
 /// Redact a command line given as one string (split on whitespace).
 pub fn redact_command_line(cmd: &str) -> String {
+    redact_command_line_at(cmd, 0)
+}
+
+fn redact_command_line_at(cmd: &str, depth: u8) -> String {
     let cmd = redact_headers(cmd);
     let parts: Vec<String> = cmd.split_whitespace().map(String::from).collect();
-    redact_args(&parts).join(" ")
+    redact_args_at(&parts, depth).join(" ")
 }
 
 /// A lease label for display. `mulchie run` sends `<directory>: <program>
@@ -716,6 +819,148 @@ mod tests {
             r(&["pip", "install", "sk-learn-thing"]),
             ["pip", "install", "sk-learn-thing"]
         );
+    }
+
+    /// N3: shell-wrapped scripts, headers inside longer arguments, and the
+    /// forms that used to pass.
+    #[test]
+    fn shell_scripts_and_other_forms() {
+        let cases: &[(&[&str], &[&str])] = &[
+            (
+                &[
+                    "sh",
+                    "-c",
+                    "curl -H 'Authorization: Bearer abc123' https://x",
+                ],
+                &["sh", "-c", "curl -H 'Authorization: [redacted]' https://x"],
+            ),
+            (
+                &["bash", "-lc", "mysql -phunter2 db"],
+                &["bash", "-lc", "mysql -p[redacted] db"],
+            ),
+            (
+                &["/bin/zsh", "-euc", "GITHUB_TOKEN=abc gh pr list"],
+                &["/bin/zsh", "-euc", "GITHUB_TOKEN=[redacted] gh pr list"],
+            ),
+            (
+                &["sudo", "sh", "-c", "curl -u a:b https://x"],
+                &["sudo", "sh", "-c", "curl -u [redacted] https://x"],
+            ),
+            (
+                &["fish", "--command", "redis-cli -a hunter2 ping"],
+                &["fish", "--command", "redis-cli -a [redacted] ping"],
+            ),
+            (
+                &["tool", "--note", "send Authorization: Bearer abc123 now"],
+                &["tool", "--note", "send Authorization: [redacted] now"],
+            ),
+            (
+                &["curl", "--user=a:b", "u"],
+                &["curl", "--user=[redacted]", "u"],
+            ),
+            (
+                &["curl", "--proxy-user=a:b", "u"],
+                &["curl", "--proxy-user=[redacted]", "u"],
+            ),
+            (
+                &["aws", "configure", "set", "aws_secret_access_key", "AbCd"],
+                &[
+                    "aws",
+                    "configure",
+                    "set",
+                    "aws_secret_access_key",
+                    "[redacted]",
+                ],
+            ),
+            (
+                &["aws", "configure", "set", "aws_session_token", "AbCd"],
+                &["aws", "configure", "set", "aws_session_token", "[redacted]"],
+            ),
+            (
+                &[
+                    "npm",
+                    "config",
+                    "set",
+                    "//registry.npmjs.org/:_authToken=abc",
+                ],
+                &[
+                    "npm",
+                    "config",
+                    "set",
+                    "//registry.npmjs.org/:_authToken=[redacted]",
+                ],
+            ),
+            (
+                &["curl", "-H", "authorization:bearer", "abc"],
+                &["curl", "-H", "authorization: [redacted]", "[redacted]"],
+            ),
+            (
+                &["curl", "--proxy-header", "Proxy-Authorization: Basic eHl6"],
+                &["curl", "--proxy-header", "Proxy-Authorization: [redacted]"],
+            ),
+            // Not secrets: must stay.
+            (
+                &["cargo", "test", "-p", "mulchie-core"],
+                &["cargo", "test", "-p", "mulchie-core"],
+            ),
+            (
+                &["docker", "run", "-p", "80:80", "nginx"],
+                &["docker", "run", "-p", "80:80", "nginx"],
+            ),
+            (&["grep", "-a", "x", "f"], &["grep", "-a", "x", "f"]),
+            (&["grep", "-c", "x", "f"], &["grep", "-c", "x", "f"]),
+            (
+                &["git", "commit", "-m", "fix the token refresh"],
+                &["git", "commit", "-m", "fix the token refresh"],
+            ),
+            (
+                &["bash", "-c", "cargo build -p x && git commit -m wip"],
+                &["bash", "-c", "cargo build -p x && git commit -m wip"],
+            ),
+            (
+                &["aws", "configure", "set", "region", "us-east-1"],
+                &["aws", "configure", "set", "region", "us-east-1"],
+            ),
+        ];
+        for (input, want) in cases {
+            assert_eq!(r(input), *want, "input: {input:?}");
+        }
+        let lines: &[(&str, &str)] = &[
+            (
+                "curl --user=a:b https://x",
+                "curl --user=[redacted] https://x",
+            ),
+            (
+                "aws configure set aws_secret_access_key AbCd",
+                "aws configure set aws_secret_access_key [redacted]",
+            ),
+            (
+                "npm config set //registry.npmjs.org/:_authToken=abc",
+                "npm config set //registry.npmjs.org/:_authToken=[redacted]",
+            ),
+            (
+                "curl -H Proxy-Authorization: Basic eHl6 u",
+                "curl -H Proxy-Authorization: [redacted] u",
+            ),
+            (
+                "curl -H authorization:bearer abc u",
+                "curl -H authorization: [redacted] u",
+            ),
+            (
+                "bash -lc \"mysql -phunter2 db\"",
+                "bash -lc \"mysql -p[redacted] db\"",
+            ),
+            ("cargo test -p mulchie-core", "cargo test -p mulchie-core"),
+            ("grep -a foo f", "grep -a foo f"),
+            ("git commit -m wip", "git commit -m wip"),
+            ("bash -c 'cargo build -p x'", "bash -c 'cargo build -p x'"),
+        ];
+        for (input, want) in lines {
+            assert_eq!(redact_command_line(input), *want, "input: {input}");
+        }
+        // A shell-wrapped header in one string never shows the credential.
+        let out = redact_command_line("sh -c \"curl -H 'Authorization: Bearer abc123' https://x\"");
+        assert!(!out.contains("abc123"), "{out}");
     }
 
     #[test]

@@ -207,10 +207,21 @@ fn pre_tool_is_guarded_and_records_are_redacted() {
         )),
     ))
     .unwrap();
+    // N3: a shell-wrapped secret in the command and in the detail text.
+    let mut req = hook_req(
+        100,
+        HookEvent::PostTool,
+        Some("bash -lc \"mysql -phunter2pw db\""),
+    );
+    req.detail = Some("ran: sh -c 'curl -H \"X-Api-Key: k3yk3yk3y\" https://x'".into());
+    e.hook(&req).unwrap();
     let ev = e.session_events("s-500-100", 0, 100).unwrap();
     let text = serde_json::to_string(&ev).unwrap();
     assert!(text.contains("hook_pre_tool"), "{text}");
     assert!(!text.contains(secret), "{text}");
+    assert!(text.contains("hook_post_tool"), "{text}");
+    assert!(!text.contains("hunter2pw"), "{text}");
+    assert!(!text.contains("k3yk3yk3y"), "{text}");
 }
 
 /// Build advice: while heavy work is not advised, a heavy build gets
