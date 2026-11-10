@@ -344,3 +344,67 @@ fn a_hook_call_on_the_real_process_table_is_fast() {
     eprintln!("hook call times: {times:?}");
     assert!(times[2] < Duration::from_millis(250), "{times:?}");
 }
+
+/// N4: a session binds to the first (client, client_session_id) that
+/// reports for it. Another caller never rebinds it, never takes its
+/// breaches, and its events are recorded as `unbound`.
+#[test]
+fn only_the_bound_client_gets_breaches_and_others_are_flagged() {
+    let c = Config {
+        limits: LimitsConfig {
+            default: Some(Budget {
+                cpu_cores: Some(Cap {
+                    max: 1.0,
+                    sustain_secs: 0,
+                    action: LimitAction::Notify,
+                }),
+                ..Budget::default()
+            }),
+            ..LimitsConfig::default()
+        },
+        ..Config::default()
+    };
+    let facts = vec![fact(100, 1, "claude", 500), fact(101, 100, "node", 600)];
+    let (_t, e) = engine(c.clone(), facts);
+    let idle = [
+        sp(100, 1, 500, Some("claude"), 0.0),
+        sp(101, 100, 600, None, 0.0),
+    ];
+    e.observe_sessions(1_000, &idle, M, &c);
+    // The real client binds first.
+    let r = e.hook(&hook_req(101, HookEvent::Prompt, None)).unwrap();
+    assert_eq!(r.session_id.as_deref(), Some("s-500-100"));
+    let busy = [
+        sp(100, 1, 500, Some("claude"), 0.0),
+        sp(101, 100, 600, None, 300.0),
+    ];
+    e.observe_sessions(1_003, &busy, M, &c);
+    assert_eq!(e.snapshot_state().sessions.breaches_undelivered, 1);
+    // Another caller naming a pid in the session.
+    let mut other = hook_req(101, HookEvent::PreTool, Some("ls"));
+    other.client = "codex".into();
+    other.client_session_id = Some("evil".into());
+    let r = e.hook(&other).unwrap();
+    assert_eq!(r.session_id.as_deref(), Some("s-500-100"));
+    assert!(r.breaches.is_empty(), "not handed to another caller");
+    assert_eq!(e.snapshot_state().sessions.breaches_undelivered, 1);
+    let s = e.session("s-500-100").unwrap().session;
+    assert_eq!(s.client.as_deref(), Some("claude"));
+    assert_eq!(s.client_session_id.as_deref(), Some("abc"));
+    // Same client name, other session id: also not the bound pair.
+    let mut same_name = hook_req(101, HookEvent::Prompt, None);
+    same_name.client_session_id = Some("xyz".into());
+    assert!(e.hook(&same_name).unwrap().breaches.is_empty());
+    // The bound client gets it, once.
+    let r = e.hook(&hook_req(101, HookEvent::Prompt, None)).unwrap();
+    assert_eq!(r.breaches.len(), 1);
+    let ev = e.session_events("s-500-100", 0, 100).unwrap();
+    let unbound: Vec<&Value> = ev.iter().filter(|v| v["unbound"] == json!(true)).collect();
+    assert_eq!(unbound.len(), 2, "{ev:?}");
+    assert_eq!(unbound[0]["client"], "codex");
+    assert_eq!(unbound[0]["client_session_id"], "evil");
+    assert!(ev
+        .iter()
+        .filter(|v| v["client"] == "claude" && v["client_session_id"] != "xyz")
+        .all(|v| v.get("unbound").is_none()));
+}

@@ -744,6 +744,13 @@ paths:
         work is not advised a heavy build gets rule `heavy_build` and `mulchie run` advice.
         `session_start` returns machine state and house rules in `context`. Each breach is
         returned in exactly one reply. The event is written to the activity record, redacted.
+
+        A session is bound to the first (`client`, `client_session_id`) that reports for it, or
+        that registered it, and is never rebound. Breaches are returned (and marked delivered)
+        only to a call carrying that pair. Calls from any other caller still get a guard decision;
+        their events are recorded with their own `client` and `client_session_id` and
+        `unbound: true`. Residual risk: a process of the same user that learns the bound pair can
+        still pose as that client, and the activity record is not tamper-proof.
         400 `invalid_body` for a malformed body, an empty or too long `client`, or a
         `client_session_id` over 512 characters. The read-only token is accepted.
       security:

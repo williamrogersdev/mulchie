@@ -203,8 +203,9 @@ impl Engine {
 
     /// The session of `pid`: one the last sample attributed it (or an
     /// ancestor) to, else a new hook-registered root. `None` when sessions
-    /// are off or the pid is not the user's running process.
-    fn hook_session(&self, req: &HookRequest, now: u64, cfg: &Config) -> Option<String> {
+    /// are off or the pid is not the user's running process. The flag says
+    /// whether the caller is the client the session is bound to.
+    fn hook_session(&self, req: &HookRequest, now: u64, cfg: &Config) -> Option<(String, bool)> {
         if !cfg.sessions.enabled {
             return None;
         }
@@ -242,12 +243,12 @@ impl Engine {
                     .get(&id)
                     .is_some_and(|s| s.status == SessionStatus::Running);
                 if running {
-                    sup.tracker.set_client(
+                    let bound = sup.tracker.set_client(
                         &id,
                         Some(req.client.clone()),
                         req.client_session_id.clone(),
                     );
-                    return Some(id);
+                    return Some((id, bound));
                 }
             }
         }
@@ -288,7 +289,7 @@ impl Engine {
                 }),
             );
         }
-        Some(id)
+        Some((id, true))
     }
 
     /// `POST /v1/hook`.
@@ -308,7 +309,10 @@ impl Engine {
         }
         let now = now_unix();
         let cfg = self.config();
-        let sid = self.hook_session(req, now, &cfg);
+        let (sid, bound) = match self.hook_session(req, now, &cfg) {
+            Some((id, b)) => (Some(id), b),
+            None => (None, false),
+        };
         let mut reply = HookReply {
             session_id: sid.clone(),
             decision: GuardDecision::Allow,
@@ -344,7 +348,10 @@ impl Engine {
                 .extend(self.session_start_context(&cfg, ws.as_deref()));
         }
         if let Some(id) = &sid {
-            reply.breaches = lock(&self.sup).limits.take_undelivered(id);
+            // Breaches go only to the client the session is bound to.
+            if bound {
+                reply.breaches = lock(&self.sup).limits.take_undelivered(id);
+            }
             reply.context.extend(
                 reply
                     .breaches
@@ -357,19 +364,22 @@ impl Engine {
                     s.as_deref()
                         .map(|c| capped(&redact_command_line(c), RECORD_TEXT))
                 };
-                self.record_writer().event(
-                    id,
-                    now,
-                    &format!("hook_{}", req.event.code()),
-                    json!({
-                        "client": capped(&req.client, 64),
-                        "tool": req.tool.as_deref().map(|t| capped(&redact_command_line(t), 128)),
-                        "command": text(&req.command),
-                        "detail": text(&req.detail),
-                        "decision": reply.decision,
-                        "rule": reply.rule,
-                    }),
-                );
+                let mut ev = json!({
+                    "client": capped(&req.client, 64),
+                    "tool": req.tool.as_deref().map(|t| capped(&redact_command_line(t), 128)),
+                    "command": text(&req.command),
+                    "detail": text(&req.detail),
+                    "decision": reply.decision,
+                    "rule": reply.rule,
+                });
+                if !bound {
+                    // Another caller: its own client fields, flagged.
+                    ev["unbound"] = json!(true);
+                    ev["client_session_id"] =
+                        json!(req.client_session_id.as_deref().map(|c| capped(c, 512)));
+                }
+                self.record_writer()
+                    .event(id, now, &format!("hook_{}", req.event.code()), ev);
             }
         }
         Ok(reply)

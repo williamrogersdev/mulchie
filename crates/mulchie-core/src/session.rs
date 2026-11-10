@@ -446,21 +446,23 @@ impl Tracker {
         id
     }
 
-    /// Note the hook client of a session found by ancestry.
+    /// Bind a session to the first hook client that reports for it. A bound
+    /// session is never rebound or overwritten. Returns whether the caller's
+    /// `(client, client_session_id)` is the bound pair.
     pub fn set_client(
         &mut self,
         id: &str,
         client: Option<String>,
         client_session_id: Option<String>,
-    ) {
-        if let Some(s) = self.sessions.get_mut(id) {
-            if client.is_some() {
-                s.client = client;
-            }
-            if client_session_id.is_some() {
-                s.client_session_id = client_session_id;
-            }
+    ) -> bool {
+        let Some(s) = self.sessions.get_mut(id) else {
+            return false;
+        };
+        if s.client.is_none() && client.is_some() {
+            s.client = client.clone();
+            s.client_session_id = client_session_id.clone();
         }
+        s.client.is_some() && s.client == client && s.client_session_id == client_session_id
     }
 
     /// Set the listening ports of each running session from (pid, port) pairs.
