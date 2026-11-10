@@ -37,6 +37,16 @@ pub struct Config {
     pub backup_ignored_max_mb: u64,
     /// What `watch` looks for and how loudly (see [`WatchConfig`]).
     pub watch: WatchConfig,
+    /// Agent executables recognised as session roots beyond the built-in list.
+    pub agents: AgentsConfig,
+    /// Session tracking and the per-session activity record.
+    pub sessions: SessionsConfig,
+    /// Per-session budgets. Empty: report only.
+    pub limits: LimitsConfig,
+    /// Guard rules applied to shell commands sent through `POST /v1/hook`.
+    pub guard: GuardConfig,
+    /// Update and advisory checks.
+    pub updates: UpdatesConfig,
 }
 
 /// A finding id kept quiet until `until_unix` (`None`: until undismissed).
@@ -167,6 +177,397 @@ impl Default for Config {
             alert_below_gb: 50,
             backup_ignored_max_mb: 200,
             watch: WatchConfig::default(),
+            agents: AgentsConfig::default(),
+            sessions: SessionsConfig::default(),
+            limits: LimitsConfig::default(),
+            guard: GuardConfig::default(),
+            updates: UpdatesConfig::default(),
+        }
+    }
+}
+
+// ------------------------------------------------------------ agents
+
+/// Extra agent executables (see [`crate::session`]).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
+#[serde(default)]
+pub struct AgentsConfig {
+    /// Executable file names (no `/`) that start a session, matched like the
+    /// built-in list: the process name, the executable's file name, `argv[0]`,
+    /// or the script an interpreter runs.
+    pub extra: Vec<String>,
+}
+
+impl AgentsConfig {
+    pub fn validate(&self, e: &mut Vec<String>) {
+        if self.extra.len() > 64 {
+            e.push("agents.extra holds at most 64 names".into());
+        }
+        if self
+            .extra
+            .iter()
+            .any(|n| n.is_empty() || n.len() > 64 || n.contains('/') || n.trim() != n)
+        {
+            e.push(
+                "agents.extra names must be 1 to 64 characters, without '/' or surrounding spaces"
+                    .into(),
+            );
+        }
+    }
+}
+
+// ---------------------------------------------------------- sessions
+
+/// Session tracking and the activity record (`<config dir>/sessions/`).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(default)]
+pub struct SessionsConfig {
+    /// Track sessions at all. Off: no sessions, records, limits or hook mapping.
+    pub enabled: bool,
+    /// Records of ended sessions are deleted after this many days.
+    pub retain_days: u64,
+    /// One session's record stops growing at this size (a `truncated` marker
+    /// is written).
+    pub max_record_mb: u64,
+    /// ... or at this many events.
+    pub max_events: u64,
+    /// All records together; the oldest ended sessions' records go first.
+    pub max_total_mb: u64,
+    /// Process-start events written per session per minute; the rest are
+    /// summed up in one `processes_coalesced` event.
+    pub process_events_per_minute: u64,
+}
+
+impl Default for SessionsConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            retain_days: 14,
+            max_record_mb: 4,
+            max_events: 20_000,
+            max_total_mb: 200,
+            process_events_per_minute: 60,
+        }
+    }
+}
+
+impl SessionsConfig {
+    pub fn validate(&self, e: &mut Vec<String>) {
+        if !(1..=365).contains(&self.retain_days) {
+            e.push("sessions.retain_days must be between 1 and 365".into());
+        }
+        if !(1..=100).contains(&self.max_record_mb) {
+            e.push("sessions.max_record_mb must be between 1 and 100".into());
+        }
+        if !(100..=1_000_000).contains(&self.max_events) {
+            e.push("sessions.max_events must be between 100 and 1000000".into());
+        }
+        if !(10..=10_000).contains(&self.max_total_mb) {
+            e.push("sessions.max_total_mb must be between 10 and 10000".into());
+        }
+        if !(1..=10_000).contains(&self.process_events_per_minute) {
+            e.push("sessions.process_events_per_minute must be between 1 and 10000".into());
+        }
+    }
+}
+
+// ------------------------------------------------------------ limits
+
+/// What happens when a session stays over a cap for `sustain_secs`.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum LimitAction {
+    /// A finding and a notification; nothing is signalled.
+    #[default]
+    Notify,
+    /// Lower the priority of the session's processes until it is back under.
+    Deprioritize,
+    /// SIGSTOP the session's descendants; SIGCONT after `resume_after_secs`.
+    Pause,
+    /// SIGTERM the session's descendants, SIGKILL after `stop_grace_secs`.
+    Stop,
+}
+
+/// One cap.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq)]
+pub struct Cap {
+    /// The ceiling, in the cap's unit (cores, MB, processes, MB per hour, hours).
+    pub max: f64,
+    /// How long the session must stay above `max` before the action runs.
+    #[serde(default = "default_sustain")]
+    pub sustain_secs: u64,
+    #[serde(default)]
+    pub action: LimitAction,
+}
+
+fn default_sustain() -> u64 {
+    60
+}
+
+/// A budget: any subset of the caps, plus how pausing and stopping behave.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(default)]
+pub struct Budget {
+    pub cpu_cores: Option<Cap>,
+    pub memory_mb: Option<Cap>,
+    pub processes: Option<Cap>,
+    pub write_mb_per_hour: Option<Cap>,
+    pub runtime_hours: Option<Cap>,
+    /// Processes paused by a `pause` cap are resumed after this long.
+    pub resume_after_secs: u64,
+    /// Let `pause` and `stop` reach the agent's own root process too.
+    pub include_agent: bool,
+    /// Between SIGTERM and SIGKILL for a `stop` cap.
+    pub stop_grace_secs: u64,
+}
+
+impl Default for Budget {
+    fn default() -> Self {
+        Self {
+            cpu_cores: None,
+            memory_mb: None,
+            processes: None,
+            write_mb_per_hour: None,
+            runtime_hours: None,
+            resume_after_secs: 300,
+            include_agent: false,
+            stop_grace_secs: 10,
+        }
+    }
+}
+
+impl Budget {
+    /// `(name, cap)` for every cap that is set.
+    pub fn caps(&self) -> Vec<(&'static str, Cap)> {
+        [
+            ("cpu_cores", self.cpu_cores),
+            ("memory_mb", self.memory_mb),
+            ("processes", self.processes),
+            ("write_mb_per_hour", self.write_mb_per_hour),
+            ("runtime_hours", self.runtime_hours),
+        ]
+        .into_iter()
+        .filter_map(|(n, c)| c.map(|c| (n, c)))
+        .collect()
+    }
+
+    fn validate(&self, at: &str, e: &mut Vec<String>) {
+        for (name, c) in self.caps() {
+            if !c.max.is_finite() || c.max <= 0.0 || c.max > 1e9 {
+                e.push(format!("{at}.{name}.max must be a positive number"));
+            }
+            if c.sustain_secs > 86_400 {
+                e.push(format!(
+                    "{at}.{name}.sustain_secs must be between 0 and 86400"
+                ));
+            }
+        }
+        if !(10..=86_400).contains(&self.resume_after_secs) {
+            e.push(format!(
+                "{at}.resume_after_secs must be between 10 and 86400"
+            ));
+        }
+        if !(1..=300).contains(&self.stop_grace_secs) {
+            e.push(format!("{at}.stop_grace_secs must be between 1 and 300"));
+        }
+    }
+}
+
+/// A budget for every session whose workspace is at or under `path`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct WorkspaceBudget {
+    pub path: PathBuf,
+    pub budget: Budget,
+}
+
+/// `limits`: a default budget and per-workspace overrides. The override with
+/// the longest matching path replaces the default whole (caps are not merged).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(default)]
+pub struct LimitsConfig {
+    pub default: Option<Budget>,
+    pub workspaces: Vec<WorkspaceBudget>,
+    /// With or without budgets: a session using at least this share of the
+    /// machine's CPU or memory while health is strained or critical, for
+    /// `hog_sustain_secs`, becomes a `session_hog` finding (report only).
+    pub hog_share_pct: f32,
+    pub hog_sustain_secs: u64,
+}
+
+impl Default for LimitsConfig {
+    fn default() -> Self {
+        Self {
+            default: None,
+            workspaces: Vec::new(),
+            hog_share_pct: 50.0,
+            hog_sustain_secs: 120,
+        }
+    }
+}
+
+impl LimitsConfig {
+    /// The budget for a session working in `workspace`, if any.
+    pub fn budget_for(&self, workspace: Option<&Path>) -> Option<&Budget> {
+        let over = workspace.and_then(|w| {
+            self.workspaces
+                .iter()
+                .filter(|o| w.starts_with(&o.path))
+                .max_by_key(|o| o.path.components().count())
+        });
+        over.map(|o| &o.budget).or(self.default.as_ref())
+    }
+
+    /// No budget anywhere: Mulchie only reports.
+    pub fn report_only(&self) -> bool {
+        self.default.is_none() && self.workspaces.is_empty()
+    }
+
+    pub fn validate(&self, e: &mut Vec<String>) {
+        if let Some(b) = &self.default {
+            b.validate("limits.default", e);
+        }
+        if self.workspaces.len() > 256 {
+            e.push("limits.workspaces holds at most 256 entries".into());
+        }
+        for (i, w) in self.workspaces.iter().enumerate() {
+            if !w.path.is_absolute() {
+                e.push(format!("limits.workspaces[{i}].path must be absolute"));
+            }
+            w.budget
+                .validate(&format!("limits.workspaces[{i}].budget"), e);
+        }
+        if !(10.0..=100.0).contains(&self.hog_share_pct) {
+            e.push("limits.hog_share_pct must be between 10 and 100".into());
+        }
+        if !(10..=3600).contains(&self.hog_sustain_secs) {
+            e.push("limits.hog_sustain_secs must be between 10 and 3600".into());
+        }
+    }
+}
+
+// ------------------------------------------------------------- guard
+
+/// How a guard rule answers a match.
+#[derive(
+    Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash, Default, PartialOrd, Ord,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum RuleMode {
+    Off,
+    /// The client asks the user (or tells the agent).
+    #[default]
+    Warn,
+    /// The client refuses the command.
+    Block,
+}
+
+/// One mode per guard rule (see [`crate::guard`]). Every rule defaults to `warn`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
+#[serde(default)]
+pub struct GuardRules {
+    /// `rm -r` / `mv` of something outside the session's workspace, or of
+    /// home or `/`.
+    pub recursive_delete: RuleMode,
+    /// `curl … | sh` and friends.
+    pub pipe_to_shell: RuleMode,
+    /// `sudo` or `doas`.
+    pub sudo: RuleMode,
+    /// Force-push to, or delete, a protected branch; rewrite its history.
+    pub force_push: RuleMode,
+    /// Stop, unload or remove Mulchie, or edit its files.
+    pub disable_mulchie: RuleMode,
+    /// Read SSH private keys, cloud credentials, or dump the keychain.
+    pub credential_read: RuleMode,
+    /// Write shell startup files, launch agents, systemd user units or crontab.
+    pub startup_write: RuleMode,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(default)]
+pub struct GuardConfig {
+    /// Off: every command is allowed and no rule is evaluated.
+    pub enabled: bool,
+    pub rules: GuardRules,
+    /// Branch names the `force_push` rule protects.
+    pub protected_branches: Vec<String>,
+    /// Under pressure, advise wrapping recognised heavy builds in `mulchie run`.
+    pub build_advice: bool,
+}
+
+impl Default for GuardConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            rules: GuardRules::default(),
+            protected_branches: vec!["main".into(), "master".into()],
+            build_advice: true,
+        }
+    }
+}
+
+impl GuardConfig {
+    pub fn validate(&self, e: &mut Vec<String>) {
+        if self.protected_branches.len() > 64 {
+            e.push("guard.protected_branches holds at most 64 names".into());
+        }
+        if self
+            .protected_branches
+            .iter()
+            .any(|b| b.is_empty() || b.len() > 255 || b.contains(char::is_whitespace))
+        {
+            e.push(
+                "guard.protected_branches names must be 1 to 255 characters without spaces".into(),
+            );
+        }
+    }
+}
+
+// ----------------------------------------------------------- updates
+
+/// Whether update checks run. `off` makes no network request and runs no
+/// version command.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum UpdateCheck {
+    #[default]
+    On,
+    Off,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(default)]
+pub struct UpdatesConfig {
+    pub check: UpdateCheck,
+    /// Mulchie's own latest GitHub release.
+    pub mulchie: bool,
+    /// Installed agent tools (`claude`, `codex`, `gemini`, `cursor-agent`).
+    pub agents: bool,
+    /// `brew outdated`, local data only (skipped when brew is absent).
+    pub homebrew: bool,
+    /// Send lockfile package names and versions to OSV.dev. Off by default:
+    /// it tells a third party what your projects depend on.
+    pub advisories: bool,
+    /// How long results are reused before checking again.
+    pub interval_hours: u64,
+}
+
+impl Default for UpdatesConfig {
+    fn default() -> Self {
+        Self {
+            check: UpdateCheck::On,
+            mulchie: true,
+            agents: true,
+            homebrew: true,
+            advisories: false,
+            interval_hours: 24,
+        }
+    }
+}
+
+impl UpdatesConfig {
+    pub fn validate(&self, e: &mut Vec<String>) {
+        if !(6..=720).contains(&self.interval_hours) {
+            e.push("updates.interval_hours must be between 6 and 720".into());
         }
     }
 }
@@ -264,6 +665,11 @@ impl Config {
             e.push(format!("scan root {} is not absolute", r.display()));
         }
         self.watch.validate(&mut e);
+        self.agents.validate(&mut e);
+        self.sessions.validate(&mut e);
+        self.limits.validate(&mut e);
+        self.guard.validate(&mut e);
+        self.updates.validate(&mut e);
         if e.is_empty() {
             Ok(())
         } else {
@@ -617,5 +1023,97 @@ mod tests {
         assert_eq!(port_from(&cfg, Some("0")), 7777, "0 is no port");
         assert_eq!(port_from(&cfg, Some("70000")), 7777, "out of range");
         assert_eq!(port_from(&cfg, Some("abc")), 7777);
+    }
+
+    #[test]
+    fn supervision_sections_default_and_validate() {
+        let c = Config::default();
+        assert!(c.limits.report_only());
+        assert!(c.sessions.enabled && c.sessions.retain_days == 14);
+        assert_eq!(c.guard.rules.sudo, RuleMode::Warn);
+        assert_eq!(c.updates.check, UpdateCheck::On);
+        assert!(!c.updates.advisories, "advisories are opt-in");
+        // An old file without the new sections loads with their defaults.
+        let old = Config::parse(br#"{"version": 1, "stale_hours": 5}"#).unwrap();
+        assert_eq!(old.limits, LimitsConfig::default());
+        assert_eq!(old.guard, GuardConfig::default());
+        // A budget in JSON.
+        let c = Config::parse(
+            br#"{"limits": {"default": {"cpu_cores": {"max": 4, "action": "pause"},
+                 "memory_mb": {"max": 8000, "sustain_secs": 30}},
+                 "workspaces": [{"path": "/w/a", "budget": {"processes": {"max": 50, "action": "stop"}}}]},
+                 "guard": {"rules": {"recursive_delete": "block"}, "protected_branches": ["trunk"]},
+                 "updates": {"check": "off"}, "agents": {"extra": ["my-agent"]}}"#,
+        )
+        .unwrap();
+        let d = c.limits.default.as_ref().unwrap();
+        assert_eq!(d.cpu_cores.unwrap().action, LimitAction::Pause);
+        assert_eq!(d.cpu_cores.unwrap().sustain_secs, 60);
+        assert_eq!(d.memory_mb.unwrap().action, LimitAction::Notify);
+        assert_eq!(d.resume_after_secs, 300);
+        assert!(!d.include_agent);
+        let w = c.limits.budget_for(Some(Path::new("/w/a/sub"))).unwrap();
+        assert!(
+            w.cpu_cores.is_none(),
+            "an override replaces the default whole"
+        );
+        assert_eq!(w.processes.unwrap().action, LimitAction::Stop);
+        assert_eq!(
+            c.limits.budget_for(Some(Path::new("/w/b"))).unwrap(),
+            d,
+            "elsewhere the default"
+        );
+        assert_eq!(c.limits.budget_for(None).unwrap(), d);
+        assert_eq!(c.guard.rules.recursive_delete, RuleMode::Block);
+        assert_eq!(c.guard.rules.sudo, RuleMode::Warn);
+        assert_eq!(c.updates.check, UpdateCheck::Off);
+        assert!(Config::parse(
+            br#"{"limits": {"default": {"cpu_cores": {"max": 4, "action": "explode"}}}}"#
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn supervision_ranges_are_checked() {
+        let bad_cap = Cap {
+            max: -1.0,
+            sustain_secs: 100_000,
+            action: LimitAction::Stop,
+        };
+        let mut c = Config::default();
+        c.limits.default = Some(Budget {
+            cpu_cores: Some(bad_cap),
+            resume_after_secs: 1,
+            stop_grace_secs: 0,
+            ..Budget::default()
+        });
+        c.limits.workspaces.push(WorkspaceBudget {
+            path: "rel".into(),
+            budget: Budget::default(),
+        });
+        c.limits.hog_share_pct = 5.0;
+        c.sessions.retain_days = 0;
+        c.sessions.max_events = 1;
+        c.guard.protected_branches = vec!["".into()];
+        c.updates.interval_hours = 1;
+        c.agents.extra = vec!["a/b".into()];
+        let errs = c.validate().unwrap_err();
+        for want in [
+            "limits.default.cpu_cores.max",
+            "limits.default.cpu_cores.sustain_secs",
+            "limits.default.resume_after_secs",
+            "limits.default.stop_grace_secs",
+            "limits.workspaces[0].path",
+            "limits.hog_share_pct",
+            "sessions.retain_days",
+            "sessions.max_events",
+            "guard.protected_branches",
+            "updates.interval_hours",
+            "agents.extra",
+        ] {
+            assert!(errs.iter().any(|e| e.contains(want)), "{want}: {errs:?}");
+        }
+        let nan = Config::parse(br#"{"limits": {"default": {"cpu_cores": {"max": 0}}}}"#);
+        assert!(matches!(nan, Err(ConfigError::Invalid(_))));
     }
 }

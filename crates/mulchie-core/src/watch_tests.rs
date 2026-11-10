@@ -685,6 +685,7 @@ fn finding(id: &str, sev: Severity, exe: Option<&str>) -> Finding {
     Finding {
         id: id.into(),
         kind: FindingKind::OrphanedProcess,
+        category: FindingCategory::Hygiene,
         severity: sev,
         title: "t".into(),
         why: "w".into(),
@@ -870,6 +871,7 @@ fn finding_json_shape() {
     let f = Finding {
         id: "exposed_listener:10:5".into(),
         kind: FindingKind::ExposedListener,
+        category: FindingCategory::Security,
         severity: Severity::Medium,
         title: "t".into(),
         why: "w".into(),
@@ -895,6 +897,7 @@ fn finding_json_shape() {
     };
     let v = serde_json::to_value(&f).unwrap();
     assert_eq!(v["kind"], "exposed_listener");
+    assert_eq!(v["category"], "security");
     assert_eq!(v["severity"], "medium");
     assert_eq!(
         v["evidence"],
@@ -904,4 +907,22 @@ fn finding_json_shape() {
     let back: Finding = serde_json::from_value(v).unwrap();
     assert_eq!(back, f);
     println!("{}", serde_json::to_string_pretty(&f).unwrap());
+}
+
+#[test]
+fn every_kind_has_a_category_and_old_json_still_parses() {
+    assert_eq!(
+        FindingKind::LimitExceeded.category(),
+        FindingCategory::Limit
+    );
+    assert_eq!(FindingKind::Advisory.category(), FindingCategory::Update);
+    assert_eq!(FindingKind::ApiExposed.category(), FindingCategory::Posture);
+    assert_eq!(FindingKind::RunawayCpu.category(), FindingCategory::Hygiene);
+    // A finding serialized before `category` existed still loads.
+    let mut v = serde_json::to_value(finding("x", Severity::Low, None)).unwrap();
+    v.as_object_mut().unwrap().remove("category");
+    let f: Finding = serde_json::from_value(v).unwrap();
+    // finalize sets it from the kind.
+    let (out, _) = finalize(vec![f], &[], &WatchConfig::default(), NOW);
+    assert_eq!(out[0].category, FindingCategory::Hygiene);
 }

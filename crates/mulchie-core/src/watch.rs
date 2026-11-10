@@ -64,6 +64,18 @@ pub enum FindingKind {
     EngineLockNotHeld,
     /// The config file was not used (parse or validation error).
     ConfigNotLoaded,
+    /// An agent session stayed over a cap of its budget (`limits`).
+    LimitExceeded,
+    /// An agent session holds most of the machine while health is poor.
+    SessionHog,
+    /// A newer Mulchie release is out.
+    MulchieUpdate,
+    /// A newer version of an installed agent tool is out.
+    AgentUpdate,
+    /// Homebrew packages are outdated (local data only).
+    HomebrewOutdated,
+    /// A package in a workspace lockfile has a known vulnerability (OSV.dev).
+    Advisory,
 }
 
 impl FindingKind {
@@ -73,6 +85,50 @@ impl FindingKind {
             .and_then(|v| v.as_str().map(String::from))
             .unwrap_or_default()
     }
+
+    /// Which family the kind belongs to.
+    pub fn category(self) -> FindingCategory {
+        use FindingKind::*;
+        match self {
+            ExecutableChanged
+            | ExposedListener
+            | TempExecutable
+            | HiddenDirExecutable
+            | SystemNameMismatch
+            | UnsignedExecutable
+            | QuarantinedExecutable => FindingCategory::Security,
+            OrphanedProcess
+            | MissingWorkingDirectory
+            | StaleProcess
+            | StoppedProcess
+            | RunawayCpu
+            | GrowingMemory => FindingCategory::Hygiene,
+            InsecurePermissions | ApiExposed | EngineLockNotHeld | ConfigNotLoaded => {
+                FindingCategory::Posture
+            }
+            LimitExceeded | SessionHog => FindingCategory::Limit,
+            MulchieUpdate | AgentUpdate | HomebrewOutdated | Advisory => FindingCategory::Update,
+        }
+    }
+}
+
+/// The family of a finding: what kind of attention it asks for.
+#[derive(
+    Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash, PartialOrd, Ord, Default,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum FindingCategory {
+    /// Something about a process may be unsafe (exposed, unsigned, odd place).
+    Security,
+    /// Left over, runaway or stuck work.
+    #[default]
+    Hygiene,
+    /// Mulchie's own setup.
+    Posture,
+    /// An agent session over its budget or hogging the machine.
+    Limit,
+    /// Updates and advisories.
+    Update,
 }
 
 /// macOS code signature of an executable, as `codesign` reports it.
@@ -190,6 +246,9 @@ pub struct Finding {
     /// process, `<kind>:<path or name>` otherwise.
     pub id: String,
     pub kind: FindingKind,
+    /// Always `kind.category()`; set when findings are finalized.
+    #[serde(default)]
+    pub category: FindingCategory,
     pub severity: Severity,
     /// One sentence, an observation.
     pub title: String,
@@ -878,6 +937,7 @@ impl<'a> Det<'a> {
         let evidence = self.evidence(p);
         self.out.push(Finding {
             id: format!("{}:{}:{}", kind.code(), p.pid, p.start_time),
+            category: kind.category(),
             kind,
             severity,
             title,
@@ -902,6 +962,7 @@ impl<'a> Det<'a> {
     ) {
         self.out.push(Finding {
             id: format!("{}:{id}", kind.code()),
+            category: kind.category(),
             kind,
             severity,
             title,
@@ -1453,6 +1514,7 @@ pub fn finalize(
     let prev_by: HashMap<&str, &Finding> = prev.iter().map(|f| (f.id.as_str(), f)).collect();
     let mut out: Vec<Finding> = Vec::with_capacity(raw.len());
     for mut f in raw {
+        f.category = f.kind.category();
         if cfg.allow_ids.iter().any(|a| a == &f.id) {
             continue;
         }
