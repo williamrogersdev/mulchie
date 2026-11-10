@@ -1,13 +1,42 @@
 // Findings ("needs attention") and status notices about Mulchie itself.
 import { st } from './store.js';
-import { esc, B, P, ago, clock } from './util.js';
+import { esc, B, ago, clock } from './util.js';
 import { cpuSummary, memSummary, ranked } from './consumers.js';
 
+// The engine's watch findings ("observations"), most severe first. Dismissed
+// ones only when asked for.
+export const SEV_LVL = { high: 'bad', medium: 'warn', low: 'info', info: 'info' };
+export const SEV_TEXT = { high: 'high', medium: 'medium', low: 'low', info: 'info' };
+export function watchFindings(S, dismissed = false) {
+  return (S?.findings || []).filter(f => !!f.dismissed === dismissed);
+}
+
+// The short button for a suggestion: what it does, not the whole sentence.
+export function suggestionLabel(sg) {
+  const r = sg.request;
+  if (!r) return sg.api ? 'Dismiss…' : sg.label;
+  if (r.action === 'signal') return { term: 'Quit…', kill: 'Force quit…', stop: 'Pause…', cont: 'Resume…' }[r.signal] || sg.label;
+  if (r.action === 'renice') return 'Lower priority…';
+  return sg.label;
+}
+
+// A watch finding as a "needs attention" row: opens its detail, and its
+// first suggestion with a request is the primary action.
+function fromWatch(f) {
+  const i = f.suggested.findIndex(sg => sg.request);
+  return {
+    lvl: SEV_LVL[f.severity] || 'info', t: f.title, d: f.why, open: ['finding', f.id],
+    act: i >= 0 ? { label: suggestionLabel(f.suggested[i]), run: `fx:${i}:${f.id}` } : { label: 'Details', run: `d:finding:${f.id}` },
+  };
+}
+
 // What needs attention, each with where it leads (`open`: a detail, or `go`:
-// a view) and one primary action (`act`: a runner name main.js knows).
+// a view) and one primary action (`act`: a runner name main.js knows): the
+// engine's findings first, then disk, CPU and memory pressure.
 export function findings() {
   const S = st.S, out = [], s = S.snapshot, c = S.config;
   if (!s.disk_total || !c) return out;
+  out.push(...watchFindings(S).filter(f => f.severity !== 'info').map(fromWatch));
   const stale = S.scan?.stale_bytes || 0, n = S.diskmap?.worktrees?.filter(w => w.sweepable).length || 0;
   const diskAct = stale ? { label: 'Clear stale…', run: 'stale' } : n ? { label: 'Sweep…', run: 'sweep' } : { label: 'Show disk', run: 'go:disk' };
   const free = s.disk_free / 1e9;
@@ -23,8 +52,6 @@ export function findings() {
     const sum = memSummary(S), top = ranked(S, 'mem_bytes')[0];
     out.push({ lvl: mp < c.throttle_mem_free_pct ? 'bad' : 'warn', t: mp < c.throttle_mem_free_pct ? `Memory pressure: ${mp.toFixed(0)}% available` : `${B(s.swap_used)} in swap`, d: sum.headline, open: ['mem', ''], act: top ? { label: `Show ${top.short}`, run: `d:group:${top.key}` } : { label: 'Show memory', run: 'd:mem:' } });
   }
-  for (const w of s.workspaces.filter(w => w.orphan)) out.push({ lvl: 'warn', t: `Orphaned: ${w.label}`, d: `${w.orphan} · ${P(w.cpu_pct)} CPU, ${B(w.mem_bytes)}`, open: ['ws', w.path], act: { label: 'Stop…', run: `stop:${w.path}` } });
-  for (const w of s.workspaces.filter(w => w.paused)) out.push({ lvl: 'warn', t: `Paused: ${w.label}`, d: 'Its processes are stopped (SIGSTOP). Resume or close it out.', open: ['ws', w.path], act: { label: 'Show', run: `d:ws:${w.path}` } });
   if (n) out.push({ lvl: 'warn', t: `${n} idle agent worktree(s), ${B(S.diskmap.sweepable_bytes)}`, d: `Idle ${c.worktree_idle_days}+ days. A sweep keeps branches and saves patches.`, go: 'disk', act: { label: 'Sweep…', run: 'sweep' } });
   if (stale > 1e9) out.push({ lvl: 'warn', t: `${B(stale)} of stale build caches`, d: 'Unused within the stale window, with no agent running in the project.', go: 'disk', act: { label: 'Clean…', run: 'stale' } });
   if (S.throttled) out.push({ lvl: 'ok', t: `${S.throttled} build process(es) at lower priority`, d: 'The optimizer reniced them under pressure.', open: ['agents', ''], act: { label: 'Show', run: 'd:agents:' } });
@@ -37,7 +64,7 @@ const target = f => f.open ? `data-d="${esc(f.open[0])}" data-dk="${esc(f.open[1
 
 export function findingsHtml(list, compact) {
   if (!list.length) return '<div class="empty" style="padding:12px">Nothing needs attention.</div>';
-  return list.slice(0, compact ? 5 : 99).map(f =>
+  return list.slice(0, compact ? 3 : 99).map(f =>
     `<div class="finding"><span class="ic" style="background:var(--${f.lvl})"></span><div class="t" role="button" tabindex="0" ${target(f)}><div>${esc(f.t)}</div>${compact ? '' : `<div class="muted">${esc(f.d)}</div>`}</div>${f.act ? `<button class="btn sm" data-run="${esc(f.act.run)}">${esc(f.act.label)}</button>` : ''}</div>`).join('');
 }
 
@@ -64,7 +91,7 @@ export function notices() {
   if (!S) return out;
   if (S.config_error) {
     out.push(['bad', 'Your settings file is invalid, so Mulchie runs on safe defaults',
-      `${S.config_error}. The file is left as it is and not overwritten; automatic cleanup and sweeping are off until it is fixed. ${conn?.mode === 'client' ? 'Fix the file by hand and restart the engine.' : 'Fix the file by hand and restart Mulchie, or save Settings here (the invalid file is kept beside the new one).'}`, 'settings']);
+      `${S.config_error}. The file is left as it is and not overwritten; automatic cleanup and sweeping are off until it is fixed. Fix the file by hand, or save Settings here${conn?.mode === 'client' ? ' (saved through the running engine)' : ''}; the invalid file is kept beside the new one.`, 'settings']);
   }
   if (S.health === 'stale') {
     const age = S.sample_age_secs;
@@ -82,8 +109,16 @@ export function notices() {
       conn?.mode === 'client' ? 'The engine this app is connected to runs with automation off.' : 'Automatic cleanup, sweeping and build throttling are not running on this engine.']);
   }
   if (S.restore_failed) {
-    out.push(['warn', 'Some builds are still at lower priority',
+    out.push(['warn', `${S.restore_failed} build process(es) are still at lower priority`,
       'Mulchie lowered their priority under pressure and macOS would not let it raise it back without admin rights. They return to normal when they exit; restart them to restore it sooner.', 'activity']);
+  }
+  if (S.journal_error) {
+    out.push(['bad', 'Mulchie cannot write its action log',
+      `${sentence(S.journal_error)} Actions still run, but the Activity view and the restore steps miss them until this is fixed.`, 'activity']);
+  }
+  if (S.scan_stale) {
+    out.push(['warn', 'The disk figures are old',
+      `The last completed disk scan was ${S.scan_age_secs != null ? ago(Date.now() / 1000 - S.scan_age_secs) + ' ago' : 'a while ago'}; scans may be failing or taking very long. Rescan from the Disk view.`, 'disk']);
   }
   return out;
 }

@@ -23,11 +23,19 @@ const ENDPOINTS = [
   ['POST', '/v1/sweep', 'full token', '{items:[…]} from the sweep plan'],
   ['POST', '/v1/worktree/plan', 'any token', '{paths:[…], allow_dirty} → plan'],
   ['POST', '/v1/worktree/remove', 'full token', '{items:[…]} from the worktree plan'],
-  ['POST', '/v1/process', 'full token', '{pid, action: term|kill|stop|cont|renice, nice?}'],
+  ['POST', '/v1/process/plan', 'any token', '{pid, signal?, tree?} or {group, action} → plan with affected processes'],
+  ['POST', '/v1/process/execute', 'full token', '{items:[…]} from a process plan'],
+  ['GET', '/v1/process/{pid}', 'any token', 'cwd, parents, children, listening ports, signature, findings'],
+  ['POST', '/v1/process', 'full token', '{pid, action, expected_start_time} (one signal or renice)'],
   ['POST', '/v1/workspace', 'full token', '{path, action: pause|resume|deprioritize|stop_builds|kill_all}'],
+  ['GET', '/v1/findings', 'any token', 'observations (?severity=&kind=&dismissed=1), counts'],
+  ['POST', '/v1/findings/dismiss', 'full token', '{id, days?} → until_unix'],
+  ['POST', '/v1/findings/undismiss', 'full token', '{id}'],
+  ['GET', '/v1/config', 'any token', '{config, config_error, path}'],
+  ['PUT', '/v1/config', 'full token', '{config} (the whole config) → saved and applied'],
   ['POST', '/v1/prune', 'full token', '{key: npm|bun|pnpm|yarn|uv|pip|homebrew|go|simulators}'],
-  ['POST', '/v1/lease', 'full token', '{label, pid?, ttl_secs?, ticket?} → granted, jobs, position'],
-  ['POST', '/v1/release', 'full token', '{ticket}'],
+  ['POST', '/v1/lease', 'any token*', '{label, pid?, ttl_secs?, ticket?} → granted, jobs, position, release_secret'],
+  ['POST', '/v1/release', 'any token*', '{ticket, secret} (the release_secret from the lease reply)'],
 ];
 
 export async function renderAgents() {
@@ -57,5 +65,6 @@ Many agents run on this machine at once. Mulchie (MCP server "mulchie", or the \
   \`mulchie run --label "<repo>: <task>" -- <command>\`
 - Do not delete worktrees or caches by hand. Use \`sweep_worktrees\` or \`clean_caches\`, which keep branches and back up uncommitted work.
 - When the machine is slow, check \`top_processes\` and \`list_workspaces\` before stopping anything.`;
-  $('#endpoints').innerHTML = th([{ l: 'Method', w: '62px' }, { l: 'Path', w: '170px' }, { l: 'Auth', w: '86px', c: 'c-md' }, { l: 'Body / returns' }]) + ENDPOINTS.map(e => `<tr><td class="mono">${e[0]}</td><td class="mono">${e[1]}</td><td class="dim c-md">${e[2]}</td><td class="muted wrap">${esc(e[3])}</td></tr>`).join('');
+  $('#endpoints').innerHTML = th([{ l: 'Method', w: '62px' }, { l: 'Path', w: '170px' }, { l: 'Auth', w: '86px', c: 'c-md' }, { l: 'Body / returns' }]) + ENDPOINTS.map(e => `<tr><td class="mono">${e[0]}</td><td class="mono">${e[1]}</td><td class="dim c-md">${e[2]}</td><td class="muted wrap">${esc(e[3])}</td></tr>`).join('') +
+    '<tr><td colspan="4" class="dim wrap">* The read-only token may take a build slot only with ttl_secs and no pid, and release it only with the lease’s release_secret.</td></tr>';
 }

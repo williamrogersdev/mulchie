@@ -108,9 +108,22 @@ fn second_backend_is_a_client_and_acts_through_the_api() {
         .unwrap_err()
         .contains("not a ready item"));
 
-    // Settings belong to the engine.
-    let err = b.set_config(Config::default()).unwrap_err();
-    assert!(err.contains("config.json"), "{err}");
+    // Settings save through the engine's PUT /v1/config.
+    let mut cfg = a.state().unwrap()["config"].clone();
+    cfg["low_disk_gb"] = json!(33);
+    cfg["watch"]["allow_ids"] = json!(["runaway_cpu:1:2"]);
+    b.set_config(serde_json::from_value(cfg).unwrap()).unwrap();
+    let saved = a.state().unwrap()["config"].clone();
+    assert_eq!(saved["low_disk_gb"], 33);
+    assert_eq!(saved["watch"]["allow_ids"][0], "runaway_cpu:1:2");
+    // An invalid config is refused with the engine's reason.
+    let mut bad = saved.clone();
+    bad["watch"]["runaway_minutes"] = json!(0);
+    if let Ok(bad) = serde_json::from_value::<Config>(bad) {
+        if bad.validate().is_err() {
+            assert!(b.set_config(bad).is_err());
+        }
+    }
 
     // The engine journaled the client's action.
     let actions = a.state().unwrap()["actions"].clone();
@@ -235,6 +248,23 @@ fn plan_book_accepts_subsets_of_the_last_plan_only() {
     // A new plan replaces the old one.
     book.record(Batch::Clean, &plan);
     book.take(Batch::Clean, &[req("/a"), req("/b")]).unwrap();
+
+    // Process plans are kept per target, so two can wait for approval.
+    let sig = |pid| Request::Signal {
+        pid,
+        signal: mulchie_core::safety::Signal::Stop,
+        expected_start_time: 7,
+    };
+    book.record_process("pid 5", vec![sig(5)]);
+    book.record_process("app:/A.app", vec![sig(6), sig(8)]);
+    assert!(book.take(Batch::Process, &[sig(9)]).is_err());
+    assert!(book.take(Batch::Clean, &[sig(5)]).is_err(), "wrong kind");
+    book.take(Batch::Process, &[sig(8), sig(5)]).unwrap();
+    assert!(book.take(Batch::Process, &[sig(5)]).is_err(), "used once");
+    // A new plan for a target replaces that target's items only.
+    book.record_process("app:/A.app", vec![sig(8)]);
+    assert!(book.take(Batch::Process, &[sig(6)]).is_err());
+    book.take(Batch::Process, &[sig(8)]).unwrap();
 }
 
 #[test]
@@ -335,12 +365,15 @@ fn reveal_allows_reported_paths_and_backups_only() {
     std::fs::write(&patch, "x").unwrap();
     let ws = f.root.join("ws");
     std::fs::create_dir_all(&ws).unwrap();
+    let app = f.root.join("Some.app");
+    std::fs::create_dir_all(&app).unwrap();
     let st = json!({
-        "snapshot": {"workspaces": [{"path": ws}]},
+        "snapshot": {"workspaces": [{"path": ws}], "consumers": {"by_cpu": [], "by_mem": [{"bundle_path": app}]}},
         "scan": {"items": []},
         "diskmap": null
     });
     assert!(revealable(&st, &ws, &backups));
+    assert!(revealable(&st, &app, &backups), "an app the engine ranked");
     assert!(revealable(&st, &patch, &backups));
     assert!(revealable(&st, &backups, &backups));
     assert!(!revealable(&st, &f.root, &backups));
@@ -372,29 +405,136 @@ fn failures_drop_the_connection_only_when_it_is_really_gone() {
     assert_eq!(backend::failure_kind(&e(400, "bad_request")), None);
 }
 
-#[test]
-fn signals_need_the_start_time_the_user_saw() {
-    let st = json!({"snapshot": {
-        "top": [{"pid": 10, "start_time": 100}],
-        "workspaces": [{"procs": [{"pid": 20, "start_time": 200}]}]
-    }});
-    assert!(backend::check_process(&st, 10, 100).is_ok());
-    assert!(backend::check_process(&st, 20, 200).is_ok());
-    let reused = backend::check_process(&st, 10, 999).unwrap_err();
-    assert!(reused.contains("different process"), "{reused}");
-    assert!(backend::check_process(&st, 30, 1)
-        .unwrap_err()
-        .contains("no longer"));
+/// A throwaway child to signal, listed in the engine's (fake) process table
+/// with a start time of 1000.
+fn sleeper(f: &Fixture) -> (std::process::Child, Options) {
+    let child = std::process::Command::new("sleep")
+        .arg("30")
+        .spawn()
+        .unwrap();
+    let procs = FakeProcesses::empty().with(child.id(), "sleep", Some(f.root.clone()), 1000);
+    let opts = Options {
+        procs: Some(Arc::new(procs)),
+        ..f.opts()
+    };
+    (child, opts)
+}
 
-    // Through the backend: a process the engine does not list is refused
-    // before anything is sent.
+fn gone_within(child: &mut std::process::Child, secs: u64) -> bool {
+    let end = std::time::Instant::now() + Duration::from_secs(secs);
+    while std::time::Instant::now() < end {
+        if child.try_wait().unwrap().is_some() {
+            return true;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    false
+}
+
+#[test]
+fn signals_go_through_a_process_plan_and_only_its_items() {
+    let f = fixture();
+    let (mut child, opts) = sleeper(&f);
+    let pid = child.id();
+    let a = Backend::start(f.paths.clone(), opts.clone());
+    let b = Backend::start(
+        f.paths.clone(),
+        Options {
+            takeover_after: Duration::from_secs(3600),
+            ..opts
+        },
+    );
+    assert_eq!(b.mode(), Mode::Client);
+
+    let req = |pid: u32, signal: &str| -> ProcessPlanRequest {
+        serde_json::from_value(json!({ "pid": pid, "signal": signal })).unwrap()
+    };
+    // Nothing is accepted before a plan, nor a request the plan did not offer.
+    let term = Request::Signal {
+        pid,
+        signal: mulchie_core::safety::Signal::Term,
+        expected_start_time: 1000,
+    };
+    assert!(b.execute(Batch::Process, vec![term.clone()]).is_err());
+
+    // Plan through the client: one ready item, carrying the start time seen.
+    let plan = b.process_plan(req(pid, "term")).unwrap();
+    assert_eq!(plan["ready"], true, "{plan}");
+    assert_eq!(plan["affected"][0]["start_time"], 1000);
+    let items = backend::ready_requests(&plan);
+    assert_eq!(items, vec![term.clone()]);
+    // Same pid, different start time: not the confirmed process.
+    let reused = Request::Signal {
+        pid,
+        signal: mulchie_core::safety::Signal::Term,
+        expected_start_time: 999,
+    };
+    assert!(b
+        .execute(Batch::Process, vec![reused])
+        .unwrap_err()
+        .contains("not a ready item"));
+    // A process request is not a cache batch.
+    assert!(b.execute(Batch::Clean, items.clone()).is_err());
+    let res = b.execute(Batch::Process, items.clone()).unwrap();
+    assert!(res[0].is_done(), "{res:?}");
+    assert!(gone_within(&mut child, 5), "the sleeper got SIGTERM");
+    assert!(b.execute(Batch::Process, items).is_err(), "used once");
+
+    // pid 1 is never planned as ready.
+    let init = a.process_plan(req(1, "term")).unwrap();
+    assert_eq!(init["ready"], false, "{init}");
+    assert!(backend::ready_requests(&init).is_empty());
+    drop(b);
+    a.shutdown();
+}
+
+#[test]
+fn process_detail_and_renice_check_the_process() {
+    let f = fixture();
+    let (mut child, opts) = sleeper(&f);
+    let pid = child.id();
+    let a = Backend::start(f.paths.clone(), opts);
+    let d = a.process_detail(pid).unwrap().unwrap();
+    assert_eq!(d["pid"], pid);
+    assert_eq!(d["start_time"], 1000);
+    assert!(d["parents"].is_array() && d["findings"].is_array(), "{d}");
+    assert!(a.process_detail(u32::MAX - 1).unwrap().is_none());
+    // A renice for a start time the process does not have is skipped.
+    let r = a.renice(pid, 999, 10).unwrap();
+    assert!(!r.is_done(), "{r:?}");
+    let _ = child.kill();
+    let _ = child.wait();
+    a.shutdown();
+}
+
+#[test]
+fn findings_dismiss_and_undismiss_through_the_config() {
     let f = fixture();
     let a = Backend::start(f.paths.clone(), f.opts());
-    let err = a
-        .process_action(std::process::id(), 1, ProcAction::Cont)
-        .unwrap_err();
-    assert!(err.contains("nothing was sent"), "{err}");
+    let b = Backend::start(
+        f.paths.clone(),
+        Options {
+            takeover_after: Duration::from_secs(3600),
+            ..f.opts()
+        },
+    );
+    let id = "stale_process:42:1000";
+    let until = b.dismiss_finding(id, Some(2)).unwrap();
+    assert!(until > now() + 86_000 && until <= now() + 2 * 86_400 + 5);
+    let cfg = a.state().unwrap()["config"]["watch"]["dismissed"].clone();
+    assert_eq!(cfg[0]["id"], id, "{cfg}");
+    assert!(b.dismiss_finding(id, Some(0)).is_err(), "days 1 to 3650");
+    assert!(b.undismiss_finding(id).unwrap());
+    assert!(!a.undismiss_finding(id).unwrap());
+    drop(b);
     a.shutdown();
+}
+
+fn now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs()
 }
 
 #[test]

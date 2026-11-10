@@ -5,8 +5,8 @@ mod update;
 mod view;
 
 use backend::{Backend, Batch, ConnInfo, Mode, Options, PlanRequest, TrayInfo};
-use mulchie_core::engine::ProcAction;
-use mulchie_core::{human_bytes, ActionResult, Config, Paths, Plan, Request, WorkspaceAction};
+use mulchie_core::procplan::ProcessPlanRequest;
+use mulchie_core::{human_bytes, ActionResult, Config, Paths, Plan, Request};
 use serde::Serialize;
 use serde_json::{json, Value};
 use std::path::{Path, PathBuf};
@@ -60,7 +60,9 @@ async fn get_history(b: B<'_>, since: Option<u64>) -> Result<Vec<Value>, String>
 async fn get_config(b: B<'_>) -> Result<Value, String> {
     blocking(&b, |b| {
         let mut v = view::config_view(&b.state()?);
-        v["editable"] = json!(b.mode() == Mode::Engine);
+        // The engine here saves directly; a client saves through the running
+        // engine's PUT /v1/config.
+        v["editable"] = json!(b.mode() != Mode::Disconnected);
         v["path"] = json!(b.paths().config_file());
         Ok(v)
     })
@@ -92,23 +94,30 @@ async fn prune(b: B<'_>, key: String) -> Result<Value, String> {
     blocking(&b, move |b| b.prune(&key)).await
 }
 
+/// `{pid, signal?, tree?}` or `{group, action}`; see `ProcessPlanRequest`.
 #[tauri::command]
-async fn workspace_action(
-    b: B<'_>,
-    path: String,
-    action: WorkspaceAction,
-) -> Result<usize, String> {
-    blocking(&b, move |b| b.workspace_action(Path::new(&path), action)).await
+async fn process_plan(b: B<'_>, request: ProcessPlanRequest) -> Result<Value, String> {
+    blocking(&b, move |b| b.process_plan(request)).await
 }
 
 #[tauri::command]
-async fn process_action(
-    b: B<'_>,
-    pid: u32,
-    start_time: u64,
-    action: ProcAction,
-) -> Result<(), String> {
-    blocking(&b, move |b| b.process_action(pid, start_time, action)).await
+async fn renice(b: B<'_>, pid: u32, start_time: u64, nice: i32) -> Result<ActionResult, String> {
+    blocking(&b, move |b| b.renice(pid, start_time, nice)).await
+}
+
+#[tauri::command]
+async fn process_detail(b: B<'_>, pid: u32) -> Result<Option<Value>, String> {
+    blocking(&b, move |b| b.process_detail(pid)).await
+}
+
+#[tauri::command]
+async fn dismiss_finding(b: B<'_>, id: String, days: Option<u64>) -> Result<u64, String> {
+    blocking(&b, move |b| b.dismiss_finding(&id, days)).await
+}
+
+#[tauri::command]
+async fn undismiss_finding(b: B<'_>, id: String) -> Result<bool, String> {
+    blocking(&b, move |b| b.undismiss_finding(&id)).await
 }
 
 #[tauri::command]
@@ -237,6 +246,14 @@ fn revealable(state: &Value, p: &Path, backups: &Path) -> bool {
         || any(&state["scan"]["items"], &["path", "project"])
         || any(&state["diskmap"]["worktrees"], &["path"])
         || any(&state["diskmap"]["categories"], &["path"])
+        || any(
+            &state["snapshot"]["consumers"]["by_cpu"],
+            &["bundle_path", "workspace"],
+        )
+        || any(
+            &state["snapshot"]["consumers"]["by_mem"],
+            &["bundle_path", "workspace"],
+        )
         || p == backups
     {
         return true;
@@ -456,8 +473,11 @@ fn main() {
             plan,
             execute,
             prune,
-            workspace_action,
-            process_action,
+            process_plan,
+            renice,
+            process_detail,
+            dismiss_finding,
+            undismiss_finding,
             set_config,
             integration,
             install_cli,

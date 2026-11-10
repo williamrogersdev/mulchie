@@ -12,10 +12,10 @@ import { renderActs } from './views/activity.js';
 import { renderAgents, loadIntegration } from './views/agents.js';
 import { renderSettings, saveCfg } from './views/settings.js';
 import { renderPanel } from './views/panel.js';
-import { openDetail, closeDetail, detailOpen, renderDetail, detailAction, copyText, NEEDS_ACTIONS } from './detail.js';
-import { findings } from './findings.js';
+import { openDetail, closeDetail, detailOpen, renderDetail, detailAction, copyText, runSuggestion, NEEDS_ACTIONS } from './detail.js';
+import { findings, watchFindings } from './findings.js';
 import { cpuSummary, memSummary, ranked } from './consumers.js';
-import { signalProcs } from './signals.js';
+import { groupAction } from './signals.js';
 
 const POLL_MS = 3000;
 const VIEWS = ['overview', 'processes', 'workspaces', 'disk', 'activity', 'agents', 'settings'];
@@ -139,7 +139,11 @@ function run(name) {
   if (name.startsWith('d:')) return go(name);
   if (name.startsWith('stop:')) {
     const w = st.S?.snapshot.workspaces.find(x => x.path === name.slice(5));
-    return signalProcs(w ? w.procs : [], 'term', w?.label);
+    return groupAction('workspace:' + name.slice(5), 'quit', w?.label || name.slice(5));
+  }
+  if (name.startsWith('fx:')) {
+    const [, i, ...id] = name.split(':');
+    return runSuggestion(i, id.join(':'));
   }
 }
 
@@ -163,7 +167,7 @@ async function copy(text, what = 'Copied') {
 // disk, what needs attention, and how to reach Mulchie.
 function overviewCopy() {
   const S = st.S, s = S.snapshot, cs = cpuSummary(S), ms = memSummary(S);
-  const top = (by, n) => ranked(S, by).slice(0, n).map(c => ({ label: c.label, kind: c.kind, cpu_pct: Math.round(c.cpu_pct), mem_bytes: c.mem_bytes, path: c.path || undefined }));
+  const top = (by, n) => ranked(S, by).slice(0, n).map(c => ({ key: c.key, label: c.label, kind: c.kind, cpu_pct: Math.round(c.cpu_pct), mem_bytes: c.mem_bytes, path: c.path || undefined, actions: c.actions, protected: c.protected }));
   return copyText('machine overview', {
     health: S.health, engine: st.conn?.mode, api_port: st.conn?.port,
     cpu: { headline: cs.headline, cpu_pct: s.cpu_pct, cores: s.cpu_count, load: s.load, top: top('cpu_pct', 5) },
@@ -171,7 +175,8 @@ function overviewCopy() {
     disk: { free: s.disk_free, total: s.disk_total, stale_cache_bytes: S.scan?.stale_bytes || 0, sweepable_worktree_bytes: S.diskmap?.sweepable_bytes || 0 },
     agents: s.agent_count, builds: s.build_count, build_slots: { active: S.slots.active.length, capacity: S.slots.capacity, waiting: S.slots.waiting.length },
     needs_attention: findings().map(f => f.t),
-    next: 'Use the mulchie MCP tools (can_i_build, top_processes, list_workspaces, sweep_worktrees) or `mulchie advice`.',
+    observations: watchFindings(S).map(f => ({ id: f.id, severity: f.severity, title: f.title })),
+    next: 'Call the mulchie MCP tool diagnose first; act on processes with a process plan, then execute_plan with the approved items.',
   });
 }
 

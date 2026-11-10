@@ -43,11 +43,12 @@ export function renderPanel() {
     $('#pDiskS').textContent = S.forecast?.hours_to_full != null ? `full in ~${S.forecast.hours_to_full.toFixed(0)} h` : `of ${B(s.disk_total, 0)}`;
     $('#pAg').textContent = `${s.agent_count} · ${s.build_count}`;
     $('#pAgS').textContent = `slots ${S.slots.active.length}/${S.slots.capacity}${S.slots.waiting.length ? ` · ${S.slots.waiting.length} queued` : ''}`;
-    $('#pCpuTop').innerHTML = barsHtml(S, 'cpu_pct', 4);
-    $('#pMemTop').innerHTML = barsHtml(S, 'mem_bytes', 4);
-    const f = findings();
-    $('#pFindW').style.display = f.length ? '' : 'none';
+    $('#pCpuTop').innerHTML = barsHtml(S, 'cpu_pct', 3);
+    $('#pMemTop').innerHTML = barsHtml(S, 'mem_bytes', 3);
+    const f = findings(), c = S.finding_counts;
+    $('#pFindW').style.display = f.length || c?.high || c?.medium || c?.low ? '' : 'none';
     $('#pFind').innerHTML = findingsHtml(f, true);
+    $('#pWatch').innerHTML = c && (c.high + c.medium + c.low + c.info) ? `<a class="lnk" role="button" tabindex="0" data-d="findings" data-dk="" title="Open the list of observations">Observations: ${[['high', c.high, 'bad'], ['medium', c.medium, 'warn'], ['low', c.low, 'info'], ['info', c.info, 'info']].filter(x => x[1]).map(([l, n, k]) => `<span class="${k}">${n} ${l}</span>`).join(' · ')}</a>` : '';
   }
   fit();
 }

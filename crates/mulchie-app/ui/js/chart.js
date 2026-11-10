@@ -1,6 +1,6 @@
 // Canvas line charts, sparklines and the panel's mini charts.
 import { st } from './store.js';
-import { esc, clock } from './util.js';
+import { esc, clock, css } from './util.js';
 
 export function chart(host, series, opt = {}) {
   if (!host.querySelector('canvas')) {
@@ -33,7 +33,7 @@ function drawChart(host) {
   const min = opt.min ?? 0;
   const X = i => padL + i / (n - 1) * w, Y = v => padT + h - (v - min) / (max - min || 1) * h;
   const YR = v => padT + h - v / rmax * h;
-  g.strokeStyle = '#1e2327'; g.fillStyle = '#646d73'; g.font = '10px ui-monospace, Menlo'; g.lineWidth = 1;
+  g.strokeStyle = css('--chart-grid'); g.fillStyle = css('--chart-tx'); g.font = '10px ui-monospace, Menlo'; g.lineWidth = 1;
   const fmt = opt.fmt || (x => x.toFixed(0));
   for (let i = 0; i <= 3; i++) {
     const v = min + (max - min) * i / 3, y = Math.round(Y(v)) + .5;
@@ -65,7 +65,7 @@ function drawChart(host) {
   if (host._hx != null && tip) {
     const i = Math.round((host._hx - padL) / w * (n - 1));
     if (i >= 0 && i < n) {
-      g.strokeStyle = '#3d454b'; g.beginPath(); g.moveTo(Math.round(X(i)) + .5, padT); g.lineTo(Math.round(X(i)) + .5, padT + h); g.stroke();
+      g.strokeStyle = css('--chart-cursor'); g.beginPath(); g.moveTo(Math.round(X(i)) + .5, padT); g.lineTo(Math.round(X(i)) + .5, padT + h); g.stroke();
       const t = H[H.length - n + i]?.t;
       tip.innerHTML = (t ? `<div class="dim">${clock(t)}</div>` : '') + series.map(s => {
         const v = s.v[i - (n - s.v.length)];

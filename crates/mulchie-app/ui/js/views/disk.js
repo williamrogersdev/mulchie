@@ -18,7 +18,7 @@ export function renderDisk() {
   const parts = [['Worktrees', m?.worktree_bytes || 0, '#6fb0f0', 'worktrees'], ['Build caches in main repos', mainCaches, '#e3b24f', 'caches'],
     ...(m?.categories || []).slice(0, 5).map((c, i) => [c.name, c.bytes, ['#b691e8', '#5fc9c0', '#ec8a5a', '#9aa3a9', '#c4a7e7'][i], 'cat:' + c.key])];
   const known = parts.reduce((a, p) => a + p[1], 0);
-  parts.push(['Everything else', Math.max(0, used - known), '#2d3338', 'other'], ['Free', s.disk_free, '#1d2a1f', 'free']);
+  parts.push(['Everything else', Math.max(0, used - known), 'var(--disk-other)', 'other'], ['Free', s.disk_free, 'var(--disk-free)', 'free']);
   $('#dStack').innerHTML = parts.map(([l, b, c, k]) => `<i role="button" tabindex="0" data-d="seg" data-dk="${esc(k)}" title="${esc(l)} ${B(b)}" style="width:${s.disk_total ? b / s.disk_total * 100 : 0}%;background:${c}"></i>`).join('');
   $('#dLegend').innerHTML = parts.map(([l, b, c, k]) => `<span class="lg-i" role="button" tabindex="0" data-d="seg" data-dk="${esc(k)}"><i style="background:${c}"></i>${esc(l)} <span class="mono">${B(b)}</span></span>`).join('');
 

@@ -1,9 +1,9 @@
 // The top bar, nav counters and the Overview view.
 import { st } from '../store.js';
-import { $, esc, B, BS, P, ago, clock, th, meter, legend } from '../util.js';
+import { $, esc, B, BS, P, ago, clock, th, meter, legend, css } from '../util.js';
 import { chart } from '../chart.js';
 import { findings, findingsHtml, notices, noticesHtml, modeHtml, modeTitle } from '../findings.js';
-import { barsHtml, consumers, cores as coresTxt, cpuSummary, memSummary, cpuTile, memTile } from '../consumers.js';
+import { barsHtml, consumers, cores as coresTxt, cpuSummary, memSummary, cpuTile, memTile, KIND_ICON } from '../consumers.js';
 
 export function renderTop() {
   const S = st.S;
@@ -53,7 +53,7 @@ export function renderOverview() {
   ], { fmt: v => v.toFixed(0) + '%', max: 100, rmax: Math.max(2, ...H.map(x => x.load1 / cores)) * 1.1, rfmt: v => v.toFixed(v < 10 ? 1 : 0) + '×' });
   $('#lgCpu').innerHTML = legend([['CPU % (left)', '#6fb0f0'], ['load per core (right)', '#ec8a5a']]);
   chart($('#chMem'), [{ l: 'used', c: '#b691e8', v: H.map(x => x.mem_used) }, { l: 'swap', c: '#ec8a5a', v: H.map(x => x.swap) }],
-    { fmt: v => B(v, 0), max: Math.max(s.mem_total, ...H.map(x => x.swap)) * 1.05, lines: [{ v: s.mem_total, c: '#3d454b', l: 'physical' }] });
+    { fmt: v => B(v, 0), max: Math.max(s.mem_total, ...H.map(x => x.swap)) * 1.05, lines: [{ v: s.mem_total, c: css('--chart-cursor'), l: 'physical' }] });
   $('#lgMem').innerHTML = legend([['used', '#b691e8'], ['swap', '#ec8a5a']]);
   chart($('#chIo'), [{ l: 'read', c: '#5fc9c0', v: H.map(x => x.read_bps) }, { l: 'write', c: '#e3b24f', v: H.map(x => x.write_bps) }], { fmt: v => B(v, 0), tipFmt: v => BS(v) });
   $('#lgIo').innerHTML = legend([['read', '#5fc9c0'], ['write', '#e3b24f']]);
@@ -68,9 +68,19 @@ export function renderOverview() {
   chart($('#chWs'), top.map((l, i) => ({ l, c: WS_COLORS[i], v: H.map(x => (x.ws.find(w => w[0] === l) || [0, 0])[1]), fill: false })), { fmt: v => v.toFixed(0) + '%' });
   $('#lgWs').innerHTML = legend(top.map((l, i) => [l.length > 30 ? l.slice(0, 29) + '…' : l, WS_COLORS[i]]));
 
-  $('#findings').innerHTML = findingsHtml(findings());
-  const gm = Math.max(1, ...s.groups.map(g => g.cpu_pct)), mm = Math.max(1, ...s.groups.map(g => g.mem_bytes));
-  const keys = new Map(consumers(S).map(c => [c.label, c.key]));
-  $('#groups').innerHTML = th([{ l: 'Group' }, { l: 'Procs', n: 1, c: 'c-md', w: '60px' }, { l: 'CPU', n: 1, w: '140px' }, { l: 'Memory', n: 1, w: '140px' }, { l: 'Read', n: 1, c: 'c-lg', w: '90px' }, { l: 'Write', n: 1, c: 'c-lg', w: '90px' }]) +
-    s.groups.slice(0, 20).map(g => `<tr class="click" role="button" tabindex="0" data-d="group" data-dk="${esc(keys.get(g.group) || 'app:' + g.group)}"><td title="${esc(g.group)}">${esc(g.group)} ${g.is_workspace ? '' : '<span class="dim">app</span>'}</td><td class="n c-md">${g.procs}</td><td class="n">${meter(g.cpu_pct, gm)}${esc(coresTxt(g.cpu_pct))}</td><td class="n">${meter(g.mem_bytes, mm, 'var(--c2)')}${B(g.mem_bytes)}</td><td class="n c-lg">${BS(g.read_bps)}</td><td class="n c-lg">${BS(g.write_bps)}</td></tr>`).join('');
+  $('#findings').innerHTML = findingsHtml(findings()) + watchLink(S);
+  const gs = consumers(S).sort((a, b) => b.cpu_pct - a.cpu_pct);
+  const gm = Math.max(1, ...gs.map(g => g.cpu_pct)), mm = Math.max(1, ...gs.map(g => g.mem_bytes));
+  $('#groups').innerHTML = th([{ l: 'Group' }, { l: 'Kind', c: 'c-lg', w: '92px' }, { l: 'Procs', n: 1, c: 'c-md', w: '60px' }, { l: 'CPU', n: 1, w: '140px' }, { l: 'Memory', n: 1, w: '140px' }]) +
+    gs.map(g => `<tr class="click" role="button" tabindex="0" data-d="group" data-dk="${esc(g.key)}"><td title="${esc(g.label)}">${KIND_ICON[g.kind] || ''} ${esc(g.short)}${g.protected ? ' <span class="chip">protected</span>' : ''}</td><td class="c-lg dim">${esc(g.kind)}</td><td class="n c-md">${g.count}</td><td class="n">${meter(g.cpu_pct, gm)}${esc(coresTxt(g.cpu_pct))}</td><td class="n">${meter(g.mem_bytes, mm, 'var(--c2)')}${B(g.mem_bytes)}</td></tr>`).join('');
+}
+
+// "All observations (11 · 2 dismissed) →": the engine's findings, with the
+// dismissed ones, in one drawer.
+export function watchLink(S) {
+  const c = S.finding_counts;
+  if (!c) return '';
+  const open = c.high + c.medium + c.low + c.info;
+  if (!open && !c.dismissed) return '';
+  return `<div class="more"><a class="lnk" role="button" tabindex="0" data-d="findings" data-dk="">All observations (${open}${c.dismissed ? ` · ${c.dismissed} dismissed` : ''}) →</a></div>`;
 }

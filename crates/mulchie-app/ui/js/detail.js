@@ -6,8 +6,9 @@ import { st, hooks } from './store.js';
 import { invoke } from './ipc.js';
 import { $, esc, B, BS, P, ago, dur, tilde, toast, kindChip } from './util.js';
 import { planThenExecute, confirmBox, reasonText } from './dialogs.js';
-import { signalProcs } from './signals.js';
-import { allProcs, consumers, findConsumer, ranked, cores, cpuSummary, memSummary, shortLabel } from './consumers.js';
+import { GROUP_ACTIONS, groupAction, signalPids, reniceProc, planAndRun } from './signals.js';
+import { allProcs, findConsumer, ranked, cores, cpuSummary, memSummary, KIND_TEXT } from './consumers.js';
+import { SEV_LVL, SEV_TEXT, suggestionLabel, watchFindings } from './findings.js';
 import { act } from './act.js';
 
 // ------------------------------------------------------------------ helpers
@@ -36,21 +37,30 @@ function procRows(procs, max = 40) {
 const pick = (o, keys) => Object.fromEntries(keys.filter(k => o[k] !== undefined).map(k => [k, o[k]]));
 const procCopy = p => pick(p, ['pid', 'name', 'kind', 'cpu_pct', 'mem_bytes', 'nice', 'stopped', 'run_secs', 'start_time', 'workspace', 'cmd']);
 
-// Group actions over a list of processes (a workspace, an app, a worktree).
-function groupActions(procs, label, { builds = true, path = null, app = false } = {}) {
-  const own = procs.filter(p => p.own);
-  const paused = own.length && own.every(p => p.stopped);
-  const key = encodeURIComponent(JSON.stringify({ pids: procs.map(p => p.pid), label }));
+// The actions a group's plan can be asked for, as buttons. `g` is a
+// consumer group from the engine (`actions` and `protected` come from it);
+// a workspace outside the ranked lists gets the workspace actions, and its
+// plan says what applies. Every button plans first.
+const WS_ACTIONS = ['quit', 'force_quit', 'pause', 'resume', 'lower_priority', 'stop_builds'];
+const DANGER = new Set(['quit', 'force_quit', 'stop_builds', 'restart']);
+function groupButtons(g, { path = null } = {}) {
+  if (g.protected) return `<p class="why-s warn">Mulchie will not act on this: ${esc(g.protected)}.</p>${path ? actions([btn('Reveal in Finder', `data-reveal="${esc(path)}"`)]) : ''}`;
+  const list = g.actions || WS_ACTIONS;
+  const arg = encodeURIComponent(JSON.stringify({ key: g.key, name: g.label || g.name }));
+  const hasBuilds = g.builds == null || g.builds > 0;
   return actions([
-    btn('Quit…', da('sig-term', key) + (own.length ? '' : ' disabled'), 'danger'),
-    btn('Force quit…', da('sig-kill', key) + (own.length ? '' : ' disabled'), 'danger'),
-    paused ? btn('Resume…', da('sig-cont', key)) : btn('Pause…', da('sig-stop', key) + (own.length ? '' : ' disabled')),
-    btn('Lower priority…', da('sig-renice', key) + (own.length ? '' : ' disabled')),
-    builds && procs.some(p => p.kind === 'build') ? btn('Stop builds…', da('sig-builds', key), 'danger') : '',
-    app ? `<button class="btn" disabled title="Restarting an app needs the engine's group actions, which are coming in the next engine version">Restart</button>` : '',
+    ...Object.keys(GROUP_ACTIONS).filter(a => list.includes(a) && (a !== 'stop_builds' || hasBuilds))
+      .map(a => btn(GROUP_ACTIONS[a].verb + '…', da('g-' + a, arg), DANGER.has(a) ? 'danger' : '')),
+    g.kind === 'app' && !list.includes('restart') ? '<button class="btn" disabled title="The engine offers a restart only for an app with a bundle id, on macOS">Restart</button>' : '',
     path ? btn('Reveal in Finder', `data-reveal="${esc(path)}"`) : '',
   ]);
 }
+
+// A workspace as a group (its key is `workspace:<path>`).
+const wsGroup = w => findConsumer(S(), 'workspace:' + w.path) || { key: 'workspace:' + w.path, kind: 'workspace', label: w.label, builds: w.builds };
+
+// Members the engine listed for a group (its biggest three), as rows.
+const memberRows = g => procRows(g.top || []) + (g.count > (g.top || []).length ? `<div class="dim">${g.count - g.top.length} more; the plan lists every process an action affects.</div>` : '');
 
 // ------------------------------------------------------------- renderers
 
@@ -93,7 +103,7 @@ function rWorkspace(path) {
   const wt = wtAt(w.path);
   const state = [w.agents && `${w.agents} agent(s)`, w.builds && `${w.builds} build(s)`, w.paused && 'paused', w.throttled && `${w.throttled} at lower priority`, w.orphan && `orphan: ${w.orphan}`, !w.exists && 'folder deleted'].filter(Boolean).join(' · ') || 'running';
   const html = `${kv([['path', esc(tilde(w.path))], ['branch', esc(w.branch || '—')], ['state', esc(state)], ['cpu', `${esc(cores(w.cpu_pct))} <span class="dim">(${P(w.cpu_pct / (S().snapshot.cpu_count || 1))} of the machine)</span>`], ['memory', B(w.mem_bytes)], ['disk i/o', `${BS(w.read_bps)} r · ${BS(w.write_bps)} w`], wt && ['on disk', `${B(wt.bytes)} · ${wt.dirty_files} uncommitted`]])}
-    ${groupActions(procs, w.label, { path: w.exists ? w.path : null })}
+    ${groupButtons(wsGroup(w), { path: w.exists ? w.path : null })}
     <div class="actions">${btn('Open in Terminal', `data-term="${esc(w.path)}"` + (w.exists ? '' : ' disabled'))}${caches.length ? btn(`Clean caches (${B(caches.reduce((a, i) => a + i.bytes, 0))})…`, da('clean-caches', w.path)) : ''}${wt ? btn('Worktree →', dl('wt', wt.path)) : ''}</div>
     ${sec(`Processes (${procs.length})`, procRows(procs))}
     ${sec(`Build caches (${caches.length})`, caches.length ? `<table class="mini-t"><colgroup><col><col style="width:80px"><col style="width:80px"></colgroup>${caches.map(i => `<tr class="click" role="button" tabindex="0" ${dl('cache', i.path)}><td><span class="cell" title="${esc(i.path)}">${esc(tilde(i.path).replace(tilde(w.path), '…'))}</span></td><td class="n">${B(i.bytes)}</td><td class="n ${i.in_use ? 'ok' : i.stale ? 'warn' : 'dim'}">${i.in_use ? 'in use' : i.stale ? 'stale' : 'recent'}</td></tr>`).join('')}</table>` : '<div class="dim">None found under this folder.</div>')}`;
@@ -101,32 +111,123 @@ function rWorkspace(path) {
     copy: { kind: 'workspace', ...pick(w, ['path', 'label', 'branch', 'agents', 'builds', 'paused', 'throttled', 'orphan', 'cpu_pct', 'mem_bytes']), processes: procs.map(procCopy), caches: caches.map(i => pick(i, ['path', 'kind', 'bytes', 'stale', 'in_use'])) } };
 }
 
+// The engine's full record of one process (`GET /v1/process/<pid>`), read
+// when the drawer opens and again every few seconds while it stays open.
+const pd = { pid: null, data: undefined, err: null, at: 0, busy: false };
+export function loadProc(pid, force) {
+  pid = +pid;
+  if (pd.pid !== pid) Object.assign(pd, { pid, data: undefined, err: null, at: 0 });
+  if (pd.busy || (!force && Date.now() - pd.at < 2500)) return;
+  pd.busy = true;
+  invoke('process_detail', { pid })
+    .then(d => { pd.data = d; pd.err = null; }, e => { pd.err = String(e); })
+    .finally(() => { pd.busy = false; pd.at = Date.now(); if (st.ui.detail?.type === 'proc' && +st.ui.detail.key === pid) renderDetail(); });
+}
+
+const SIG = { apple: 'Apple', app_store: 'App Store', developer_id: 'Developer ID', development: 'a developer’s own build', other_signed: 'signed by another certificate', ad_hoc: 'ad-hoc (no identity)', unsigned: 'not signed', unknown: 'could not be checked' };
+const procName = (pid, name) => link('proc', pid, `${name} ${pid}`);
+
 function rProc(pid) {
   pid = +pid;
-  const p = procBy(pid);
-  if (!p) return gone(`Process ${pid}`, '', 'It exited, or it is no longer among the tracked processes.');
-  const all = allProcs(S()), parent = all.find(x => x.pid === p.ppid), kids = all.filter(x => x.ppid === p.pid);
-  const g = consumers(S()).find(c => c.procs.some(x => x.pid === pid));
-  const started = p.start_time ? new Date(p.start_time * 1000).toLocaleString() : '—';
-  const html = `<div>${kindChip(p.kind)} ${p.own ? '' : '<span class="chip">another user</span>'} ${p.stopped ? '<span class="chip warn">paused</span>' : ''} ${p.nice > 0 ? `<span class="chip warn">nice ${p.nice}</span>` : ''}</div>
-    ${kv([['cpu', `${esc(cores(p.cpu_pct))} <span class="dim">(${P(p.cpu_pct, 1)} of one core)</span>`], ['memory', B(p.mem_bytes)], ['disk i/o', `${BS(p.read_bps)} r · ${BS(p.write_bps)} w`], ['nice', String(p.nice)],
-      ['age', `${esc(dur(p.run_secs))} <span class="dim">(started ${esc(started)})</span>`], ['parent', parent ? `${link('proc', parent.pid, `${parent.name} ${parent.pid}`)}` : esc(String(p.ppid))],
-      ['children', kids.length ? kids.slice(0, 10).map(k => link('proc', k.pid, `${k.name} ${k.pid}`)).join(', ') : '—'],
-      ['workspace', p.workspace ? link('ws', p.workspace, tilde(p.workspace)) : '<span class="dim">none (its working directory is outside your projects)</span>'], g && ['group', link('group', g.key, g.label)]])}
-    <h3 class="ds-h">Command line</h3><pre class="code">${esc(p.cmd)}</pre>
-    ${p.own ? actions([btn('Quit…', da('p-term', pid), 'danger'), btn('Force quit…', da('p-kill', pid), 'danger'), p.stopped ? btn('Resume', da('p-cont', pid)) : btn('Pause…', da('p-stop', pid)), btn('Lower priority', da('p-renice', pid))])
-      : '<div class="muted" style="margin-top:10px">Owned by another user; Mulchie will not signal it.</div>'}`;
-  return { title: `${p.name}`, sub: `<span class="dim mono">pid ${p.pid}</span>`, html, copy: { kind: 'process', ...procCopy(p), ppid: p.ppid, own: p.own } };
+  loadProc(pid);
+  const p = procBy(pid), d = pd.pid === pid ? pd.data : undefined;
+  if (d === null || (!p && !d && pd.at)) return gone(`Process ${pid}`, '', pd.err ? `Could not read it: ${pd.err}` : 'It has exited.');
+  if (!p && !d) return { title: `Process ${pid}`, html: '<p class="dim">Reading…</p>', copy: { kind: 'process', pid } };
+  // The engine's record wins; the tracked row adds I/O and nice.
+  const x = { ...(p || {}), ...(d || {}) }, own = d ? d.own : p.own;
+  const cmd = Array.isArray(d?.cmd) ? d.cmd.join(' ') : p?.cmd || '';
+  const started = x.start_time ? new Date(x.start_time * 1000).toLocaleString() : '—';
+  const age = d?.age_secs ?? p?.run_secs;
+  const fs = d?.findings || [];
+  const html = `<div>${x.kind ? kindChip(x.kind) : ''} ${own ? '' : '<span class="chip">another user</span>'} ${x.stopped ? '<span class="chip warn">paused</span>' : ''} ${p?.nice > 0 ? `<span class="chip warn">nice ${p.nice}</span>` : ''}</div>
+    ${d?.protected ? `<p class="why-s warn">Mulchie will not signal it: ${esc(d.protected)}.</p>` : ''}
+    ${fs.length ? sec(`Observations (${fs.length})`, fs.map(f => `<div class="finding" role="button" tabindex="0" ${dl('finding', f.id)}><span class="ic" style="background:var(--${SEV_LVL[f.severity] || 'info'})"></span><div class="t"><div>${esc(f.title)}</div></div></div>`).join('')) : ''}
+    ${kv([['cpu', x.cpu_pct != null ? `${esc(cores(x.cpu_pct))} <span class="dim">(${P(x.cpu_pct, 1)} of one core)</span>` : '—'], ['memory', x.mem_bytes != null ? B(x.mem_bytes) : '—'], p && ['disk i/o', `${BS(p.read_bps)} r · ${BS(p.write_bps)} w`], p && ['nice', String(p.nice)],
+      ['age', `${age != null ? esc(dur(age)) : '—'} <span class="dim">(started ${esc(started)})</span>`],
+      ['working dir', d?.cwd ? `<span class="mono">${esc(tilde(d.cwd))}</span>` : `<span class="dim">${d ? 'not readable' : '…'}</span>`],
+      ['program', d?.exe ? `<span class="mono">${esc(tilde(d.exe))}</span>` : '<span class="dim">—</span>'],
+      d?.signature && ['signature', esc(SIG[d.signature] || d.signature) + (d.quarantined ? ' · <span class="warn">downloaded (quarantine flag)</span>' : '')],
+      ['listening', d?.listening == null ? '<span class="dim">unknown</span>' : d.listening.length ? d.listening.map(l => `<span class="mono">${esc(l)}</span>`).join(', ') : '<span class="dim">no ports</span>'],
+      ['parents', d?.parents?.length ? d.parents.slice(0, 6).map(q => procName(q.pid, q.name)).join(' ← ') : esc(String(x.ppid ?? '—'))],
+      ['children', d?.children?.length ? d.children.slice(0, 12).map(k => procName(k.pid, k.name)).join(', ') + (d.children.length > 12 ? ` <span class="dim">+${d.children.length - 12}</span>` : '') : '—'],
+      ['workspace', x.workspace ? link('ws', x.workspace, d?.workspace_label || tilde(x.workspace)) : '<span class="dim">none (its working directory is outside your projects)</span>'],
+      d?.group && findConsumer(S(), d.group) && ['group', link('group', d.group, findConsumer(S(), d.group).label)]])}
+    <h3 class="ds-h">Command line</h3><pre class="code">${esc(cmd) || '<span class="dim">not readable</span>'}</pre>
+    ${own && !d?.protected ? actions([btn('Quit…', da('p-term', pid), 'danger'), btn('Force quit…', da('p-kill', pid), 'danger'), x.stopped ? btn('Resume…', da('p-cont', pid)) : btn('Pause…', da('p-stop', pid)), btn('Lower priority…', da('p-renice', pid)), d?.children?.length ? btn('Quit with children…', da('p-tree', pid), 'danger') : ''])
+      : own ? '' : '<div class="muted" style="margin-top:10px">Owned by another user; Mulchie will not signal it.</div>'}`;
+  return { title: `${x.name}`, sub: `<span class="dim mono">pid ${pid}</span>`, html,
+    copy: { kind: 'process', ...pick(x, ['pid', 'ppid', 'name', 'kind', 'cpu_pct', 'mem_bytes', 'start_time', 'workspace', 'cwd', 'exe', 'signature', 'listening', 'protected']), cmd, parents: d?.parents, children: d?.children, findings: fs.map(f => f.id) } };
 }
 
 function rGroup(key) {
   const c = findConsumer(S(), key);
-  if (!c) return gone('Group', key.replace(/^\w+:/, ''), 'Nothing of it is running now.');
-  const html = `${kv([['kind', c.kind === 'workspace' ? 'workspace (a project folder)' : 'app or tool'], ['cpu', `${esc(cores(c.cpu_pct))} <span class="dim">(${P(c.share * 100)} of the machine)</span>`], ['memory', B(c.mem_bytes)], ['processes', `${c.count}${c.tracked < c.count ? ` <span class="dim">(${c.tracked} tracked individually; actions apply to those)</span>` : ''}`], c.path && ['path', esc(tilde(c.path))]])}
-    ${groupActions(c.procs, c.label, { path: c.path, app: c.kind === 'app' })}
+  if (!c) {
+    const ws = key.startsWith('workspace:') && wsAt(key.slice(10));
+    if (ws) return rWorkspace(ws.path);
+    return gone('Group', key.replace(/^\w+:/, ''), 'It is not among the biggest users of CPU or memory right now.');
+  }
+  const html = `${kv([['kind', esc(KIND_TEXT[c.kind] || c.kind)], ['cpu', `${esc(cores(c.cpu_pct))} <span class="dim">(${P(c.share * 100)} of the machine)</span>`], ['memory', `${B(c.mem_bytes)} <span class="dim">(${P(c.mem_share_pct)})</span>`],
+    ['processes', `${c.count}${c.agents ? ` · ${c.agents} agent(s)` : ''}${c.builds ? ` · ${c.builds} build(s)` : ''}`], ['main process', procName(c.main_pid, c.top?.find(t => t.pid === c.main_pid)?.name || c.label)],
+    c.bundle_id && ['bundle id', `<span class="mono">${esc(c.bundle_id)}</span>`], c.path && ['path', esc(tilde(c.path))]])}
+    <p class="dim">${esc(S().snapshot.consumers?.memory_note || '')}</p>
+    ${groupButtons(c, { path: c.path })}
     ${c.kind === 'workspace' ? `<div class="actions">${btn('Workspace details →', dl('ws', c.path))}</div>` : ''}
-    ${sec(`Processes (${c.tracked})`, procRows(c.procs))}`;
-  return { title: c.label, sub: `<span class="chip">${esc(c.kind)}</span>`, html, copy: { kind: 'group', ...pick(c, ['label', 'kind', 'path', 'cpu_pct', 'cores', 'share', 'mem_bytes', 'count']), processes: c.procs.map(procCopy) } };
+    ${sec(`Biggest processes (${(c.top || []).length} of ${c.count})`, memberRows(c))}`;
+  return { title: c.label, sub: `<span class="chip">${esc(c.kind)}</span>`, html, copy: { kind: 'group', ...pick(c, ['key', 'label', 'kind', 'path', 'bundle_id', 'cpu_pct', 'cpu_cores', 'cpu_share_pct', 'mem_bytes', 'count', 'main_pid', 'main_start_time', 'actions', 'protected']), top: c.top } };
+}
+
+const fmtEvidence = e => [
+  e.pid != null && ['process', procName(e.pid, e.name || 'pid')],
+  e.start_time && ['started', esc(new Date(e.start_time * 1000).toLocaleString())],
+  e.age_secs != null && ['age', esc(dur(e.age_secs))],
+  e.exe && ['program', `<span class="mono">${esc(tilde(e.exe))}</span>`],
+  e.cwd && ['working dir', `<span class="mono">${esc(tilde(e.cwd))}</span>`],
+  e.workspace && ['workspace', link('ws', e.workspace, tilde(e.workspace))],
+  e.parent && ['parent', procName(e.parent.pid, e.parent.name)],
+  e.listen?.length && ['listening', e.listen.map(l => `<span class="mono">${esc(l)}</span>`).join(', ')],
+  e.signature && ['signature', esc(SIG[e.signature] || e.signature)],
+  e.quarantined != null && ['quarantine flag', e.quarantined ? 'yes (downloaded)' : 'no'],
+  e.cpu_pct != null && ['cpu', esc(cores(e.cpu_pct))],
+  e.mem_bytes != null && ['memory', B(e.mem_bytes)],
+  e.path && ['path', `<span class="mono">${esc(tilde(e.path))}</span>`],
+  e.mode && ['mode', `<span class="mono">${esc(e.mode)}</span>`],
+  e.detail && ['detail', esc(e.detail)],
+];
+
+const findingBy = id => (S().findings || []).find(f => f.id === id);
+const until = t => new Date(t * 1000).toLocaleDateString([], { month: 'short', day: 'numeric', year: 'numeric' });
+
+function rFinding(id) {
+  const f = findingBy(id);
+  if (!f) return gone('Observation', '', 'The engine no longer reports it: the cause went away, or the watch has not run since.');
+  const e = f.evidence || {};
+  const sug = f.suggested.map((sg, i) => sg.request ? btn(sg.label + '…', da('fx', `${i}:${f.id}`), sg.reversible ? '' : 'danger') : '').filter(Boolean);
+  const html = `<p class="why-s ${SEV_LVL[f.severity] === 'bad' ? 'warn' : ''}">${esc(f.why)}</p>
+    ${kv(fmtEvidence(e))}
+    ${e.cmd ? `<h3 class="ds-h">Command line</h3><pre class="code">${esc(e.cmd)}</pre>` : ''}
+    ${kv([['first seen', when(f.first_seen_unix)], ['last seen', when(f.last_seen_unix)], f.dismissed && ['dismissed', f.dismissed_until ? `until ${esc(until(f.dismissed_until))}` : 'indefinitely']])}
+    ${sug.length ? sec('What you can do', `<div class="actions">${sug.join('')}</div><div class="dim">Each action is planned first and shows the processes it affects before anything is sent.</div>`) : ''}
+    ${sec(f.dismissed ? 'Dismissed' : 'Dismiss', f.dismissed
+      ? `<div class="actions">${btn('Show again', da('undismiss', f.id))}</div>`
+      : `<div class="actions"><select id="dDays" aria-label="Dismiss for">${[[1, '1 day'], [7, '7 days'], [30, '30 days'], [365, '1 year']].map(([d, l]) => `<option value="${d}" ${d === 30 ? 'selected' : ''}>${l}</option>`).join('')}</select>${btn('Dismiss', da('dismiss', f.id))}</div><div class="dim">Hidden until the date shown, then reported again if it still holds. Saved in the settings file.</div>`)}`;
+  return { title: f.title, sub: `<span class="chip ${SEV_LVL[f.severity]}">${esc(SEV_TEXT[f.severity] || f.severity)}</span> <span class="dim mono">${esc(f.kind.replace(/_/g, ' '))}</span>`, html,
+    copy: { kind: 'finding', ...pick(f, ['id', 'kind', 'severity', 'title', 'why', 'evidence', 'dismissed', 'dismissed_until']), suggested: f.suggested.map(sg => sg.request ? { label: sg.label, request: sg.request } : { label: sg.label, api: sg.api }) } };
+}
+
+function findingList(list) {
+  if (!list.length) return '<div class="dim">None.</div>';
+  return list.map(f => `<div class="finding" role="button" tabindex="0" ${dl('finding', f.id)}><span class="ic" style="background:var(--${SEV_LVL[f.severity] || 'info'})"></span><div class="t"><div>${esc(f.title)}</div><div class="muted">${esc(SEV_TEXT[f.severity])}${f.dismissed && f.dismissed_until ? ` · dismissed until ${esc(until(f.dismissed_until))}` : ''}</div></div></div>`).join('');
+}
+
+function rFindings() {
+  const open = watchFindings(S()), dis = watchFindings(S(), true), c = S().finding_counts || {};
+  const off = S().config?.watch && S().config.watch.enabled === false;
+  const html = `<p class="dim">Things the engine noticed about running programs and Mulchie’s own setup. They are observations to check, not verdicts; nothing is acted on unless you choose an action.${S().findings_unix ? ` Last checked ${esc(ago(S().findings_unix))} ago.` : ''}</p>
+    ${off ? '<p class="why-s warn">The watch is off in Settings, so nothing new is reported.</p>' : ''}
+    ${kv([['high', String(c.high || 0)], ['medium', String(c.medium || 0)], ['low', String(c.low || 0)], ['info', String(c.info || 0)]])}
+    ${sec(`Open (${open.length})`, findingList(open))}
+    ${sec(`Dismissed (${dis.length})`, findingList(dis))}`;
+  return { title: 'Observations', html, copy: { kind: 'findings', counts: c, open: open.map(f => pick(f, ['id', 'severity', 'title'])), dismissed: dis.map(f => pick(f, ['id', 'title', 'dismissed_until'])) } };
 }
 
 // CPU or memory: the ranked consumers, each expandable to its processes with
@@ -138,12 +239,12 @@ function rResource(res) {
   const rows = list.map(c => `<details class="cons" data-key="${esc(c.key)}"><summary>
       <span class="bar"><i style="width:${(cpu ? c.cpu_pct : c.mem_bytes) / max * 100}%"></i></span>
       <span class="nm" title="${esc(c.label)}">${esc(c.short)}</span><span class="v">${cpu ? esc(cores(c.cpu_pct)) : B(c.mem_bytes)}</span></summary>
-      <div class="cons-b">${procRows(c.procs, 12)}${groupActions(c.procs, c.label, { path: c.path, app: c.kind === 'app' })}<div class="actions">${btn('Details →', dl('group', c.key))}</div></div></details>`).join('');
+      <div class="cons-b">${memberRows(c)}${groupButtons(c, { path: c.path })}<div class="actions">${btn('Details →', dl('group', c.key))}</div></div></details>`).join('');
   const html = `<p class="why-s ${sum.level}">${esc(sum.headline)}</p><p class="dim">${esc(sum.detail)}</p>
     ${sec(cpu ? 'Using the CPU' : 'Using memory', rows || '<div class="dim">Nothing measurable.</div>')}`;
   return { title: cpu ? 'CPU' : 'Memory', sub: `<span class="chip ${sum.level === 'ok' ? 'ok' : sum.level}">${esc(sum.word)}</span>`, html,
-    copy: { kind: cpu ? 'cpu' : 'memory', headline: sum.headline, detail: sum.detail, ...(cpu ? { cpu_pct: s.cpu_pct, cores: s.cpu_count, load: s.load } : { mem_total: s.mem_total, mem_available: s.mem_available, swap_used: s.swap_used }),
-      top: list.slice(0, 8).map(c => ({ ...pick(c, ['label', 'kind', 'path', 'cpu_pct', 'mem_bytes', 'count']), top_pids: c.procs.slice(0, 5).map(p => p.pid) })) } };
+    copy: { kind: cpu ? 'cpu' : 'memory', summary: cpu ? s.cpu_summary : s.mem_summary,
+      top: list.slice(0, 8).map(c => ({ ...pick(c, ['key', 'label', 'kind', 'path', 'cpu_pct', 'mem_bytes', 'count', 'main_pid']), top_pids: (c.top || []).map(p => p.pid) })) } };
 }
 
 function rAgents() {
@@ -229,7 +330,7 @@ function gone(title, path, why = 'It is no longer reported by the engine.') {
   return { title, html: `<p class="muted">${path ? esc(tilde(path)) + '<br><br>' : ''}${esc(why)}</p>`, copy: { kind: 'gone', title, path } };
 }
 
-const RENDER = { wt: rWorktree, ws: rWorkspace, proc: rProc, group: rGroup, cpu: () => rResource('cpu'), mem: () => rResource('mem'), agents: rAgents, cache: rCache, cat: rCategory, seg: rSegment, act: rAction };
+const RENDER = { wt: rWorktree, ws: rWorkspace, proc: rProc, group: rGroup, cpu: () => rResource('cpu'), mem: () => rResource('mem'), agents: rAgents, cache: rCache, cat: rCategory, seg: rSegment, act: rAction, finding: rFinding, findings: rFindings };
 export const NEEDS_ACTIONS = new Set(['wt', 'act']);
 
 // ------------------------------------------------------------- the drawer
@@ -242,10 +343,11 @@ export function openDetail(type, key) {
   if (!RENDER[type]) return;
   if (!st.ui.detail) opener = document.activeElement;
   st.ui.detail = { type, key: String(key ?? '') };
+  if (type === 'proc') loadProc(key, true);
   last = '';
   renderDetail();
   $('#dBody').scrollTop = 0;
-  $('#dClose').focus();
+  $('#dClose').focus({ preventScroll: true });
   if (NEEDS_ACTIONS.has(type)) hooks.refresh(true);
 }
 
@@ -287,7 +389,7 @@ export function renderDetail() {
   last = r.html;
   for (const k of open) body.querySelector(`details[data-key="${CSS.escape(k)}"]`)?.setAttribute('open', '');
   body.scrollTop = top;
-  if (sel) body.querySelector(sel.replace('#drawer ', ''))?.focus();
+  if (sel) body.querySelector(sel.replace('#drawer ', ''))?.focus({ preventScroll: true });
 }
 
 // Text an agent can act on: a heading and the facts as JSON.
@@ -299,27 +401,46 @@ export function copyText(title, data) {
 // ------------------------------------------------------------- actions
 
 const decode = s => JSON.parse(decodeURIComponent(s));
-const SIG = { 'sig-term': 'term', 'sig-kill': 'kill', 'sig-stop': 'stop', 'sig-cont': 'cont', 'sig-renice': 'renice' };
+
+// Run suggestion `i` of finding `id`: a signal is planned again (and must
+// still name the observed process); a renice goes to the gate with the
+// observed start time.
+export async function runSuggestion(i, id) {
+  const f = findingBy(id), sg = f?.suggested[+i], r = sg?.request;
+  if (!r) return toast('That observation is gone.', true);
+  if (r.action === 'signal') {
+    return planAndRun([{ pid: r.pid, signal: r.signal }], { title: `${sg.label}?`, verb: suggestionLabel(sg).replace('…', ''), danger: !sg.reversible, expect: { pid: r.pid, start_time: r.expected_start_time } });
+  }
+  if (r.action === 'renice') return reniceProc({ pid: r.pid, name: f.evidence?.name || `pid ${r.pid}`, start_time: r.expected_start_time }, r.nice);
+  return toast('This suggestion has no action the app can run.', true);
+}
 
 export async function detailAction(t) {
   const name = t.dataset.da, arg = t.dataset.arg;
-  if (SIG[name] || name === 'sig-builds') {
-    const { pids, label } = decode(arg);
-    const all = allProcs(S());
-    let procs = pids.map(pid => all.find(p => p.pid === pid)).filter(Boolean);
-    if (name === 'sig-builds') procs = procs.filter(p => p.kind === 'build');
-    if (name === 'sig-cont') procs = procs.filter(p => p.stopped);
-    return signalProcs(procs, SIG[name] || 'term', name === 'sig-builds' ? `the builds of ${shortLabel(label)}` : shortLabel(label));
+  if (name.startsWith('g-')) {
+    const { key, name: label } = decode(arg);
+    return groupAction(key, name.slice(2), label);
   }
   if (name.startsWith('p-')) {
-    const p = procBy(+arg);
+    const pid = +arg, p = procBy(pid) || (pd.pid === pid && pd.data);
     if (!p) return toast('That process is gone.', true);
-    return signalProcs([p], name.slice(2), `${p.name} (${p.pid})`);
+    if (name === 'p-renice') return reniceProc(p);
+    if (name === 'p-tree') return planAndRun([{ pid, signal: 'term', tree: true }], { title: `Quit ${p.name} (${pid}) and its children?`, verb: 'Quit', note: 'Sends SIGTERM to the process and every descendant, children first.' });
+    return signalPids([pid], name.slice(2), `${p.name} (${pid})`);
   }
   switch (name) {
+    case 'fx': {
+      const [i, ...id] = arg.split(':');
+      return runSuggestion(i, id.join(':'));
+    }
+    case 'dismiss': {
+      const days = +($('#dDays')?.value || 30);
+      return act(() => invoke('dismiss_finding', { id: arg, days }), u => `Dismissed until ${until(u)}`);
+    }
+    case 'undismiss': return act(() => invoke('undismiss_finding', { id: arg }), 'Shown again');
     case 'stop-here': {
       const w = wsAt(arg);
-      return signalProcs(w ? w.procs : [], 'term', `everything running in ${tilde(arg).split('/').pop()}`);
+      return groupAction('workspace:' + arg, 'quit', `everything running in ${w?.label || tilde(arg).split('/').pop()}`);
     }
     case 'remove-wt': return planThenExecute({ request: { kind: 'worktrees', paths: [arg], allow_dirty: true }, batch: 'worktree', title: 'Remove this worktree?', verb: 'Remove', intro: 'Runs <span class="mono">git worktree remove</span>. The branch is kept; uncommitted changes and ignored files that are not caches are saved first.' });
     case 'clean-caches': {

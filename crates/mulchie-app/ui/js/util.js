@@ -12,6 +12,8 @@ export function B(n, d = 1) {
   while (Math.abs(n) >= 1000 && i < u.length - 1) { n /= 1000; i++; }
   return (i === 0 ? n.toFixed(0) : n.toFixed(Math.abs(n) >= 100 ? 0 : d)) + ' ' + u[i];
 }
+// A colour token's current value (canvas drawing cannot use var()).
+export const css = name => getComputedStyle(document.documentElement).getPropertyValue(name).trim();
 export const BS = n => B(n) + '/s';
 export const P = (n, d = 0) => (Number(n) || 0).toFixed(d) + '%';
 

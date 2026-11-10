@@ -15,13 +15,12 @@ use mulchie_core::api::{self, ApiError, Client, Server};
 use mulchie_core::engine::{ProcAction, Sample};
 use mulchie_core::lock::{self, EngineLock, LockError};
 use mulchie_core::process::ProcessSource;
-use mulchie_core::{
-    ActionResult, Config, Engine, LoadedConfig, Paths, Plan, Request, WorkspaceAction,
-};
+use mulchie_core::procplan::ProcessPlanRequest;
+use mulchie_core::{ActionResult, Config, Engine, LoadedConfig, Paths, Plan, Request};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::collections::HashMap;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -59,6 +58,8 @@ pub enum Batch {
     Clean,
     Worktree,
     Sweep,
+    /// Signals, renices and app reopens from a process or group plan.
+    Process,
 }
 
 impl Batch {
@@ -69,6 +70,10 @@ impl Batch {
                 r,
                 Request::RemoveWorktree { .. } | Request::PruneWorktree { .. }
             ),
+            Batch::Process => matches!(
+                r,
+                Request::Signal { .. } | Request::Renice { .. } | Request::ReopenApp { .. }
+            ),
         }
     }
 
@@ -77,8 +82,20 @@ impl Batch {
             Batch::Clean => "/v1/clean",
             Batch::Worktree => "/v1/worktree/remove",
             Batch::Sweep => "/v1/sweep",
+            Batch::Process => "/v1/process/execute",
         }
     }
+}
+
+/// The ready requests of a process plan (`ProcessPlan` as JSON), in order.
+pub fn ready_requests(plan: &Value) -> Vec<Request> {
+    plan["items"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter(|i| i["ready"].as_bool() == Some(true))
+        .filter_map(|i| serde_json::from_value(i["request"].clone()).ok())
+        .collect()
 }
 
 /// What the UI asks a plan for.
@@ -112,21 +129,42 @@ impl PlanRequest {
     }
 }
 
-/// The ready requests of the last plan issued for each batch kind. An execute
+/// The ready requests of the last plan issued for each batch kind (for
+/// process plans, the last plan for each target: a pid or a group). An execute
 /// must name only these, so the UI can approve a subset of a plan but never
 /// add to it.
 #[derive(Debug, Default)]
 pub struct PlanBook {
-    ready: HashMap<Batch, Vec<Request>>,
+    ready: HashMap<(Batch, String), Vec<Request>>,
 }
+
+/// Process plans kept at once; the oldest beyond this are forgotten.
+const PROCESS_PLANS_KEPT: usize = 32;
 
 impl PlanBook {
     pub fn record(&mut self, batch: Batch, plan: &Plan) {
-        self.ready.insert(batch, plan.approved());
+        self.ready.insert((batch, String::new()), plan.approved());
     }
 
-    /// Check `items` against the last plan for `batch`. On success the items
-    /// leave the book, so the same approval cannot be sent twice.
+    /// Record the ready items of a process plan for its `target`.
+    pub fn record_process(&mut self, target: &str, ready: Vec<Request>) {
+        let n = self.ready.keys().filter(|k| k.0 == Batch::Process).count();
+        if n >= PROCESS_PLANS_KEPT && !self.ready.contains_key(&(Batch::Process, target.into())) {
+            let drop: Vec<_> = self
+                .ready
+                .keys()
+                .filter(|k| k.0 == Batch::Process)
+                .cloned()
+                .collect();
+            for k in drop {
+                self.ready.remove(&k);
+            }
+        }
+        self.ready.insert((Batch::Process, target.into()), ready);
+    }
+
+    /// Check `items` against the plans recorded for `batch`. On success the
+    /// items leave the book, so the same approval cannot be sent twice.
     pub fn take(&mut self, batch: Batch, items: &[Request]) -> Result<(), String> {
         if items.is_empty() {
             return Err("nothing was selected".into());
@@ -138,15 +176,21 @@ impl PlanBook {
                 items[i].target()
             ));
         }
-        let ready = self.ready.get(&batch).map(Vec::as_slice).unwrap_or(&[]);
-        if let Some(r) = items.iter().find(|r| !ready.contains(r)) {
+        let known = |r: &Request| {
+            self.ready
+                .iter()
+                .any(|(k, list)| k.0 == batch && list.contains(r))
+        };
+        if let Some(r) = items.iter().find(|r| !known(r)) {
             return Err(format!(
                 "{} is not a ready item of the current plan; review the plan again",
                 r.target()
             ));
         }
-        if let Some(list) = self.ready.get_mut(&batch) {
-            list.retain(|r| !items.contains(r));
+        for (k, list) in self.ready.iter_mut() {
+            if k.0 == batch {
+                list.retain(|r| !items.contains(r));
+            }
         }
         Ok(())
     }
@@ -255,33 +299,6 @@ pub fn failure_kind(e: &ApiError) -> Option<bool> {
         (0, _) => Some(false),
         (401, _) => Some(true),
         _ => None,
-    }
-}
-
-/// Check that `pid` is still the process the user saw (same start time) in
-/// an engine state, before sending it a signal.
-pub fn check_process(state: &Value, pid: u32, start_time: u64) -> Result<(), String> {
-    let snap = &state["snapshot"];
-    let listed = snap["top"]
-        .as_array()
-        .into_iter()
-        .flatten()
-        .chain(
-            snap["workspaces"]
-                .as_array()
-                .into_iter()
-                .flatten()
-                .flat_map(|w| w["procs"].as_array().into_iter().flatten()),
-        )
-        .find(|p| p["pid"].as_u64() == Some(u64::from(pid)));
-    match listed {
-        None => Err(format!(
-            "process {pid} is no longer running or no longer listed; nothing was sent"
-        )),
-        Some(p) if p["start_time"].as_u64() != Some(start_time) => Err(format!(
-            "pid {pid} now belongs to a different process than the one you confirmed; nothing was sent"
-        )),
-        Some(_) => Ok(()),
     }
 }
 
@@ -685,53 +702,116 @@ impl Backend {
         }
     }
 
-    pub fn workspace_action(&self, path: &Path, action: WorkspaceAction) -> Result<usize, String> {
+    /// Plan an action on one process (optionally its descendants) or on a
+    /// consumer group, from facts read now. The plan's ready items become the
+    /// only process requests [`Backend::execute`] accepts for that target.
+    /// The app's own pid goes along, so a group holding the app is refused.
+    pub fn process_plan(&self, mut req: ProcessPlanRequest) -> Result<Value, String> {
+        req.caller_pid = Some(std::process::id());
+        let plan = match self.conn() {
+            Conn::Local(e) => to_value(&e.process_plan(&req))?,
+            Conn::Remote(c) => {
+                self.remote(&c, "POST", "/v1/process/plan", Some(to_value(&req)?))?
+            }
+            Conn::Down => return Err(self.down_error()),
+        };
+        let target = plan["target"].as_str().unwrap_or_default().to_string();
+        guard(&self.plans).record_process(&target, ready_requests(&plan));
+        Ok(plan)
+    }
+
+    /// Lower one process's priority to `nice`, only if it is still the
+    /// process started at `start_time` (the gate checks; a mismatch comes
+    /// back as a skipped result). Process plans have no renice for a single
+    /// pid, so this goes to the gate directly, like the engine's own
+    /// throttling.
+    pub fn renice(&self, pid: u32, start_time: u64, nice: i32) -> Result<ActionResult, String> {
+        let action = ProcAction::Renice {
+            nice: nice.clamp(0, 20),
+        };
         match self.conn() {
-            Conn::Local(e) => e.workspace_action(path, action, "manual"),
+            Conn::Local(e) => Ok(e.process_action_expecting(pid, action, start_time, "manual")),
+            Conn::Remote(c) => {
+                let mut body = to_value(&action)?;
+                body["pid"] = json!(pid);
+                body["expected_start_time"] = json!(start_time);
+                let v = self.remote(&c, "POST", "/v1/process", Some(body))?;
+                from_value(v["result"].clone())
+            }
+            Conn::Down => Err(self.down_error()),
+        }
+    }
+
+    /// Everything the engine knows about one process, read now
+    /// (`ProcessDetail` as JSON). `Ok(None)` when it does not exist.
+    pub fn process_detail(&self, pid: u32) -> Result<Option<Value>, String> {
+        match self.conn() {
+            Conn::Local(e) => e.process_detail(pid).as_ref().map(to_value).transpose(),
+            Conn::Remote(c) => {
+                let path = format!("/v1/process/{pid}");
+                match c.request("GET", &path, None, api::timeout_for("GET", &path)) {
+                    Ok(v) => {
+                        self.note_ok();
+                        Ok(Some(v))
+                    }
+                    Err(e) if e.status == 404 => {
+                        self.note_ok();
+                        Ok(None)
+                    }
+                    Err(e) => {
+                        self.note_failure(&e);
+                        Err(e.message)
+                    }
+                }
+            }
+            Conn::Down => Err(self.down_error()),
+        }
+    }
+
+    /// Hide finding `id` for `days`; returns when the dismissal ends.
+    pub fn dismiss_finding(&self, id: &str, days: Option<u64>) -> Result<u64, String> {
+        match self.conn() {
+            Conn::Local(e) => e.dismiss_finding(id, days).map_err(|(_, m)| m),
             Conn::Remote(c) => {
                 let v = self.remote(
                     &c,
                     "POST",
-                    "/v1/workspace",
-                    Some(json!({ "path": path, "action": action })),
+                    "/v1/findings/dismiss",
+                    Some(json!({ "id": id, "days": days })),
                 )?;
-                Ok(v["processes"].as_u64().unwrap_or(0) as usize)
+                v["until_unix"]
+                    .as_u64()
+                    .ok_or_else(|| "unexpected answer from the engine".into())
             }
             Conn::Down => Err(self.down_error()),
         }
     }
 
-    /// Signal `pid`, but only if it is still the process with `start_time`
-    /// that the user confirmed.
-    pub fn process_action(
-        &self,
-        pid: u32,
-        start_time: u64,
-        action: ProcAction,
-    ) -> Result<(), String> {
-        check_process(&self.state()?, pid, start_time)?;
+    /// Show finding `id` again; false when it was not dismissed.
+    pub fn undismiss_finding(&self, id: &str) -> Result<bool, String> {
         match self.conn() {
-            Conn::Local(e) => e.process_action(pid, action, "manual"),
+            Conn::Local(e) => e.undismiss_finding(id).map_err(|(_, m)| m),
             Conn::Remote(c) => {
-                let mut body = to_value(&action)?;
-                body["pid"] = json!(pid);
-                self.remote(&c, "POST", "/v1/process", Some(body))
-                    .map(|_| ())
+                let v = self.remote(
+                    &c,
+                    "POST",
+                    "/v1/findings/undismiss",
+                    Some(json!({ "id": id })),
+                )?;
+                Ok(v["was_dismissed"].as_bool().unwrap_or(false))
             }
             Conn::Down => Err(self.down_error()),
         }
     }
 
-    /// Save and apply settings. Only the engine can do this: the API has no
-    /// route for it, so a client says where the settings live instead.
+    /// Save and apply settings: in this engine, or through the running
+    /// engine's `PUT /v1/config`, which saves its file the same way.
     pub fn set_config(&self, cfg: Config) -> Result<(), String> {
         match self.conn() {
             Conn::Local(e) => e.set_config(cfg).map_err(|e| e.to_string()),
-            Conn::Remote(_) => Err(format!(
-                "Settings belong to the engine that is running (pid {}). Edit {} and restart that engine, or stop it so this app runs the engine.",
-                self.info().engine_pid.map(|p| p.to_string()).unwrap_or_else(|| "?".into()),
-                self.paths.config_file().display()
-            )),
+            Conn::Remote(c) => self
+                .remote(&c, "PUT", "/v1/config", Some(json!({ "config": cfg })))
+                .map(|_| ()),
             Conn::Down => Err(self.down_error()),
         }
     }

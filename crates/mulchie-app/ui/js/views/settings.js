@@ -1,5 +1,7 @@
-// The Settings view. Only the engine this app runs can save; as a client the
-// form is read-only and says where the settings live.
+// The Settings view. The engine this app runs saves directly; as a client
+// the app saves through the running engine (PUT /v1/config), which checks
+// and writes the same file. The watch section sets the thresholds of the
+// read-only detectors and what they never report.
 import { st } from '../store.js';
 import { invoke } from '../ipc.js';
 import { $, esc, tilde } from '../util.js';
@@ -28,23 +30,50 @@ const CFG = [
   ['api_port', 'API port', 'num', 'Takes effect after restart.'],
 ];
 
+// `config.watch`: the detectors behind "Observations". They only report.
+const WATCH = [
+  ['enabled', 'Watch running programs', 'bool', 'Looks for stuck, runaway or unusual processes and reports them as observations. It never acts on its own.'],
+  ['interval_secs', 'Check every (seconds)', 'num'],
+  ['runaway_minutes', 'Runaway window (minutes)', 'num', 'CPU and memory are judged over this long.'],
+  ['runaway_cpu_pct', 'Runaway CPU (% of one core, averaged)', 'num'],
+  ['memory_growth_mb', 'Report memory growth over the window (MB)', 'num'],
+  ['stale_process_hours', 'Report idle agents and builds older than (hours)', 'num'],
+  ['stale_idle_cpu_pct', 'Idle means average CPU below (% of one core)', 'num'],
+  ['stopped_hours', 'Report processes paused longer than (hours)', 'num'],
+  ['check_listeners', 'Check listening network ports', 'bool'],
+  ['check_signatures', 'Check code signatures and download flags (macOS)', 'bool'],
+  ['allow_exes', 'Never report these programs', 'list', 'Full paths, one per line.'],
+  ['allow_ids', 'Never report these observations', 'list', 'Observation ids, one per line (the drawer’s Copy for agent shows the id).'],
+];
+
+const field = (id, [, l, t, h], v) => `<label for="${id}">${esc(l)}</label>${t === 'bool' ? `<div><input type="checkbox" id="${id}" ${v ? 'checked' : ''}></div>` : t === 'list' ? `<textarea id="${id}" rows="3" style="font:11.5px var(--mono)">${esc((v || []).join('\n'))}</textarea>` : `<input type="number" step="any" id="${id}" value="${esc(v)}" style="width:120px">`}${h ? `<div class="hint">${esc(h)}</div>` : ''}`;
+const read = (el, t) => t === 'bool' ? el.checked : t === 'list' ? el.value.split('\n').map(x => x.trim()).filter(Boolean) : Number(el.value);
+
 export function renderSettings(force) {
   const ui = st.ui, cfg = st.cfg;
   if (!cfg || (ui.cfgDirty && !force)) return;
-  const c = cfg.config, editable = cfg.editable;
-  $('#cfgNote').innerHTML = editable ? '' : noticesHtml([['info', 'Read-only while connected to another engine',
-    `The running engine owns these settings. Edit ${tilde(cfg.path)} and restart that engine, or stop it so this app runs the engine.`]]);
-  $('#form').innerHTML = CFG.map(([k, l, t, h]) => `<label for="cf_${k}">${l}</label>${t === 'bool' ? `<div><input type="checkbox" id="cf_${k}" ${c[k] ? 'checked' : ''}></div>` : t === 'list' ? `<textarea id="cf_${k}" rows="3" style="font:11.5px var(--mono)">${esc((c[k] || []).join('\n'))}</textarea>` : `<input type="number" id="cf_${k}" value="${esc(c[k])}" style="width:120px">`}${h ? `<div class="hint">${esc(h)}</div>` : ''}`).join('');
+  const c = cfg.config, w = c.watch || {}, editable = cfg.editable, conn = st.conn;
+  const notes = [];
+  if (cfg.config_error) notes.push(['bad', 'The settings file could not be used', `${cfg.config_error}. Mulchie runs on safe defaults with automatic cleanup off. Saving here writes a valid file and keeps the invalid one beside it.`]);
+  if (!editable) notes.push(['info', 'Not connected to an engine', 'Settings can be saved once the app reaches Mulchie’s engine again.']);
+  else if (conn?.mode === 'client') notes.push(['info', `Saved through the running engine (pid ${conn.engine_pid ?? '?'})`, `It checks the values and writes ${tilde(cfg.path || '')}; changes apply at once.`]);
+  $('#cfgNote').innerHTML = noticesHtml(notes);
+  const dis = (w.dismissed || []).length;
+  $('#form').innerHTML = CFG.map(f => field('cf_' + f[0], f, c[f[0]])).join('') +
+    `<h3 class="form-h">Watch</h3><div class="hint form-hint">Observations are checks for you to look at, not verdicts.${dis ? ` ${dis} dismissed observation(s) are kept in the file; show them again from Overview → All observations.` : ''}</div>` +
+    WATCH.map(f => field('cw_' + f[0], f, w[f[0]])).join('');
   $('#form').querySelectorAll('input,textarea').forEach(el => { el.disabled = !editable; });
   $('#saveCfg').disabled = !editable;
 }
 
 export async function saveCfg() {
-  const c = { ...st.cfg.config };
-  for (const [k, , t] of CFG) {
-    const el = $('#cf_' + k);
-    c[k] = t === 'bool' ? el.checked : t === 'list' ? el.value.split('\n').map(x => x.trim()).filter(Boolean) : Number(el.value);
-  }
+  // Dismissals change from the drawer while the form is open: keep the
+  // engine's current list, not the one the form was drawn from.
+  let fresh = st.cfg;
+  try { fresh = await invoke('get_config'); } catch (e) { /* save what we have */ }
+  const c = { ...st.cfg.config, watch: { ...(st.cfg.config.watch || {}), dismissed: fresh.config?.watch?.dismissed || [] } };
+  for (const [k, , t] of CFG) c[k] = read($('#cf_' + k), t);
+  for (const [k, , t] of WATCH) c.watch[k] = read($('#cw_' + k), t);
   const r = await act(() => invoke('set_config', { config: c }).then(() => true), 'Settings saved');
   if (r) {
     st.ui.cfgDirty = false;
