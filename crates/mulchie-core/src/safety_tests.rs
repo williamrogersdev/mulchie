@@ -1184,3 +1184,74 @@ fn a_patch_that_does_not_verify_is_a_failed_backup() {
     .unwrap();
     env.gate().verify_patch(&facts, &dir, &good).unwrap();
 }
+
+/// C4: a second edit to an already-untracked file while the backup runs left
+/// `git status` unchanged, so the removal went ahead with a stale patch.
+#[test]
+fn appending_to_an_untracked_file_during_backup_stops_the_removal() {
+    let env = Env::new();
+    let repo = env.repo("repo");
+    let wt = env.worktree(&repo, "agent-x", false);
+    let work = wt.join("work.txt");
+    std::fs::write(&work, "first\n").unwrap();
+    let mut g = env.gate();
+    let w2 = work.clone();
+    g.after_backup = Some(Box::new(move || {
+        use std::io::Write;
+        let mut f = std::fs::OpenOptions::new().append(true).open(&w2).unwrap();
+        f.write_all(b"second\n").unwrap();
+    }));
+    let r = g.execute_one(&env.remove_req(&wt, &env.head(&wt)), "t");
+    assert_eq!(reason(&r), Some(SkipReason::ChangedDuringBackup), "{r:?}");
+    assert_eq!(std::fs::read_to_string(&work).unwrap(), "first\nsecond\n");
+
+    // Same size, same second: only the content differs. The tree hash sees it
+    // even if the stat fingerprint could not.
+    let mut g = env.gate();
+    let w3 = work.clone();
+    g.after_backup = Some(Box::new(move || {
+        let m = std::fs::metadata(&w3).unwrap().modified().unwrap();
+        std::fs::write(&w3, "FIRST\nSECOND\n").unwrap();
+        std::fs::File::options()
+            .write(true)
+            .open(&w3)
+            .unwrap()
+            .set_modified(m)
+            .unwrap();
+    }));
+    let r = g.execute_one(&env.remove_req(&wt, &env.head(&wt)), "t");
+    assert_eq!(reason(&r), Some(SkipReason::ChangedDuringBackup), "{r:?}");
+    assert!(wt.exists());
+}
+
+/// C4: a change to an ignored `.env` during the backup is not in the archive
+/// and invisible to `git status`.
+#[test]
+fn changing_an_ignored_env_during_backup_stops_the_removal() {
+    let env = Env::new();
+    let repo = env.repo("repo");
+    let wt = env.worktree(&repo, "agent-x", false);
+    let dotenv = wt.join(".env");
+    std::fs::write(&dotenv, "A=1\n").unwrap();
+    let mut g = env.gate();
+    let d2 = dotenv.clone();
+    g.after_backup = Some(Box::new(move || std::fs::write(&d2, "A=2\n").unwrap()));
+    let r = g.execute_one(&env.remove_req(&wt, &env.head(&wt)), "t");
+    assert_eq!(reason(&r), Some(SkipReason::ChangedDuringBackup), "{r:?}");
+    assert_eq!(std::fs::read_to_string(&dotenv).unwrap(), "A=2\n");
+
+    // A new ignored file appearing during the backup is not in the archive.
+    let mut g = env.gate();
+    let n = wt.join("new.sqlite");
+    let n2 = n.clone();
+    g.after_backup = Some(Box::new(move || std::fs::write(&n2, "db").unwrap()));
+    let r = g.execute_one(&env.remove_req(&wt, &env.head(&wt)), "t");
+    assert_eq!(reason(&r), Some(SkipReason::ChangedDuringBackup), "{r:?}");
+    assert!(n.exists());
+
+    // With nothing touched, it goes ahead.
+    let r = env
+        .gate()
+        .execute_one(&env.remove_req(&wt, &env.head(&wt)), "t");
+    assert!(done(&r), "{r:?}");
+}

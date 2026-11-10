@@ -432,6 +432,71 @@ struct WorktreeFacts {
     bytes: u64,
 }
 
+/// What [`Gate::back_up`] wrote, and what it needs to recheck afterwards.
+struct BackupSet {
+    backups: Vec<Backup>,
+    /// The backup set directory, when one was written.
+    dir: Option<PathBuf>,
+    /// The tree the patch was made from (`add -A` + `write-tree`).
+    tree: Option<String>,
+}
+
+/// (type, length, mtime seconds, mtime nanoseconds, inode) of one path, or
+/// `None` when it is missing.
+type StatPrint = Option<(u32, u64, i64, i64, u64)>;
+
+fn stat_print(p: &Path) -> StatPrint {
+    use std::os::unix::fs::MetadataExt;
+    let m = std::fs::symlink_metadata(p).ok()?;
+    Some((
+        m.mode() & 0o170000,
+        m.len(),
+        m.mtime(),
+        m.mtime_nsec(),
+        m.ino(),
+    ))
+}
+
+/// At most this many paths are fingerprinted; past it the recheck cannot
+/// complete, which stops the removal.
+const FINGERPRINT_BUDGET: usize = 200_000;
+
+/// Stat fingerprints of every dirty path (from porcelain status) and every
+/// file and directory under the ignored entries that are archived. Taken before
+/// the backup and compared after it, so an edit made while the backup ran (a
+/// second write to an already-dirty file, a change to an ignored `.env`) stops
+/// the removal even when `git status` looks the same.
+fn fingerprint(f: &WorktreeFacts) -> Option<std::collections::BTreeMap<PathBuf, StatPrint>> {
+    let mut out = std::collections::BTreeMap::new();
+    for line in f.status.lines() {
+        let Some(rest) = line.get(3..) else { continue };
+        // Renames list `old -> new`; quoted names are covered by the tree hash.
+        for part in rest.split(" -> ") {
+            if !part.starts_with('"') {
+                let p = f.path.join(part);
+                out.insert(p.clone(), stat_print(&p));
+            }
+        }
+    }
+    let mut budget = FINGERPRINT_BUDGET;
+    for rel in &f.ignored {
+        let mut stack = vec![f.path.join(rel)];
+        while let Some(p) = stack.pop() {
+            budget = budget.checked_sub(1)?;
+            let st = stat_print(&p);
+            let is_dir = st.is_some_and(|s| s.0 == 0o040000);
+            out.insert(p.clone(), st);
+            if is_dir {
+                let rd = std::fs::read_dir(&p).ok()?;
+                for e in rd.flatten() {
+                    stack.push(e.path());
+                }
+            }
+        }
+    }
+    Some(out)
+}
+
 struct PruneFacts {
     repo: PathBuf,
     entry: WorktreeEntry,
@@ -1100,10 +1165,17 @@ impl<'a> Gate<'a> {
         require_idle: bool,
     ) -> Result<Outcome, Skip> {
         let f = self.check_worktree(path, Some(expected_head), allow_dirty, require_idle)?;
-        let backups = self.back_up(&f).map_err(|e| Skip {
+        let Some(before) = fingerprint(&f) else {
+            return skip(
+                SkipReason::BackupFailed,
+                "could not record the state of changed and ignored files; nothing was removed",
+            );
+        };
+        let set = self.back_up(&f).map_err(|e| Skip {
             reason: SkipReason::BackupFailed,
             detail: format!("{e}; nothing was removed"),
         })?;
+        let backups = set.backups;
         #[cfg(test)]
         if let Some(h) = &self.after_backup {
             h();
@@ -1136,6 +1208,42 @@ impl<'a> Gate<'a> {
                 "files changed while backing up; nothing was removed",
             );
         }
+        // Status does not see a second edit to a dirty file or any edit to an
+        // ignored one. Compare stat fingerprints, the set of ignored entries, and
+        // (when a patch was written) the tree a fresh `add -A` produces now.
+        if fingerprint(&f).as_ref() != Some(&before) {
+            return skip(
+                SkipReason::ChangedDuringBackup,
+                "changed or ignored files were modified while backing up; nothing was removed",
+            );
+        }
+        let (ignored_now, _) = ignored_to_archive(self.paths, &f.path)?;
+        if ignored_now != f.ignored {
+            return skip(
+                SkipReason::ChangedDuringBackup,
+                "ignored files appeared or disappeared while backing up; nothing was removed",
+            );
+        }
+        if let (Some(tree), Some(dir)) = (&set.tree, &set.dir) {
+            let index = dir.join("recheck.index.tmp");
+            let now = self.staged_tree(&f, &index);
+            let _ = std::fs::remove_file(&index);
+            match now {
+                Ok(t) if &t == tree => {}
+                Ok(_) => {
+                    return skip(
+                        SkipReason::ChangedDuringBackup,
+                        "file contents changed while backing up; nothing was removed",
+                    )
+                }
+                Err(e) => {
+                    return skip(
+                        SkipReason::ChangedDuringBackup,
+                        format!("could not recheck the worktree after the backup: {e}"),
+                    )
+                }
+            }
+        }
         self.busy_check_with(&f.path, false, true)?;
 
         let mut g = Git::new(self.paths, &f.repo).args(["worktree", "remove"]);
@@ -1163,13 +1271,16 @@ impl<'a> Gate<'a> {
     }
 
     /// Write every backup the worktree needs. Any failure fails the whole step.
-    fn back_up(&self, f: &WorktreeFacts) -> Result<Vec<Backup>, String> {
+    fn back_up(&self, f: &WorktreeFacts) -> Result<BackupSet, String> {
         let mut out = Vec::new();
+        let mut set_dir = None;
+        let mut tree = None;
         let needs_dir = f.dirty_files > 0 || !f.ignored.is_empty();
         if needs_dir {
             let dir = self.backup_set_dir(f)?;
             if f.dirty_files > 0 {
-                let p = self.write_patch(f, &dir)?;
+                let (p, t) = self.write_patch(f, &dir)?;
+                tree = Some(t);
                 out.push(Backup {
                     kind: BackupKind::Patch,
                     location: p.display().to_string(),
@@ -1196,6 +1307,7 @@ impl<'a> Gate<'a> {
                 &serde_json::to_vec_pretty(&manifest).unwrap_or_default(),
             )
             .map_err(|e| format!("could not write the backup manifest: {e}"))?;
+            set_dir = Some(dir);
         }
         if f.detached {
             let b = self.ensure_backup_branch(f)?;
@@ -1204,7 +1316,11 @@ impl<'a> Gate<'a> {
                 location: b,
             });
         }
-        Ok(out)
+        Ok(BackupSet {
+            backups: out,
+            dir: set_dir,
+            tree,
+        })
     }
 
     /// A new directory `<backups>/<repo>-<name>-<now>-<random>`, mode 0700, created
@@ -1230,7 +1346,9 @@ impl<'a> Gate<'a> {
         Err("could not pick a unique backup directory".into())
     }
 
-    fn write_patch(&self, f: &WorktreeFacts, dir: &Path) -> Result<PathBuf, String> {
+    /// Stage everything (`add -A`) into a private copy of the worktree index at
+    /// `index` and return the tree it describes. The caller removes `index`.
+    fn staged_tree(&self, f: &WorktreeFacts, index: &Path) -> Result<String, String> {
         let real_index = git::git(self.paths, &f.path, &["rev-parse", "--git-path", "index"])
             .map_err(|e| e.to_string())?;
         let real_index = PathBuf::from(real_index.trim());
@@ -1241,15 +1359,28 @@ impl<'a> Gate<'a> {
         };
         let bytes = std::fs::read(&real_index)
             .map_err(|e| format!("could not read the worktree index: {e}"))?;
+        create_private_file(index, &bytes).map_err(|e| e.to_string())?;
+        Git::new(self.paths, &f.path)
+            .env("GIT_INDEX_FILE", index)
+            .args(["add", "-A"])
+            .timeout(BACKUP_TIMEOUT)
+            .run()
+            .map_err(|e| format!("could not stage a backup: {e}"))?;
+        let tree = Git::new(self.paths, &f.path)
+            .env("GIT_INDEX_FILE", index)
+            .args(["write-tree"])
+            .timeout(BACKUP_TIMEOUT)
+            .text()
+            .map_err(|e| format!("could not record the backed-up tree: {e}"))?;
+        Ok(tree.trim().to_string())
+    }
+
+    /// `changes.patch` (HEAD → everything in the worktree, `add -A`) and the tree
+    /// it was made from.
+    fn write_patch(&self, f: &WorktreeFacts, dir: &Path) -> Result<(PathBuf, String), String> {
         let index = dir.join("index.tmp");
-        create_private_file(&index, &bytes).map_err(|e| e.to_string())?;
         let res = (|| {
-            Git::new(self.paths, &f.path)
-                .env("GIT_INDEX_FILE", &index)
-                .args(["add", "-A"])
-                .timeout(BACKUP_TIMEOUT)
-                .run()
-                .map_err(|e| format!("could not stage a backup: {e}"))?;
+            let tree = self.staged_tree(f, &index)?;
             Git::new(self.paths, &f.path)
                 .env("GIT_INDEX_FILE", &index)
                 .args([
@@ -1266,9 +1397,10 @@ impl<'a> Gate<'a> {
                 .timeout(BACKUP_TIMEOUT)
                 .run()
                 .map_err(|e| format!("could not write the patch: {e}"))
+                .map(|o| (o, tree))
         })();
         let _ = std::fs::remove_file(&index);
-        let out = res?;
+        let (out, tree) = res?;
         if out.stdout.is_empty() {
             return Err(format!(
                 "{} file(s) are changed but the patch came out empty",
@@ -1283,7 +1415,7 @@ impl<'a> Gate<'a> {
         let p = dir.join("changes.patch");
         create_private_file(&p, &out.stdout).map_err(|e| e.to_string())?;
         self.verify_patch(f, dir, &p)?;
-        Ok(p)
+        Ok((p, tree))
     }
 
     /// The patch must apply cleanly to HEAD: `git apply --cached --check` against
