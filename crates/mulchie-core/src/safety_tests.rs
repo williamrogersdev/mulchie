@@ -891,6 +891,7 @@ fn skip_reasons_have_stable_codes() {
             reason: SkipReason::HeadMoved,
             detail: "d".into(),
         },
+        journal_error: None,
     };
     let v = serde_json::to_value(&r).unwrap();
     assert_eq!(v["status"], "skipped");
@@ -1329,4 +1330,34 @@ fn pruning_skips_when_the_backup_branch_cannot_be_made() {
         .unwrap()
         .iter()
         .any(|e| e.path == a));
+}
+
+/// C6: a journal that cannot be written no longer fails silently.
+#[test]
+fn journal_failures_are_reported_on_the_result() {
+    let env = Env::new();
+    let blocker = env._t.path().join("not-a-dir");
+    std::fs::write(&blocker, "x").unwrap();
+    let j = Journal::at(blocker.join("actions.jsonl"), 1 << 20);
+    let g = env.gate().with_journal(&j);
+    let r = g.execute_one(&sig(1, 0), "t");
+    assert_eq!(reason(&r), Some(SkipReason::ProtectedProcess));
+    let e = r
+        .journal_error
+        .clone()
+        .expect("journal error on the result");
+    assert!(e.contains("not journaled"), "{e}");
+    assert!(j.last_error().is_some());
+    let v = serde_json::to_value(&r).unwrap();
+    assert!(v["journal_error"].is_string());
+
+    // A working journal: no field at all.
+    let ok = Journal::at(env._t.path().join("j/actions.jsonl"), 1 << 20);
+    let r = env.gate().with_journal(&ok).execute_one(&sig(1, 0), "t");
+    assert!(r.journal_error.is_none());
+    assert!(serde_json::to_value(&r)
+        .unwrap()
+        .get("journal_error")
+        .is_none());
+    assert!(ok.last_error().is_none());
 }

@@ -194,6 +194,10 @@ pub struct ActionResult {
     pub target: String,
     #[serde(flatten)]
     pub outcome: Outcome,
+    /// Set when the action ran (or was skipped) but could not be written to the
+    /// action journal.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub journal_error: Option<String>,
 }
 
 impl ActionResult {
@@ -791,17 +795,20 @@ impl<'a> Gate<'a> {
                 },
             }
         };
-        let result = ActionResult {
+        let mut result = ActionResult {
             action: req.action(),
             target: req.target(),
             outcome,
+            journal_error: None,
         };
         if let Some(j) = self.journal {
             let sig = match req {
                 Request::Signal { signal, .. } => Some(*signal),
                 _ => None,
             };
-            let _ = j.append(&result.to_action(self.now, source, sig));
+            if let Err(e) = j.append(&result.to_action(self.now, source, sig)) {
+                result.journal_error = Some(format!("not journaled: {e}"));
+            }
         }
         result
     }

@@ -231,6 +231,9 @@ pub struct HealthSummary {
     pub ok_to_start_heavy_work: bool,
     pub reclaimable_stale: u64,
     pub restarts: u32,
+    /// Why the action journal could not be written, while that is so.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub journal_error: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -257,6 +260,11 @@ pub struct State {
     /// Automatic reclaim, sweeping and throttling run only when true: the config
     /// loaded cleanly and this engine holds the engine lock.
     pub automation: bool,
+    /// Why the action journal could not be written, while that is so. Actions
+    /// still run; their results carry `journal_error` too.
+    pub journal_error: Option<String>,
+    /// Build processes whose original priority could not be restored.
+    pub restore_failed: usize,
 }
 
 impl State {
@@ -472,6 +480,8 @@ impl Engine {
             throttled: 0,
             low_disk: false,
             loops: Loops::default(),
+            journal_error: None,
+            restore_failed: 0,
         };
         Self {
             state: Arc::new(Mutex::new(state)),
@@ -509,6 +519,11 @@ impl Engine {
         st.sample_age_secs = st.sample_age(now);
         st.health = st.health_at(now);
         st.automation = st.automation && self.automation_allowed();
+        st.journal_error = self.journal.last_error();
+        st.restore_failed = lock(&self.reniced)
+            .values()
+            .filter(|r| r.restore_failed)
+            .count();
         st
     }
 
@@ -536,6 +551,7 @@ impl Engine {
             ok_to_start_heavy_work: adv.ok_to_start_heavy_work,
             reclaimable_stale: st.scan.as_ref().map(|s| s.stale_bytes).unwrap_or(0),
             restarts: st.loops.sample.restarts + st.loops.scan.restarts,
+            journal_error: self.journal.last_error(),
         }
     }
 

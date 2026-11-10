@@ -64,6 +64,8 @@ pub struct Journal {
     path: PathBuf,
     max_bytes: u64,
     lock: Mutex<()>,
+    /// The last append failure, cleared by the next successful append.
+    last_error: Mutex<Option<String>>,
 }
 
 impl Journal {
@@ -76,6 +78,7 @@ impl Journal {
             path,
             max_bytes,
             lock: Mutex::new(()),
+            last_error: Mutex::new(None),
         }
     }
 
@@ -89,8 +92,29 @@ impl Journal {
         PathBuf::from(s)
     }
 
+    /// Why the last append failed, if it did (and none has succeeded since).
+    /// Failures matter most when the disk is full, exactly when automatic
+    /// reclaim runs; callers keep acting and surface this instead.
+    pub fn last_error(&self) -> Option<String> {
+        self.last_error
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+    }
+
     /// Append one line, rotating first when the file would pass the limit.
     pub fn append(&self, a: &Action) -> std::io::Result<()> {
+        let res = self.append_inner(a);
+        *self.last_error.lock().unwrap_or_else(|e| e.into_inner()) = res.as_ref().err().map(|e| {
+            format!(
+                "could not write the action journal {}: {e}",
+                self.path.display()
+            )
+        });
+        res
+    }
+
+    fn append_inner(&self, a: &Action) -> std::io::Result<()> {
         use std::os::unix::fs::OpenOptionsExt;
         let _g = self.lock.lock().unwrap_or_else(|e| e.into_inner());
         let mut line = serde_json::to_vec(a).map_err(std::io::Error::other)?;

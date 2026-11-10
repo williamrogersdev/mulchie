@@ -565,3 +565,27 @@ fn throttling_tracks_and_restores_only_own_builds() {
     e.apply_sample(calm, &kinds[1..], &mut ctx);
     assert_eq!(e.snapshot_state().throttled, 0);
 }
+
+/// C6: journal failures reach state and health; recording keeps going.
+#[test]
+fn journal_failures_show_in_state_and_health() {
+    let (_t, e) = engine();
+    let jf = e.paths().journal_file();
+    std::fs::create_dir_all(&jf).unwrap(); // a directory where the file goes
+    e.log("note", "hello".into(), 0, None, "t");
+    let st = e.snapshot_state();
+    assert!(
+        st.actions.iter().any(|a| a.detail == "hello"),
+        "kept in memory"
+    );
+    assert!(st
+        .journal_error
+        .as_deref()
+        .unwrap_or("")
+        .contains("journal"));
+    assert!(e.health_summary().journal_error.is_some());
+    std::fs::remove_dir(&jf).unwrap();
+    e.log("note", "again".into(), 0, None, "t");
+    assert!(e.snapshot_state().journal_error.is_none());
+    assert!(e.health_summary().journal_error.is_none());
+}
