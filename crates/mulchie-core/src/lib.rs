@@ -4,6 +4,7 @@ pub mod consumers;
 pub mod diskmap;
 pub mod engine;
 pub mod git;
+pub mod guard;
 pub mod journal;
 pub mod lock;
 pub mod monitor;
