@@ -243,8 +243,18 @@ mod tests {
             .mode();
         assert_eq!(mode & 0o777, 0o600);
         drop(a);
-        // A stale file from an engine that is gone does not count.
-        assert_eq!(running_engine(&paths), None);
+        // A stale file from an engine that is gone does not count. Another test
+        // thread's fork() can share the open file description until its exec
+        // closes it (O_CLOEXEC), holding the flock for a moment: wait for that.
+        let mut gone = false;
+        for _ in 0..200 {
+            if running_engine(&paths).is_none() {
+                gone = true;
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert!(gone, "the lock is released once the holder drops it");
         let b = EngineLock::acquire(&paths, 9).unwrap();
         assert_eq!(b.holder().started_unix, 9);
     }
