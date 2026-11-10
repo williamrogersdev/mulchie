@@ -5,7 +5,9 @@
 //!
 //! Covers: initialize, tools/list, diagnose (with and without an engine), a
 //! plan call, plan-then-execute refusing items outside the plan, and the
-//! read-only server leaving out and refusing destructive tools.
+//! read-only server leaving out and refusing destructive tools, build slots
+//! with the release secret kept in the server, findings, process detail with
+//! secrets redacted, and a process plan carried out by execute_plan.
 
 use mulchie_core::{api, Config, Engine, Paths};
 use serde_json::{json, Value};
@@ -163,7 +165,7 @@ impl Server {
 #[test]
 fn read_write_server_with_an_engine() {
     let h = Home::new();
-    let (_engine, _lk, server) = h.engine();
+    let (engine, _lk, server) = h.engine();
     let mut s = h.server(&["mcp"], &[]);
 
     let init = s.initialize();
@@ -176,7 +178,15 @@ fn read_write_server_with_an_engine() {
 
     let tools = s.tools();
     assert_eq!(tools[0], "diagnose");
-    for t in ["execute_plan", "plan_worktree_sweep", "plan_cache_cleanup"] {
+    for t in [
+        "execute_plan",
+        "plan_worktree_sweep",
+        "plan_cache_cleanup",
+        "plan_process_action",
+        "list_findings",
+        "inspect_process",
+        "dismiss_finding",
+    ] {
         assert!(tools.contains(&t.to_string()), "{t}");
     }
 
@@ -209,8 +219,50 @@ fn read_write_server_with_an_engine() {
         json!({ "label": "smoke", "ttl_secs": 30 }),
     );
     assert!(!err, "{slot}");
-    let (err, _) = s.call("release_build_slot", json!({ "ticket": slot["ticket"] }));
-    assert!(!err);
+    // The release secret stays in the server; release sends it.
+    assert!(!slot.to_string().contains("secret"), "{slot}");
+    let (err, r) = s.call("release_build_slot", json!({ "ticket": slot["ticket"] }));
+    assert!(!err, "{r}");
+    assert!(engine.snapshot_state().slots.active.is_empty());
+
+    // Findings: observations, with the note.
+    let (err, f) = s.call("list_findings", json!({ "severity": "low" }));
+    assert!(!err, "{f}");
+    assert!(f["findings"].is_array());
+    assert!(f["note"].as_str().unwrap().contains("not verdicts"));
+
+    // A process of ours with a secret on its command line.
+    let mut child = Command::new("sh")
+        .args(["-c", "sleep 30; exit 0", "smoke", "--password", "hunter2"])
+        .spawn()
+        .unwrap();
+    let pid = child.id();
+    std::thread::sleep(Duration::from_millis(200));
+    let (err, d) = s.call("inspect_process", json!({ "pid": pid }));
+    assert!(!err, "{d}");
+    assert_eq!(d["pid"], pid);
+    assert!(!d.to_string().contains("hunter2"), "a secret leaked: {d}");
+    assert!(
+        d.to_string().contains(mulchie_core::redact::REDACTED),
+        "{d}"
+    );
+
+    // Plan, then execute: the process is signalled only by execute_plan.
+    let (err, plan) = s.call(
+        "plan_process_action",
+        json!({ "pid": pid, "signal": "term" }),
+    );
+    assert!(!err, "{plan}");
+    assert!(
+        child.try_wait().unwrap().is_none(),
+        "planning changed nothing"
+    );
+    let id = plan["plan_id"].as_str().unwrap_or_else(|| panic!("{plan}"));
+    let target = plan["ready"][0]["target"].as_str().unwrap().to_string();
+    let (err, done) = s.call("execute_plan", json!({ "plan_id": id, "items": [target] }));
+    assert!(!err, "{done}");
+    let status = child.wait().unwrap();
+    assert!(!status.success(), "the process was signalled");
 
     let r = s.request("prompts/list", json!({}));
     assert_eq!(r["result"]["prompts"].as_array().unwrap().len(), 2);
@@ -233,12 +285,7 @@ fn read_only_server_hides_and_refuses_destructive_tools() {
         let init = s.initialize();
         assert!(init["instructions"].as_str().unwrap().contains("read-only"));
         let tools = s.tools();
-        for t in [
-            "execute_plan",
-            "prune_cache",
-            "workspace_action",
-            "process_action",
-        ] {
+        for t in ["execute_plan", "prune_cache", "dismiss_finding"] {
             assert!(!tools.contains(&t.to_string()), "{args:?} lists {t}");
         }
         assert!(tools.contains(&"diagnose".to_string()));
@@ -253,6 +300,18 @@ fn read_only_server_hides_and_refuses_destructive_tools() {
         assert!(plan.get("plan_id").is_none());
         let (err, d) = s.call("diagnose", json!({}));
         assert!(!err, "{d}");
+        // The read-only token still takes and releases TTL build slots.
+        let (err, slot) = s.call("acquire_build_slot", json!({ "ttl_secs": 30 }));
+        assert!(!err, "{slot}");
+        let (err, r) = s.call("release_build_slot", json!({ "ticket": slot["ticket"] }));
+        assert!(!err, "{r}");
+        // Plans are shown, never stored.
+        let (err, plan) = s.call(
+            "plan_process_action",
+            json!({ "pid": std::process::id(), "signal": "stop" }),
+        );
+        assert!(!err, "{plan}");
+        assert!(plan.get("plan_id").is_none(), "{plan}");
         s.finish();
     }
     server.stop();

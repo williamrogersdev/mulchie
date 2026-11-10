@@ -6,12 +6,14 @@ mod doctor;
 mod mcp;
 mod mcp_install;
 mod mcp_tools;
+mod observe;
 mod plan;
+mod process;
 mod run;
 mod service;
 
 use clap::{CommandFactory, Parser};
-use cli::{Cli, Command, McpCommand};
+use cli::{Cli, Command, ConfigCommand, McpCommand};
 use mulchie_core::Paths;
 
 fn main() {
@@ -44,7 +46,30 @@ fn dispatch(paths: &Paths, cmd: Command) -> i32 {
         Command::Worktrees(j) => commands::worktrees(paths, j.json),
         Command::Sweep(s) => plan::command(paths, plan::Job::Sweep, s.confirm, s.out.json),
         Command::Prune(p) => commands::prune(paths, &p.cache, p.out.json),
-        Command::Signal(s) => commands::signal(paths, s.pid, s.signal.as_str()),
+        Command::Signal(s) => process::command(
+            paths,
+            process::Target::Pid {
+                pid: s.pid,
+                signal: s.signal.as_str().into(),
+                tree: s.tree,
+            },
+            s.confirm,
+            s.out.json,
+        ),
+        Command::Group(g) => process::command(
+            paths,
+            process::Target::Group {
+                key: g.key,
+                action: g.action.as_str().into(),
+            },
+            g.confirm,
+            g.out.json,
+        ),
+        Command::Findings(f) => match &f.action {
+            Some(a) => observe::findings_action(paths, a),
+            None => observe::findings(paths, f.severity, f.kind.as_deref(), f.all, f.out.json),
+        },
+        Command::Inspect(i) => observe::inspect(paths, i.pid, i.out.json),
         Command::Advice(j) => commands::advice(paths, j.json),
         Command::Run(r) => run::run(paths, &r),
         Command::Diagnose(j) => commands::diagnose(paths, j.json),
@@ -56,7 +81,12 @@ fn dispatch(paths: &Paths, cmd: Command) -> i32 {
         },
         Command::Token(t) => commands::token(paths, t.read_only, t.show),
         Command::Serve => commands::serve(paths),
-        Command::Config(j) => commands::config(paths, j.json),
+        Command::Config(c) => match c.action {
+            None => observe::config_show(paths, c.out.json),
+            Some(ConfigCommand::Set { key, value, out }) => {
+                observe::config_set(paths, &key, &value, out.json || c.out.json)
+            }
+        },
         Command::Doctor(j) => doctor::command(paths, j.json),
         Command::Service(s) => service::command(paths, &s),
         Command::Completions { shell } => {

@@ -136,6 +136,9 @@ fn every_subcommand_has_help() {
         "sweep",
         "prune",
         "signal",
+        "group",
+        "findings",
+        "inspect",
         "advice",
         "run",
         "mcp",
@@ -522,4 +525,155 @@ fn mcp_install_edits_only_the_temp_home() {
     let o = run(&["mcp", "config", "--read-only"]);
     let v: serde_json::Value = serde_json::from_slice(&o.stdout).unwrap();
     assert_eq!(v["mcpServers"]["mulchie"]["args"][1], "--read-only");
+}
+
+/// A child of ours with a secret on its command line.
+fn secret_child() -> Child {
+    let c = Command::new("sh")
+        .args([
+            "-c",
+            "sleep 30; exit 0",
+            "cli-test",
+            "--password",
+            "hunter2",
+        ])
+        .spawn()
+        .unwrap();
+    std::thread::sleep(Duration::from_millis(200));
+    c
+}
+
+#[test]
+fn inspect_redacts_locally_and_through_the_engine() {
+    let h = Home::new();
+    let mut child = secret_child();
+    let pid = child.id().to_string();
+    let o = h.run(&["inspect", &pid, "--json"]);
+    assert!(o.status.success(), "{}", text(&o.stderr));
+    assert!(text(&o.stderr).contains("no engine is running"));
+    let out = text(&o.stdout);
+    assert!(
+        !out.contains("hunter2") && out.contains(mulchie_core::redact::REDACTED),
+        "{out}"
+    );
+    let (_engine, _lk, server) = h.engine();
+    let o = h.run(&["inspect", &pid]);
+    assert!(o.status.success(), "{}", text(&o.stderr));
+    let out = text(&o.stdout);
+    assert!(
+        !out.contains("hunter2") && out.contains("--password"),
+        "{out}"
+    );
+    assert_eq!(h.run(&["inspect", "999999"]).status.code(), Some(1));
+    server.stop();
+    let _ = child.kill();
+    let _ = child.wait();
+}
+
+#[test]
+fn signal_plans_then_acts_through_the_engine() {
+    let h = Home::new();
+    let (_engine, _lk, server) = h.engine();
+    let mut child = secret_child();
+    let pid = child.id().to_string();
+    // A dry run shows the plan and changes nothing.
+    let o = h.run(&["signal", &pid, "term", "--dry-run"]);
+    assert!(o.status.success(), "{}", text(&o.stderr));
+    assert!(text(&o.stdout).contains("Plan:"), "{}", text(&o.stdout));
+    assert!(child.try_wait().unwrap().is_none());
+    // Without a terminal and without --yes, it refuses.
+    let o = h.run(&["signal", &pid, "term", "--json"]);
+    assert_eq!(o.status.code(), Some(2), "{}", text(&o.stderr));
+    let v: serde_json::Value = serde_json::from_slice(&o.stdout).unwrap();
+    assert_eq!(v["executed"], false);
+    assert!(child.try_wait().unwrap().is_none());
+    // With --yes it signals exactly the planned process.
+    let o = h.run(&["signal", &pid, "term", "--yes", "--json"]);
+    assert!(
+        o.status.success(),
+        "{} {}",
+        text(&o.stdout),
+        text(&o.stderr)
+    );
+    let v: serde_json::Value = serde_json::from_slice(&o.stdout).unwrap();
+    assert_eq!(v["results"][0]["status"], "done", "{v}");
+    assert!(!child.wait().unwrap().success());
+    // Groups are planned the same way; an unknown group is refused.
+    let o = h.run(&["group", "app:/Nope.app", "quit", "--yes"]);
+    assert!(o.status.success(), "{}", text(&o.stderr));
+    assert!(text(&o.stdout).contains("Blocked:"), "{}", text(&o.stdout));
+    server.stop();
+}
+
+#[test]
+fn top_findings_and_config() {
+    let h = Home::new();
+    // Grouped by default, single processes with --processes.
+    let o = h.run(&["top", "--json"]);
+    assert!(o.status.success(), "{}", text(&o.stderr));
+    let v: serde_json::Value = serde_json::from_slice(&o.stdout).unwrap();
+    assert!(v["by_cpu"].is_array() && v["by_mem"].is_array(), "{v}");
+    let o = h.run(&["top", "--processes", "--json", "-n", "3"]);
+    let v: serde_json::Value = serde_json::from_slice(&o.stdout).unwrap();
+    assert!(v.as_array().unwrap().len() <= 3);
+
+    // Findings, locally, as observations.
+    let o = h.run(&["findings", "--json"]);
+    assert!(o.status.success(), "{}", text(&o.stderr));
+    let v: serde_json::Value = serde_json::from_slice(&o.stdout).unwrap();
+    assert!(v["findings"].is_array());
+    assert!(v["note"].as_str().unwrap().contains("not verdicts"));
+    assert!(!text(&o.stdout).contains("hunter2"));
+    assert_eq!(
+        h.run(&["findings", "--kind", "Bad Kind"]).status.code(),
+        Some(1)
+    );
+
+    // Config without an engine edits the file and says so.
+    let o = h.run(&["config", "set", "worktree_idle_days", "21"]);
+    assert!(o.status.success(), "{}", text(&o.stderr));
+    assert!(
+        text(&o.stdout).contains("in the file"),
+        "{}",
+        text(&o.stdout)
+    );
+    assert_eq!(Config::load_from(&h.paths()).config.worktree_idle_days, 21);
+    assert_eq!(
+        h.run(&["config", "set", "worktree_idle_dayz", "2"])
+            .status
+            .code(),
+        Some(1)
+    );
+    assert_eq!(
+        h.run(&["config", "set", "worktree_idle_days", "0"])
+            .status
+            .code(),
+        Some(1)
+    );
+    // Dismissing locally lands in the config too.
+    let o = h.run(&["findings", "dismiss", "runaway_cpu:1:1", "--days", "2"]);
+    assert!(o.status.success(), "{}", text(&o.stderr));
+    assert_eq!(
+        Config::load_from(&h.paths()).config.watch.dismissed.len(),
+        1
+    );
+
+    // With an engine, through it: in effect at once.
+    let (engine, _lk, server) = h.engine();
+    let o = h.run(&["config", "set", "worktree_idle_days", "9"]);
+    assert!(o.status.success(), "{}", text(&o.stderr));
+    assert!(
+        text(&o.stdout).contains("in effect now"),
+        "{}",
+        text(&o.stdout)
+    );
+    assert_eq!(engine.config().worktree_idle_days, 9);
+    let o = h.run(&["config", "--json"]);
+    let v: serde_json::Value = serde_json::from_slice(&o.stdout).unwrap();
+    assert_eq!(v["source"], "engine");
+    assert_eq!(v["config"]["worktree_idle_days"], 9);
+    let o = h.run(&["findings", "undismiss", "runaway_cpu:1:1"]);
+    assert!(o.status.success(), "{}", text(&o.stderr));
+    assert!(engine.config().watch.dismissed.is_empty());
+    server.stop();
 }

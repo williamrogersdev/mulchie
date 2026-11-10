@@ -1,4 +1,4 @@
-//! The read commands, `prune`, `signal`, `config` and `serve`.
+//! The read commands, `prune` and `serve`.
 
 use crate::cli::{SortKey, TopArgs};
 use crate::conn::{self, Conn};
@@ -64,7 +64,7 @@ fn state(paths: &Paths, scan: bool, what: &str) -> Result<Value, String> {
     }
 }
 
-fn fail(msg: impl std::fmt::Display) -> i32 {
+pub fn fail(msg: impl std::fmt::Display) -> i32 {
     eprintln!("mulchie: {msg}");
     1
 }
@@ -216,6 +216,15 @@ pub fn top(paths: &Paths, a: &TopArgs) -> i32 {
         Ok(v) => v,
         Err(e) => return fail(e),
     };
+    if !a.processes {
+        let snap = &st["snapshot"];
+        if a.out.json {
+            print_json(&crate::observe::groups_json(snap, a.limit));
+        } else {
+            print!("{}", crate::observe::render_groups(snap, a.limit.min(15)));
+        }
+        return 0;
+    }
     let mut procs: Vec<Value> = st["snapshot"]["top"]
         .as_array()
         .cloned()
@@ -388,57 +397,6 @@ pub fn prune(paths: &Paths, key: &str, json_out: bool) -> i32 {
     i32::from(r["ok"] != true)
 }
 
-// ------------------------------------------------------------------ signal
-
-pub fn signal(paths: &Paths, pid: u32, sig: &str) -> i32 {
-    let c = match conn::connect(paths) {
-        Conn::Engine(c) => c,
-        other => return fail(other.explain_required("`mulchie signal`")),
-    };
-    match conn::call(
-        &c,
-        "POST",
-        "/v1/process",
-        Some(&json!({ "pid": pid, "action": sig })),
-    ) {
-        Ok(_) => {
-            println!("sent {sig} to {pid}");
-            0
-        }
-        Err(e) => fail(conn::describe(&e)),
-    }
-}
-
-// ------------------------------------------------------------------ config
-
-pub fn config(paths: &Paths, json_out: bool) -> i32 {
-    let loaded = Config::load_from(paths);
-    let file = paths.config_file();
-    let exists = file.exists();
-    let error = loaded.error.as_ref().map(|e| e.to_string());
-    if json_out {
-        print_json(&json!({
-            "path": file,
-            "exists": exists,
-            "error": error,
-            "config": loaded.config,
-        }));
-    } else {
-        println!("{}", file.display());
-        if !exists {
-            println!("(no file yet; these are the defaults)");
-        }
-        if let Some(e) = &error {
-            eprintln!("mulchie: {e}");
-            eprintln!(
-                "mulchie: running with safe defaults (automatic cleanup off) until the file is fixed"
-            );
-        }
-        print_json(&loaded.config);
-    }
-    i32::from(error.is_some())
-}
-
 // ------------------------------------------------------------------- serve
 
 pub fn serve(paths: &Paths) -> i32 {
@@ -554,9 +512,9 @@ mod tests {
     fn config_reports_errors() {
         let dir = tempfile::tempdir().unwrap();
         let p = Paths::under(dir.path());
-        assert_eq!(config(&p, true), 0);
+        assert_eq!(crate::observe::config_show(&p, true), 0);
         std::fs::create_dir_all(&p.config_dir).unwrap();
         std::fs::write(p.config_file(), b"{ not json").unwrap();
-        assert_eq!(config(&p, true), 1);
+        assert_eq!(crate::observe::config_show(&p, true), 1);
     }
 }

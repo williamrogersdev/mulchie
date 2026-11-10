@@ -70,6 +70,8 @@ pub fn exit_code(st: ExitStatus) -> i32 {
 struct Lease {
     client: Client,
     ticket: u64,
+    /// From the reply that created the ticket; the engine needs it to release.
+    secret: Option<String>,
 }
 
 impl Drop for Lease {
@@ -78,8 +80,15 @@ impl Drop for Lease {
             &self.client,
             "POST",
             "/v1/release",
-            Some(&json!({ "ticket": self.ticket })),
+            Some(&release_body(self.ticket, self.secret.as_deref())),
         );
+    }
+}
+
+fn release_body(ticket: u64, secret: Option<&str>) -> serde_json::Value {
+    match secret {
+        Some(s) => json!({ "ticket": ticket, "secret": s }),
+        None => json!({ "ticket": ticket }),
     }
 }
 
@@ -95,20 +104,32 @@ fn queue(client: Client, label: &str) -> Queued {
     let mut lease: Option<Lease> = None;
     let mut last_reason = String::new();
     loop {
-        let body = json!({
+        // Polling an existing ticket names it, with its secret: the engine
+        // may require the secret on every call that names a ticket.
+        let mut body = json!({
             "label": label,
             "pid": std::process::id(),
             "ticket": lease.as_ref().map(|l| l.ticket),
         });
+        if let Some(sec) = lease.as_ref().and_then(|l| l.secret.as_deref()) {
+            body["secret"] = json!(sec);
+        }
         match conn::call(&client, "POST", "/v1/lease", Some(&body)) {
             Ok(r) => {
                 if let Some(t) = r["ticket"].as_u64() {
+                    let secret = r["release_secret"].as_str().map(String::from);
                     match &mut lease {
-                        Some(l) => l.ticket = t,
+                        Some(l) => {
+                            l.ticket = t;
+                            if secret.is_some() {
+                                l.secret = secret;
+                            }
+                        }
                         None => {
                             lease = Some(Lease {
                                 client: client.clone(),
                                 ticket: t,
+                                secret,
                             })
                         }
                     }
@@ -357,5 +378,30 @@ mod tests {
         assert_eq!(wait_forwarding(&mut c, "sh", || true), 3);
         assert!(started.elapsed() < Duration::from_secs(3));
         t.join().unwrap();
+    }
+
+    #[test]
+    fn the_lease_is_released_with_its_secret() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = Paths::under(dir.path());
+        std::fs::create_dir_all(&paths.home).unwrap();
+        let engine =
+            mulchie_core::Engine::new(paths.clone(), mulchie_core::Config::load_from(&paths));
+        let mut lk = engine.acquire_lock().unwrap();
+        let server = mulchie_core::api::serve(engine.clone(), 0).unwrap();
+        lk.set_port(Some(server.port())).unwrap();
+        let client = Client::connect_in(&paths, server.port()).unwrap();
+        let Queued::Go(Some(lease), _) = queue(client, "t") else {
+            panic!("no lease")
+        };
+        assert!(
+            lease.secret.is_some(),
+            "the engine hands out a release secret"
+        );
+        assert_eq!(engine.snapshot_state().slots.active.len(), 1);
+        // This test process is alive, so only a real release frees the slot.
+        drop(lease);
+        assert!(engine.snapshot_state().slots.active.is_empty());
+        server.stop();
     }
 }

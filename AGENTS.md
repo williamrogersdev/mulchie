@@ -67,15 +67,18 @@ Connect the MCP server:
 mulchie mcp install --client claude-code
 ```
 
-Other clients are `claude-desktop`, `cursor` and `codex`. Add `--read-only` to leave out every tool that deletes, signals or prunes.
+Other clients are `claude-desktop`, `cursor` and `codex`. Add `--read-only` to leave out every tool that deletes, signals, prunes or dismisses. A read-only server also connects with the engine's read-only token, so the engine itself refuses changes; build slots still work.
 
-1. Call `diagnose` first. It returns health, what is using the machine, reclaimable space and recommendations. Each recommendation names the exact next tool call.
-2. To reclaim space, call a plan tool:
+1. Call `diagnose` first. It returns CPU and memory in words with the top apps and workspaces, health, findings, reclaimable space and recommendations. Each recommendation and finding names the exact next tool call.
+2. To reclaim space or act on processes, call a plan tool:
    - `plan_cache_cleanup`
    - `plan_worktree_sweep`
    - `plan_worktree_removal`
+   - `plan_process_action`: one pid with a signal, or a consumer group (`app:…`, `workspace:…`, `process:…`) with an action. Protected processes and the agent's own app and terminal come back blocked, with the reason.
 3. Show the user the plan.
-4. Call `execute_plan` with the `plan_id` and only the items the user approved. The result lists every backup and how to restore it.
-5. Wrap heavy builds in `acquire_build_slot` and `release_build_slot`.
+4. Call `execute_plan` with the `plan_id` and only the items the user approved. The result lists every backup and how to restore it. Processes are re-checked by start time.
+5. Wrap heavy builds in `acquire_build_slot` and `release_build_slot`. The release secret stays inside the MCP server.
 
-The CLI equivalent is `mulchie diagnose`, then `mulchie clean` or `mulchie sweep`, which show the plan and ask before acting.
+Findings (`list_findings`, `mulchie://findings`) are observations from heuristics, not verdicts; never call them malware. `inspect_process` shows one process with secrets in its command line redacted. `dismiss_finding` hides one the user says is expected.
+
+The CLI equivalent is `mulchie diagnose`, then `mulchie clean`, `mulchie sweep`, `mulchie signal` or `mulchie group`, which show the plan and ask before acting. `mulchie findings`, `mulchie inspect <pid>` and `mulchie top` look; `mulchie config set` changes a setting through the running engine.

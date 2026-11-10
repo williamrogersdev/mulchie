@@ -60,9 +60,13 @@ Only recognised build caches are deleted: Rust `target/` with CACHEDIR.TAG, `.ne
     )]
     Clean(CleanArgs),
 
-    /// Processes by CPU, memory or disk I/O with workspace and command
+    /// What is using CPU and memory, by app and workspace (--processes for single processes)
     #[command(
-        after_help = "Examples:\n  mulchie top\n  mulchie top --sort mem -n 10\n  mulchie top --json"
+        long_about = "What is using CPU and memory, grouped the way you think of it: apps \
+(with all their helper processes), agent workspaces, and other programs. Each group shows its \
+key, which `mulchie group` takes. With --processes, single processes by CPU, memory or disk \
+I/O, with workspace and command (secrets in command lines are redacted).",
+        after_help = "Examples:\n  mulchie top\n  mulchie top --processes --sort mem -n 10\n  mulchie top --json"
     )]
     Top(TopArgs),
 
@@ -86,11 +90,43 @@ caches are archived, a detached HEAD gets a backup/<name> branch, and branches a
     #[command(after_help = "Examples:\n  mulchie prune npm\n  mulchie prune go --json")]
     Prune(PruneArgs),
 
-    /// Send a signal to one of your processes (needs the engine)
+    /// Signal one of your processes: show the plan, confirm, then signal (needs the engine)
     #[command(
-        after_help = "Examples:\n  mulchie signal 4242 term\n  mulchie signal 4242 stop\n  mulchie signal 4242 cont"
+        long_about = "Send a signal to one of your processes, and with --tree to its \
+descendants too (deepest first). The engine plans it first: which processes would be \
+signalled, and why any is refused (protected processes, other users' processes, Mulchie \
+itself, and this terminal and its parents are never signalled). After you confirm, each \
+process is re-checked by its start time, so a pid reused since the plan is skipped.",
+        after_help = "Examples:\n  mulchie signal 4242 term --dry-run\n  mulchie signal 4242 term\n  mulchie signal 4242 stop --yes\n  mulchie signal 4242 term --tree"
     )]
     Signal(SignalArgs),
+
+    /// Act on an app, workspace or program as a whole: plan, confirm, act (needs the engine)
+    #[command(
+        long_about = "Act on a consumer group from `mulchie top` or `mulchie diagnose`: an app \
+with its helpers (app:…), an agent workspace (workspace:…) or a program (process:…). Actions: \
+quit, force-quit, pause, resume, lower-priority, stop-builds, and restart where the plan \
+offers it. The engine plans it first and says what happens to each process; protected \
+processes and the group holding this terminal are refused. After you confirm, each process \
+is re-checked by its start time.",
+        after_help = "Examples:\n  mulchie group 'app:/Applications/Slack.app' quit --dry-run\n  mulchie group 'workspace:/Users/me/dev/app' pause\n  mulchie group 'workspace:/Users/me/dev/app' lower-priority --yes"
+    )]
+    Group(GroupArgs),
+
+    /// What Mulchie's watch noticed about processes and its own setup
+    #[command(
+        long_about = "Findings from Mulchie's watch: leftover, runaway, stopped, exposed or \
+oddly placed processes, and problems with Mulchie's own setup. They are observations from \
+simple heuristics, not verdicts: none of them means malware was found. Each says why it was \
+raised and what to look at next. Dismiss one you know is expected.",
+        args_conflicts_with_subcommands = true,
+        after_help = "Examples:\n  mulchie findings\n  mulchie findings --severity medium\n  mulchie findings --kind runaway_cpu --json\n  mulchie findings dismiss 'runaway_cpu:4242:1700000000' --days 7\n  mulchie findings undismiss 'runaway_cpu:4242:1700000000'"
+    )]
+    Findings(FindingsArgs),
+
+    /// Everything known about one process (secrets in its command line redacted)
+    #[command(after_help = "Examples:\n  mulchie inspect 4242\n  mulchie inspect 4242 --json")]
+    Inspect(InspectArgs),
 
     /// Is it OK to start heavy work right now?
     #[command(after_help = "Examples:\n  mulchie advice\n  mulchie advice --json")]
@@ -154,9 +190,17 @@ or SIGTERM. The port is `api_port` from the config, or MULCHIE_PORT for this pro
     )]
     Serve,
 
-    /// Print the config path, any config error, and the current settings
-    #[command(after_help = "Examples:\n  mulchie config\n  mulchie config --json")]
-    Config(JsonArg),
+    /// Show or change the settings (through the engine when it runs, so changes apply at once)
+    #[command(
+        long_about = "Print the config path, any config error, and the current settings. \
+`mulchie config set <key> <value>` changes one setting (a dotted key, e.g. \
+`stale_after_days` or `queue.max_slots`; the value is TOML, e.g. 3, true or '\"text\"'). When \
+an engine runs, both go through it, so a change takes effect without a restart; otherwise \
+the file is read or edited directly, and Mulchie says so.",
+        args_conflicts_with_subcommands = true,
+        after_help = "Examples:\n  mulchie config\n  mulchie config --json\n  mulchie config set stale_after_days 21"
+    )]
+    Config(ConfigArgs),
 
     /// Check the install end to end; exits 1 if any check fails
     #[command(
@@ -314,13 +358,147 @@ pub enum SortKey {
 }
 
 #[derive(Args, Debug)]
+pub struct ConfigArgs {
+    #[command(flatten)]
+    pub out: JsonArg,
+    #[command(subcommand)]
+    pub action: Option<ConfigCommand>,
+}
+
+#[derive(Subcommand, Debug, Clone)]
+pub enum ConfigCommand {
+    /// Change one setting
+    Set {
+        /// A dotted key, e.g. stale_after_days or queue.max_slots
+        key: String,
+        /// The value, in TOML: 3, true, "text", [1, 2]
+        value: String,
+        #[command(flatten)]
+        out: JsonArg,
+    },
+}
+
+#[derive(Args, Debug)]
+pub struct FindingsArgs {
+    /// Only findings at least this severe
+    #[arg(long, value_enum)]
+    pub severity: Option<Severity>,
+    /// Only this kind, e.g. runaway_cpu
+    #[arg(long)]
+    pub kind: Option<String>,
+    /// Include dismissed findings
+    #[arg(long)]
+    pub all: bool,
+    #[command(flatten)]
+    pub out: JsonArg,
+    #[command(subcommand)]
+    pub action: Option<FindingsCommand>,
+}
+
+#[derive(ValueEnum, Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Severity {
+    Info,
+    Low,
+    Medium,
+    High,
+}
+
+impl Severity {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Severity::Info => "info",
+            Severity::Low => "low",
+            Severity::Medium => "medium",
+            Severity::High => "high",
+        }
+    }
+}
+
+#[derive(Subcommand, Debug, Clone)]
+pub enum FindingsCommand {
+    /// Hide a finding you know is expected
+    Dismiss {
+        /// The finding id
+        id: String,
+        /// For this many days (default 30)
+        #[arg(long, value_parser = clap::value_parser!(u32).range(1..=3650))]
+        days: Option<u32>,
+        #[command(flatten)]
+        out: JsonArg,
+    },
+    /// Show a dismissed finding again
+    Undismiss {
+        /// The finding id
+        id: String,
+        #[command(flatten)]
+        out: JsonArg,
+    },
+}
+
+#[derive(Args, Debug)]
+pub struct InspectArgs {
+    /// The process id
+    pub pid: u32,
+    #[command(flatten)]
+    pub out: JsonArg,
+}
+
+#[derive(ValueEnum, Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GroupActionName {
+    /// Ask the app or every process to quit
+    Quit,
+    /// Stop them now
+    ForceQuit,
+    /// Pause them (SIGSTOP)
+    Pause,
+    /// Resume paused processes
+    Resume,
+    /// Lower their CPU priority
+    LowerPriority,
+    /// Stop the builds in a workspace
+    StopBuilds,
+    /// Quit the app and open it again (where the plan offers it)
+    Restart,
+}
+
+impl GroupActionName {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            GroupActionName::Quit => "quit",
+            GroupActionName::ForceQuit => "force_quit",
+            GroupActionName::Pause => "pause",
+            GroupActionName::Resume => "resume",
+            GroupActionName::LowerPriority => "lower_priority",
+            GroupActionName::StopBuilds => "stop_builds",
+            GroupActionName::Restart => "restart",
+        }
+    }
+}
+
+#[derive(Args, Debug)]
+pub struct GroupArgs {
+    /// The group key from `mulchie top` or `mulchie diagnose`, e.g. app:/Applications/Slack.app
+    pub key: String,
+    /// What to do
+    #[arg(value_enum)]
+    pub action: GroupActionName,
+    #[command(flatten)]
+    pub confirm: Confirm,
+    #[command(flatten)]
+    pub out: JsonArg,
+}
+
+#[derive(Args, Debug)]
 pub struct TopArgs {
     /// What to rank by
     #[arg(long, value_enum, default_value_t = SortKey::Cpu)]
     pub sort: SortKey,
-    /// How many processes to show
+    /// How many processes (or groups per resource) to show
     #[arg(short = 'n', long = "limit", default_value_t = 25)]
     pub limit: usize,
+    /// Single processes instead of apps and workspaces
+    #[arg(long, short = 'p')]
+    pub processes: bool,
     #[command(flatten)]
     pub out: JsonArg,
 }
@@ -363,6 +541,13 @@ pub struct SignalArgs {
     /// The signal
     #[arg(value_enum)]
     pub signal: SignalName,
+    /// Its descendants too, deepest first
+    #[arg(long)]
+    pub tree: bool,
+    #[command(flatten)]
+    pub confirm: Confirm,
+    #[command(flatten)]
+    pub out: JsonArg,
 }
 
 #[derive(Args, Debug)]
@@ -519,6 +704,84 @@ mod tests {
         assert_eq!((s.pid, s.signal), (42, SignalName::Stop));
         assert!(parse(&["signal", "42", "hup"]).is_err());
         assert!(parse(&["signal", "-1", "term"]).is_err());
+        let Some(Command::Signal(s)) =
+            parse(&["signal", "42", "term", "--tree", "--dry-run", "--json"])
+                .unwrap()
+                .command
+        else {
+            panic!()
+        };
+        assert!(s.tree && s.confirm.dry_run && s.out.json);
+        assert!(parse(&["signal", "42", "term", "--yes", "--dry-run"]).is_err());
+    }
+
+    #[test]
+    fn group_findings_inspect_config() {
+        let Some(Command::Group(g)) = parse(&["group", "app:/A.app", "lower-priority", "-y"])
+            .unwrap()
+            .command
+        else {
+            panic!()
+        };
+        assert_eq!(
+            (g.key.as_str(), g.action.as_str()),
+            ("app:/A.app", "lower_priority")
+        );
+        assert!(g.confirm.yes);
+        assert!(parse(&["group", "app:/A.app", "explode"]).is_err());
+        assert!(parse(&["group", "app:/A.app"]).is_err());
+
+        let Some(Command::Findings(f)) = parse(&[
+            "findings",
+            "--severity",
+            "medium",
+            "--kind",
+            "runaway_cpu",
+            "--all",
+            "--json",
+        ])
+        .unwrap()
+        .command
+        else {
+            panic!()
+        };
+        assert_eq!(f.severity, Some(Severity::Medium));
+        assert!(f.all && f.out.json && f.action.is_none());
+        let Some(Command::Findings(f)) = parse(&["findings", "dismiss", "x:1", "--days", "7"])
+            .unwrap()
+            .command
+        else {
+            panic!()
+        };
+        assert!(matches!(
+            f.action,
+            Some(FindingsCommand::Dismiss { days: Some(7), .. })
+        ));
+        assert!(parse(&["findings", "dismiss", "x", "--days", "0"]).is_err());
+        assert!(parse(&["findings", "undismiss", "x"]).is_ok());
+        assert!(parse(&["findings", "--severity", "dire"]).is_err());
+
+        let Some(Command::Inspect(i)) = parse(&["inspect", "42", "--json"]).unwrap().command else {
+            panic!()
+        };
+        assert_eq!(i.pid, 42);
+        assert!(parse(&["inspect"]).is_err());
+
+        let Some(Command::Config(c)) = parse(&["config", "set", "stale_after_days", "21"])
+            .unwrap()
+            .command
+        else {
+            panic!()
+        };
+        assert!(
+            matches!(c.action, Some(ConfigCommand::Set { ref key, ref value, .. }) if key == "stale_after_days" && value == "21")
+        );
+        assert!(parse(&["config", "set", "x"]).is_err());
+
+        let Some(Command::Top(t)) = parse(&["top", "--processes"]).unwrap().command else {
+            panic!()
+        };
+        assert!(t.processes);
     }
 
     #[test]

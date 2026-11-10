@@ -23,6 +23,12 @@ pub enum Conn {
 /// announced. The core checks the listener and the token file before the
 /// token is sent.
 pub fn connect(paths: &Paths) -> Conn {
+    connect_as(paths, false)
+}
+
+/// As [`connect`], with the read-only token when `read_only` is set: the
+/// engine then refuses everything but reads, plans and TTL build slots.
+pub fn connect_as(paths: &Paths, read_only: bool) -> Conn {
     let Some(holder) = lock::running_engine(paths) else {
         return Conn::NotRunning;
     };
@@ -32,7 +38,12 @@ pub fn connect(paths: &Paths) -> Conn {
             reason: "it has no API listener yet (still starting, or its port was taken)".into(),
         };
     };
-    match Client::connect_in(paths, port) {
+    let c = if read_only {
+        Client::connect_read_only_in(paths, port)
+    } else {
+        Client::connect_in(paths, port)
+    };
+    match c {
         Ok(c) => Conn::Engine(c),
         Err(reason) => Conn::Unreachable {
             pid: holder.pid,

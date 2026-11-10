@@ -12,6 +12,12 @@ use serde_json::{json, Value};
 const TOP_WORKSPACES: usize = 6;
 const TOP_PROCESSES: usize = 5;
 const TOP_ITEMS: usize = 5;
+const TOP_FINDINGS: usize = 6;
+const TOP_GROUPS: usize = 3;
+
+/// Said wherever findings are shown.
+pub const FINDINGS_NOTE: &str = "Findings are observations from simple heuristics (what a process is doing, where it runs from, how long it has run), not verdicts: none of them means malware was found. Each says why it was raised; check before acting.";
+
 /// Package caches smaller than this are not worth a recommendation.
 const PRUNE_WORTH: u64 = 1_000_000_000;
 
@@ -65,6 +71,76 @@ impl Rec {
 
 fn call(name: &str, args: Value) -> Option<Value> {
     Some(json!({ "name": name, "arguments": args }))
+}
+
+/// The consumer group key of a workspace.
+fn ws_key(w: &Value) -> String {
+    format!("workspace:{}", w["path"].as_str().unwrap_or(""))
+}
+
+fn severity_rank(s: &Value) -> u8 {
+    match s.as_str() {
+        Some("high") => 0,
+        Some("medium") => 1,
+        Some("low") => 2,
+        _ => 3,
+    }
+}
+
+/// A finding, short, with the tool calls (all of them look or plan) and CLI
+/// commands that follow from its suggestions.
+pub fn finding_brief(f: &Value) -> Value {
+    let ev = &f["evidence"];
+    let pid = ev["pid"].as_u64();
+    let mut next = Vec::new();
+    let mut cli = Vec::new();
+    for sug in f["suggested"].as_array().into_iter().flatten() {
+        let r = &sug["request"];
+        if r["action"] == "signal" {
+            if let (Some(p), Some(sig)) = (r["pid"].as_u64(), r["signal"].as_str()) {
+                next.push(json!({ "label": sug["label"], "name": "plan_process_action", "arguments": { "pid": p, "signal": sig } }));
+                cli.push(format!("mulchie signal {p} {sig}"));
+            }
+        }
+    }
+    if let Some(p) = pid {
+        next.push(json!({ "label": "Look at the process", "name": "inspect_process", "arguments": { "pid": p } }));
+        cli.push(format!("mulchie inspect {p}"));
+    }
+    if let Some(id) = f["id"].as_str() {
+        next.push(json!({ "label": "Hide it if the user says it is expected", "name": "dismiss_finding", "arguments": { "id": id } }));
+        cli.push(format!("mulchie findings dismiss '{id}'"));
+    }
+    let mut evidence = serde_json::Map::new();
+    for k in [
+        "pid",
+        "name",
+        "exe",
+        "cmd",
+        "cwd",
+        "workspace",
+        "path",
+        "listen",
+        "cpu_pct",
+        "detail",
+    ] {
+        if !ev[k].is_null() {
+            evidence.insert(k.into(), ev[k].clone());
+        }
+    }
+    if let Some(m) = ev["mem_bytes"].as_u64() {
+        evidence.insert("memory".into(), json!(sz(m)));
+    }
+    json!({
+        "id": f["id"],
+        "kind": f["kind"],
+        "severity": f["severity"],
+        "title": f["title"],
+        "why": f["why"],
+        "evidence": evidence,
+        "next_calls": next,
+        "cli": cli,
+    })
 }
 
 /// Build the picture. `state` and `advice` may be `Null` when unavailable.
@@ -254,10 +330,10 @@ pub fn build(state: &Value, advice: &Value, origin: Origin) -> Value {
                 ),
                 risk: "high",
                 next_call: call(
-                    "workspace_action",
-                    json!({ "path": w["path"], "action": "kill_all" }),
+                    "plan_process_action",
+                    json!({ "group": ws_key(w), "action": "quit" }),
                 ),
-                command: None,
+                command: Some(format!("mulchie group '{}' quit", ws_key(w))),
             });
         }
         if w["paused"] == true {
@@ -273,10 +349,10 @@ pub fn build(state: &Value, advice: &Value, origin: Origin) -> Value {
                 gain: format!("{} of memory if stopped", sz(u(w, "mem_bytes"))),
                 risk: "low",
                 next_call: call(
-                    "workspace_action",
-                    json!({ "path": w["path"], "action": "resume" }),
+                    "plan_process_action",
+                    json!({ "group": ws_key(w), "action": "resume" }),
                 ),
-                command: None,
+                command: Some(format!("mulchie group '{}' resume", ws_key(w))),
             });
         }
     }
@@ -295,8 +371,8 @@ pub fn build(state: &Value, advice: &Value, origin: Origin) -> Value {
                 gain_bytes: None,
                 gain: "a more responsive machine; builds take longer".into(),
                 risk: "low",
-                next_call: call("workspace_action", json!({ "path": w["path"], "action": "deprioritize" })),
-                command: None,
+                next_call: call("plan_process_action", json!({ "group": ws_key(w), "action": "lower_priority" })),
+                command: Some(format!("mulchie group '{}' lower-priority", ws_key(w))),
             });
         }
     }
@@ -435,6 +511,42 @@ pub fn build(state: &Value, advice: &Value, origin: Origin) -> Value {
         });
     }
 
+    // ---------------------------------------------------------- findings
+    let mut found: Vec<&Value> = state["findings"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter(|f| f["dismissed"] != true)
+        .collect();
+    found.sort_by_key(|f| severity_rank(&f["severity"]));
+    let serious = found
+        .iter()
+        .filter(|f| severity_rank(&f["severity"]) <= 1)
+        .count();
+    if serious > 0 {
+        recs.push(Rec {
+            priority: 2,
+            id: "review_findings",
+            title: format!("Look at {serious} finding(s) Mulchie's watch flagged"),
+            reason: format!(
+                "First: {} These are observations, not verdicts; each says why it was raised.",
+                found[0]["title"].as_str().unwrap_or("")
+            ),
+            gain_bytes: None,
+            gain: "knowing what these processes are".into(),
+            risk: "none",
+            next_call: call("list_findings", json!({ "severity": "medium" })),
+            command: Some("mulchie findings --severity medium".into()),
+        });
+    }
+    let findings = json!({
+        "total": found.len(),
+        "counts": state["finding_counts"],
+        "note": FINDINGS_NOTE,
+        "top": found.iter().take(TOP_FINDINGS).map(|f| finding_brief(f)).collect::<Vec<_>>(),
+    });
+    let consumers = crate::mcp_tools::consumers_brief(snap, TOP_GROUPS);
+
     let machine = json!({
         "cpu_pct": (f(snap, "cpu_pct") * 10.0).round() / 10.0,
         "cores": cores,
@@ -453,6 +565,8 @@ pub fn build(state: &Value, advice: &Value, origin: Origin) -> Value {
     });
     let health = json!({ "status": state["health"], "why": why });
     let rest = json!({
+        "consumers": consumers,
+        "findings": findings,
         "machine": machine,
         "workspaces": { "total": ws_total, "top": top_ws },
         "top_processes": top_procs,
@@ -502,17 +616,26 @@ fn finish(
     };
     let mut out = json!({
         "summary": summary,
+        // The core's own sentences about CPU and memory come first.
+        "cpu": rest.as_ref().map(|r| r["consumers"]["cpu"].clone()),
+        "memory": rest.as_ref().map(|r| r["consumers"]["memory"].clone()),
         "source": source,
         "version": state["version"],
         "health": health,
         "engine_problems": problems,
         "recommendations": recs.iter().map(Rec::to_json).collect::<Vec<_>>(),
-        "safety": "Every next_call here changes nothing. Caches and worktrees are deleted only by execute_plan with items from a plan the user saw, and each item is re-checked first; worktree removals save uncommitted work as a patch and keep branches. prune_cache, workspace_action and process_action only preview until called again with execute=true, after the user agrees.",
+        "safety": "Every next_call here only looks or plans; dismiss_finding only hides a finding. Caches, worktrees and processes are changed only by execute_plan with items from a plan the user saw, and each item is re-checked first (processes by start time); worktree removals save uncommitted work as a patch and keep branches. prune_cache only previews until called again with execute=true, after the user agrees.",
     });
     if let (Some(r), Some(o)) = (rest, out.as_object_mut()) {
         for (k, v) in r.as_object().cloned().unwrap_or_default() {
-            o.insert(k, v);
+            if k != "consumers" {
+                o.insert(k, v);
+            }
         }
+        o.insert("memory_note".into(), r["consumers"]["memory_note"].clone());
+    } else if let Some(o) = out.as_object_mut() {
+        o.remove("cpu");
+        o.remove("memory");
     }
     out
 }
@@ -523,6 +646,36 @@ pub fn render(d: &Value) -> String {
     s.push_str(&format!("{}\n", d["summary"].as_str().unwrap_or("")));
     if d["source"] == "local" {
         s.push_str("(No engine running: this is a one-off local look.)\n");
+    }
+    for (label, k) in [("CPU", "cpu"), ("Memory", "memory")] {
+        let c = &d[k];
+        if c.is_null() {
+            continue;
+        }
+        let head = c["headline"].as_str().unwrap_or("");
+        if !head.is_empty() {
+            s.push_str(&format!("\n{label}: {head}"));
+            if let Some(det) = c["detail"].as_str().filter(|x| !x.is_empty()) {
+                s.push_str(&format!(" {det}"));
+            }
+            s.push('\n');
+        }
+        let tops: Vec<String> = c["top"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .map(|g| {
+                let amount = if k == "cpu" {
+                    format!("{:.0}%", g["cpu_pct"].as_f64().unwrap_or(0.0))
+                } else {
+                    g["memory"].as_str().unwrap_or("").to_string()
+                };
+                format!("{} {amount}", g["name"].as_str().unwrap_or("?"))
+            })
+            .collect();
+        if !tops.is_empty() {
+            s.push_str(&format!("  most: {}\n", tops.join(", ")));
+        }
     }
     let m = &d["machine"];
     if !m.is_null() {
@@ -620,6 +773,30 @@ pub fn render(d: &Value) -> String {
             s.push_str("\nReclaimable: not scanned yet.\n");
         }
     }
+    let fs = d["findings"]["top"].as_array().cloned().unwrap_or_default();
+    if !fs.is_empty() {
+        s.push_str(&format!(
+            "\nWatch noticed ({}; observations, not verdicts):\n",
+            d["findings"]["total"]
+        ));
+        for f in &fs {
+            s.push_str(&format!(
+                "  [{}] {}\n       {}\n",
+                f["severity"].as_str().unwrap_or(""),
+                f["title"].as_str().unwrap_or(""),
+                f["why"].as_str().unwrap_or("")
+            ));
+            let cli: Vec<&str> = f["cli"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter_map(Value::as_str)
+                .collect();
+            if !cli.is_empty() {
+                s.push_str(&format!("       next: {}\n", cli.join("  |  ")));
+            }
+        }
+    }
     let recs = d["recommendations"].as_array().cloned().unwrap_or_default();
     if recs.is_empty() {
         s.push_str("\nNothing to do.\n");
@@ -710,9 +887,15 @@ mod tests {
         );
         assert_eq!(recs[1]["id"], "sweep_idle_worktrees");
         assert_eq!(recs[1]["next_call"]["name"], "plan_worktree_sweep");
-        assert!(recs
-            .iter()
-            .any(|r| r["id"] == "orphan_workspace" && r["risk"] == "high"));
+        let orphan = recs.iter().find(|r| r["id"] == "orphan_workspace").unwrap();
+        assert_eq!(orphan["risk"], "high");
+        // Workspace actions are process plans on the workspace group.
+        assert_eq!(orphan["next_call"]["name"], "plan_process_action");
+        assert!(orphan["next_call"]["arguments"]["group"]
+            .as_str()
+            .unwrap()
+            .starts_with("workspace:/"));
+        assert!(!d.to_string().contains("workspace_action"));
         assert!(recs.iter().any(
             |r| r["id"] == "prune_package_cache" && r["next_call"]["arguments"]["key"] == "npm"
         ));
@@ -765,5 +948,67 @@ mod tests {
         );
         assert_eq!(d["recommendations"], json!([]));
         assert!(render(&d).contains("Nothing to do"));
+    }
+
+    #[test]
+    fn consumers_and_findings_lead_and_are_ordered() {
+        let mut st = state();
+        st["snapshot"]["cpu_summary"] =
+            json!({ "headline": "CPU is busy.", "detail": "Slack uses two cores." });
+        st["snapshot"]["mem_summary"] = json!({ "headline": "Memory is tight.", "detail": "" });
+        st["snapshot"]["consumers"] = json!({
+            "by_cpu": [{ "key": "app:/Applications/Slack.app", "kind": "app", "name": "Slack", "cpu_pct": 200.0, "mem_bytes": 1u64 << 30, "procs": 9 }],
+            "by_mem": [], "memory_note": "Shared memory is counted once."
+        });
+        let f = |id: &str, sev: &str, dismissed: bool| {
+            json!({ "id": id, "kind": "runaway_cpu", "severity": sev,
+            "title": format!("{id} title"), "why": "Because a heuristic said so.", "dismissed": dismissed,
+            "evidence": { "pid": 42, "cmd": ["node", "--token", "[redacted]"] },
+            "suggested": [{ "label": "Stop it", "request": { "action": "signal", "pid": 42, "signal": "term" }, "reversible": false }] })
+        };
+        st["findings"] = json!([
+            f("a", "low", false),
+            f("b", "high", false),
+            f("c", "medium", true),
+            f("d", "medium", false)
+        ]);
+        let d = build(&st, &json!({}), Origin::Engine);
+        assert_eq!(d["cpu"]["headline"], "CPU is busy.");
+        assert_eq!(d["cpu"]["top"][0]["name"], "Slack");
+        assert_eq!(d["memory"]["headline"], "Memory is tight.");
+        let top = d["findings"]["top"].as_array().unwrap();
+        let ids: Vec<&str> = top.iter().map(|x| x["id"].as_str().unwrap()).collect();
+        assert_eq!(
+            ids,
+            ["b", "d", "a"],
+            "most severe first, dismissed left out"
+        );
+        assert_eq!(
+            top[0]["next_calls"][0],
+            json!({ "label": "Stop it", "name": "plan_process_action", "arguments": { "pid": 42, "signal": "term" } })
+        );
+        assert!(d["findings"]["note"]
+            .as_str()
+            .unwrap()
+            .contains("not verdicts"));
+        assert!(d["recommendations"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|r| r["id"] == "review_findings"));
+        let text = render(&d);
+        assert!(
+            text.contains("CPU: CPU is busy. Slack uses two cores."),
+            "{text}"
+        );
+        assert!(
+            text.contains("observations, not verdicts") && text.contains("[high] b title"),
+            "{text}"
+        );
+        assert!(!text.to_lowercase().contains("malware detected"));
+        // Keys appear in the order a reader needs them.
+        let j = d.to_string();
+        assert!(j.find("\"cpu\"").unwrap() < j.find("\"recommendations\"").unwrap());
+        assert!(j.len() < 12_000, "{}", j.len());
     }
 }

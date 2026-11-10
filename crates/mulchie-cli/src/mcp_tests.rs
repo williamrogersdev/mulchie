@@ -156,7 +156,7 @@ fn tools_have_titles_and_annotations() {
     let f = Fake::default();
     let r = one(&f, req(1, "tools/list", json!({})));
     let tools = r["result"]["tools"].as_array().unwrap();
-    assert_eq!(tools.len(), 17);
+    assert_eq!(tools.len(), 19);
     assert_eq!(tools[0]["name"], "diagnose", "diagnose comes first");
     for t in tools {
         let name = t["name"].as_str().unwrap();
@@ -184,15 +184,13 @@ fn tools_have_titles_and_annotations() {
             .unwrap()
             .to_string()
     };
-    for n in [
-        "execute_plan",
-        "prune_cache",
-        "workspace_action",
-        "process_action",
-    ] {
+    for n in ["execute_plan", "prune_cache"] {
         assert_eq!(ann(n)["destructiveHint"], true, "{n}");
         assert_eq!(ann(n)["readOnlyHint"], false, "{n}");
     }
+    // Hiding a finding changes nothing on the machine.
+    assert_eq!(ann("dismiss_finding")["destructiveHint"], false);
+    assert_eq!(ann("dismiss_finding")["readOnlyHint"], false);
     for n in [
         "diagnose",
         "get_status",
@@ -202,12 +200,21 @@ fn tools_have_titles_and_annotations() {
         "plan_cache_cleanup",
         "plan_worktree_removal",
         "plan_worktree_sweep",
+        "plan_process_action",
+        "list_findings",
+        "inspect_process",
     ] {
         assert_eq!(ann(n)["readOnlyHint"], true, "{n}");
     }
-    // No one-step deletion is offered.
+    // No one-step deletion or signal is offered.
     let names = tool_names(&r);
-    for gone in ["clean_caches", "remove_worktrees", "sweep_worktrees"] {
+    for gone in [
+        "clean_caches",
+        "remove_worktrees",
+        "sweep_worktrees",
+        "workspace_action",
+        "process_action",
+    ] {
         assert!(!names.contains(&gone.to_string()), "{gone}");
     }
     for n in [
@@ -221,6 +228,8 @@ fn tools_have_titles_and_annotations() {
             "{n}: {d}"
         );
     }
+    let d = desc("list_findings");
+    assert!(!d.to_lowercase().contains("malware detected"), "{d}");
     let d = desc("execute_plan");
     assert!(
         d.contains("approved") && d.contains("re-checked") && d.contains("restore"),
@@ -240,18 +249,16 @@ fn read_only_mode_hides_and_refuses_destructive_tools() {
     let mut s = Session::read_only(&f);
     let r = s.handle(req(1, "tools/list", json!({}))).unwrap();
     let names = tool_names(&r);
-    assert_eq!(names.len(), 13, "{names:?}");
-    for n in [
-        "execute_plan",
-        "prune_cache",
-        "workspace_action",
-        "process_action",
-    ] {
+    assert_eq!(names.len(), 16, "{names:?}");
+    for n in ["execute_plan", "prune_cache", "dismiss_finding"] {
         assert!(!names.contains(&n.to_string()), "{n}");
     }
     for n in [
         "diagnose",
         "plan_worktree_sweep",
+        "plan_process_action",
+        "list_findings",
+        "inspect_process",
         "acquire_build_slot",
         "release_build_slot",
     ] {
@@ -372,7 +379,32 @@ fn invalid_arguments_are_tool_errors() {
         ("execute_plan", json!({ "items": ["/a"] })),
         ("acquire_build_slot", json!({ "ttl_secs": 0 })),
         ("acquire_build_slot", json!({ "ttl_secs": 100000 })),
-        ("process_action", json!({ "pid": 1, "action": "term" })),
+        ("plan_process_action", json!({})),
+        ("plan_process_action", json!({ "pid": 1 })),
+        (
+            "plan_process_action",
+            json!({ "pid": 42, "action": "quit" }),
+        ),
+        ("plan_process_action", json!({ "pid": 42, "signal": "hup" })),
+        ("plan_process_action", json!({ "group": "app:/A.app" })),
+        (
+            "plan_process_action",
+            json!({ "group": "app:/A.app", "action": "explode" }),
+        ),
+        (
+            "plan_process_action",
+            json!({ "group": "app:/A.app", "action": "quit", "tree": true }),
+        ),
+        (
+            "plan_process_action",
+            json!({ "pid": 42, "group": "app:/A.app" }),
+        ),
+        ("list_findings", json!({ "severity": "dire" })),
+        ("list_findings", json!({ "kind": "Runaway CPU&x=1" })),
+        ("dismiss_finding", json!({})),
+        ("dismiss_finding", json!({ "id": "f", "days": 0 })),
+        ("inspect_process", json!({})),
+        ("inspect_process", json!({ "pid": "x" })),
         ("plan_cache_cleanup", json!({})),
         (
             "plan_cache_cleanup",
@@ -585,53 +617,243 @@ fn removal_and_cache_plans_go_to_their_routes() {
     assert_eq!(f.posted("/v1/clean").len(), 1);
 }
 
+fn process_plan(ready: bool) -> Value {
+    json!({
+        "created_unix": 1,
+        "target": "app:/Applications/Slack.app",
+        "name": "Slack",
+        "action": "quit",
+        "ready": ready,
+        "refused": if ready { Value::Null } else { json!("protected") },
+        "detail": if ready { "Quit Slack: 3 processes." } else { "Slack holds this agent; Mulchie will not act on it." },
+        "items": [{
+            "ready": ready, "target": "pid 42", "name": "Slack", "verdict": if ready { "ok" } else { "protected" },
+            "reason": null, "bytes": 0,
+            "request": { "action": "signal", "pid": 42, "signal": "term", "expected_start_time": 777 }
+        }],
+        "affected": [
+            { "pid": 42, "name": "Slack", "start_time": 777, "how": "signalled" },
+            { "pid": 43, "name": "Slack Helper", "start_time": 778, "how": "exits_with_app" }
+        ],
+    })
+}
+
 #[test]
-fn workspace_and_process_actions_preview_by_default() {
-    let state = json!({ "snapshot": {
-        "top": [{ "pid": 42, "name": "cargo", "kind": "build" }],
-        "workspaces": [{ "path": "/w/a", "label": "a", "procs": [
-            { "pid": 42, "name": "cargo", "kind": "build", "own": true },
-            { "pid": 43, "name": "claude", "kind": "agent", "own": true }
-        ] }]
-    }});
+fn process_actions_plan_then_execute() {
     let f = Fake::default()
-        .with("GET /v1/state", state)
-        .with("POST /v1/workspace", json!({ "ok": true }))
-        .with("POST /v1/process", json!({ "ok": true }));
+        .with("POST /v1/process/plan", process_plan(true))
+        .with(
+            "POST /v1/process/execute",
+            json!([{ "action": "signal", "target": "pid 42", "status": "done", "freed_bytes": 0, "backups": [] }]),
+        );
+    let mut s = Session::new(&f);
+    let shown = result(
+        &s.handle(call(
+            1,
+            "plan_process_action",
+            json!({ "group": "app:/Applications/Slack.app", "action": "quit" }),
+        ))
+        .unwrap(),
+    );
+    // The plan asked the core, which knows the caller, and changed nothing.
+    let asked = f.posted("/v1/process/plan");
+    assert_eq!(asked[0]["group"], "app:/Applications/Slack.app");
+    assert_eq!(asked[0]["action"], "quit");
+    assert_eq!(asked[0]["caller_pid"], std::process::id());
+    assert!(f.posted("/v1/process/execute").is_empty());
+    assert_eq!(shown["affected"].as_array().unwrap().len(), 2);
+    assert_eq!(shown["ready"][0]["target"], "pid 42");
+    let id = shown["plan_id"].as_str().unwrap().to_string();
+    // Only targets in the plan.
+    let r = s
+        .handle(call(
+            2,
+            "execute_plan",
+            json!({ "plan_id": id, "items": ["pid 1"] }),
+        ))
+        .unwrap();
+    assert_eq!(r["result"]["isError"], true);
+    assert!(f.posted("/v1/process/execute").is_empty());
+    let done = result(
+        &s.handle(call(
+            3,
+            "execute_plan",
+            json!({ "plan_id": id, "items": ["pid 42"] }),
+        ))
+        .unwrap(),
+    );
+    // The stored request, with its start time, went to the execute route.
+    let sent = f.posted("/v1/process/execute");
+    assert_eq!(sent.len(), 1);
+    assert_eq!(sent[0]["items"][0]["expected_start_time"], 777);
+    assert_eq!(sent[0]["items"][0]["signal"], "term");
+    assert!(
+        done.to_string().contains("cannot be brought back"),
+        "{done}"
+    );
+    // A plan is executed once.
+    let r = s
+        .handle(call(
+            4,
+            "execute_plan",
+            json!({ "plan_id": id, "items": ["pid 42"] }),
+        ))
+        .unwrap();
+    assert_eq!(r["result"]["isError"], true);
+
+    // A pid plan sends the signal and tree, defaulting to term.
+    let r = one(
+        &f,
+        call(5, "plan_process_action", json!({ "pid": 42, "tree": true })),
+    );
+    result(&r);
+    let asked = f.posted("/v1/process/plan");
+    assert_eq!(asked[1]["pid"], 42);
+    assert_eq!(asked[1]["signal"], "term");
+    assert_eq!(asked[1]["tree"], true);
+}
+
+#[test]
+fn a_refused_process_plan_has_no_plan_id() {
+    let f = Fake::default().with("POST /v1/process/plan", process_plan(false));
     let v = result(&one(
         &f,
         call(
             1,
-            "workspace_action",
-            json!({ "path": "/w/a", "action": "stop_builds" }),
+            "plan_process_action",
+            json!({ "group": "app:/Applications/Slack.app", "action": "quit" }),
         ),
     ));
-    assert_eq!(v["preview"], true);
-    assert_eq!(v["would_affect"].as_array().unwrap().len(), 1);
+    assert!(v.get("plan_id").is_none(), "{v}");
+    assert_eq!(v["refused"], "protected");
+    // Blocked, not an error: the reason is the answer.
+    let next = v["next"].as_str().unwrap();
+    assert!(
+        next.contains("nothing to execute") && next.contains("holds this agent"),
+        "{next}"
+    );
+    // Read-only: a ready plan is shown but not stored.
+    let f = Fake::default().with("POST /v1/process/plan", process_plan(true));
+    let mut s = Session::read_only(&f);
+    let v = result(
+        &s.handle(call(
+            1,
+            "plan_process_action",
+            json!({ "pid": 42, "signal": "stop" }),
+        ))
+        .unwrap(),
+    );
+    assert!(v.get("plan_id").is_none(), "{v}");
+    assert!(v["next"].as_str().unwrap().contains("read-only"));
+}
+
+#[test]
+fn findings_and_process_detail() {
+    let findings = json!({ "findings": [{ "id": "runaway_cpu:42:777", "kind": "runaway_cpu", "severity": "medium",
+        "title": "node has used a full core for 40 minutes", "why": "High CPU for a long time can be a stuck loop.",
+        "evidence": { "pid": 42 }, "suggested": [] }], "counts": { "medium": 1 }, "enabled": true });
+    let f = Fake::default()
+        .with("GET /v1/findings", findings.clone())
+        .with(
+            "GET /v1/findings?severity=medium&kind=runaway_cpu&dismissed=1",
+            findings,
+        )
+        .with("POST /v1/findings/dismiss", json!({ "ok": true }))
+        .with("POST /v1/findings/undismiss", json!({ "ok": true }))
+        .with(
+            "GET /v1/process/42",
+            json!({ "pid": 42, "name": "node", "cmd": ["node", "--token", "[REDACTED]"] }),
+        )
+        .with("GET /v1/state", json!({ "findings": [] }));
+    let v = result(&one(&f, call(1, "list_findings", json!({}))));
+    assert_eq!(v["findings"][0]["kind"], "runaway_cpu");
+    let note = v["note"].as_str().unwrap();
+    assert!(
+        note.contains("not verdicts") && note.contains("malware"),
+        "{note}"
+    );
     let v = result(&one(
         &f,
-        call(2, "process_action", json!({ "pid": 42, "action": "term" })),
+        call(
+            2,
+            "list_findings",
+            json!({ "severity": "medium", "kind": "runaway_cpu", "include_dismissed": true }),
+        ),
     ));
-    assert_eq!(v["process"]["pid"], 42);
-    assert!(f.posted("/v1/workspace").is_empty() && f.posted("/v1/process").is_empty());
+    assert_eq!(v["counts"]["medium"], 1);
     result(&one(
         &f,
         call(
             3,
-            "workspace_action",
-            json!({ "path": "/w/a", "action": "pause", "execute": true }),
+            "dismiss_finding",
+            json!({ "id": "runaway_cpu:42:777", "days": 7 }),
         ),
     ));
+    assert_eq!(
+        f.posted("/v1/findings/dismiss"),
+        vec![json!({ "id": "runaway_cpu:42:777", "days": 7 })]
+    );
     result(&one(
         &f,
         call(
             4,
-            "process_action",
-            json!({ "pid": 42, "action": "renice", "execute": true }),
+            "dismiss_finding",
+            json!({ "id": "runaway_cpu:42:777", "undo": true }),
         ),
     ));
-    assert_eq!(f.posted("/v1/workspace").len(), 1);
-    assert_eq!(f.posted("/v1/process")[0]["nice"], 10);
+    assert_eq!(
+        f.posted("/v1/findings/undismiss"),
+        vec![json!({ "id": "runaway_cpu:42:777" })]
+    );
+    let v = result(&one(&f, call(5, "inspect_process", json!({ "pid": 42 }))));
+    assert_eq!(v["cmd"][2], "[REDACTED]");
+    // The findings resource.
+    let r = one(
+        &f,
+        req(6, "resources/read", json!({ "uri": "mulchie://findings" })),
+    );
+    assert!(
+        r["result"]["contents"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("runaway_cpu"),
+        "{r}"
+    );
+}
+
+#[test]
+fn the_release_secret_stays_in_the_server() {
+    let f = Fake::default()
+        .with(
+            "POST /v1/lease",
+            json!({ "granted": true, "ticket": 9, "release_secret": "s3cr3t" }),
+        )
+        .with("POST /v1/release", json!({ "ok": true }));
+    let mut s = Session::new(&f);
+    let r = s.handle(call(1, "acquire_build_slot", json!({}))).unwrap();
+    assert!(!r.to_string().contains("s3cr3t"), "{r}");
+    assert_eq!(result(&r)["ticket"], 9);
+    // Renewing or polling the ticket sends its secret too.
+    result(
+        &s.handle(call(2, "acquire_build_slot", json!({ "ticket": 9 })))
+            .unwrap(),
+    );
+    assert_eq!(f.posted("/v1/lease")[1]["secret"], "s3cr3t");
+    assert!(f.posted("/v1/lease")[0].get("secret").is_none());
+    result(
+        &s.handle(call(2, "release_build_slot", json!({ "ticket": 9 })))
+            .unwrap(),
+    );
+    assert_eq!(
+        f.posted("/v1/release"),
+        vec![json!({ "ticket": 9, "secret": "s3cr3t" })]
+    );
+    // Forgotten after use.
+    result(
+        &s.handle(call(3, "release_build_slot", json!({ "ticket": 9 })))
+            .unwrap(),
+    );
+    assert_eq!(f.posted("/v1/release")[1], json!({ "ticket": 9 }));
 }
 
 #[test]
@@ -865,6 +1087,9 @@ fn against_a_real_engine() {
     assert_eq!(r[1]["result"]["isError"], false, "{}", r[1]);
     let lease: Value = serde_json::from_str(&text(&r[1])).unwrap();
     assert_eq!(lease["granted"], true);
+    // The release secret stays inside the server.
+    assert!(lease.get("release_secret").is_none(), "{lease}");
+    assert!(!text(&r[1]).contains("secret"), "{}", r[1]);
     let ticket = lease["ticket"].as_u64().unwrap();
     assert_eq!(engine.snapshot_state().slots.active[0].ttl_secs, Some(30));
     assert_eq!(engine.snapshot_state().slots.active[0].pid, None);
@@ -873,12 +1098,42 @@ fn against_a_real_engine() {
     let d = one(&api, call(5, "diagnose", json!({})));
     let d: Value = serde_json::from_str(&text(&d)).unwrap();
     assert_eq!(d["source"], "engine");
+    // Another session does not know the secret, so it cannot release it.
     let r = one(
         &api,
         call(4, "release_build_slot", json!({ "ticket": ticket })),
     );
-    assert_eq!(r["result"]["isError"], false);
-    assert!(engine.snapshot_state().slots.active.is_empty());
+    assert_eq!(r["result"]["isError"], true, "{r}");
+    assert_eq!(engine.snapshot_state().slots.active.len(), 1);
+    // The session that took a slot releases it with the stored secret.
+    // Tickets are numbered from 1, so the next one is ticket + 1.
+    let next = ticket + 1;
+    let r = exchange(
+        &api,
+        &[
+            req(
+                1,
+                "initialize",
+                json!({ "protocolVersion": "2025-11-25", "capabilities": {} }),
+            ),
+            call(
+                2,
+                "acquire_build_slot",
+                json!({ "label": "u", "ttl_secs": 30 }),
+            ),
+            call(3, "release_build_slot", json!({ "ticket": next })),
+        ],
+    );
+    let got: Value = serde_json::from_str(&text(&r[1])).unwrap();
+    assert_eq!(got["ticket"], next, "{got}");
+    assert_eq!(r[2]["result"]["isError"], false, "{}", r[2]);
+    assert!(engine
+        .snapshot_state()
+        .slots
+        .active
+        .iter()
+        .all(|s| s.id != next));
+    assert!(engine.release_with(ticket, None).is_err());
     server.stop();
 }
 
@@ -903,4 +1158,54 @@ fn prune_cache_previews_by_default() {
         call(3, "prune_cache", json!({ "key": "npm", "execute": true })),
     ));
     assert_eq!(f.posted("/v1/prune"), vec![json!({ "key": "npm" })]);
+}
+
+#[test]
+fn read_only_mode_uses_the_read_only_token() {
+    let dir = tempfile::tempdir().unwrap();
+    let paths = Paths::under(dir.path());
+    std::fs::create_dir_all(&paths.home).unwrap();
+    let engine = mulchie_core::Engine::new(paths.clone(), mulchie_core::Config::load_from(&paths));
+    let mut lk = engine.acquire_lock().unwrap();
+    let server = mulchie_core::api::serve(engine.clone(), 0).unwrap();
+    lk.set_port(Some(server.port())).unwrap();
+    let api = EngineApi::read_only(paths.clone());
+    // The engine itself refuses changes from this server, whatever tool
+    // filtering does.
+    for (path, body) in [
+        ("/v1/process/execute", json!({ "items": [] })),
+        ("/v1/sweep", json!({ "items": [] })),
+        ("/v1/prune", json!({ "key": "npm" })),
+        ("/v1/findings/dismiss", json!({ "id": "x" })),
+    ] {
+        let e = api.call("POST", path, Some(&body)).unwrap_err();
+        assert_eq!(
+            (e.status, e.code.as_str()),
+            (403, "read_only_token"),
+            "{path}"
+        );
+    }
+    // Reads, plans and TTL build slots work.
+    let mut s = Session::read_only(&api);
+    let v = result(
+        &s.handle(call(1, "acquire_build_slot", json!({ "ttl_secs": 30 })))
+            .unwrap(),
+    );
+    let ticket = v["ticket"].as_u64().unwrap();
+    assert_eq!(engine.snapshot_state().slots.active.len(), 1);
+    result(
+        &s.handle(call(2, "release_build_slot", json!({ "ticket": ticket })))
+            .unwrap(),
+    );
+    assert!(engine.snapshot_state().slots.active.is_empty());
+    result(&s.handle(call(3, "list_findings", json!({}))).unwrap());
+    // The full-token server can.
+    let full = EngineApi::new(paths.clone());
+    full.call(
+        "POST",
+        "/v1/findings/dismiss",
+        Some(&json!({ "id": "x", "days": 1 })),
+    )
+    .unwrap();
+    server.stop();
 }

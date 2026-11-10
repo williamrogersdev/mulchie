@@ -20,6 +20,7 @@ use crate::mcp_tools::{self as tools, Ctx, Plans, Tool};
 use mulchie_core::api::{ApiError, Client};
 use mulchie_core::Paths;
 use serde_json::{json, Map, Value};
+use std::collections::HashMap;
 use std::io::{BufRead, Write};
 use std::sync::Mutex;
 
@@ -46,26 +47,31 @@ pub const READ_ONLY_ENV: &str = "MULCHIE_MCP_READ_ONLY";
 
 const INSTRUCTIONS: &str =
     "Mulchie watches this machine while several coding agents share it: CPU, \
-memory, disk, build caches, git worktrees and a machine-wide build queue. \
-Start with the diagnose tool: it returns health and why, what is using the machine, reclaimable \
-space with sizes, engine problems, and recommendations, each with a reason, expected gain, risk \
-and the exact next tool call. \
-Deleting is always plan-then-execute: plan_cache_cleanup, plan_worktree_removal and \
-plan_worktree_sweep change nothing and return a plan_id with ready items; show the user the plan \
-(what, size, what would be backed up) and call execute_plan with that plan_id and only the items \
-the user approved. Nothing outside a plan can be executed, and each item is re-checked just \
-before it runs. Before a worktree is removed, uncommitted changes are saved as a patch, ignored \
-non-cache files as a tar.gz archive, and a detached HEAD on a backup/<name> branch, all under \
-Mulchie's backups directory; execute_plan's result lists each backup's path and how to restore. \
-Branches are never deleted. Build caches are not backed up: the next build recreates them. \
-prune_cache, workspace_action and process_action only preview unless execute=true; show the \
-preview and ask the user before calling them again with execute=true. \
+memory, disk, build caches, git worktrees, processes and a machine-wide build queue. \
+Start with the diagnose tool: it explains CPU and memory in words with the apps and workspaces \
+using the most, health and why, reclaimable space with sizes, watch findings, engine problems, and \
+recommendations, each with a reason, risk and the exact next tool call. \
+Findings are observations from heuristics (a leftover, runaway, stopped or exposed process, an \
+executable in an odd place, a setup problem), never verdicts: say what was observed and why, in \
+the finding's own words, and never call anything malware. \
+Every change is plan-then-execute: plan_cache_cleanup, plan_worktree_removal, plan_worktree_sweep \
+and plan_process_action change nothing and return a plan_id with ready items; show the user the \
+plan (what, size, what would be backed up, which processes are affected) and call execute_plan \
+with that plan_id and only the items the user approved. Nothing outside a plan can be executed, \
+and each item is re-checked just before it runs (processes by their start time). Protected \
+processes, including this agent's own app and terminal, are never acted on. Before a worktree is \
+removed, uncommitted changes are saved as a patch, ignored non-cache files as a tar.gz archive, \
+and a detached HEAD on a backup/<name> branch, under Mulchie's backups directory; execute_plan's \
+result lists each backup's path and how to restore. Branches are never deleted. Build caches are \
+not backed up: the next build recreates them. prune_cache only previews unless execute=true; show \
+the preview and ask first. dismiss_finding hides a finding the user chose to ignore. \
 Before heavy builds or test suites, call can_i_build, and when other agents share the machine \
 wrap the work in acquire_build_slot / release_build_slot (poll with the ticket until granted, \
 renew before ttl_secs passes, release as soon as the work ends).";
 
-const READ_ONLY_NOTE: &str = " This server is read-only: it can look, plan and use build slots, \
-but cannot delete, signal or prune; the user can carry out a plan with the mulchie CLI.";
+const READ_ONLY_NOTE: &str = " This server is read-only (it uses Mulchie's read-only token): it \
+can look, plan and use build slots, but cannot delete, signal, prune or dismiss; the user can carry \
+out a plan with the mulchie CLI.";
 
 fn server_info() -> Value {
     json!({ "name": "mulchie", "title": "Mulchie", "version": env!("CARGO_PKG_VERSION") })
@@ -86,6 +92,9 @@ pub trait Api {
 pub struct EngineApi {
     paths: Paths,
     client: Mutex<Option<Client>>,
+    /// Connect with the read-only token: the engine itself then refuses
+    /// anything but reads, plans and TTL build slots.
+    read_only: bool,
 }
 
 impl EngineApi {
@@ -93,6 +102,14 @@ impl EngineApi {
         Self {
             paths,
             client: Mutex::new(None),
+            read_only: false,
+        }
+    }
+
+    pub fn read_only(paths: Paths) -> Self {
+        Self {
+            read_only: true,
+            ..Self::new(paths)
         }
     }
 }
@@ -101,7 +118,7 @@ impl Api for EngineApi {
     fn call(&self, method: &str, path: &str, body: Option<&Value>) -> Result<Value, ApiError> {
         let mut guard = self.client.lock().unwrap_or_else(|e| e.into_inner());
         if guard.is_none() {
-            match conn::connect(&self.paths) {
+            match conn::connect_as(&self.paths, self.read_only) {
                 Conn::Engine(c) => *guard = Some(c),
                 Conn::NotRunning => {
                     let msg = format!("Mulchie's engine is not running; {START_HINT}.");
@@ -171,6 +188,8 @@ pub struct Session<'a> {
     /// Plans shown by this server process (in memory, lost on restart);
     /// execute_plan needs one.
     pub plans: Plans,
+    /// Build-slot release secrets by ticket; never shown to the client.
+    secrets: HashMap<u64, String>,
 }
 
 fn capabilities() -> Value {
@@ -184,6 +203,7 @@ impl<'a> Session<'a> {
             negotiated: None,
             read_only: false,
             plans: Plans::default(),
+            secrets: HashMap::new(),
         }
     }
 
@@ -402,6 +422,7 @@ impl<'a> Session<'a> {
                     api: self.api,
                     plans: &mut self.plans,
                     read_only: self.read_only,
+                    secrets: &mut self.secrets,
                 };
                 let outcome = tools::validate(&tool.schema(), &args)
                     .and_then(|()| tools::call_tool(&mut cx, name, &args));
@@ -452,6 +473,7 @@ impl<'a> Session<'a> {
             "mulchie://state" => get("/v1/state")?,
             "mulchie://plan/sweep" => get("/v1/sweep")?,
             "mulchie://actions" => get("/v1/state")?["actions"].clone(),
+            "mulchie://findings" => get("/v1/findings")?,
             _ => {
                 return Err(RpcError {
                     code: RESOURCE_NOT_FOUND,
@@ -487,8 +509,10 @@ fn prompt(name: &str, read_only: bool) -> Option<Value> {
             "Diagnose the machine and explain it",
             "Call Mulchie's diagnose tool and explain to me, in plain language, what is going on with \
 this computer: whether it is healthy and why, what is using CPU, memory and disk, whether builds \
-are queued, how much space could be reclaimed, and any engine problems. Then list the \
-recommendations with their expected gain and risk. Do not change anything."
+are queued, how much space could be reclaimed, what Mulchie's watch noticed, and any engine \
+problems. Use the summaries' own words; findings are observations, not verdicts, so say what was \
+seen and why it was flagged, and never call anything malware. Then list the recommendations with \
+their expected gain and risk. Do not change anything."
                 .to_string(),
         ),
         "optimize" => (
@@ -496,15 +520,15 @@ recommendations with their expected gain and risk. Do not change anything."
             format!(
                 "Help me optimize this computer with Mulchie. First call diagnose and summarise what \
 you found. Then, for the recommendations worth doing, make the plans (plan_cache_cleanup, \
-plan_worktree_sweep, plan_worktree_removal) and show me each plan: what would be removed, its \
-size, and what would be backed up. {} Never act on anything I have not approved, and finish by \
+plan_worktree_sweep, plan_worktree_removal, plan_process_action) and show me each plan: what \
+would be removed or which processes would be affected, its size, and what would be backed up. {} Never act on anything I have not approved, and finish by \
 telling me what was freed, what was skipped and where any backups are.",
                 if read_only {
                     "This server is read-only, so stop after showing the plans and tell me the mulchie CLI \
 commands that would carry them out."
                 } else {
                     "Wait for my approval, then call execute_plan with only the items I approved. For \
-workspace_action, process_action and prune_cache, preview first and ask me before executing."
+prune_cache, preview first and ask me before executing."
                 }
             ),
         ),
@@ -523,6 +547,7 @@ fn resource_list() -> Value {
         r("mulchie://state", "state", "Engine state", "The engine's full state: snapshot, health, slots, scan, disk map and recent actions."),
         r("mulchie://plan/sweep", "sweep-plan", "Sweep plan", "What a sweep of idle agent worktrees would do now (read only; execute through plan_worktree_sweep and execute_plan)."),
         r("mulchie://actions", "actions", "Recent actions", "Mulchie's recent action journal, newest first."),
+        r("mulchie://findings", "findings", "Watch findings", "What the watch noticed (observations, not verdicts), most severe first."),
     ])
 }
 
@@ -561,8 +586,13 @@ pub fn read_only_from_env() -> bool {
 }
 
 pub fn command(paths: &Paths, read_only: bool) -> i32 {
-    let api = EngineApi::new(paths.clone());
-    let session = if read_only || read_only_from_env() {
+    let read_only = read_only || read_only_from_env();
+    let api = if read_only {
+        EngineApi::read_only(paths.clone())
+    } else {
+        EngineApi::new(paths.clone())
+    };
+    let session = if read_only {
         Session::read_only(&api)
     } else {
         Session::new(&api)
