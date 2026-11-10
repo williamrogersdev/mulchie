@@ -640,20 +640,28 @@ pub fn unknown_key(given: &serde_json::Value, cfg: &Config) -> Option<String> {
     fn walk(g: &serde_json::Value, k: &serde_json::Value, at: &str) -> Option<String> {
         use serde_json::Value;
         match (g, k) {
-            (Value::Object(gm), Value::Object(km)) => gm.iter().find_map(|(key, gv)| {
-                if gv.is_null() {
-                    return None;
-                }
-                let p = if at.is_empty() {
-                    key.clone()
-                } else {
-                    format!("{at}.{key}")
-                };
-                match km.get(key) {
-                    None => Some(p),
-                    Some(kv) => walk(gv, kv, &p),
-                }
-            }),
+            (Value::Object(gm), Value::Object(km)) => {
+                // In key order, not the map's: with serde_json's
+                // `preserve_order` (which a crate in the same build may turn
+                // on) the map keeps insertion order, and the key named would
+                // depend on how the binary was built.
+                let mut keys: Vec<(&String, &Value)> = gm.iter().collect();
+                keys.sort_by(|a, b| a.0.cmp(b.0));
+                keys.into_iter().find_map(|(key, gv)| {
+                    if gv.is_null() {
+                        return None;
+                    }
+                    let p = if at.is_empty() {
+                        key.clone()
+                    } else {
+                        format!("{at}.{key}")
+                    };
+                    match km.get(key) {
+                        None => Some(p),
+                        Some(kv) => walk(gv, kv, &p),
+                    }
+                })
+            }
             (Value::Array(ga), Value::Array(ka)) => ga
                 .iter()
                 .zip(ka)
@@ -909,6 +917,28 @@ mod tests {
         let t = tempfile::tempdir().unwrap();
         let p = Paths::under(t.path());
         (t, p)
+    }
+
+    /// The key named is the first in key order at each level, whatever
+    /// order the map keeps (insertion order under `preserve_order`).
+    #[test]
+    fn unknown_key_names_the_first_key_in_key_order() {
+        let cfg = Config::default();
+        let mut v = serde_json::to_value(&cfg).unwrap();
+        v["watch"]["newer_detector"] = serde_json::json!(true);
+        v["from_a_newer_engine"] = serde_json::json!(1);
+        assert_eq!(
+            unknown_key(&v, &cfg).as_deref(),
+            Some("from_a_newer_engine")
+        );
+        let mut v = serde_json::to_value(&cfg).unwrap();
+        v["watch"]["zz"] = serde_json::json!(true);
+        v["watch"]["aa"] = serde_json::json!(true);
+        assert_eq!(unknown_key(&v, &cfg).as_deref(), Some("watch.aa"));
+        assert_eq!(
+            unknown_key(&serde_json::to_value(&cfg).unwrap(), &cfg),
+            None
+        );
     }
 
     #[test]

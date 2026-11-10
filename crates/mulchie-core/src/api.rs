@@ -300,7 +300,8 @@ impl Server {
         self.port
     }
 
-    /// Stop accepting connections and wait for the accept loop to end.
+    /// Stop accepting connections, wait for the accept loop to end, then wait
+    /// (up to [`STOP_CLOSE_WAIT`]) until the port refuses connections.
     /// Requests already being handled finish on their own threads.
     pub fn stop(mut self) {
         self.stop.store(true, Ordering::SeqCst);
@@ -311,6 +312,7 @@ impl Server {
         );
         if let Some(h) = self.handle.take() {
             let _ = h.join();
+            wait_until_refused(self.port, STOP_CLOSE_WAIT);
         }
     }
 
@@ -319,6 +321,30 @@ impl Server {
         if let Some(h) = self.handle.take() {
             let _ = h.join();
         }
+    }
+}
+
+/// The longest [`Server::stop`] waits for the closed listener to go away.
+pub const STOP_CLOSE_WAIT: Duration = Duration::from_secs(2);
+
+/// Wait until nothing accepts on `127.0.0.1:port`, for at most `within`;
+/// whether it got there. Dropping the listener does not always close the
+/// socket at once: a child that another thread of this process is spawning
+/// holds a copy of every descriptor until its exec closes the close-on-exec
+/// ones, and meanwhile the kernel still queues connections that nobody will
+/// answer. Each probe that gets through lands in that queue and is reset.
+fn wait_until_refused(port: u16, within: Duration) -> bool {
+    let addr = SocketAddr::from(([127, 0, 0, 1], port));
+    let deadline = Instant::now() + within;
+    loop {
+        match TcpStream::connect_timeout(&addr, Duration::from_millis(100)) {
+            Err(e) if e.kind() == std::io::ErrorKind::ConnectionRefused => return true,
+            _ => {}
+        }
+        if Instant::now() >= deadline {
+            return false;
+        }
+        std::thread::sleep(Duration::from_millis(2));
     }
 }
 

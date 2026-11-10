@@ -1511,3 +1511,42 @@ fn unknown_config_keys_are_refused() {
     );
     assert_eq!(code, 200, "{v}");
 }
+
+/// Server::stop returns only once the port refuses connections, even while a
+/// copy of the listener's descriptor (what a child being spawned by another
+/// thread holds until its exec) keeps the socket open for a moment.
+#[test]
+fn stop_waits_until_the_port_refuses_connections() {
+    let refused = |port: u16| {
+        matches!(
+            TcpStream::connect_timeout(
+                &SocketAddr::from(([127, 0, 0, 1], port)),
+                Duration::from_millis(500)
+            ),
+            Err(e) if e.kind() == std::io::ErrorKind::ConnectionRefused
+        )
+    };
+    let l = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = l.local_addr().unwrap().port();
+    let copy = l.try_clone().unwrap();
+    drop(l);
+    assert!(!refused(port), "the copy keeps the socket listening");
+    assert!(!wait_until_refused(port, Duration::from_millis(50)));
+    let closer = std::thread::spawn(move || {
+        std::thread::sleep(Duration::from_millis(200));
+        drop(copy);
+    });
+    let t = Instant::now();
+    assert!(wait_until_refused(port, Duration::from_secs(10)));
+    assert!(
+        t.elapsed() >= Duration::from_millis(150),
+        "{:?}",
+        t.elapsed()
+    );
+    closer.join().unwrap();
+
+    let mut r = running(Limits::default());
+    let port = r.port;
+    r.server.take().unwrap().stop();
+    assert!(refused(port), "nothing accepts once stop returns");
+}
