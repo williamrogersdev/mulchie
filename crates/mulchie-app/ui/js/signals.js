@@ -21,6 +21,19 @@ export const GROUP_ACTIONS = {
   restart: { verb: 'Restart', note: 'Quits the app, waits for it to exit, then opens it again.', danger: true },
 };
 
+// Actions on an agent session's processes (`{session, action}` plans): what
+// happens to them, and to the agent itself.
+export const SESSION_NOTES = {
+  pause: 'Pauses (SIGSTOP) these processes. They freeze, keep their memory and carry on where they were when resumed.',
+  resume: 'Resumes (SIGCONT) the processes of this session that are paused.',
+  lower_priority: 'Raises the nice value of these processes so other work gets the CPU first. They keep running.',
+  quit: 'Asks each of these processes to quit (SIGTERM) so it can clean up. Work they have not saved may be lost.',
+  force_quit: 'Kills each of these processes (SIGKILL). It cannot be caught, so anything unsaved is lost.',
+};
+export const sessionNote = (action, includeAgent) => `${SESSION_NOTES[action] || GROUP_ACTIONS[action]?.note || ''} ${includeAgent
+  ? 'The agent process itself is included.'
+  : 'The agent process itself is left alone and keeps running.'}`;
+
 // Signals for one process (`ProcessPlanRequest.signal`).
 export const SIGNALS = {
   term: { verb: 'Quit', note: 'Sends SIGTERM so the process can save and exit cleanly.', danger: true },
@@ -50,11 +63,12 @@ const affectedHtml = plan => plan.affected?.length
   : '';
 
 // Show the plans; resolve to the approved requests, or null.
-async function review(plans, { title, verb, note, danger }) {
+async function review(plans, { title, verb, note, danger, lines = [] }) {
   const items = plans.flatMap(p => p.items);
   const ready = items.filter(i => i.ready).length;
   const refused = plans.filter(p => p.refused);
   const html = `${note ? `<div>${esc(note)}</div>` : ''}
+    ${lines.map(l => `<p class="why-s warn">${esc(l)}</p>`).join('')}
     ${plans.map(p => `<p class="${p.refused ? 'why-s warn' : 'dim'}">${p.refused ? `<b>${esc(REFUSED[p.refused] || reasonText(p.refused))}:</b> ` : ''}${esc(p.detail)}</p>${p.restart ? `<p class="dim">Then: ${esc(p.restart)}</p>` : ''}`).join('')}
     ${items.length ? `<div class="sum"><span>Ready <b>${ready}</b></span>${items.length > ready ? `<span>Left alone <b>${items.length - ready}</b></span>` : ''}</div>
     <div class="plan">${items.map(itemRow).join('')}${plans.map(affectedHtml).join('')}</div>` : ''}
@@ -85,7 +99,11 @@ function showResults(results, verb) {
 // Plan each request, review them together, execute what was approved.
 // `expect` (optional): {pid, start_time} that a plan must still name, for
 // actions started from something the user looked at earlier (a finding).
-export async function planAndRun(requests, { title, verb, note, danger = true, expect } = {}) {
+// `same` (optional): [{pid, start_time}] the requests are about; an item
+// for one of those pids with another start time is a different process
+// now, so it is left alone and said so. `after` runs once the user
+// approved and the items are being sent.
+export async function planAndRun(requests, { title, verb, note, danger = true, expect, same, after } = {}) {
   toast('Checking…');
   // One call plans them all, and the engine keeps them as one plan, so a
   // selection of any size is one review and one approval.
@@ -99,8 +117,10 @@ export async function planAndRun(requests, { title, verb, note, danger = true, e
       return modal({ title: `${title}: not possible`, html: `<p class="why-s warn">Process ${esc(expect.pid)} has exited, or its pid now belongs to a different process than the one observed. Nothing was sent.</p>`, yes: '', cancel: 'Close' });
     }
   }
-  const items = await review(plans, { title, verb, note, danger });
+  const lines = same ? keepSameProcesses(plans, same) : [];
+  const items = await review(plans, { title, verb, note, danger, lines });
   if (!items?.length) return;
+  try { after?.(); } catch { /* the action was sent; only the callback failed */ }
   toast(`${verb}…`);
   let res;
   try { res = await invoke('execute', { batch: 'process', items }); }
@@ -108,6 +128,38 @@ export async function planAndRun(requests, { title, verb, note, danger = true, e
   hideToast();
   await hooks.refresh(true);
   return showResults(res, verb);
+}
+
+// Mark items whose pid now names another process (another start time) as
+// not ready; return a line for each.
+export function keepSameProcesses(plans, same) {
+  const want = new Map(same.map(p => [Number(p.pid), Number(p.start_time)]));
+  const lines = [];
+  for (const p of plans) {
+    for (const i of p.items || []) {
+      const pid = i.request?.pid;
+      if (!want.has(pid) || i.request.expected_start_time === want.get(pid)) continue;
+      i.ready = false;
+      i.reason = 'not_same_process';
+      lines.push(`pid ${pid} is no longer the same process (it started at a different time), so it is left alone.`);
+    }
+    for (const a of p.affected || []) {
+      if (want.has(a.pid) && a.start_time !== want.get(a.pid) && !lines.some(l => l.startsWith(`pid ${a.pid} `))) {
+        lines.push(`pid ${a.pid} is no longer the same process (it started at a different time), so it is left alone.`);
+      }
+    }
+    if (p.affected) p.affected = p.affected.filter(a => !want.has(a.pid) || a.start_time === want.get(a.pid));
+  }
+  return lines;
+}
+
+// Resume processes Mulchie paused ([{pid, start_time}]), each only while it
+// is still that process.
+export function resumePaused(list, title = 'Resume the processes Mulchie paused?') {
+  return planAndRun(list.map(p => ({ pid: p.pid, signal: 'cont' })), {
+    title, verb: 'Resume', danger: false, same: list,
+    note: 'Sends SIGCONT to each process that is still the one Mulchie paused: the same pid and the same start time.',
+  });
 }
 
 // A group action ("quit Google Chrome").

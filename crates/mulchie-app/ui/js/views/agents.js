@@ -52,7 +52,7 @@ export async function renderAgents() {
   const base = I.port ? `http://127.0.0.1:${I.port}` : '(the API is not running)';
   const cli = I.cli_linked || I.cli_path || 'mulchie';
   const tok = I.token
-    ? `<span id="tok">••••••••••••</span> <button class="btn sm" id="showTok">show</button> <button class="btn sm" data-copy="token">copy</button>`
+    ? `<span id="tok">••••••••••••</span> <button class="btn sm" id="showTok">show</button> <button class="btn sm" data-copy-token="">copy</button>`
     : `<span class="warn">${esc(I.token_error || 'not available')}</span>`;
   const who = I.mode === 'client' ? '<dt>served by</dt><dd>another Mulchie engine (this app is its client)</dd>' : I.mode === 'engine' ? '<dt>served by</dt><dd>this app</dd>' : '';
   $('#apiKv').innerHTML = `<dt>base url</dt><dd>${esc(base)}</dd>${who}<dt>token file</dt><dd>${esc(tilde(I.token_path))}</dd><dt>token</dt><dd>${tok}</dd>`;

@@ -787,6 +787,15 @@ impl Backend {
         Ok(json!({ "target": target, "plans": plans }))
     }
 
+    /// The engine this backend runs, when it runs one.
+    #[cfg(test)]
+    pub fn local_engine(&self) -> Option<Engine> {
+        match self.conn() {
+            Conn::Local(e) => Some(e),
+            _ => None,
+        }
+    }
+
     /// Whether the plan book keeps a process plan for `target`.
     #[cfg(test)]
     pub fn keeps_process_plan(&self, target: &str) -> bool {
@@ -876,9 +885,14 @@ impl Backend {
     pub fn set_config(&self, cfg: Value) -> Result<(), String> {
         match self.conn() {
             Conn::Local(e) => {
-                let cfg: Config = serde_json::from_value(cfg)
+                let parsed: Config = serde_json::from_value(cfg.clone())
                     .map_err(|e| format!("the settings are not valid: {e}"))?;
-                e.set_config(cfg).map_err(|e| e.to_string())
+                // As PUT /v1/config: a key this engine does not know would be
+                // dropped, so nothing is saved.
+                if let Some(k) = mulchie_core::config::unknown_key(&cfg, &parsed) {
+                    return Err(mulchie_core::config::ConfigError::UnknownKey(k).to_string());
+                }
+                e.set_config(parsed).map_err(|e| e.to_string())
             }
             Conn::Remote(c) => self
                 .remote(&c, "PUT", "/v1/config", Some(config_put_body(cfg)))
@@ -1010,19 +1024,10 @@ impl Backend {
     /// applied to the file's current content. Returns the whole config now
     /// in use.
     pub fn patch_config(&self, patch: Value) -> Result<Value, ConfigFailure> {
-        use mulchie_core::config::ConfigError;
         match self.conn() {
             Conn::Local(e) => match e.patch_config(&patch) {
                 Ok(cfg) => to_value(&cfg).map_err(|m| ConfigFailure::new("internal", m)),
-                Err(err) => Err(ConfigFailure::new(
-                    match &err {
-                        ConfigError::NotLockHolder(_) => "not_lock_holder",
-                        ConfigError::Io(_) => "config_io",
-                        ConfigError::Changed(_) => "config_changed",
-                        _ => "invalid_config",
-                    },
-                    err.to_string(),
-                )),
+                Err(err) => Err(ConfigFailure::of(&err)),
             },
             Conn::Remote(c) => {
                 let path = "/v1/config";
@@ -1072,6 +1077,22 @@ impl ConfigFailure {
             code: code.into(),
             message: message.into(),
         }
+    }
+
+    /// The API's error code for a refused config change, so the UI sees the
+    /// same `code` from the engine here as from `PATCH /v1/config`.
+    fn of(err: &mulchie_core::config::ConfigError) -> Self {
+        use mulchie_core::config::ConfigError;
+        let code = match err {
+            ConfigError::NotLockHolder(_) => "not_lock_holder",
+            ConfigError::Io(_) => "config_io",
+            ConfigError::UnknownKey(_) => "unknown_key",
+            // PATCH /v1/config answers every other refusal with 400
+            // invalid_config (a patch is applied to the file's current
+            // content, so `Changed` does not occur for it).
+            _ => "invalid_config",
+        };
+        Self::new(code, err.to_string())
     }
 }
 

@@ -6,7 +6,7 @@ import { st, hooks } from './store.js';
 import { invoke } from './ipc.js';
 import { $, esc, B, BS, P, ago, dur, tilde, toast, kindChip } from './util.js';
 import { planThenExecute, confirmBox, reasonText } from './dialogs.js';
-import { GROUP_ACTIONS, groupAction, signalPids, reniceProc, planAndRun, canLower } from './signals.js';
+import { GROUP_ACTIONS, groupAction, signalPids, reniceProc, planAndRun, canLower, sessionNote, resumePaused } from './signals.js';
 import { allProcs, findConsumer, ranked, cores, cpuSummary, memSummary, KIND_TEXT } from './consumers.js';
 import { SEV_LVL, SEV_TEXT, suggestionLabel, watchFindings, CATEGORY, CATEGORY_ORDER, planApi, sessionApi, runCommand } from './findings.js';
 import { act } from './act.js';
@@ -237,7 +237,7 @@ function rFindings(cat) {
   const open = watchFindings(S()).filter(inCat), dis = watchFindings(S(), true).filter(inCat), c = S().finding_counts || {};
   const all = watchFindings(S()), cats = [...new Set(all.map(f => f.category || 'other'))];
   const counts = k => all.filter(f => (f.category || 'other') === k).length;
-  const filter = `<div class="seg" role="group" aria-label="Show observations of one kind">${[['', `All (${all.length})`], ...CATEGORY_ORDER.filter(k => cats.includes(k)).map(k => [k, `${CATEGORY[k] || k} (${counts(k)})`])].map(([k, l]) => `<button class="${(cat || '') === k ? 'on' : ''}" ${dl('findings', k)} aria-pressed="${(cat || '') === k}">${esc(l)}</button>`).join('')}</div>`;
+  const filter = `<div class="seg" role="group" aria-label="Show observations of one kind">${[['', `All (${all.length})`], ...CATEGORY_ORDER.filter(k => cats.includes(k)).map(k => [k, `${CATEGORY[k] || k} (${counts(k)})`])].map(([k, l]) => `<button class="${(cat || '') === k ? 'on' : ''}" ${da('fcat', k)} aria-pressed="${(cat || '') === k}">${esc(l)}</button>`).join('')}</div>`;
   const grouped = cat ? findingList(open) : CATEGORY_ORDER.filter(k => open.some(f => (f.category || 'other') === k)).map(k => `<h4 class="cat-h">${esc(CATEGORY[k] || k)}</h4>${findingList(open.filter(f => (f.category || 'other') === k))}`).join('') || findingList([]);
   const off = S().config?.watch && S().config.watch.enabled === false;
   const html = `<p class="dim">Things the engine noticed about running programs and Mulchie’s own setup. They are observations to check, not verdicts; nothing is acted on unless you choose an action.${S().findings_unix ? ` Last checked ${esc(ago(S().findings_unix))} ago.` : ''}</p>
@@ -326,31 +326,53 @@ function rSegment(seg) {
 
 // One session from the engine (`GET /v1/sessions/{id}`) and its activity
 // record (`GET /v1/sessions/{id}/events`), refreshed while the drawer shows
-// it. The record pages forward from `next_since`; it is shown newest first.
-const sd = { id: null, data: undefined, err: null, at: 0, busy: false, events: [], next: 0, evErr: null, show: 100 };
+// it. The record pages forward from `next_since` (the engine has no read
+// from the end yet): the first load reads it through once ("catching up",
+// shown as such, never as the newest), then each poll reads only what
+// follows the newest seq. `gen` changes with the session, so a reply for an
+// earlier one is dropped.
+const sd = { gen: 0, id: null, data: undefined, err: null, at: 0, busy: false, events: [], next: 0, evErr: null, show: 100, caught: false, read: 0 };
 const EV_PAGE = 500, EV_KEEP = 5000;
+const renderIfSession = () => { if (st.ui.detail?.type === 'session') renderDetail(); };
 export function loadSession(id, force) {
-  if (sd.id !== id) { Object.assign(sd, { id, data: undefined, err: null, at: 0, events: [], next: 0, evErr: null, show: 100 }); st.ui.sIncAgent = false; }
+  if (sd.id !== id) Object.assign(sd, { gen: sd.gen + 1, id, data: undefined, err: null, at: 0, busy: false, events: [], next: 0, evErr: null, show: 100, caught: false, read: 0 });
   if (sd.busy || (!force && Date.now() - sd.at < 3000)) return;
+  const g = sd.gen;
   sd.busy = true;
   (async () => {
-    try { const d = await invoke('session_detail', { id }); if (sd.id === id) { sd.data = d; sd.err = null; } }
-    catch (e) { if (sd.id === id) sd.err = String(e); }
+    try { const d = await invoke('session_detail', { id }); if (g !== sd.gen) return; sd.data = d; sd.err = null; }
+    catch (e) { if (g !== sd.gen) return; sd.err = String(e); }
     try {
-      for (let page = 0; page < 10 && sd.id === id; page++) {
+      for (;;) {
         const r = await invoke('session_events', { id, since: sd.next, limit: EV_PAGE });
-        if (sd.id !== id) break;
-        sd.events = sd.events.concat(r.events || []).slice(-EV_KEEP);
+        if (g !== sd.gen) return;
+        const ev = r.events || [];
+        sd.events = sd.events.concat(ev).slice(-EV_KEEP);
+        sd.read += ev.length;
         sd.next = r.next_since ?? sd.next;
         sd.evErr = null;
-        if ((r.events || []).length < EV_PAGE) break;
+        if (ev.length < EV_PAGE) { sd.caught = true; break; }
+        if (!sd.caught) renderIfSession();
       }
-    } catch (e) { if (sd.id === id) sd.evErr = String(e); }
+    } catch (e) { if (g === sd.gen) sd.evErr = String(e); }
   })().finally(() => {
+    if (g !== sd.gen) return;
     sd.busy = false;
-    if (sd.id === id) sd.at = Date.now();
-    if (st.ui.detail?.type === 'session') renderDetail();
+    sd.at = Date.now();
+    renderIfSession();
   });
+}
+
+// The activity section: nothing is called newest until the record was read
+// through.
+function activityHtml(id) {
+  const evs = sd.id === id ? sd.events : [];
+  if (sd.evErr) return `<div class="warn">The record could not be read: ${esc(sd.evErr)}</div>`;
+  if (!sd.caught) return `<div class="dim" role="status">Loading older activity: ${sd.read} event(s) read so far. The newest are shown once the record has been read through.</div>`;
+  if (!evs.length) return `<div class="dim">${S().sessions?.enabled === false ? 'Session tracking is off, so nothing is recorded.' : 'Nothing recorded yet. Only the engine that holds the lock writes the record.'}</div>`;
+  const shown = evs.slice(-sd.show).reverse();
+  return `<div class="dim">Newest first.${sd.read > evs.length ? ` The newest ${evs.length} of ${sd.read} are kept here.` : ''}</div>
+    <ol class="evlist">${shown.map(e => `<li><span class="dim mono">${esc(new Date(e.t * 1000).toLocaleTimeString())}</span> ${esc(eventText(e))}</li>`).join('')}</ol>${evs.length > shown.length ? actions([btn(`Show older (${evs.length - shown.length})`, da('ev-more', id))]) : ''}`;
 }
 
 const CAP_WORDS = { cpu_cores: 'CPU cores', memory_mb: 'MB of memory', processes: 'processes', write_mb_per_hour: 'MB written per hour', runtime_hours: 'hours of runtime' };
@@ -402,8 +424,6 @@ function rSession(id) {
   const breaches = d?.breaches || (S().sessions?.breaches || []).filter(b => b.session_id === id);
   const paused = d?.paused_by_mulchie || [];
   const procs = d?.processes || [];
-  const evs = sd.id === id ? sd.events : [];
-  const shown = evs.slice(-sd.show).reverse();
   const MBt = mb => B((mb || 0) * 1048576);
   const html = `${x.source === 'hook' ? '<p class="why-s warn">Registered by an agent hook, not found in the process table. Limits report on it but never lower its priority, pause or stop it.</p>' : ''}
     ${sd.err && d === undefined ? `<p class="why-s warn">Could not read the full session: ${esc(sd.err)}</p>` : ''}
@@ -417,14 +437,12 @@ function rSession(id) {
       ['written', !writes ? '<span class="dim">not reported on this system</span>' : u.bytes_written != null ? `${B(u.bytes_written)}${u.write_mb_per_hour != null ? ` · ${MBt(u.write_mb_per_hour)}/h` : ''}` : '—'],
       s.peak && ['peaks', `${esc(coresText(s.peak.cpu_cores))} cores · ${MBt(s.peak.memory_mb)} · ${s.peak.processes} processes${s.peak.write_mb_per_hour != null ? ` · ${MBt(s.peak.write_mb_per_hour)}/h written` : ''}`]]))}
     ${sec(`Limits (${breaches.length})`, breaches.length ? breaches.map(b => { const t = breachText(b); return `<div class="bkrow"><span class="${t.cleared ? 'dim' : 'bad'}">${t.cleared ? 'cleared' : 'over'}</span> ${esc(t.what)}<div class="dim">${esc(t.act)} · since ${esc(ago(b.breached_unix || b.over_since_unix))} ago</div></div>`; }).join('') : '<div class="dim">Not over any limit.</div>')}
-    ${paused.length ? sec(`Paused by Mulchie (${paused.length})`, `${paused.map(p => `<div class="bkrow">${link('proc', p.pid, `pid ${p.pid}`)} <span class="dim">since ${esc(ago(p.since_unix))} ago</span></div>`).join('')}${actions([btn('Resume these…', da('resume-paused', paused.map(p => p.pid).join(',')))])}`) : ''}
+    ${paused.length ? sec(`Paused by Mulchie (${paused.length})`, `${paused.map(p => `<div class="bkrow">${link('proc', p.pid, `pid ${p.pid}`)} <span class="dim">since ${esc(ago(p.since_unix))} ago</span></div>`).join('')}${actions([btn('Resume these…', da('resume-paused', paused.map(p => `${p.pid}:${p.start_time}`).join(',')))])}`) : ''}
     ${running && S().sessions?.enabled !== false ? sec('Act on this session', `${actions(SESSION_ACTIONS.map(a => btn(GROUP_ACTIONS[a].verb + '…', da('s-' + a, id), DANGER.has(a) ? 'danger' : '')))}
       <label class="chk"><input type="checkbox" id="sIncAgent" ${st.ui.sIncAgent ? 'checked' : ''}> Include the agent itself (pid ${esc(x.root_pid)})</label>
       <div class="dim">Without it, only what the agent started is affected and the agent keeps running. Each action is planned first and lists the processes before anything is sent.</div>`) : ''}
     ${sec(`Processes (${procs.length})`, procs.length ? `<table class="mini-t"><colgroup><col><col style="width:70px"><col style="width:76px"></colgroup>${procs.slice(0, 60).map(p => `<tr class="click" role="button" tabindex="0" ${dl('proc', p.pid)}><td><span class="cell">${esc(p.name)} <span class="dim mono">${p.pid}</span>${p.root ? ' <span class="chip agent">agent</span>' : ''}${p.stopped ? ' <span class="chip warn">paused</span>' : ''}</span></td><td class="n">${esc(cores(p.cpu_pct))}</td><td class="n">${B(p.mem_bytes)}</td></tr>`).join('')}</table>${procs.length > 60 ? `<div class="dim">and ${procs.length - 60} more</div>` : ''}` : `<div class="dim">${running ? (d ? 'None at the last sample.' : 'Reading…') : 'The session has ended.'}</div>`)}
-    ${sec(`Activity (${evs.length}${evs.length >= EV_KEEP ? '+' : ''})`, sd.evErr ? `<div class="warn">The record could not be read: ${esc(sd.evErr)}</div>`
-      : shown.length ? `<ol class="evlist">${shown.map(e => `<li><span class="dim mono">${esc(new Date(e.t * 1000).toLocaleTimeString())}</span> ${esc(eventText(e))}</li>`).join('')}</ol>${evs.length > shown.length ? actions([btn(`Show older (${evs.length - shown.length})`, da('ev-more', id))]) : ''}`
-      : `<div class="dim">${S().sessions?.enabled === false ? 'Session tracking is off, so nothing is recorded.' : 'Nothing recorded yet. Only the engine that holds the lock writes the record.'}</div>`)}`;
+    ${sec(`Activity${sd.caught && sd.id === id ? ` (${sd.read})` : ''}`, activityHtml(id))}`;
   return { title: `${x.agent || 'Session'}${x.workspace ? ` · ${tilde(x.workspace).split('/').pop()}` : ''}`, sub: `<span class="dim mono">${esc(id)}</span>${running ? '' : ' <span class="chip">ended</span>'}${breaches.some(b => b.cleared_unix == null) ? ' <span class="chip bad">over a limit</span>' : ''}`, html,
     copy: { kind: 'session', id, ...pick(x, ['agent', 'source', 'status', 'workspace', 'cwd', 'root_pid', 'started_unix', 'ended_unix']), usage: u, peak: s.peak, breaches: breaches.map(b => pick(b, ['cap', 'max', 'value', 'action', 'action_state', 'cleared_unix'])), hint: 'Act on it with POST /v1/process/plan {"session": id, "action": …} then /v1/process/execute.' } };
 }
@@ -470,7 +488,8 @@ export function openDetail(type, key) {
   if (!st.ui.detail) opener = document.activeElement;
   st.ui.detail = { type, key: String(key ?? '') };
   if (type === 'proc') loadProc(key, true);
-  if (type === 'session') loadSession(String(key), true);
+  // Acting on the agent itself is chosen again each time.
+  if (type === 'session') { st.ui.sIncAgent = false; loadSession(String(key), true); }
   last = '';
   renderDetail();
   $('#dBody').scrollTop = 0;
@@ -537,7 +556,7 @@ export async function runSuggestion(i, id) {
   const pr = sg && planApi(sg);
   if (pr) {
     const sess = (S().sessions?.list || []).find(x => x.id === pr.session);
-    return planAndRun([{ ...pr, include_agent: false }], { title: `${GROUP_ACTIONS[pr.action]?.verb || 'Act on'} what ${sess?.agent || 'this agent'} started?`, verb: GROUP_ACTIONS[pr.action]?.verb || 'Run', note: `${GROUP_ACTIONS[pr.action]?.note || ''} The agent itself keeps running.`, danger: pr.action !== 'pause' && pr.action !== 'resume' && pr.action !== 'lower_priority' });
+    return planAndRun([{ ...pr, include_agent: false }], { title: `${GROUP_ACTIONS[pr.action]?.verb || 'Act on'} what ${sess?.agent || 'this agent'} started?`, verb: GROUP_ACTIONS[pr.action]?.verb || 'Run', note: sessionNote(pr.action, false), danger: pr.action !== 'pause' && pr.action !== 'resume' && pr.action !== 'lower_priority' });
   }
   if (!r) return toast('That observation is gone.', true);
   if (r.action === 'signal') {
@@ -566,11 +585,16 @@ export async function detailAction(t) {
   if (name.startsWith('s-')) {
     const action = name.slice(2), a = GROUP_ACTIONS[action], include = !!st.ui.sIncAgent;
     const brief = (S().sessions?.list || []).find(x => x.id === arg);
-    return planAndRun([{ session: arg, action, include_agent: include }], { title: `${a.verb} ${include ? 'the agent and everything it started' : 'what this agent started'}?`, verb: a.verb, note: `${a.note}${include ? ' The agent itself is included.' : ' The agent itself keeps running.'}`, danger: a.danger, what: brief?.agent });
+    const reset = () => { st.ui.sIncAgent = false; const c = $('#sIncAgent'); if (c) c.checked = false; };
+    return planAndRun([{ session: arg, action, include_agent: include }], { title: `${a.verb} ${include ? `${brief?.agent || 'the agent'} and everything it started` : `what ${brief?.agent || 'this agent'} started`}?`, verb: a.verb, note: sessionNote(action, include), danger: a.danger, after: reset });
   }
   switch (name) {
     case 'ev-more': sd.show += 200; last = ''; return renderDetail();
-    case 'resume-paused': return planAndRun(arg.split(',').filter(Boolean).map(pid => ({ pid: +pid, signal: 'cont' })), { title: 'Resume the processes Mulchie paused?', verb: 'Resume', note: 'Sends SIGCONT to each one that is still the process Mulchie paused.', danger: false });
+    case 'resume-paused': return resumePaused(arg.split(',').filter(Boolean).map(x => { const [pid, start] = x.split(':'); return { pid: +pid, start_time: +start }; }));
+    case 'fcat':
+      // Filter in place: the same drawer, focus stays on the pressed button.
+      st.ui.detail = { type: 'findings', key: arg || '' };
+      return renderDetail();
     case 'fx': {
       const [i, ...id] = arg.split(':');
       return runSuggestion(i, id.join(':'));

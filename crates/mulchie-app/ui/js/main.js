@@ -182,7 +182,7 @@ function overviewCopy() {
   });
 }
 
-const SEL = '[data-psel],[data-wtsel],[data-bcsel],[data-all],[data-da],[data-run],[data-reveal],[data-term],[data-copy],[data-copy-el],[data-bulk],[data-v],[data-sort],[data-open],[data-go],[data-gproc],[data-k],[data-d],#wtSeg button,#bcSeg button,#aSeg button,#showTok,#dClose,#dCopy,#copyOverview';
+const SEL = '[data-psel],[data-wtsel],[data-bcsel],[data-all],[data-da],[data-run],[data-reveal],[data-term],[data-copy],[data-copy-token],[data-copy-el],[data-bulk],[data-v],[data-sort],[data-open],[data-go],[data-gproc],[data-k],[data-d],#wtSeg button,#bcSeg button,#aSeg button,#showTok,#dClose,#dCopy,#copyOverview';
 
 document.addEventListener('click', async e => {
   const t = e.target.closest(SEL);
@@ -192,7 +192,10 @@ document.addEventListener('click', async e => {
   if (t.id === 'dCopy') return st.ui.detailCopy && copy(copyText(st.ui.detailCopy.title, st.ui.detailCopy.data), 'Copied for an agent');
   if (t.id === 'copyOverview') return st.S && copy(overviewCopy(), 'Copied for an agent');
   if (t.id === 'showTok') { $('#tok').textContent = st.integ?.token || ''; t.remove(); return; }
-  if (d.copy) return copy(d.copy === 'token' ? st.integ?.token || '' : d.copy);
+  // The token is copied only from its own button, never from text that
+  // happens to read "token".
+  if (d.copyToken != null) return copy(st.integ?.token || '');
+  if (d.copy) return copy(d.copy);
   if (d.copyEl) return copy($('#' + d.copyEl).textContent);
   if (d.open) return MODE === 'panel' ? toDash(d.open) : go(d.open);
   if (d.run) {

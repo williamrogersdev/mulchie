@@ -731,7 +731,7 @@ fn a_failed_execute_says_whether_the_action_may_have_run() {
 }
 
 #[test]
-fn client_settings_save_passes_on_keys_this_build_does_not_know() {
+fn client_settings_send_unknown_keys_unchanged_and_the_engine_refuses_them() {
     let cfg = Config {
         low_disk_gb: 9,
         ..Config::default()
@@ -741,15 +741,22 @@ fn client_settings_save_passes_on_keys_this_build_does_not_know() {
     v["watch"]["newer_detector"] = json!(true);
     let body = backend::config_put_body(v.clone());
     assert_eq!(body["config"], v, "sent unchanged");
-    // Saving it works through a client and as the engine (this engine
-    // ignores keys it does not know).
+    // An engine refuses keys it does not know (it would drop them), from a
+    // client and as the engine, naming the key; nothing is saved.
     let f = fixture();
     let a = Backend::start(f.paths.clone(), f.opts());
     let b = client_of(&f, f.opts());
-    b.set_config(v.clone()).unwrap();
+    for (who, x) in [("client", &b), ("engine", &a)] {
+        let err = x.set_config(v.clone()).unwrap_err();
+        assert!(err.contains("from_a_newer_engine"), "{who}: {err}");
+    }
+    assert_ne!(a.state().unwrap()["config"]["low_disk_gb"], 9);
+    // The keys it knows save through either side.
+    let mut known = serde_json::to_value(&cfg).unwrap();
+    b.set_config(known.clone()).unwrap();
     assert_eq!(a.state().unwrap()["config"]["low_disk_gb"], 9);
-    v["low_disk_gb"] = json!(10);
-    a.set_config(v).unwrap();
+    known["low_disk_gb"] = json!(10);
+    a.set_config(known).unwrap();
     assert_eq!(a.state().unwrap()["config"]["low_disk_gb"], 10);
     assert!(a.set_config(json!({"low_disk_gb": "lots"})).is_err());
     // The client reports the running engine's settings file.
@@ -964,5 +971,326 @@ fn sessions_limits_and_updates_through_the_engine_and_a_client() {
     drop(b);
     let _ = child.kill();
     let _ = child.wait();
+    a.shutdown();
+}
+
+/// A config for tests whose engine samples the real process table: nothing
+/// is reclaimed, swept or throttled, no alert or update check runs.
+fn quiet_config(f: &Fixture) -> Config {
+    use mulchie_core::config::{UpdateCheck, UpdatesConfig};
+    Config {
+        scan_roots: vec![f.root.clone()],
+        throttle_builds: false,
+        auto_reclaim: false,
+        auto_sweep_worktrees: false,
+        low_disk_gb: 0,
+        alert_below_gb: 0,
+        updates: UpdatesConfig {
+            check: UpdateCheck::Off,
+            ..UpdatesConfig::default()
+        },
+        ..Config::default()
+    }
+}
+
+#[test]
+fn config_refusals_carry_the_api_codes_on_both_sides() {
+    use std::os::unix::fs::PermissionsExt;
+    let f = fixture();
+    let a = Backend::start(f.paths.clone(), f.opts());
+    let b = client_of(&f, f.opts());
+    let e = a.local_engine().expect("a runs the engine");
+    let patch = json!({"guard": {"rules": {"sudo": "block"}}});
+
+    // An engine that does not hold the lock never writes the settings.
+    e.set_automation_enabled(false);
+    for (who, x) in [("engine", &a), ("client", &b)] {
+        let err = x.patch_config(patch.clone()).unwrap_err();
+        assert_eq!(err.code, "not_lock_holder", "{who}: {err:?}");
+    }
+    e.set_automation_enabled(true);
+
+    // A settings folder that cannot be written to.
+    let dir = f.paths.config_dir.clone();
+    std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o500)).unwrap();
+    let results: Vec<_> = [&a, &b]
+        .iter()
+        .map(|x| x.patch_config(patch.clone()))
+        .collect();
+    std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+    for (who, r) in ["engine", "client"].iter().zip(results) {
+        let err = r.unwrap_err();
+        assert_eq!(err.code, "config_io", "{who}: {err:?}");
+    }
+
+    // A key the engine does not know.
+    for (who, x) in [("engine", &a), ("client", &b)] {
+        let err = x
+            .patch_config(json!({"limits": {"no_such_key": 1}}))
+            .unwrap_err();
+        assert_eq!(err.code, "unknown_key", "{who}: {err:?}");
+    }
+
+    // And a bad value is still invalid_config, so the codes are not constant.
+    let bad = json!({"updates": {"interval_hours": 1}});
+    for (who, x) in [("engine", &a), ("client", &b)] {
+        let err = x.patch_config(bad.clone()).unwrap_err();
+        assert_eq!(err.code, "invalid_config", "{who}: {err:?}");
+        assert!(
+            err.message.contains("updates.interval_hours"),
+            "{who}: {err:?}"
+        );
+    }
+    let ok = b.patch_config(patch).unwrap();
+    assert_eq!(ok["guard"]["rules"]["sudo"], "block");
+    drop(b);
+    a.shutdown();
+}
+
+/// Kills its throwaway processes when the test ends, passed or not.
+struct Reap(Vec<u32>);
+impl Drop for Reap {
+    fn drop(&mut self) {
+        for p in &self.0 {
+            let _ = std::process::Command::new("kill")
+                .args(["-9", &p.to_string()])
+                .stderr(std::process::Stdio::null())
+                .status();
+        }
+    }
+}
+
+fn stat_of(pid: u32) -> String {
+    let out = std::process::Command::new("ps")
+        .args(["-o", "stat=", "-p", &pid.to_string()])
+        .output()
+        .unwrap();
+    String::from_utf8_lossy(&out.stdout).trim().to_string()
+}
+
+fn wait_stat(pid: u32, stopped: bool) -> bool {
+    let end = std::time::Instant::now() + Duration::from_secs(5);
+    while std::time::Instant::now() < end {
+        if stat_of(pid).starts_with('T') == stopped {
+            return true;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    false
+}
+
+#[test]
+fn session_plans_record_paging_end_and_unreadable_record() {
+    use mulchie_core::engine::SampleCtx;
+    use std::os::unix::fs::PermissionsExt;
+    let f = fixture();
+    // The real process table, so the session's members are real processes:
+    // a throwaway perl (the "agent") with a sleep it started.
+    let opts = Options {
+        procs: None,
+        config: Some(quiet_config(&f)),
+        ..f.opts()
+    };
+    let a = Backend::start(f.paths.clone(), opts.clone());
+    let b = client_of(&f, opts);
+    let e = a.local_engine().unwrap();
+    // Detached (its parent exits, so it is reparented), so the hook cannot
+    // bind it to the session of an agent that runs this test.
+    let out = std::process::Command::new("/bin/sh")
+        .args([
+            "-c",
+            // A non-shell root (the hook registers the nearest non-shell)
+            // with one child.
+            "/usr/bin/perl -e 'fork or exec qw(sleep 60); wait' </dev/null >/dev/null 2>&1 & echo $!",
+        ])
+        .current_dir(&f.root)
+        .output()
+        .unwrap();
+    let rpid: u32 = String::from_utf8_lossy(&out.stdout).trim().parse().unwrap();
+    let ppid_of = |pid: u32| {
+        let o = std::process::Command::new("ps")
+            .args(["-o", "ppid=", "-p", &pid.to_string()])
+            .output()
+            .unwrap();
+        String::from_utf8_lossy(&o.stdout).trim().to_string()
+    };
+    let end = std::time::Instant::now() + Duration::from_secs(5);
+    while ppid_of(rpid) != "1" && std::time::Instant::now() < end {
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    let _reap_root = Reap(vec![rpid]);
+    assert_eq!(ppid_of(rpid), "1", "the throwaway agent is detached");
+    let kill_all = |pids: &[u32]| {
+        for p in pids {
+            let _ = std::process::Command::new("kill")
+                .args(["-9", &p.to_string()])
+                .stderr(std::process::Stdio::null())
+                .status();
+        }
+    };
+    let api = mulchie_core::api::Client::connect_in(&f.paths, a.info().port.unwrap()).unwrap();
+    let hook = api
+        .call(
+            "POST",
+            "/v1/hook",
+            Some(
+                &json!({"client": "claude", "event": "session_start", "pid": rpid, "cwd": f.root}),
+            ),
+        )
+        .unwrap();
+    let id = hook["session_id"].as_str().expect("a session").to_string();
+    if !id.ends_with(&format!("-{rpid}")) {
+        kill_all(&[rpid]);
+        panic!("the hook joined another session ({id}); nothing is signalled");
+    }
+    let mut ctx = SampleCtx::default();
+    let mut kid = None;
+    for _ in 0..5 {
+        e.sample_tick(&mut ctx);
+        let d = a.session_detail(&id).unwrap().unwrap();
+        kid = d["processes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|p| p["pid"] != rpid && p["name"] == "sleep")
+            .and_then(|p| p["pid"].as_u64())
+            .map(|p| p as u32);
+        if kid.is_some() {
+            break;
+        }
+    }
+    let Some(kid) = kid else {
+        kill_all(&[rpid]);
+        panic!("the sleep is not a member of the session");
+    };
+    let _reap = Reap(vec![kid, rpid]);
+    // Never execute a plan that names anything but these two processes.
+    let only_ours = |plan: &Value| {
+        let mine = |p: u64| p == rpid as u64 || p == kid as u64;
+        let ok = plan["affected"]
+            .as_array()
+            .is_some_and(|a| a.iter().all(|p| p["pid"].as_u64().is_some_and(mine)))
+            && backend::ready_requests(plan).iter().all(|r| match r {
+                Request::Signal { pid, .. } => mine(*pid as u64),
+                _ => false,
+            });
+        if !ok {
+            kill_all(&[kid, rpid]);
+            panic!("the plan names other processes; nothing was sent: {plan}");
+        }
+    };
+
+    // Pause without the agent: only the sleep stops; then with the agent.
+    for (who, x) in [("engine", &a), ("client", &b)] {
+        for include in [false, true] {
+            let req: ProcessPlanRequest = serde_json::from_value(
+                json!({"session": id, "action": "pause", "include_agent": include}),
+            )
+            .unwrap();
+            let plan = x.process_plan(req).unwrap();
+            only_ours(&plan);
+            let pids: Vec<u64> = plan["affected"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter_map(|p| p["pid"].as_u64())
+                .collect();
+            assert!(pids.contains(&(kid as u64)), "{who} {plan}");
+            assert_eq!(pids.contains(&(rpid as u64)), include, "{who} {plan}");
+            let res = x
+                .execute(Batch::Process, backend::ready_requests(&plan))
+                .unwrap();
+            assert!(res.iter().all(|r| r.is_done()), "{who} {res:?}");
+            assert!(wait_stat(kid, true), "{who}: the sleep is paused");
+            assert_eq!(
+                stat_of(rpid).starts_with('T'),
+                include,
+                "{who} include_agent={include}: agent {}",
+                stat_of(rpid)
+            );
+            let req: ProcessPlanRequest = serde_json::from_value(
+                json!({"session": id, "action": "resume", "include_agent": true}),
+            )
+            .unwrap();
+            let plan = x.process_plan(req).unwrap();
+            only_ours(&plan);
+            x.execute(Batch::Process, backend::ready_requests(&plan))
+                .unwrap();
+            assert!(wait_stat(kid, false) && wait_stat(rpid, false), "{who}");
+        }
+    }
+
+    // Paging: one event per page follows `next_since` through the whole
+    // record and ends where a single read ends.
+    for (who, x) in [("engine", &a), ("client", &b)] {
+        let all = x.session_events(&id, 0, 1000).unwrap();
+        let all = all["events"].as_array().unwrap().clone();
+        assert!(all.len() >= 2, "{who} {all:?}");
+        let (mut since, mut paged) = (0, Vec::new());
+        loop {
+            let r = x.session_events(&id, since, 1).unwrap();
+            let ev = r["events"].as_array().unwrap();
+            if ev.is_empty() {
+                assert_eq!(
+                    r["next_since"], since,
+                    "{who}: an empty page keeps the cursor"
+                );
+                break;
+            }
+            assert_eq!(
+                r["next_since"], ev[0]["seq"],
+                "{who}: the cursor is the last seq"
+            );
+            since = r["next_since"].as_u64().unwrap();
+            paged.push(ev[0].clone());
+            assert!(paged.len() <= all.len(), "{who}: paging never repeats");
+        }
+        assert_eq!(paged, all, "{who}");
+    }
+
+    // The session ends with its agent; its record stays readable.
+    kill_all(&[kid, rpid]);
+    for _ in 0..5 {
+        e.sample_tick(&mut ctx);
+        if a.session_detail(&id).unwrap().unwrap()["session"]["status"] == "ended" {
+            break;
+        }
+    }
+    for (who, x) in [("engine", &a), ("client", &b)] {
+        let d = x
+            .session_detail(&id)
+            .unwrap()
+            .expect("an ended session is kept");
+        assert_eq!(d["session"]["status"], "ended", "{who} {d}");
+        let ev = x.session_events(&id, 0, 1000).unwrap();
+        assert!(
+            ev["events"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|e| e["type"] == "session_end"),
+            "{who} {ev}"
+        );
+    }
+
+    // A record that cannot be read is an error, not an empty record.
+    let file = mulchie_core::record::file_of(&f.paths.config_dir.join("sessions"), &id);
+    assert!(file.exists(), "{}", file.display());
+    std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o000)).unwrap();
+    let results: Vec<_> = [&a, &b]
+        .iter()
+        .map(|x| x.session_events(&id, 0, 10))
+        .collect();
+    std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o600)).unwrap();
+    for (who, r) in ["engine", "client"].iter().zip(results) {
+        let err = r.unwrap_err();
+        assert!(
+            err.contains("could not be read")
+                || err.contains("record_unreadable")
+                || err.to_lowercase().contains("permission"),
+            "{who}: {err}"
+        );
+    }
+    drop(b);
     a.shutdown();
 }

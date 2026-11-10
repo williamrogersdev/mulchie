@@ -11,7 +11,7 @@ import { invoke } from '../ipc.js';
 import { $, esc, tilde, toast } from '../util.js';
 import { act } from '../act.js';
 import { noticesHtml } from '../findings.js';
-import { renderCfgMore } from './settings_more.js';
+import { renderCfgMore, setHtml } from './settings_more.js';
 
 const CFG = [
   ['scan_roots', 'Scan roots', 'list', 'Folders searched for repos, worktrees and build caches. One per line; empty means the defaults under your home folder.'],
@@ -78,18 +78,22 @@ function notes(cfg, changedElsewhere) {
   return noticesHtml(out);
 }
 
-// Draw the form from the current config. While it has unsaved edits, a new
-// config only adds a note; `force` redraws anyway (after a save).
+// Draw the form from the current config, only when the config (or whether
+// it can be saved) changed since the form was drawn, so a poll never
+// replaces a focused field or closes an open control. While it has unsaved
+// edits, a new config only adds a note; `force` redraws anyway (after a
+// save).
 export function renderSettings(force) {
   const ui = st.ui, cfg = st.cfg;
   if (!cfg) return;
   renderCfgMore();
-  if (ui.cfgDirty && !force) {
-    $('#cfgNote').innerHTML = notes(cfg, ui.cfgFormRev != null && cfg.rev !== ui.cfgFormRev);
+  const same = $('#form').childElementCount && cfg.rev === ui.cfgFormRev && cfg.editable === ui.cfgFormEditable;
+  if ((ui.cfgDirty || same) && !force) {
+    setHtml($('#cfgNote'), notes(cfg, ui.cfgDirty && ui.cfgFormRev != null && cfg.rev !== ui.cfgFormRev));
     return;
   }
   const c = cfg.config, w = c.watch || {}, editable = cfg.editable;
-  $('#cfgNote').innerHTML = notes(cfg, false);
+  setHtml($('#cfgNote'), notes(cfg, false));
   const dis = (w.dismissed || []).length;
   $('#form').innerHTML = CFG.map(f => field('cf_' + f[0], f, c[f[0]])).join('') +
     `<h3 class="form-h">Watch</h3><div class="hint form-hint">Observations are checks for you to look at, not verdicts.${dis ? ` ${dis} dismissed observation(s) are kept in the file; show them again from Overview → All observations.` : ''}</div>` +
@@ -98,6 +102,7 @@ export function renderSettings(force) {
   $('#saveCfg').disabled = !editable;
   ui.cfgDirty = false;
   ui.cfgFormRev = cfg.rev;
+  ui.cfgFormEditable = editable;
   ui.cfgBase = Object.fromEntries(FIELDS().map(([id]) => [id, raw($('#' + id))]));
 }
 

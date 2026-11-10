@@ -431,3 +431,6 @@ tr.click:focus-visible td, .tile:focus-visible, .cb:focus-visible, .kpi:focus-vi
 .explain { font-size: 12px; margin: 4px 0 0; padding-left: 16px; }
 .explain li { margin: 2px 0; }
 @media (max-width: 760px) { .budget .caps { grid-template-columns: 1fr 1fr; } .budget .caps .hd { display: none; } }
+
+.cfg-card .actions { flex-wrap: wrap; }
+.cfg-card .actions .btn { white-space: normal; text-align: left; }

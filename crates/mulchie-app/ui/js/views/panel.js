@@ -48,10 +48,12 @@ export function renderPanel() {
     const f = findings(), c = S.finding_counts;
     $('#pFindW').style.display = f.length || c?.high || c?.medium || c?.low ? '' : 'none';
     // Sessions over a limit and available updates, each a link to its view.
-    const nb = S.sessions?.breaches_active || 0, nu = S.updates?.available || 0;
+    // Sessions, not breaches: one session can be over several caps.
+    const over = new Set((S.sessions?.breaches || []).filter(b => b.cleared_unix == null).map(b => b.session_id));
+    const nb = over.size, nu = S.updates?.available || 0;
     $('#pLim').innerHTML = [
-      nb && `<a class="lnk" role="button" tabindex="0" data-v="sessions" title="Open the agent sessions"><span class="bad">${nb} session limit(s) exceeded</span></a>`,
-      nu && `<a class="lnk" role="button" tabindex="0" data-d="findings" data-dk="update" title="Open the available updates"><span class="info">${nu} update(s) available</span></a>`,
+      nb && `<a class="lnk" role="button" tabindex="0" data-v="sessions" title="Open the agent sessions"><span class="bad">${nb === 1 ? '1 session' : `${nb} sessions`} over a limit</span></a>`,
+      nu && `<a class="lnk" role="button" tabindex="0" data-d="findings" data-dk="update" title="Open the available updates"><span class="info">${nu === 1 ? '1 update' : `${nu} updates`} available</span></a>`,
     ].filter(Boolean).join(' · ');
     // One finding fewer while that line shows, so the panel fits its cap.
     $('#pFind').innerHTML = findingsHtml(f, nb || nu ? 2 : 3);

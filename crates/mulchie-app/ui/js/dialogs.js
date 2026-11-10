@@ -61,6 +61,7 @@ export const confirmBox = (title, html, yes = 'Confirm', danger = true) => modal
 export const dismissModal = () => { if (closeModal) closeModal(false); };
 
 const REASONS = {
+  not_same_process: 'No longer the same process (another start time)',
   not_absolute: 'Not an absolute path',
   not_found: 'No longer exists',
   symlink: 'Is a symbolic link',
