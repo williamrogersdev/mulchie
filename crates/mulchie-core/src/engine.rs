@@ -38,8 +38,9 @@ const RECLAIM_COOLDOWN: Duration = Duration::from_secs(600);
 const SCAN_POLL: Duration = Duration::from_secs(2);
 /// Longest lease TTL a caller may ask for.
 pub const MAX_LEASE_TTL_SECS: u64 = 86_400;
-/// A waiter that has not polled for this long (or its TTL, if longer) leaves
-/// the queue.
+/// A waiter that has not polled for this long leaves the queue, whatever its
+/// TTL: the TTL is the lease's length once granted, not a licence to hold the
+/// head of the queue without polling.
 pub const WAITER_POLL_SECS: u64 = 30;
 /// A supervised loop that ran this long before panicking restarts without
 /// backoff.
@@ -108,6 +109,10 @@ pub struct Lease {
     /// The lease ends unless renewed (the same ticket sent again) within this.
     pub ttl_secs: Option<u64>,
     pub expires_unix: Option<u64>,
+    /// The start time of `pid` when the lease was taken, when the process
+    /// table knows it; a reused pid does not keep the lease.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pid_start_time: Option<u64>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -118,6 +123,8 @@ pub struct Waiter {
     pub since_unix: u64,
     pub last_poll: u64,
     pub ttl_secs: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pid_start_time: Option<u64>,
 }
 
 #[derive(Debug, Clone, Serialize, Default)]
@@ -156,6 +163,9 @@ pub enum LeaseError {
     NeedsPidOrTtl,
     PidNotAlive(u32),
     TtlOutOfRange(u64),
+    /// pid 1 (or 0), or a process of another user: its lifetime says nothing
+    /// about the caller's build.
+    PidNotAllowed(u32),
 }
 
 impl LeaseError {
@@ -164,6 +174,7 @@ impl LeaseError {
             LeaseError::NeedsPidOrTtl => "lease_needs_pid_or_ttl",
             LeaseError::PidNotAlive(_) => "pid_not_alive",
             LeaseError::TtlOutOfRange(_) => "ttl_out_of_range",
+            LeaseError::PidNotAllowed(_) => "pid_not_allowed",
         }
     }
 }
@@ -179,6 +190,10 @@ impl std::fmt::Display for LeaseError {
             LeaseError::TtlOutOfRange(t) => {
                 write!(f, "ttl_secs {t} is out of range 1..={MAX_LEASE_TTL_SECS}")
             }
+            LeaseError::PidNotAllowed(p) => write!(
+                f,
+                "process {p} is pid 1 or belongs to another user; lease a process of your own"
+            ),
         }
     }
 }
@@ -843,7 +858,7 @@ impl Engine {
             let cap = capacity(&cfg, snap.cpu_count);
             st.slots.capacity = cap;
             st.slots.jobs_per_slot = (snap.cpu_count / cap).max(1);
-            expire_leases(&mut st.slots, now);
+            expire_leases(&mut st.slots, now, &|p, s| self.lease_pid_alive(p, s));
             if !newly.is_empty() {
                 notes.extend(throttle_notes(&snap, &newly, now));
             }
@@ -1353,14 +1368,30 @@ impl Engine {
     /// renewed in time, with a pid when that process exits.
     pub fn acquire_at(&self, req: &LeaseRequest, now: u64) -> Result<LeaseReply, LeaseError> {
         let pid = req.pid.filter(|p| *p > 0);
+        if let Some(p) = pid {
+            if p == 1 {
+                return Err(LeaseError::PidNotAllowed(p));
+            }
+        }
         if let Some(t) = req.ttl_secs {
             if t == 0 || t > MAX_LEASE_TTL_SECS {
                 return Err(LeaseError::TtlOutOfRange(t));
             }
         }
+        let mut pid_start_time = None;
         if let Some(p) = pid {
             if !pid_alive(p) {
                 return Err(LeaseError::PidNotAlive(p));
+            }
+            // Alive but not ours to signal: another user's process.
+            if !own_pid_alive(p) {
+                return Err(LeaseError::PidNotAllowed(p));
+            }
+            if let Some(f) = self.procs.get(p) {
+                if f.uid.is_some_and(|u| u != self.procs.current_uid()) {
+                    return Err(LeaseError::PidNotAllowed(p));
+                }
+                pid_start_time = Some(f.start_time);
             }
         }
         let label = if req.label.is_empty() {
@@ -1370,7 +1401,7 @@ impl Engine {
             req.label.clone()
         };
         let mut st = lock(&self.state);
-        expire_leases(&mut st.slots, now);
+        expire_leases(&mut st.slots, now, &|p, s| self.lease_pid_alive(p, s));
         // A known ticket (renewal or poll) keeps what it was granted with; a
         // new request must say how it ends.
         let known = req.ticket.is_some_and(|t| {
@@ -1406,6 +1437,7 @@ impl Engine {
                     since_unix: now,
                     last_poll: now,
                     ttl_secs: req.ttl_secs,
+                    pid_start_time,
                 });
                 id
             }
@@ -1437,6 +1469,7 @@ impl Engine {
                 jobs,
                 ttl_secs: w.ttl_secs,
                 expires_unix,
+                pid_start_time: w.pid_start_time,
             });
             let reason = format!("slot {}/{}", st.slots.active.len(), cap);
             return Ok(LeaseReply {
@@ -1476,7 +1509,21 @@ impl Engine {
     /// Drop leases whose process exited or whose TTL passed, and waiters that
     /// stopped polling.
     pub fn expire_leases_at(&self, now: u64) {
-        expire_leases(&mut lock(&self.state).slots, now);
+        expire_leases(&mut lock(&self.state).slots, now, &|p, s| {
+            self.lease_pid_alive(p, s)
+        });
+    }
+
+    /// A lease's process is still the one that took it: signalable by us
+    /// (EPERM is not enough) and, when known, with the same start time.
+    fn lease_pid_alive(&self, pid: u32, start_time: Option<u64>) -> bool {
+        if !own_pid_alive(pid) {
+            return false;
+        }
+        match start_time {
+            Some(s) => self.procs.get(pid).is_none_or(|f| f.start_time == s),
+            None => true,
+        }
     }
 
     #[cfg(test)]
@@ -1496,14 +1543,20 @@ impl Engine {
     }
 }
 
-fn expire_leases(slots: &mut Slots, now: u64) {
+fn expire_leases(slots: &mut Slots, now: u64, alive: &dyn Fn(u32, Option<u64>) -> bool) {
     slots.active.retain(|l| {
-        l.pid.map(pid_alive).unwrap_or(true) && l.expires_unix.map(|e| now < e).unwrap_or(true)
+        l.pid.is_none_or(|p| alive(p, l.pid_start_time))
+            && l.expires_unix.map(|e| now < e).unwrap_or(true)
     });
     slots.waiting.retain(|w| {
-        let window = w.ttl_secs.unwrap_or(0).max(WAITER_POLL_SECS);
-        w.pid.map(pid_alive).unwrap_or(true) && now.saturating_sub(w.last_poll) < window
+        w.pid.is_none_or(|p| alive(p, w.pid_start_time))
+            && now.saturating_sub(w.last_poll) < WAITER_POLL_SECS
     });
+}
+
+/// `kill(pid, 0)` succeeds: the process exists and this user may signal it.
+fn own_pid_alive(pid: u32) -> bool {
+    pid > 1 && pid <= i32::MAX as u32 && unsafe { libc::kill(pid as i32, 0) } == 0
 }
 
 fn throttle_notes(snap: &Snapshot, newly: &[u32], now: u64) -> Vec<Action> {

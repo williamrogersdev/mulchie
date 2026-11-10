@@ -589,3 +589,101 @@ fn journal_failures_show_in_state_and_health() {
     assert!(e.snapshot_state().journal_error.is_none());
     assert!(e.health_summary().journal_error.is_none());
 }
+
+/// C8: a head waiter with a long TTL that stops polling no longer blocks the
+/// queue for its TTL; it leaves after the poll window.
+#[test]
+fn a_silent_head_waiter_leaves_after_the_poll_window() {
+    let (_t, e) = engine();
+    one_slot(&e);
+    let t0 = 1_000_000;
+    let a = e
+        .acquire_at(&lease("a", None, None, Some(600)), t0)
+        .unwrap();
+    assert!(a.granted);
+    let b = e
+        .acquire_at(&lease("b", None, None, Some(3600)), t0)
+        .unwrap();
+    assert_eq!((b.granted, b.position), (false, 0));
+    let c = e.acquire_at(&lease("c", None, None, Some(60)), t0).unwrap();
+    assert_eq!(c.position, 1);
+    assert!(e.release(a.ticket));
+    // c keeps polling; b went quiet.
+    let c1 = e
+        .acquire_at(&lease("c", None, Some(c.ticket), None), t0 + 20)
+        .unwrap();
+    assert!(!c1.granted, "b still within the poll window");
+    let c2 = e
+        .acquire_at(
+            &lease("c", None, Some(c.ticket), None),
+            t0 + WAITER_POLL_SECS + 1,
+        )
+        .unwrap();
+    assert!(c2.granted, "{c2:?}");
+}
+
+/// C10: pid 1 and other users' processes cannot hold a lease; a reused pid
+/// does not keep one.
+#[test]
+fn leases_refuse_pid1_and_end_when_the_pid_is_reused() {
+    let (_t, e) = engine();
+    one_slot(&e);
+    assert_eq!(
+        e.acquire(&lease("x", Some(1), None, None)).unwrap_err(),
+        LeaseError::PidNotAllowed(1)
+    );
+    assert_eq!(LeaseError::PidNotAllowed(1).code(), "pid_not_allowed");
+
+    // Our own child, recorded with its start time by a fake table.
+    let mut child = std::process::Command::new("/bin/sleep")
+        .arg("30")
+        .spawn()
+        .unwrap();
+    let pid = child.id();
+    let t = tempfile::tempdir().unwrap();
+    let paths = Paths::under(t.path());
+    let procs = Arc::new(FakeProcesses::empty().with(pid, "sleep", None, 500));
+    let e2 = Engine::with_processes(
+        paths,
+        LoadedConfig {
+            config: Config::default(),
+            error: None,
+        },
+        procs.clone(),
+    );
+    one_slot(&e2);
+    let l = e2.acquire(&lease("build", Some(pid), None, None)).unwrap();
+    assert!(l.granted);
+    assert_eq!(
+        e2.snapshot_state().slots.active[0].pid_start_time,
+        Some(500)
+    );
+    e2.expire_leases_at(now_unix());
+    assert_eq!(e2.snapshot_state().slots.active.len(), 1, "same process");
+    let _ = child.kill();
+    let _ = child.wait();
+    e2.expire_leases_at(now_unix());
+    assert!(e2.snapshot_state().slots.active.is_empty(), "exited");
+
+    // A live pid whose start time no longer matches: reused.
+    let me = std::process::id();
+    let procs = FakeProcesses::empty().with(me, "me", None, 700);
+    let t = tempfile::tempdir().unwrap();
+    let e3 = Engine::with_processes(
+        Paths::under(t.path()),
+        LoadedConfig {
+            config: Config::default(),
+            error: None,
+        },
+        Arc::new(procs),
+    );
+    one_slot(&e3);
+    assert!(
+        e3.acquire(&lease("me", Some(me), None, None))
+            .unwrap()
+            .granted
+    );
+    e3.state_mut().slots.active[0].pid_start_time = Some(699);
+    e3.expire_leases_at(now_unix());
+    assert!(e3.snapshot_state().slots.active.is_empty(), "pid reused");
+}
