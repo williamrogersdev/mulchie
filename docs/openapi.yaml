@@ -284,7 +284,9 @@ paths:
         Or `session` (an id from `GET /v1/sessions`) with `action`: the session's processes,
         without the agent itself unless `include_agent`.
         A plan that would signal the engine, `caller_pid` or any of their ancestors is refused
-        (`protected`), for `pid`, `tree`, `group` and `session` alike.
+        (`protected`), for `pid`, `tree`, `group` and `session` alike. The engine cannot see who
+        calls it over HTTP: only a client that sends `caller_pid` (its own pid) gets itself, its
+        shell, terminal and agent protected. Without it, only the engine and its ancestors are.
       requestBody:
         required: true
         content:
@@ -297,7 +299,7 @@ paths:
                 tree: { type: boolean }
                 group: { type: string }
                 action: { type: string, enum: [quit, force_quit, pause, resume, lower_priority, stop_builds, restart] }
-                caller_pid: { type: integer }
+                caller_pid: { type: integer, description: "The calling process's own pid; send it so the caller and its ancestors are never planned" }
                 session: { type: string, description: A session id; plans its processes }
                 include_agent: { type: boolean, description: "With `session`, also the agent process at its root" }
       responses:
