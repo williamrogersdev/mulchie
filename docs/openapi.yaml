@@ -796,7 +796,15 @@ paths:
   /v1/guard/check:
     post:
       summary: Check a command against the guard rules
-      description: Records nothing. `advice` is set for a heavy build while heavy work is not advised. The read-only token is accepted.
+      description: |
+        Records nothing. `advice` is set for a heavy build while heavy work is not advised. The
+        read-only token is accepted. Rules: recursive_delete (`rm -r`, `mv`, `find -delete`,
+        `rsync --delete`, `git clean -f` with `-d`/`-x`, `xargs rm -r` not fed only by a `find`
+        inside the boundary), pipe_to_shell (piping a download into a shell, or running a file an
+        earlier command downloaded), sudo, force_push, disable_mulchie, credential_read,
+        startup_write, and too_long (always a warning: the command is longer than 64 KiB and only
+        its first 64 KiB were checked). Deletes are judged against the session's workspace, or
+        with none known the given `cwd`.
       requestBody:
         required: true
         content:

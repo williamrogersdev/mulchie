@@ -43,6 +43,9 @@ pub enum GuardRule {
     DisableMulchie,
     CredentialRead,
     StartupWrite,
+    /// The command was longer than [`MAX_COMMAND_BYTES`] and only its start
+    /// was checked. Always a warning; not configurable (not in `ALL`).
+    TooLong,
 }
 
 impl GuardRule {
@@ -65,6 +68,7 @@ impl GuardRule {
             GuardRule::DisableMulchie => "disable_mulchie",
             GuardRule::CredentialRead => "credential_read",
             GuardRule::StartupWrite => "startup_write",
+            GuardRule::TooLong => "too_long",
         }
     }
 
@@ -78,6 +82,7 @@ impl GuardRule {
             GuardRule::DisableMulchie => r.disable_mulchie,
             GuardRule::CredentialRead => r.credential_read,
             GuardRule::StartupWrite => r.startup_write,
+            GuardRule::TooLong => RuleMode::Warn,
         }
     }
 }
@@ -141,11 +146,22 @@ pub fn check(input: &GuardInput, cfg: &GuardConfig) -> Verdict {
     let text = truncate_utf8(input.command, MAX_COMMAND_BYTES);
     let script = parse_script(text, input.home, 0);
     let mut found: Vec<(GuardRule, String)> = Vec::new();
+    if input.command.len() > MAX_COMMAND_BYTES {
+        found.push((
+            GuardRule::TooLong,
+            format!(
+                "the command is longer than {} KiB; only its first {} KiB were checked",
+                MAX_COMMAND_BYTES / 1024,
+                MAX_COMMAND_BYTES / 1024
+            ),
+        ));
+    }
     let mut ctx = Ctx {
         input,
         cfg,
         found: &mut found,
         cwd: Some(normalize(input.cwd)),
+        downloaded: Vec::new(),
     };
     ctx.script(&script, 0);
     let mut matches: Vec<RuleMatch> = Vec::new();
@@ -687,6 +703,8 @@ struct Ctx<'a, 'b> {
     /// `None` after a `cd` to somewhere unknown (relative paths then match
     /// nothing).
     cwd: Option<PathBuf>,
+    /// Files an earlier command in the line downloaded (`curl -o f`).
+    downloaded: Vec<PathBuf>,
 }
 
 const SHELLS: &[&str] = &["sh", "bash", "zsh", "dash", "ksh", "fish", "mksh", "ash"];
@@ -703,6 +721,8 @@ fn base(s: &str) -> &str {
 #[derive(Debug, Clone)]
 struct Simple<'a> {
     prog: String,
+    /// The program word as written (`./install.sh`).
+    word: &'a Word,
     args: Vec<&'a Word>,
     sudo: bool,
 }
@@ -769,6 +789,7 @@ fn simplify(words: &[Word]) -> Option<Simple<'_>> {
             _ => {
                 return Some(Simple {
                     prog: b.to_string(),
+                    word: w,
                     args: words[i + 1..].iter().collect(),
                     sudo,
                 });
@@ -892,8 +913,14 @@ impl Ctx<'_, '_> {
         }
         let prog = sc.prog.as_str();
         let args = &sc.args;
+        self.runs_download(&sc);
+        if DOWNLOADERS.contains(&prog) {
+            self.note_download(prog, args, c);
+        }
         match prog {
             "rm" => self.rm(args),
+            "rsync" => self.rsync(args),
+            "xargs" => self.xargs(args, c, s),
             "mv" => self.mv(args),
             "find" => self.find(args),
             "git" => self.git(args),
@@ -967,18 +994,36 @@ impl Ctx<'_, '_> {
         if TEMP_DIRS.iter().any(|t| p.starts_with(t)) {
             return None;
         }
-        let ws = self.input.workspace.map(normalize)?;
+        let (ws, what) = self.boundary();
         if p == ws {
-            return Some(format!("the whole workspace {}", ws.display()));
+            return Some(format!("the whole {what} {}", ws.display()));
         }
         if !p.starts_with(&ws) {
             return Some(format!(
-                "{}, outside the session's workspace {}",
+                "{}, outside the {what} {}",
                 p.display(),
                 ws.display()
             ));
         }
         None
+    }
+
+    /// What deletes must stay inside: the session's workspace, or with none
+    /// known the working directory the command was given.
+    fn boundary(&self) -> (PathBuf, &'static str) {
+        match self.input.workspace {
+            Some(ws) => (normalize(ws), "session's workspace"),
+            None => (normalize(self.input.cwd), "working directory"),
+        }
+    }
+
+    /// Like [`Ctx::danger`], but the boundary itself is fine: for tools that
+    /// delete inside a target (`rsync --delete`, `git clean`).
+    fn danger_outside(&self, p: &Path) -> Option<String> {
+        if p.starts_with(self.boundary().0) && p != Path::new("/") {
+            return None;
+        }
+        self.danger(p)
     }
 
     /// A target word: its path, or for `dir/*` the directory when that is
@@ -1004,10 +1049,10 @@ impl Ctx<'_, '_> {
         if TEMP_DIRS.iter().any(|x| d.starts_with(x)) {
             return None;
         }
-        let ws = self.input.workspace.map(normalize)?;
+        let (ws, what) = self.boundary();
         (!d.starts_with(&ws)).then(|| {
             format!(
-                "files in {}, outside the session's workspace {}",
+                "files in {}, outside the {what} {}",
                 d.display(),
                 ws.display()
             )
@@ -1142,9 +1187,13 @@ impl Ctx<'_, '_> {
     fn git(&mut self, args: &[&Word]) {
         // Global options before the subcommand.
         let mut i = 0;
+        let mut dir: Option<Option<PathBuf>> = None;
         while let Some(w) = args.get(i) {
             let t = w.text.as_str();
             if ["-C", "-c", "--git-dir", "--work-tree", "--namespace"].contains(&t) {
+                if t == "-C" || t == "--work-tree" {
+                    dir = Some(args.get(i + 1).and_then(|d| self.path_of(d)));
+                }
                 i += 2;
             } else if t.starts_with('-') {
                 i += 1;
@@ -1157,6 +1206,14 @@ impl Ctx<'_, '_> {
         };
         let rest: Vec<&Word> = args[i + 1..].to_vec();
         let cur = self.input.current_branch;
+        if sub == "clean" {
+            let dir = match dir {
+                Some(d) => d,
+                None => self.cwd.clone(),
+            };
+            self.git_clean(dir, &rest);
+            return;
+        }
         match sub {
             "push" => {
                 let mut force = false;
@@ -1409,7 +1466,267 @@ impl Ctx<'_, '_> {
         }
     }
 
+    // ------------------------------------------------- other deleting tools
+
+    /// `git clean -f` with `-d`, `-x` or `-X` deletes untracked (and ignored)
+    /// files: refused outside the boundary.
+    fn git_clean(&mut self, dir: Option<PathBuf>, rest: &[&Word]) {
+        let mut force = false;
+        let mut wide = false;
+        let mut specs = Vec::new();
+        let mut opts_done = false;
+        for w in rest {
+            let t = w.text.as_str();
+            if !opts_done && t == "--" {
+                opts_done = true;
+            } else if !opts_done && t == "--force" {
+                force = true;
+            } else if !opts_done && t.starts_with("--") {
+            } else if !opts_done && is_option(w) {
+                force |= t.contains('f');
+                wide |= t.contains(['d', 'x', 'X']);
+            } else {
+                specs.push(*w);
+            }
+        }
+        if !force || !wide {
+            return;
+        }
+        let Some(dir) = dir else { return };
+        let targets: Vec<PathBuf> = if specs.is_empty() {
+            vec![dir]
+        } else {
+            specs
+                .iter()
+                .filter(|w| !w.dynamic && !w.glob)
+                .map(|w| normalize(&dir.join(&w.text)))
+                .collect()
+        };
+        for p in targets {
+            if let Some(why) = self.danger_outside(&p) {
+                self.hit(
+                    GuardRule::RecursiveDelete,
+                    format!("git clean deletes untracked and ignored files in {why}"),
+                );
+                return;
+            }
+        }
+    }
+
+    /// `rsync --delete` (and `--del`, `--delete-*`) removes files in the
+    /// destination that the source lacks: refused outside the boundary.
+    fn rsync(&mut self, args: &[&Word]) {
+        const TAKES: &[&str] = &[
+            "-e",
+            "--rsh",
+            "--exclude",
+            "--include",
+            "--filter",
+            "-f",
+            "--files-from",
+            "--password-file",
+            "--port",
+            "--chmod",
+            "--chown",
+            "-T",
+            "--temp-dir",
+            "--log-file",
+            "--partial-dir",
+            "--backup-dir",
+            "--suffix",
+            "--timeout",
+            "--bwlimit",
+            "--max-size",
+            "--min-size",
+            "--compare-dest",
+            "--copy-dest",
+            "--link-dest",
+            "-B",
+            "--block-size",
+        ];
+        let mut delete = false;
+        let mut pos: Vec<&Word> = Vec::new();
+        let mut skip = false;
+        for w in args {
+            if skip {
+                skip = false;
+                continue;
+            }
+            let t = w.text.as_str();
+            if t == "--del" || t.starts_with("--delete") {
+                delete = true;
+            } else if TAKES.contains(&t) {
+                skip = true;
+            } else if !is_option(w) {
+                pos.push(w);
+            }
+        }
+        if !delete || pos.len() < 2 {
+            return;
+        }
+        let dest = pos[pos.len() - 1];
+        // `host:path` is another machine.
+        if dest.text.split('/').next().is_some_and(|h| h.contains(':')) {
+            return;
+        }
+        if let Some(why) = self.path_of(dest).and_then(|p| self.danger_outside(&p)) {
+            self.hit(
+                GuardRule::RecursiveDelete,
+                format!("rsync --delete removes files in {why}"),
+            );
+        }
+    }
+
+    /// `… | xargs rm -r`: the paths come from the input. Allowed when every
+    /// command feeding it is a `find` rooted inside the boundary.
+    fn xargs(&mut self, args: &[&Word], c: &Cmd, s: &Script) {
+        const TAKES: &[&str] = &[
+            "-I",
+            "-n",
+            "-P",
+            "-L",
+            "-d",
+            "-E",
+            "-s",
+            "-a",
+            "--max-args",
+            "--max-procs",
+            "--delimiter",
+            "--arg-file",
+            "--max-lines",
+            "--eof",
+            "--max-chars",
+        ];
+        let mut i = 0;
+        while let Some(w) = args.get(i) {
+            let t = w.text.as_str();
+            if t == "--" {
+                i += 1;
+                break;
+            }
+            if !is_option(w) {
+                break;
+            }
+            i += if TAKES.contains(&t) { 2 } else { 1 };
+        }
+        let rest = &args[i.min(args.len())..];
+        let Some(first) = rest.first() else { return };
+        if base(&first.text) != "rm" {
+            return;
+        }
+        let tail = &rest[1..];
+        self.rm(tail);
+        let recursive = tail.iter().any(|w| {
+            is_option(w)
+                && (w.text == "--recursive"
+                    || (!w.text.starts_with("--") && w.text[1..].contains(['r', 'R'])))
+        });
+        if !recursive {
+            return;
+        }
+        let (bound, _) = self.boundary();
+        let feeders: Vec<&Cmd> = s
+            .cmds
+            .iter()
+            .filter(|o| o.pipeline == c.pipeline && o.pos < c.pos)
+            .collect();
+        let safe = !feeders.is_empty()
+            && feeders.iter().all(|o| {
+                simplify(&o.words).is_some_and(|sc| {
+                    if sc.prog != "find" {
+                        return false;
+                    }
+                    let roots: Vec<&&Word> = sc
+                        .args
+                        .iter()
+                        .take_while(|w| !w.text.starts_with(['-', '(', '!']))
+                        .collect();
+                    if roots.is_empty() {
+                        return self.cwd.as_ref().is_some_and(|d| d.starts_with(&bound));
+                    }
+                    roots
+                        .iter()
+                        .all(|w| self.path_of(w).is_some_and(|p| p.starts_with(&bound)))
+                })
+            });
+        if !safe {
+            self.hit(
+                GuardRule::RecursiveDelete,
+                "recursively deletes paths read from its input (xargs rm -r); which ones cannot be seen here".into(),
+            );
+        }
+    }
+
     // ------------------------------------------------------- pipe to shell
+
+    /// Remember where a downloader writes: `-o f`, `-O f`, `--output f`,
+    /// `--output-document=f`, a short cluster ending in `o`/`O`, or `> f`.
+    fn note_download(&mut self, prog: &str, args: &[&Word], c: &Cmd) {
+        let flag = if prog == "wget" { 'O' } else { 'o' };
+        let mut out: Vec<PathBuf> = Vec::new();
+        for (i, w) in args.iter().enumerate() {
+            let t = w.text.as_str();
+            let next = || args.get(i + 1).and_then(|n| self.path_of(n));
+            if ["--output", "--output-document", "-o", "-O"].contains(&t) {
+                if t == "-o" || t == "-O" {
+                    if t.ends_with(flag) {
+                        out.extend(next());
+                    }
+                } else {
+                    out.extend(next());
+                }
+            } else if let Some(v) = t
+                .strip_prefix("--output=")
+                .or_else(|| t.strip_prefix("--output-document="))
+            {
+                if !w.dynamic {
+                    out.extend(self.try_resolve(v));
+                }
+            } else if !t.starts_with("--")
+                && t.len() > 2
+                && t.starts_with('-')
+                && t.ends_with(flag)
+                && t[1..].chars().all(|c| c.is_ascii_alphabetic())
+            {
+                out.extend(next());
+            }
+        }
+        for r in &c.redirs {
+            if r.op.starts_with('>') {
+                out.extend(self.path_of(&r.target));
+            }
+        }
+        self.downloaded.extend(out);
+    }
+
+    /// Running a file an earlier command downloaded: `sh f`, `python3 f`,
+    /// `source f`, `./f`.
+    fn runs_download(&mut self, sc: &Simple) {
+        if self.downloaded.is_empty() {
+            return;
+        }
+        let prog = sc.prog.as_str();
+        let run: Option<PathBuf> = if SHELLS.contains(&prog)
+            || INTERPRETERS.contains(&prog)
+            || prog == "source"
+            || prog == "."
+        {
+            sc.args
+                .iter()
+                .find(|w| !is_option(w))
+                .and_then(|w| self.path_of(w))
+        } else if sc.word.text.contains('/') {
+            self.path_of(sc.word)
+        } else {
+            None
+        };
+        if let Some(p) = run.filter(|p| self.downloaded.contains(p)) {
+            self.hit(
+                GuardRule::PipeToShell,
+                format!("runs {}, which an earlier command downloaded", p.display()),
+            );
+        }
+    }
 
     fn has_download(&self, scripts: &[Script]) -> bool {
         scripts.iter().flat_map(|s| s.cmds.iter()).any(|c| {
