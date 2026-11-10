@@ -179,6 +179,69 @@ fn pause_spares_the_agent_and_resumes_after_resume_after_secs() {
         .contains("resumed 1 of 1"));
 }
 
+/// A4: each session says whether a breach would be acted on here, and if
+/// not, why.
+#[test]
+fn sessions_say_whether_limits_are_enforced() {
+    let busy = [
+        proc(77_777, 1, 500, Some("claude"), 0.0),
+        proc(77_778, 77_777, 1000, None, 0.0),
+    ];
+    let reason = |e: &Engine| {
+        let s = e.sessions().into_iter().next().unwrap();
+        (s.enforced, s.not_enforced_reason)
+    };
+    let c = cfg(LimitAction::Pause, false);
+    let (_t, e) = engine(&c, &[]);
+    e.observe_sessions(1_000, &busy, M, &c);
+    assert_eq!(reason(&e), (true, None));
+    let id = Session::id_for(77_777, 500);
+    assert!(e.session(&id).unwrap().session.enforced);
+    let brief = e.snapshot_state().sessions.list[0].clone();
+    assert!(brief.enforced && brief.not_enforced_reason.is_none());
+    let v = serde_json::to_value(e.sessions()).unwrap();
+    assert_eq!(v[0]["enforced"], true);
+    assert!(v[0].get("not_enforced_reason").is_none());
+
+    // The same session, as a hook registered it, or ended.
+    let s = e.sessions().into_iter().next().unwrap();
+    let hook = Session {
+        source: crate::session::RootSource::Hook,
+        ..s.clone()
+    };
+    let r = Engine::with_enforcement(hook, &c, true);
+    assert_eq!(r.not_enforced_reason.as_deref(), Some("hook_registered"));
+    let ended = Session {
+        status: SessionStatus::Ended,
+        ..s.clone()
+    };
+    let r = Engine::with_enforcement(ended, &c, true);
+    assert_eq!(r.not_enforced_reason.as_deref(), Some("ended"));
+    let r = Engine::with_enforcement(s.clone(), &c, false);
+    assert_eq!(
+        (r.enforced, r.not_enforced_reason.as_deref()),
+        (false, Some("not_automating"))
+    );
+
+    let c = cfg(LimitAction::Notify, false);
+    let (_t, e) = engine(&c, &[]);
+    e.observe_sessions(1_000, &busy, M, &c);
+    assert_eq!(reason(&e), (false, Some("notify_only".into())));
+    let v = serde_json::to_value(e.sessions()).unwrap();
+    assert_eq!(v[0]["not_enforced_reason"], "notify_only");
+
+    let c = Config::default();
+    let (_t, e) = engine(&c, &[]);
+    e.observe_sessions(1_000, &busy, M, &c);
+    assert_eq!(reason(&e), (false, Some("no_budget".into())));
+
+    let c = cfg(LimitAction::Pause, false);
+    let (_t, e) = engine(&c, &[]);
+    e.set_automation_enabled(false);
+    e.observe_sessions(1_000, &busy, M, &c);
+    assert_eq!(reason(&e), (false, Some("not_automating".into())));
+}
+
 /// The `limit_action` events of a session's record.
 fn limit_actions(e: &Engine, id: &str) -> Vec<serde_json::Value> {
     e.flush_record();

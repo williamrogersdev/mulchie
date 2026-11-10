@@ -1132,6 +1132,19 @@ components:
         started_unix: { type: integer }
         ended_unix: { type: [integer, "null"] }
         listening: { type: array, items: { type: integer }, description: "Ports the session's processes listen on, from the last watch run" }
+        enforced:
+          type: boolean
+          description: >-
+            Whether a breach of this session's limits would be acted on by this engine (also on
+            each entry of `state.sessions.list`).
+        not_enforced_reason:
+          type: string
+          enum: [hook_registered, not_automating, no_budget, notify_only, ended]
+          description: >-
+            Present when `enforced` is false. `hook_registered`: a hook call named the session, so
+            Mulchie only reports. `not_automating`: this engine does not hold the lock or its
+            config did not load. `no_budget`: no budget applies to its workspace. `notify_only`:
+            every cap of its budget only notifies. `ended`: the session ended.
         usage: { $ref: "#/components/schemas/SessionUsage" }
         peak: { type: object, properties: { cpu_cores: { type: number }, memory_mb: { type: number }, processes: { type: integer }, write_mb_per_hour: { type: [number, "null"] } } }
     SessionUsage:

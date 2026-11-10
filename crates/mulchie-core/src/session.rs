@@ -263,6 +263,14 @@ pub struct Session {
     pub peak: Peak,
     /// TCP ports the session's processes listen on (from the last watch run).
     pub listening: Vec<u16>,
+    /// Whether a limit breach of this session would be acted on here. Set
+    /// by the engine when it hands sessions out.
+    #[serde(default)]
+    pub enforced: bool,
+    /// Why not, when `enforced` is false: `hook_registered`,
+    /// `not_automating`, `no_budget`, `notify_only` or `ended`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub not_enforced_reason: Option<String>,
 }
 
 impl Session {
@@ -430,6 +438,8 @@ impl Tracker {
             usage: Usage::default(),
             peak: Peak::default(),
             listening: Vec::new(),
+            enforced: false,
+            not_enforced_reason: None,
         });
         self.live.entry(id.clone()).or_insert_with(|| Live {
             members: HashMap::from([(
@@ -613,6 +623,8 @@ impl Tracker {
                 usage: Usage::default(),
                 peak: Peak::default(),
                 listening: Vec::new(),
+                enforced: false,
+                not_enforced_reason: None,
             });
             if is_new {
                 events.push(SessionEvent::Started { id: id.clone() });

@@ -155,11 +155,17 @@ pub struct SessionBrief {
     pub write_mb_per_hour: Option<f64>,
     pub runtime_secs: u64,
     pub build_slots: u32,
+    /// As on [`Session`].
+    pub enforced: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub not_enforced_reason: Option<String>,
 }
 
 impl SessionBrief {
     fn of(s: &Session) -> Self {
         Self {
+            enforced: s.enforced,
+            not_enforced_reason: s.not_enforced_reason.clone(),
             id: s.id.clone(),
             agent: s.agent.clone(),
             source: s.source,
@@ -1183,6 +1189,7 @@ impl Engine {
     pub(crate) fn sessions_state(&self, cfg: &Config) -> SessionsState {
         let write = lock(&self.state).snapshot.write_bytes_available;
         let record_error = self.record.get().and_then(|r| r.error());
+        let automating = self.automation_allowed();
         let sup = lock(&self.sup);
         let mut list: Vec<&Session> = sup.tracker.sessions().collect();
         let running = list
@@ -1215,7 +1222,7 @@ impl Engine {
             list: list
                 .into_iter()
                 .take(STATE_SESSIONS_KEPT)
-                .map(SessionBrief::of)
+                .map(|s| SessionBrief::of(&Self::with_enforcement(s.clone(), cfg, automating)))
                 .collect(),
             breaches_active: breaches.iter().filter(|b| b.active()).count(),
             breaches_undelivered: sup.limits.breaches().filter(|b| !b.delivered).count(),
@@ -1240,10 +1247,50 @@ impl Engine {
         )
     }
 
+    /// A4: whether a breach of `s` would be acted on here, and why not.
+    /// `automating` is [`Engine::automation_allowed`], read before `sup` is
+    /// locked (it takes `state`, which comes first).
+    pub(crate) fn with_enforcement(mut s: Session, cfg: &Config, automating: bool) -> Session {
+        let reason = if s.status == SessionStatus::Ended {
+            Some("ended")
+        } else if s.source == RootSource::Hook {
+            Some("hook_registered")
+        } else if !automating {
+            Some("not_automating")
+        } else {
+            match cfg.limits.budget_for(s.workspace.as_deref()) {
+                None => Some("no_budget"),
+                Some(b) => {
+                    let caps = [
+                        &b.cpu_cores,
+                        &b.memory_mb,
+                        &b.processes,
+                        &b.write_mb_per_hour,
+                        &b.runtime_hours,
+                    ];
+                    let acts = caps
+                        .iter()
+                        .filter_map(|c| c.as_ref())
+                        .any(|c| c.action != LimitAction::Notify);
+                    (!acts).then_some("notify_only")
+                }
+            }
+        };
+        s.enforced = reason.is_none();
+        s.not_enforced_reason = reason.map(String::from);
+        s
+    }
+
     /// Every session Mulchie keeps, running first.
     pub fn sessions(&self) -> Vec<Session> {
+        let cfg = self.config();
+        let automating = self.automation_allowed();
         let sup = lock(&self.sup);
-        let mut v: Vec<Session> = sup.tracker.sessions().cloned().collect();
+        let mut v: Vec<Session> = sup
+            .tracker
+            .sessions()
+            .map(|s| Self::with_enforcement(s.clone(), &cfg, automating))
+            .collect();
         v.sort_by(|a, b| {
             (a.status == SessionStatus::Ended)
                 .cmp(&(b.status == SessionStatus::Ended))
@@ -1254,8 +1301,10 @@ impl Engine {
 
     pub fn session(&self, id: &str) -> Option<SessionDetail> {
         let procs: Vec<SessionProc> = lock(&self.state).snapshot.session_procs.clone();
+        let cfg = self.config();
+        let automating = self.automation_allowed();
         let sup = lock(&self.sup);
-        let s = sup.tracker.get(id)?.clone();
+        let s = Self::with_enforcement(sup.tracker.get(id)?.clone(), &cfg, automating);
         let members: HashSet<(u32, u64)> = sup.tracker.members(id).into_iter().collect();
         let processes = procs
             .iter()

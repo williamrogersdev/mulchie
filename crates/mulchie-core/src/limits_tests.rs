@@ -30,6 +30,8 @@ fn session(id: &str, ws: &str, cpu: f64) -> Session {
         },
         peak: Peak::default(),
         listening: Vec::new(),
+        enforced: false,
+        not_enforced_reason: None,
     }
 }
 
