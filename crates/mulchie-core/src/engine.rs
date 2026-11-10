@@ -917,6 +917,14 @@ impl Engine {
         newly
     }
 
+    /// `pid` is, read now, still the user's own process that started at
+    /// `start_time`.
+    fn same_own_process(&self, pid: u32, start_time: u64) -> bool {
+        self.procs
+            .get(pid)
+            .is_some_and(|p| p.uid == Some(self.procs.current_uid()) && p.start_time == start_time)
+    }
+
     /// Stop tracking processes that exited (or whose pid was reused).
     fn forget_exited(&self, kinds: &[KindInfo]) {
         let alive: HashMap<u32, u64> = kinds.iter().map(|k| (k.pid, k.start_time)).collect();
@@ -931,6 +939,11 @@ impl Engine {
         {
             let mut rn = lock(&self.reniced);
             rn.retain(|pid, r| {
+                // Read now: a pid that exited or was reused is not ours to
+                // renice; forget it.
+                if !self.same_own_process(*pid, r.start_time) {
+                    return false;
+                }
                 if r.restore_failed {
                     return true;
                 }
@@ -1226,7 +1239,10 @@ impl Engine {
         if action == WorkspaceAction::Deprioritize {
             let done = targets
                 .iter()
-                .filter(|p| lower_priority(p.pid, nice.max(10)).is_some())
+                .filter(|p| {
+                    self.same_own_process(p.pid, p.start_time)
+                        && lower_priority(p.pid, nice.max(10)).is_some()
+                })
                 .count();
             self.log(
                 "throttle",

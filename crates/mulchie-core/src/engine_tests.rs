@@ -22,6 +22,21 @@ pub(crate) fn engine_with(cfg: Config) -> (tempfile::TempDir, Engine) {
     (t, e)
 }
 
+pub(crate) fn engine_with_procs(cfg: Config, procs: FakeProcesses) -> (tempfile::TempDir, Engine) {
+    let t = tempfile::tempdir().unwrap();
+    let paths = Paths::under(t.path());
+    std::fs::create_dir_all(&paths.home).unwrap();
+    let e = Engine::with_processes(
+        paths,
+        LoadedConfig {
+            config: cfg,
+            error: None,
+        },
+        Arc::new(procs),
+    );
+    (t, e)
+}
+
 fn engine() -> (tempfile::TempDir, Engine) {
     engine_with(Config::default())
 }
@@ -513,7 +528,7 @@ fn throttling_tracks_and_restores_only_own_builds() {
         build_nice: target,
         ..Config::default()
     };
-    let (_t, e) = engine_with(cfg);
+    let (_t, e) = engine_with_procs(cfg, FakeProcesses::empty().with(pid, "sleep", None, 42));
     let kinds = [
         KindInfo {
             pid,
@@ -686,4 +701,51 @@ fn leases_refuse_pid1_and_end_when_the_pid_is_reused() {
     e3.state_mut().slots.active[0].pid_start_time = Some(699);
     e3.expire_leases_at(now_unix());
     assert!(e3.snapshot_state().slots.active.is_empty(), "pid reused");
+}
+
+/// C9: restoring priorities (shutdown, pressure gone) and Deprioritize read
+/// the process now and leave a reused pid alone.
+#[test]
+fn priority_changes_skip_a_reused_pid() {
+    let mut child = std::process::Command::new("/bin/sleep")
+        .arg("30")
+        .spawn()
+        .unwrap();
+    let pid = child.id();
+    let before = nice_of(pid).unwrap();
+    if before >= 15 {
+        let _ = child.kill();
+        let _ = child.wait();
+        return;
+    }
+    // The table says this pid started at 500; we tracked one that started at 400.
+    let (_t, e) = engine_with_procs(
+        Config::default(),
+        FakeProcesses::empty().with(pid, "sleep", None, 500),
+    );
+    lock(&e.reniced).insert(
+        pid,
+        Reniced {
+            start_time: 400,
+            original: before + 4,
+            restore_failed: false,
+        },
+    );
+    e.restore_priorities("t");
+    assert_eq!(nice_of(pid), Some(before), "a reused pid is not reniced");
+    assert!(lock(&e.reniced).is_empty(), "and no longer tracked");
+
+    // The same process (start time matches) is restored.
+    lock(&e.reniced).insert(
+        pid,
+        Reniced {
+            start_time: 500,
+            original: before + 4,
+            restore_failed: false,
+        },
+    );
+    e.restore_priorities("t");
+    assert_eq!(nice_of(pid), Some(before + 4));
+    let _ = child.kill();
+    let _ = child.wait();
 }
