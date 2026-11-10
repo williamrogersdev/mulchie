@@ -1282,3 +1282,64 @@ fn pid_and_tree_plans_block_the_callers_ancestors() {
     let _ = child.kill();
     let _ = child.wait();
 }
+
+/// R8: config writes are one read-modify-write under a lock. A full
+/// replacement over a file that changed on disk is refused (and the engine
+/// takes the file's content); a dismissal is merged into the file's content.
+#[test]
+fn config_writes_detect_changes_on_disk() {
+    let (_t, a) = engine();
+    let paths = a.paths().clone();
+    let b = Engine::with_processes(
+        paths.clone(),
+        Config::load_from(&paths),
+        Arc::new(FakeProcesses::empty()),
+    )
+    .with_watch_probe(Arc::new(crate::watch::NoProbe));
+
+    // A writes; B's copy is now stale, so B's replacement is refused.
+    let mut ca = a.config();
+    ca.build_nice = 15;
+    a.set_config(ca).unwrap();
+    let mut cb = b.config();
+    cb.worktree_idle_days = 9;
+    let err = b.set_config(cb).unwrap_err();
+    assert!(matches!(err, ConfigError::Changed(_)), "{err}");
+    assert_eq!(b.config().build_nice, 15, "B took the file's content");
+    assert_eq!(
+        Config::load_from(&paths).config.worktree_idle_days,
+        Config::default().worktree_idle_days
+    );
+    // Read again, reapply: accepted, and A's change is kept.
+    let mut cb = b.config();
+    cb.worktree_idle_days = 9;
+    b.set_config(cb).unwrap();
+    let on_disk = Config::load_from(&paths).config;
+    assert_eq!((on_disk.build_nice, on_disk.worktree_idle_days), (15, 9));
+
+    // A dismissal on A (whose copy is stale again) merges into the file.
+    a.dismiss_finding("f1", Some(1)).unwrap();
+    let on_disk = Config::load_from(&paths).config;
+    assert_eq!(on_disk.worktree_idle_days, 9, "B's change survived");
+    assert!(on_disk.watch.dismissed.iter().any(|d| d.id == "f1"));
+
+    // Concurrent dismissals on one engine: none is lost.
+    std::thread::scope(|s| {
+        for i in 0..8 {
+            let a = &a;
+            s.spawn(move || a.dismiss_finding(&format!("c{i}"), Some(1)).unwrap());
+        }
+    });
+    let on_disk = Config::load_from(&paths).config;
+    for i in 0..8 {
+        assert!(
+            on_disk
+                .watch
+                .dismissed
+                .iter()
+                .any(|d| d.id == format!("c{i}")),
+            "c{i} lost"
+        );
+    }
+    assert!(on_disk.watch.dismissed.iter().any(|d| d.id == "f1"));
+}

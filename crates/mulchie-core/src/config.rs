@@ -601,6 +601,9 @@ pub enum ConfigError {
     Invalid(Vec<String>),
     /// Reading or writing failed.
     Io(String),
+    /// The file changed on disk since this engine loaded or wrote it; the
+    /// change was not saved, and the engine now uses the file's content.
+    Changed(String),
 }
 
 impl std::fmt::Display for ConfigError {
@@ -609,6 +612,7 @@ impl std::fmt::Display for ConfigError {
             ConfigError::Parse(e) => write!(f, "config file could not be parsed: {e}"),
             ConfigError::Invalid(v) => write!(f, "config has invalid values: {}", v.join("; ")),
             ConfigError::Io(e) => write!(f, "config file error: {e}"),
+            ConfigError::Changed(e) => write!(f, "config file changed on disk: {e}"),
         }
     }
 }

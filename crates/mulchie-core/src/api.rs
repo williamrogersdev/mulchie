@@ -729,6 +729,7 @@ fn reason_phrase(code: u16) -> &'static str {
         400 => "Bad Request",
         401 => "Unauthorized",
         403 => "Forbidden",
+        409 => "Conflict",
         404 => "Not Found",
         405 => "Method Not Allowed",
         408 => "Request Timeout",
@@ -1156,6 +1157,9 @@ fn route(req: &Req, engine: &Engine, read_only: bool) -> Resp {
                 };
                 match engine.set_config(cfg) {
                     Ok(()) => ok(&serde_json::json!({ "ok": true, "config": engine.config() })),
+                    Err(e @ crate::config::ConfigError::Changed(_)) => {
+                        fail(409, "config_changed", e.to_string())
+                    }
                     Err(e) => fail(400, "invalid_config", e.to_string()),
                 }
             }

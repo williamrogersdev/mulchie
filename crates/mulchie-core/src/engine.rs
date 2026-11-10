@@ -602,6 +602,11 @@ pub struct ProcessDetail {
     pub findings: Vec<Finding>,
 }
 
+/// The config file's bytes, `None` when there is none or it cannot be read.
+fn read_config_bytes(paths: &Paths) -> Option<Vec<u8>> {
+    std::fs::read(paths.config_file()).ok()
+}
+
 #[derive(Clone)]
 pub struct Engine {
     state: Arc<Mutex<State>>,
@@ -621,6 +626,9 @@ pub struct Engine {
     probe: Arc<dyn WatchProbe>,
     /// The port the API serves on, 0 when it does not.
     api_port: Arc<AtomicU64>,
+    /// The config file's bytes as this engine last loaded or wrote them
+    /// (`None`: no file). Held across every config read-modify-write.
+    config_disk: Arc<Mutex<Option<Vec<u8>>>>,
 }
 
 impl Engine {
@@ -642,6 +650,7 @@ impl Engine {
         procs: Arc<dyn ProcessSource>,
     ) -> Self {
         let journal = Journal::new(&paths);
+        let config_disk = read_config_bytes(&paths);
         let actions: VecDeque<Action> = journal.tail(ACTIONS_KEPT).into_iter().rev().collect();
         let config_error = loaded.error.map(|e| e.to_string());
         let state = State {
@@ -687,6 +696,7 @@ impl Engine {
             watch: Arc::new(Mutex::new(WatchMem::default())),
             probe: Arc::new(watch::SystemProbe),
             api_port: Arc::new(AtomicU64::new(0)),
+            config_disk: Arc::new(Mutex::new(config_disk)),
         }
     }
 
@@ -785,8 +795,43 @@ impl Engine {
 
     /// Validate, save atomically, then apply. A file that failed to load is moved
     /// aside, never overwritten (see [`Config::save_to`]).
+    ///
+    /// Refused with [`ConfigError::Changed`] when the file changed on disk
+    /// since this engine loaded or wrote it (another engine, an editor): the
+    /// engine then takes the file's content, so a caller reads the config
+    /// again and reapplies its change.
     pub fn set_config(&self, cfg: Config) -> Result<(), ConfigError> {
+        let mut disk = lock(&self.config_disk);
+        let now_bytes = read_config_bytes(&self.paths);
+        if now_bytes != *disk {
+            self.adopt_disk_config(&mut disk, now_bytes);
+            return Err(ConfigError::Changed(format!(
+                "{} was changed by something else since Mulchie read it; read the config again and reapply the change",
+                self.paths.config_file().display()
+            )));
+        }
+        self.save_config_locked(&mut disk, cfg)
+    }
+
+    /// Take the file's current content as the engine's config, as a start
+    /// would. Called with the config lock held.
+    fn adopt_disk_config(&self, disk: &mut Option<Vec<u8>>, bytes: Option<Vec<u8>>) {
+        *disk = bytes;
+        let loaded = Config::load_from(&self.paths);
+        let mut st = lock(&self.state);
+        st.config_error = loaded.error.as_ref().map(|e| e.to_string());
+        st.automation = st.config_error.is_none();
+        st.config = loaded.config;
+    }
+
+    /// Save and use `cfg`. Called with the config lock held.
+    fn save_config_locked(
+        &self,
+        disk: &mut Option<Vec<u8>>,
+        cfg: Config,
+    ) -> Result<(), ConfigError> {
         cfg.save_to(&self.paths, now_unix())?;
+        *disk = read_config_bytes(&self.paths);
         {
             let mut st = lock(&self.state);
             st.config = cfg;
@@ -1549,11 +1594,26 @@ impl Engine {
             ));
         }
         let now = now_unix();
+        // One read-modify-write under the config lock. When the file changed
+        // on disk since it was read, the edit is applied to the file's
+        // current content (merged), not to the engine's older copy.
+        let mut disk = lock(&self.config_disk);
+        let now_bytes = read_config_bytes(&self.paths);
+        if now_bytes != *disk {
+            self.adopt_disk_config(&mut disk, now_bytes);
+            if let Some(e) = self.config_error() {
+                return Err((
+                    "config_not_loaded",
+                    format!("the config file changed on disk and is not usable ({e}); fix it before dismissing findings"),
+                ));
+            }
+        }
         let mut cfg = self.config();
         watch::prune_dismissed(&mut cfg.watch, now);
         f(&mut cfg.watch.dismissed);
-        self.set_config(cfg.clone())
+        self.save_config_locked(&mut disk, cfg.clone())
             .map_err(|e| ("invalid_config", e.to_string()))?;
+        drop(disk);
         // Apply to the stored findings now, not at the next run.
         let mut st = lock(&self.state);
         for x in st.findings.iter_mut() {

@@ -479,6 +479,10 @@ paths:
         Send `{"config": {...}}`, the whole config from `GET /v1/config` with your changes;
         fields left out take their defaults. Validated (400 `invalid_config`) and saved
         atomically; a file that failed to load is moved aside, not overwritten. Full token only.
+        When the file changed on disk since the engine loaded or wrote it (another engine, an
+        editor), nothing is saved: 409 `config_changed`, and the engine takes the file's
+        content. Read the config again and reapply the change. Dismissing or undismissing a
+        finding instead applies its edit to the file's current content.
       requestBody:
         required: true
         content:
@@ -498,6 +502,7 @@ paths:
                 properties:
                   ok: { type: boolean }
                   config: { type: object }
+        "409": { $ref: "#/components/responses/Error" }
         default: { $ref: "#/components/responses/Error" }
   /v1/lease:
     post:
