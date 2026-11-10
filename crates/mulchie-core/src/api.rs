@@ -82,6 +82,13 @@ pub const ROUTES: &[(&str, &str)] = &[
     ("POST", "/v1/process/execute"),
     ("POST", "/v1/lease"),
     ("POST", "/v1/release"),
+    ("GET", "/v1/findings"),
+    ("POST", "/v1/findings/dismiss"),
+    ("POST", "/v1/findings/undismiss"),
+    // `{pid}` is a whole number; see `route`.
+    ("GET", "/v1/process/{pid}"),
+    ("GET", "/v1/config"),
+    ("PUT", "/v1/config"),
 ];
 
 // ------------------------------------------------------------------ token
@@ -308,6 +315,7 @@ pub fn serve(engine: Engine, port: u16) -> std::io::Result<Server> {
 pub fn serve_with(engine: Engine, port: u16, limits: Limits) -> std::io::Result<Server> {
     let listener = TcpListener::bind(("127.0.0.1", port))?;
     let port = listener.local_addr()?.port();
+    engine.set_api_port(port);
     let token: Arc<str> = load_or_create_token_in(engine.paths())?.into();
     let read_token: Arc<str> = load_or_create_read_only_token_in(engine.paths())?.into();
     let stop = Arc::new(AtomicBool::new(false));
@@ -870,6 +878,55 @@ struct ProcessBody {
 }
 
 #[derive(Deserialize)]
+struct DismissBody {
+    id: String,
+    /// Default 30, 1 to 3650.
+    #[serde(default)]
+    days: Option<u64>,
+}
+
+#[derive(Deserialize)]
+struct ConfigBody {
+    /// The whole config, as `GET /v1/config` returns it. Fields left out take
+    /// their defaults.
+    config: Option<crate::config::Config>,
+}
+
+/// The raw value of `key` in the query string. Not percent-decoded: the
+/// values read this way are snake_case codes.
+fn query_str<'a>(req: &'a Req, key: &str) -> Option<&'a str> {
+    req.query
+        .split('&')
+        .filter_map(|p| p.split_once('='))
+        .find(|(k, _)| *k == key)
+        .map(|(_, v)| v)
+}
+
+fn query_enum<T: serde::de::DeserializeOwned>(req: &Req, key: &str) -> Result<Option<T>, Resp> {
+    let Some(v) = query_str(req, key).filter(|v| !v.is_empty()) else {
+        return Ok(None);
+    };
+    serde_json::from_value(serde_json::Value::String(v.to_string()))
+        .map(Some)
+        .map_err(|_| fail(400, "invalid_query", format!("unknown {key} {v:?}")))
+}
+
+/// `GET /v1/process/<pid>`.
+fn process_detail(engine: &Engine, rest: &str) -> Resp {
+    let Ok(pid) = rest.parse::<u32>() else {
+        return fail(
+            400,
+            "invalid_pid",
+            "expected /v1/process/<pid> with a whole-number pid",
+        );
+    };
+    match engine.process_detail(pid) {
+        Some(d) => ok(&d),
+        None => fail(404, "unknown_pid", format!("no process {pid}")),
+    }
+}
+
+#[derive(Deserialize)]
 struct PruneBody {
     key: String,
 }
@@ -918,6 +975,13 @@ fn run_items(
 }
 
 fn route(req: &Req, engine: &Engine, read_only: bool) -> Resp {
+    if req.method == "GET" {
+        if let Some(rest) = req.path.strip_prefix("/v1/process/") {
+            if !rest.contains('/') && rest != "plan" && rest != "execute" {
+                return process_detail(engine, rest);
+            }
+        }
+    }
     let r = (|| -> Result<Resp, Resp> {
         Ok(match (req.method.as_str(), req.path.as_str()) {
             ("GET", "/v1/state") => ok(&engine.snapshot_state()),
@@ -1044,6 +1108,55 @@ fn route(req: &Req, engine: &Engine, read_only: bool) -> Resp {
                         "items_required",
                         "expected {\"items\": [...]} with the requests of a plan from POST /v1/process/plan",
                     ),
+                }
+            }
+            ("GET", "/v1/findings") => {
+                let sev = query_enum(req, "severity")?;
+                let kind = query_enum(req, "kind")?;
+                let all = matches!(query_str(req, "dismissed"), Some("1" | "true"));
+                let (counts, at) = engine.finding_summary();
+                ok(&serde_json::json!({
+                    "findings": engine.findings(sev, kind, all),
+                    "counts": counts,
+                    "updated_unix": at,
+                    "enabled": engine.config().watch.enabled,
+                }))
+            }
+            ("POST", "/v1/findings/dismiss") => {
+                let b: DismissBody = body(req)?;
+                match engine.dismiss_finding(&b.id, b.days) {
+                    Ok(until) => {
+                        ok(&serde_json::json!({ "ok": true, "id": b.id, "until_unix": until }))
+                    }
+                    Err((code, m)) => fail(400, code, m),
+                }
+            }
+            ("POST", "/v1/findings/undismiss") => {
+                let b: DismissBody = body(req)?;
+                match engine.undismiss_finding(&b.id) {
+                    Ok(was) => {
+                        ok(&serde_json::json!({ "ok": true, "id": b.id, "was_dismissed": was }))
+                    }
+                    Err((code, m)) => fail(400, code, m),
+                }
+            }
+            ("GET", "/v1/config") => ok(&serde_json::json!({
+                "config": engine.config(),
+                "config_error": engine.config_error(),
+                "path": engine.paths().config_file(),
+            })),
+            ("PUT", "/v1/config") => {
+                let b: ConfigBody = body(req)?;
+                let Some(cfg) = b.config else {
+                    return Ok(fail(
+                        400,
+                        "config_required",
+                        "expected {\"config\": {...}}: the whole config from GET /v1/config with your changes",
+                    ));
+                };
+                match engine.set_config(cfg) {
+                    Ok(()) => ok(&serde_json::json!({ "ok": true, "config": engine.config() })),
+                    Err(e) => fail(400, "invalid_config", e.to_string()),
                 }
             }
             ("POST", "/v1/lease") => {

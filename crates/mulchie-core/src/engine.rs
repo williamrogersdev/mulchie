@@ -27,6 +27,7 @@ use crate::process::{own_cwds, ProcessSource, SystemProcesses};
 use crate::procplan::{draft_group, draft_pid, ProcessPlan, ProcessPlanRequest};
 use crate::reclaim::{self, ScanReport};
 use crate::safety::{pid_alive, ActionResult, Gate, Outcome, Plan, Request, Signal};
+use crate::watch::{self, Finding, FindingCounts, WatchProbe};
 
 const HISTORY_LEN: usize = 600;
 pub const SAMPLE_SECS: u64 = 3;
@@ -294,6 +295,8 @@ pub struct HealthSummary {
     /// The last scan is older than twice the scan interval (plus 10 minutes):
     /// the scan loop may be stuck, and scan figures are old.
     pub scan_stale: bool,
+    /// Open watch findings by severity (see `GET /v1/findings`).
+    pub findings: FindingCounts,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -329,6 +332,12 @@ pub struct State {
     pub scan_age_secs: Option<u64>,
     /// See [`HealthSummary::scan_stale`].
     pub scan_stale: bool,
+    /// Watch findings, most severe first; dismissed ones are included with
+    /// `dismissed: true`. Empty while watch is off or before its first run.
+    pub findings: Vec<Finding>,
+    pub finding_counts: FindingCounts,
+    /// When the watch detectors last ran.
+    pub findings_unix: Option<u64>,
 }
 
 impl State {
@@ -497,6 +506,75 @@ pub struct SampleCtx {
 #[derive(Default)]
 pub struct ScanCtx {
     last_scan: Option<Instant>,
+    last_watch: Option<Instant>,
+}
+
+/// What the watch detectors keep between runs.
+#[derive(Default)]
+struct WatchMem {
+    tracker: watch::Tracker,
+    sigs: watch::SigCache,
+    /// Listening sockets from the last run, and when.
+    listeners: Option<Vec<watch::Listener>>,
+    listeners_unix: Option<u64>,
+    last_notify: Option<u64>,
+}
+
+/// New code-signature checks per watch run (each up to 2 s).
+const SIG_CHECKS_PER_RUN: usize = 12;
+/// Loose executables checked for the quarantine flag per run.
+const QUARANTINE_CHECKS_PER_RUN: usize = 200;
+/// At most one notification for new high-severity findings per this long.
+const FINDING_NOTIFY_SECS: u64 = 600;
+/// Findings journaled one by one per run; the rest are summed up.
+const FINDINGS_JOURNALED: usize = 20;
+
+/// A child process in [`ProcessDetail`].
+#[derive(Debug, Clone, Serialize, PartialEq)]
+pub struct ChildInfo {
+    pub pid: u32,
+    pub name: String,
+    pub start_time: u64,
+}
+
+/// `GET /v1/process/<pid>`: everything Mulchie knows about one process.
+#[derive(Debug, Clone, Serialize)]
+pub struct ProcessDetail {
+    pub pid: u32,
+    pub ppid: u32,
+    pub name: String,
+    /// Runs as this user.
+    pub own: bool,
+    pub exe: Option<PathBuf>,
+    /// argv with secrets redacted; empty for other users' processes.
+    pub cmd: Vec<String>,
+    /// Working directory; `None` for other users' processes or when unreadable.
+    pub cwd: Option<PathBuf>,
+    pub workspace: Option<PathBuf>,
+    pub workspace_label: Option<String>,
+    /// The consumer group key (`app:…`, `workspace:…`, `process:…`, `system`).
+    pub group: Option<String>,
+    pub kind: Option<ProcKind>,
+    pub start_time: u64,
+    pub age_secs: Option<u64>,
+    pub cpu_pct: Option<f32>,
+    pub mem_bytes: Option<u64>,
+    pub stopped: bool,
+    /// Parent, grandparent, … up to pid 1, nearest first.
+    pub parents: Vec<watch::ParentInfo>,
+    pub children: Vec<ChildInfo>,
+    /// Listening TCP sockets as of the last watch run (`listening_unix`);
+    /// `None` when unknown.
+    pub listening: Option<Vec<String>>,
+    pub listening_unix: Option<u64>,
+    /// macOS code signature, when the watch has checked it.
+    pub signature: Option<watch::SigStatus>,
+    /// The executable carries the download quarantine flag (macOS).
+    pub quarantined: Option<bool>,
+    /// Why Mulchie will not signal it, when it will not.
+    pub protected: Option<String>,
+    /// Watch findings about this process (same pid and start time).
+    pub findings: Vec<Finding>,
 }
 
 #[derive(Clone)]
@@ -514,6 +592,10 @@ pub struct Engine {
     reniced: Arc<Mutex<HashMap<u32, Reniced>>>,
     threads: Arc<Mutex<Vec<JoinHandle<()>>>>,
     backoff_ms: Arc<AtomicU64>,
+    watch: Arc<Mutex<WatchMem>>,
+    probe: Arc<dyn WatchProbe>,
+    /// The port the API serves on, 0 when it does not.
+    api_port: Arc<AtomicU64>,
 }
 
 impl Engine {
@@ -558,6 +640,9 @@ impl Engine {
             restore_failed: 0,
             scan_age_secs: None,
             scan_stale: false,
+            findings: Vec::new(),
+            finding_counts: FindingCounts::default(),
+            findings_unix: None,
         };
         Self {
             state: Arc::new(Mutex::new(state)),
@@ -573,7 +658,22 @@ impl Engine {
             reniced: Arc::new(Mutex::new(HashMap::new())),
             threads: Arc::new(Mutex::new(Vec::new())),
             backoff_ms: Arc::new(AtomicU64::new(1000)),
+            watch: Arc::new(Mutex::new(WatchMem::default())),
+            probe: Arc::new(watch::SystemProbe),
+            api_port: Arc::new(AtomicU64::new(0)),
         }
+    }
+
+    /// Use `probe` for listening sockets, signatures and quarantine flags
+    /// (tests use a fake).
+    pub fn with_watch_probe(mut self, probe: Arc<dyn WatchProbe>) -> Self {
+        self.probe = probe;
+        self
+    }
+
+    /// Record the port the API serves on, for the posture check.
+    pub fn set_api_port(&self, port: u16) {
+        self.api_port.store(port as u64, Ordering::SeqCst);
     }
 
     pub fn paths(&self) -> &Paths {
@@ -631,6 +731,7 @@ impl Engine {
             journal_error: self.journal.last_error(),
             scan_age_secs: st.scan_age(now).0,
             scan_stale: st.scan_age(now).1,
+            findings: st.finding_counts,
         }
     }
 
@@ -887,6 +988,12 @@ impl Engine {
             forecast(&h, &cfg)
         };
 
+        if cfg.watch.enabled {
+            lock(&self.watch)
+                .tracker
+                .observe(now, snap.members.values().flatten());
+        }
+
         let pressured =
             snap.mem_free_pct() < cfg.throttle_mem_free_pct || snap.cpu_pct > cfg.throttle_cpu_pct;
         let automation = self.automation_allowed();
@@ -1049,6 +1156,14 @@ impl Engine {
     /// (waiting up to `wait` for one).
     pub fn scan_tick(&self, ctx: &mut ScanCtx, wait: Duration) {
         let cfg = self.config();
+        let watch_due = ctx
+            .last_watch
+            .is_none_or(|t| t.elapsed() >= Duration::from_secs(cfg.watch.interval_secs.max(10)));
+        // Wait for the first sample: the detectors need its process kinds.
+        if watch_due && lock(&self.state).snapshot.at_unix > 0 {
+            self.run_watch();
+            ctx.last_watch = Some(Instant::now());
+        }
         let interval = Duration::from_secs(cfg.scan_interval_mins.max(1) * 60);
         let due = ctx
             .last_scan
@@ -1117,6 +1232,425 @@ impl Engine {
         st.diskmap = Some(Arc::new(map));
         st.scanning = false;
         report
+    }
+
+    // ----------------------------------------------------------------- watch
+
+    /// Run the watch detectors now (the scan loop does every
+    /// `watch.interval_secs`): read the process table and the probes, turn them
+    /// into findings, store them in state, journal what appeared or went away,
+    /// and notify about new high-severity ones. Read-only: nothing is acted on.
+    pub fn run_watch(&self) -> Vec<Finding> {
+        use std::os::unix::fs::MetadataExt;
+        let cfg = self.config();
+        let now = now_unix();
+        if !cfg.watch.enabled {
+            let mut st = lock(&self.state);
+            st.findings.clear();
+            st.finding_counts = FindingCounts::default();
+            st.findings_unix = None;
+            return Vec::new();
+        }
+        let procs = self.procs.list();
+        let uid = self.procs.current_uid();
+        let self_pid = self.procs.self_pid();
+        let (snap, config_error, prev) = {
+            let st = lock(&self.state);
+            (
+                st.snapshot.clone(),
+                st.config_error.clone(),
+                st.findings.clone(),
+            )
+        };
+        let samples: HashMap<u32, ProcSample> = snap
+            .members
+            .values()
+            .flatten()
+            .map(|p| (p.pid, p.clone()))
+            .collect();
+        let roots: Vec<PathBuf> = cfg
+            .roots(&self.paths)
+            .into_iter()
+            .map(|r| r.canonicalize().unwrap_or(r))
+            .collect();
+        let temps = watch::temp_dirs(&self.paths.home);
+        let listeners = if cfg.watch.check_listeners {
+            self.probe.listeners()
+        } else {
+            None
+        };
+
+        // Signatures: a few new executables per run, outside the watch lock
+        // (codesign can take seconds); quarantine flags: one getxattr each.
+        let mut sigs = HashMap::new();
+        let mut quarantined = HashSet::new();
+        if cfg.watch.check_signatures {
+            let known: HashSet<PathBuf> = {
+                let w = lock(&self.watch);
+                procs
+                    .iter()
+                    .filter(|p| p.uid == Some(uid))
+                    .filter_map(|p| p.exe.clone())
+                    .filter(|e| w.sigs.get(e).is_some())
+                    .collect()
+            };
+            let fresh: Vec<(PathBuf, Option<watch::SigStatus>)> = watch::signature_candidates(
+                &procs,
+                uid,
+                &|p| known.contains(p),
+                &temps,
+                SIG_CHECKS_PER_RUN,
+            )
+            .into_iter()
+            .map(|e| {
+                let s = self.probe.signature(&e);
+                (e, s)
+            })
+            .collect();
+            for e in watch::signature_candidates(
+                &procs,
+                uid,
+                &|_| false,
+                &temps,
+                QUARANTINE_CHECKS_PER_RUN,
+            ) {
+                if crate::consumers::outer_bundle(&e).is_none() && self.probe.quarantined(&e) {
+                    quarantined.insert(e);
+                }
+            }
+            let mut w = lock(&self.watch);
+            for (e, s) in fresh {
+                if let Some(s) = s {
+                    w.sigs.put(&e, s);
+                }
+            }
+            for p in procs.iter().filter(|p| p.uid == Some(uid)) {
+                if let Some(e) = &p.exe {
+                    if let Some(s) = w.sigs.get(e) {
+                        sigs.insert(e.clone(), s);
+                    }
+                }
+            }
+        }
+
+        let mode = |p: &Path| std::fs::metadata(p).ok().map(|m| m.mode());
+        let port = self.api_port.load(Ordering::SeqCst);
+        let posture = watch::Posture {
+            config_dir: self.paths.config_dir.clone(),
+            config_dir_mode: mode(&self.paths.config_dir),
+            token_modes: [
+                crate::api::token_path_in(&self.paths),
+                crate::api::read_only_token_path_in(&self.paths),
+            ]
+            .into_iter()
+            .filter_map(|p| mode(&p).map(|m| (p, m)))
+            .collect(),
+            api_port: (port > 0).then_some(port as u16),
+            lock_held_by_other: if self.automation_enabled.load(Ordering::SeqCst) {
+                None
+            } else {
+                lock::running_engine(&self.paths)
+                    .map(|h| h.pid)
+                    .filter(|p| *p != self_pid)
+            },
+            config_error,
+        };
+
+        let raw = {
+            let mut w = lock(&self.watch);
+            w.listeners = listeners.clone();
+            w.listeners_unix = listeners.as_ref().map(|_| now);
+            let input = watch::WatchInput {
+                now,
+                cfg: &cfg.watch,
+                procs: &procs,
+                samples: &samples,
+                tracker: &w.tracker,
+                listeners: listeners.as_deref(),
+                signatures: &sigs,
+                quarantined: &quarantined,
+                uid,
+                self_pid,
+                home: &self.paths.home,
+                roots: &roots,
+                temp_dirs: &temps,
+                posture: &posture,
+            };
+            watch::detect(&input)
+        };
+        let (findings, changes) = watch::finalize(raw, &prev, &cfg.watch, now);
+        {
+            let mut st = lock(&self.state);
+            st.finding_counts = FindingCounts::of(&findings);
+            st.findings = findings.clone();
+            st.findings_unix = Some(now);
+        }
+        self.journal_findings(&changes, now);
+        findings
+    }
+
+    /// Journal findings that appeared or went away, and notify about new
+    /// high-severity ones (rate limited, only with notifications on).
+    fn journal_findings(&self, changes: &watch::Changes, now: u64) {
+        let ws = |f: &Finding| {
+            f.evidence
+                .workspace
+                .as_ref()
+                .map(|w| w.display().to_string())
+        };
+        let appeared: Vec<&Finding> = changes.appeared.iter().filter(|f| !f.dismissed).collect();
+        for f in appeared.iter().take(FINDINGS_JOURNALED) {
+            self.record(Action::note(
+                now,
+                "finding",
+                format!("[{}] {}", f.kind.code(), f.title),
+                0,
+                ws(f),
+                "watch",
+            ));
+        }
+        for f in changes.gone.iter().take(FINDINGS_JOURNALED) {
+            self.record(Action::note(
+                now,
+                "finding",
+                format!("No longer seen: {}", f.title),
+                0,
+                ws(f),
+                "watch",
+            ));
+        }
+        let more = appeared.len().saturating_sub(FINDINGS_JOURNALED)
+            + changes.gone.len().saturating_sub(FINDINGS_JOURNALED);
+        if more > 0 {
+            self.record(Action::note(
+                now,
+                "finding",
+                format!("{more} more finding change(s); see GET /v1/findings"),
+                0,
+                None,
+                "watch",
+            ));
+        }
+        let high: Vec<&&Finding> = appeared
+            .iter()
+            .filter(|f| f.severity == crate::consumers::Severity::High)
+            .collect();
+        if high.is_empty() || !self.notify.load(Ordering::SeqCst) {
+            return;
+        }
+        let mut w = lock(&self.watch);
+        if w.last_notify
+            .is_some_and(|t| now.saturating_sub(t) < FINDING_NOTIFY_SECS)
+        {
+            return;
+        }
+        w.last_notify = Some(now);
+        drop(w);
+        let body = if high.len() > 1 {
+            format!("{} (and {} more)", high[0].title, high.len() - 1)
+        } else {
+            high[0].title.clone()
+        };
+        crate::notify::notify("Mulchie", &body);
+    }
+
+    /// Counts of the stored findings and when the watch last ran.
+    pub fn finding_summary(&self) -> (FindingCounts, Option<u64>) {
+        let st = lock(&self.state);
+        (st.finding_counts, st.findings_unix)
+    }
+
+    /// Findings from the last watch run, at least `min_severity`, of `kind`.
+    pub fn findings(
+        &self,
+        min_severity: Option<crate::consumers::Severity>,
+        kind: Option<watch::FindingKind>,
+        include_dismissed: bool,
+    ) -> Vec<Finding> {
+        let st = lock(&self.state);
+        watch::filter(&st.findings, min_severity, kind, include_dismissed)
+            .into_iter()
+            .cloned()
+            .collect()
+    }
+
+    /// Hide finding `id` for `days` (default 30, 1 to 3650). Saved in the
+    /// config's `watch.dismissed`. Returns when the dismissal ends.
+    pub fn dismiss_finding(
+        &self,
+        id: &str,
+        days: Option<u64>,
+    ) -> Result<u64, (&'static str, String)> {
+        let days = days.unwrap_or(30);
+        if !(1..=3650).contains(&days) {
+            return Err(("invalid_body", "days must be 1 to 3650".into()));
+        }
+        if id.is_empty() || id.len() > 512 {
+            return Err(("invalid_body", "id must be 1 to 512 characters".into()));
+        }
+        let until = now_unix() + days * 86_400;
+        self.edit_dismissals(|d| {
+            d.retain(|x| x.id != id);
+            d.push(crate::config::Dismissal {
+                id: id.to_string(),
+                until_unix: Some(until),
+            });
+        })?;
+        Ok(until)
+    }
+
+    /// Show finding `id` again. False when it was not dismissed.
+    pub fn undismiss_finding(&self, id: &str) -> Result<bool, (&'static str, String)> {
+        let mut found = false;
+        self.edit_dismissals(|d| {
+            let before = d.len();
+            d.retain(|x| x.id != id);
+            found = d.len() != before;
+        })?;
+        Ok(found)
+    }
+
+    fn edit_dismissals(
+        &self,
+        f: impl FnOnce(&mut Vec<crate::config::Dismissal>),
+    ) -> Result<(), (&'static str, String)> {
+        if let Some(e) = self.config_error() {
+            return Err((
+                "config_not_loaded",
+                format!("the config file was not used ({e}); fix it before dismissing findings"),
+            ));
+        }
+        let now = now_unix();
+        let mut cfg = self.config();
+        watch::prune_dismissed(&mut cfg.watch, now);
+        f(&mut cfg.watch.dismissed);
+        self.set_config(cfg.clone())
+            .map_err(|e| ("invalid_config", e.to_string()))?;
+        // Apply to the stored findings now, not at the next run.
+        let mut st = lock(&self.state);
+        for x in st.findings.iter_mut() {
+            let d = cfg.watch.dismissed.iter().find(|d| d.id == x.id);
+            x.dismissed = d.is_some_and(|d| d.until_unix.is_none_or(|u| u > now));
+            x.dismissed_until = d.filter(|_| x.dismissed).and_then(|d| d.until_unix);
+        }
+        st.finding_counts = FindingCounts::of(&st.findings);
+        Ok(())
+    }
+
+    /// Everything known about one process, read now. `None` when it does not
+    /// exist.
+    pub fn process_detail(&self, pid: u32) -> Option<ProcessDetail> {
+        let procs = self.procs.list();
+        let p = procs.iter().find(|p| p.pid == pid)?;
+        let uid = self.procs.current_uid();
+        let own = p.uid == Some(uid);
+        let now = now_unix();
+        let by_pid: HashMap<u32, &crate::process::ProcFacts> =
+            procs.iter().map(|q| (q.pid, q)).collect();
+        let mut parents = Vec::new();
+        let mut cur = p.ppid;
+        let mut seen = HashSet::new();
+        while cur > 0 && seen.insert(cur) && parents.len() < 64 {
+            let Some(q) = by_pid.get(&cur) else { break };
+            parents.push(watch::ParentInfo {
+                pid: q.pid,
+                name: q.name.clone(),
+            });
+            cur = q.ppid;
+        }
+        let mut children: Vec<ChildInfo> = procs
+            .iter()
+            .filter(|q| q.ppid == pid && q.pid != pid)
+            .map(|q| ChildInfo {
+                pid: q.pid,
+                name: q.name.clone(),
+                start_time: q.start_time,
+            })
+            .collect();
+        children.sort_by_key(|c| c.pid);
+        let (snap, findings) = {
+            let st = lock(&self.state);
+            (
+                st.snapshot.clone(),
+                st.findings
+                    .iter()
+                    .filter(|f| {
+                        f.evidence.pid == Some(pid) && f.evidence.start_time == Some(p.start_time)
+                    })
+                    .cloned()
+                    .collect::<Vec<_>>(),
+            )
+        };
+        let (group, sample) = snap
+            .members
+            .iter()
+            .find_map(|(k, v)| {
+                v.iter()
+                    .find(|s| s.pid == pid && s.start_time == p.start_time)
+                    .map(|s| (k.clone(), s.clone()))
+            })
+            .unzip();
+        let (listening, listening_unix, signature) = {
+            let w = lock(&self.watch);
+            let l = w.listeners.as_ref().map(|ls| {
+                let mut v: Vec<String> = ls
+                    .iter()
+                    .filter(|l| l.pid == pid)
+                    .map(|l| l.shown())
+                    .collect();
+                v.sort();
+                v.dedup();
+                v
+            });
+            let sig = p.exe.as_deref().and_then(|e| w.sigs.get(e));
+            (l, w.listeners_unix, sig)
+        };
+        let quarantined = (own && cfg!(target_os = "macos"))
+            .then(|| p.exe.as_deref().map(|e| self.probe.quarantined(e)))
+            .flatten();
+        let mut protected = crate::consumers::protected_reason(
+            pid,
+            &p.name,
+            p.exe.as_deref(),
+            self.procs.self_pid(),
+        );
+        if protected.is_none() && !own {
+            protected = Some("another user's process".into());
+        }
+        Some(ProcessDetail {
+            pid,
+            ppid: p.ppid,
+            name: p.name.clone(),
+            own,
+            exe: p.exe.clone(),
+            cmd: if own {
+                crate::redact::redact_args(&p.cmd)
+            } else {
+                Vec::new()
+            },
+            cwd: if own { p.cwd.clone() } else { None },
+            workspace: sample
+                .as_ref()
+                .and_then(|s| s.workspace.as_ref().map(|w| w.0.clone())),
+            workspace_label: sample
+                .as_ref()
+                .and_then(|s| s.workspace.as_ref().map(|w| w.1.clone())),
+            group,
+            kind: sample.as_ref().map(|s| s.kind),
+            start_time: p.start_time,
+            age_secs: (p.start_time > 0).then(|| now.saturating_sub(p.start_time)),
+            cpu_pct: sample.as_ref().map(|s| s.cpu_pct),
+            mem_bytes: sample.as_ref().map(|s| s.mem_bytes),
+            stopped: sample.as_ref().is_some_and(|s| s.stopped),
+            parents,
+            children,
+            listening,
+            listening_unix,
+            signature,
+            quarantined,
+            protected,
+            findings,
+        })
     }
 
     // ------------------------------------------------------- plan and execute

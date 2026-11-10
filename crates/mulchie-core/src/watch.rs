@@ -273,9 +273,10 @@ pub struct TrackView {
 }
 
 impl Tracker {
-    pub fn observe(&mut self, now: u64, procs: &[ProcSample]) {
+    /// One sample of every process; processes not in it are forgotten.
+    pub fn observe<'a>(&mut self, now: u64, procs: impl IntoIterator<Item = &'a ProcSample>) {
         let minute = now / 60;
-        let mut seen = HashSet::with_capacity(procs.len());
+        let mut seen = HashSet::with_capacity(self.procs.len());
         for p in procs {
             let key = (p.pid, p.start_time);
             seen.insert(key);
@@ -319,10 +320,16 @@ impl Tracker {
                 ..Default::default()
             });
         }
-        let avg_cpu =
-            ms.iter().map(|m| m.cpu_sum / m.n.max(1) as f64).sum::<f64>() / ms.len() as f64;
+        let avg_cpu = ms
+            .iter()
+            .map(|m| m.cpu_sum / m.n.max(1) as f64)
+            .sum::<f64>()
+            / ms.len() as f64;
         let steps = ms.len().saturating_sub(1);
-        let rising = ms.windows(2).filter(|w| w[1].mem_max >= w[0].mem_max).count();
+        let rising = ms
+            .windows(2)
+            .filter(|w| w[1].mem_max >= w[0].mem_max)
+            .count();
         Some(TrackView {
             minutes: ms.len(),
             avg_cpu,
@@ -348,7 +355,10 @@ impl Tracker {
     /// Tests: pretend a process was stopped since `at`.
     #[cfg(test)]
     pub(crate) fn set_stopped_since(&mut self, pid: u32, start_time: u64, at: u64) {
-        self.procs.entry((pid, start_time)).or_default().stopped_since = Some(at);
+        self.procs
+            .entry((pid, start_time))
+            .or_default()
+            .stopped_since = Some(at);
     }
 }
 
@@ -426,9 +436,8 @@ impl WatchProbe for SystemProbe {
                 return false;
             };
             let name = c"com.apple.quarantine";
-            let r = unsafe {
-                libc::getxattr(p.as_ptr(), name.as_ptr(), std::ptr::null_mut(), 0, 0, 0)
-            };
+            let r =
+                unsafe { libc::getxattr(p.as_ptr(), name.as_ptr(), std::ptr::null_mut(), 0, 0, 0) };
             return r >= 0;
         }
         #[allow(unreachable_code)]
@@ -451,7 +460,10 @@ pub fn parse_lsof(text: &str) -> Vec<Listener> {
                 continue;
             };
             let Ok(port) = port.parse() else { continue };
-            let addr = addr.trim_start_matches('[').trim_end_matches(']').to_string();
+            let addr = addr
+                .trim_start_matches('[')
+                .trim_end_matches(']')
+                .to_string();
             if pid > 0 {
                 out.push(Listener { pid, addr, port });
             }
@@ -470,7 +482,11 @@ pub fn parse_codesign(stderr: &str) -> SigStatus {
     if stderr.contains("Signature=adhoc") {
         return SigStatus::AdHoc;
     }
-    let auth = |s: &str| stderr.lines().any(|l| l.starts_with("Authority=") && l.contains(s));
+    let auth = |s: &str| {
+        stderr
+            .lines()
+            .any(|l| l.starts_with("Authority=") && l.contains(s))
+    };
     if auth("Software Signing") {
         SigStatus::Apple
     } else if auth("Apple Mac OS Application Signing") {
@@ -554,7 +570,9 @@ fn linux_listeners() -> Option<Vec<Listener>> {
         };
         for fd in fds.flatten() {
             budget = budget.checked_sub(1)?;
-            let Ok(t) = std::fs::read_link(fd.path()) else { continue };
+            let Ok(t) = std::fs::read_link(fd.path()) else {
+                continue;
+            };
             let t = t.to_string_lossy();
             if let Some(i) = t
                 .strip_prefix("socket:[")
@@ -714,17 +732,61 @@ const SYSTEM_DIRS: &[&str] = &[
 
 /// Hidden directory names that hold ordinary tools in a workspace.
 const ORDINARY_HIDDEN: &[&str] = &[
-    ".venv", ".bin", ".build", ".next", ".nuxt", ".svelte-kit", ".turbo", ".cargo", ".rustup",
-    ".nvm", ".bun", ".deno", ".local", ".pyenv", ".cache", ".claude", ".pnpm", ".yarn", ".gradle",
-    ".m2", ".tox", ".nox", ".direnv", ".devenv", ".mise", ".asdf", ".volta", ".expo", ".angular",
-    ".parcel-cache", ".vercel", ".netlify", ".wrangler", ".swiftpm",
+    ".venv",
+    ".bin",
+    ".build",
+    ".next",
+    ".nuxt",
+    ".svelte-kit",
+    ".turbo",
+    ".cargo",
+    ".rustup",
+    ".nvm",
+    ".bun",
+    ".deno",
+    ".local",
+    ".pyenv",
+    ".cache",
+    ".claude",
+    ".pnpm",
+    ".yarn",
+    ".gradle",
+    ".m2",
+    ".tox",
+    ".nox",
+    ".direnv",
+    ".devenv",
+    ".mise",
+    ".asdf",
+    ".volta",
+    ".expo",
+    ".angular",
+    ".parcel-cache",
+    ".vercel",
+    ".netlify",
+    ".wrangler",
+    ".swiftpm",
 ];
 
 /// Parents that run programs from temporary directories as a matter of course
 /// (`go run`, test runners, Xcode previews).
 const TEMP_RUNNERS: &[&str] = &[
-    "go", "cargo", "node", "python", "python3", "xcodebuild", "swift", "dotnet", "java", "bun",
-    "deno", "npx", "pnpm", "yarn", "make", "bazel",
+    "go",
+    "cargo",
+    "node",
+    "python",
+    "python3",
+    "xcodebuild",
+    "swift",
+    "dotnet",
+    "java",
+    "bun",
+    "deno",
+    "npx",
+    "pnpm",
+    "yarn",
+    "make",
+    "bazel",
 ];
 
 fn exe_base(p: &ProcFacts) -> String {
@@ -829,7 +891,15 @@ impl<'a> Det<'a> {
         });
     }
 
-    fn push_other(&mut self, id: &str, kind: FindingKind, severity: Severity, title: String, why: &str, evidence: Evidence) {
+    fn push_other(
+        &mut self,
+        id: &str,
+        kind: FindingKind,
+        severity: Severity,
+        title: String,
+        why: &str,
+        evidence: Evidence,
+    ) {
         self.out.push(Finding {
             id: format!("{}:{id}", kind.code()),
             kind,
@@ -919,7 +989,9 @@ fn dismiss(id_hint: &str) -> Suggestion {
     Suggestion {
         label: "Dismiss this finding for 30 days".into(),
         request: None,
-        api: Some(format!("POST /v1/findings/dismiss {{\"id\": \"{id_hint}\"}}")),
+        api: Some(format!(
+            "POST /v1/findings/dismiss {{\"id\": \"{id_hint}\"}}"
+        )),
         reversible: true,
     }
 }
@@ -1026,7 +1098,10 @@ fn detect_leftovers(d: &mut Det, p: &ProcFacts) {
     if matches!(kind, ProcKind::Agent | ProcKind::Build) && p.start_time > 0 {
         let age = i.now.saturating_sub(p.start_time);
         if age > i.cfg.stale_process_hours * 3600 {
-            if let Some(v) = i.tracker.view(p.pid, p.start_time, i.now, TRACK_MINUTES as u64) {
+            if let Some(v) = i
+                .tracker
+                .view(p.pid, p.start_time, i.now, TRACK_MINUTES as u64)
+            {
                 if v.minutes >= 30 && v.avg_cpu < i.cfg.stale_idle_cpu_pct as f64 {
                     d.push_proc(
                         p,
@@ -1113,10 +1188,9 @@ fn detect_origin(d: &mut Det, p: &ProcFacts) {
     }
     let sig = i.signatures.get(&exe).copied();
     let quarantined = i.quarantined.contains(&exe);
-    let parent_runner = d
-        .by_pid
-        .get(&p.ppid)
-        .is_some_and(|pp| TEMP_RUNNERS.contains(&exe_base(pp).as_str()) || TEMP_RUNNERS.contains(&pp.name.as_str()));
+    let parent_runner = d.by_pid.get(&p.ppid).is_some_and(|pp| {
+        TEMP_RUNNERS.contains(&exe_base(pp).as_str()) || TEMP_RUNNERS.contains(&pp.name.as_str())
+    });
     let exposed = d
         .by_exe_listen
         .get(&p.pid)
@@ -1141,12 +1215,21 @@ fn detect_origin(d: &mut Det, p: &ProcFacts) {
     }
     // Hidden directory inside a workspace or scan root.
     if under(&exe, i.roots) {
-        let root = i.roots.iter().find(|r| exe.starts_with(r)).cloned().unwrap_or_default();
+        let root = i
+            .roots
+            .iter()
+            .find(|r| exe.starts_with(r))
+            .cloned()
+            .unwrap_or_default();
         let rel = exe.strip_prefix(&root).unwrap_or(&exe);
-        let hidden = rel.parent().into_iter().flat_map(|p| p.components()).find(|c| {
-            let s = c.as_os_str().to_string_lossy();
-            s.starts_with('.') && s.len() > 1 && !ORDINARY_HIDDEN.contains(&s.as_ref())
-        });
+        let hidden = rel
+            .parent()
+            .into_iter()
+            .flat_map(|p| p.components())
+            .find(|c| {
+                let s = c.as_os_str().to_string_lossy();
+                s.starts_with('.') && s.len() > 1 && !ORDINARY_HIDDEN.contains(&s.as_ref())
+            });
         if let Some(h) = hidden {
             d.push_proc(
                 p,
@@ -1185,9 +1268,7 @@ fn detect_origin(d: &mut Det, p: &ProcFacts) {
     // Unsigned or ad-hoc app bundles (not workspace build output).
     if let (Some(st), Some(bundle)) = (sig, outer_bundle(&exe)) {
         let built_here = under(&exe, i.roots)
-            || i.samples
-                .get(&p.pid)
-                .is_some_and(|s| s.workspace.is_some())
+            || i.samples.get(&p.pid).is_some_and(|s| s.workspace.is_some())
             || bundle.components().any(|c| c.as_os_str() == "DerivedData");
         if st.weak() && !built_here {
             d.push_proc(
@@ -1224,7 +1305,11 @@ fn detect_exposure(d: &mut Det, p: &ProcFacts) {
         return;
     };
     let open: Vec<String> = {
-        let mut v: Vec<String> = ls.iter().filter(|l| !l.loopback()).map(|l| l.shown()).collect();
+        let mut v: Vec<String> = ls
+            .iter()
+            .filter(|l| !l.loopback())
+            .map(|l| l.shown())
+            .collect();
         v.sort();
         v.dedup();
         v
@@ -1233,7 +1318,11 @@ fn detect_exposure(d: &mut Det, p: &ProcFacts) {
         return;
     }
     // Mulchie's own API is reported by the posture check.
-    if i.posture.api_port.is_some_and(|port| ls.iter().any(|l| l.port == port)) && p.name.to_ascii_lowercase().starts_with("mulchie") {
+    if i.posture
+        .api_port
+        .is_some_and(|port| ls.iter().any(|l| l.port == port))
+        && p.name.to_ascii_lowercase().starts_with("mulchie")
+    {
         return;
     }
     let ws = d.in_workspace_or_root(p);
@@ -1355,15 +1444,19 @@ pub struct Changes {
 /// Apply the allow-lists and dismissals, keep `first_seen_unix` from the
 /// previous run, and say what appeared and what went away. Allow-listed
 /// findings are dropped; dismissed ones are kept with `dismissed: true`.
-pub fn finalize(raw: Vec<Finding>, prev: &[Finding], cfg: &WatchConfig, now: u64) -> (Vec<Finding>, Changes) {
+pub fn finalize(
+    raw: Vec<Finding>,
+    prev: &[Finding],
+    cfg: &WatchConfig,
+    now: u64,
+) -> (Vec<Finding>, Changes) {
     let prev_by: HashMap<&str, &Finding> = prev.iter().map(|f| (f.id.as_str(), f)).collect();
     let mut out: Vec<Finding> = Vec::with_capacity(raw.len());
     for mut f in raw {
         if cfg.allow_ids.iter().any(|a| a == &f.id) {
             continue;
         }
-        if f
-            .evidence
+        if f.evidence
             .exe
             .as_ref()
             .is_some_and(|e| cfg.allow_exes.iter().any(|a| a == e))
@@ -1410,17 +1503,18 @@ pub fn finalize(raw: Vec<Finding>, prev: &[Finding], cfg: &WatchConfig, now: u64
 /// Dismissals that have run out, removed.
 pub fn prune_dismissed(cfg: &mut WatchConfig, now: u64) -> bool {
     let before = cfg.dismissed.len();
-    cfg.dismissed.retain(|d| d.until_unix.is_none_or(|u| u > now));
+    cfg.dismissed
+        .retain(|d| d.until_unix.is_none_or(|u| u > now));
     before != cfg.dismissed.len()
 }
 
 /// Filter for `GET /v1/findings?severity=&kind=`: `severity` is a minimum.
-pub fn filter<'a>(
-    findings: &'a [Finding],
+pub fn filter(
+    findings: &[Finding],
     min_severity: Option<Severity>,
     kind: Option<FindingKind>,
     include_dismissed: bool,
-) -> Vec<&'a Finding> {
+) -> Vec<&Finding> {
     findings
         .iter()
         .filter(|f| min_severity.is_none_or(|s| f.severity >= s))
@@ -1442,12 +1536,18 @@ pub fn signature_candidates(
     let mut out: BTreeMap<u8, Vec<PathBuf>> = BTreeMap::new();
     let mut seen = HashSet::new();
     for p in procs.iter().filter(|p| p.uid == Some(uid)) {
-        let Some((exe, gone)) = exe_path(p) else { continue };
+        let Some((exe, gone)) = exe_path(p) else {
+            continue;
+        };
         if gone || !seen.insert(exe.clone()) || known(&exe) {
             continue;
         }
         let s = exe.to_string_lossy();
-        if s.starts_with("/System/") || s.starts_with("/usr/") || s.starts_with("/bin/") || s.starts_with("/sbin/") {
+        if s.starts_with("/System/")
+            || s.starts_with("/usr/")
+            || s.starts_with("/bin/")
+            || s.starts_with("/sbin/")
+        {
             continue;
         }
         let rank = if under(&exe, temp) {

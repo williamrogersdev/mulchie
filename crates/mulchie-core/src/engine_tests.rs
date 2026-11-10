@@ -18,7 +18,8 @@ pub(crate) fn engine_with(cfg: Config) -> (tempfile::TempDir, Engine) {
             error: None,
         },
         Arc::new(FakeProcesses::empty()),
-    );
+    )
+    .with_watch_probe(Arc::new(crate::watch::NoProbe));
     (t, e)
 }
 
@@ -33,7 +34,8 @@ pub(crate) fn engine_with_procs(cfg: Config, procs: FakeProcesses) -> (tempfile:
             error: None,
         },
         Arc::new(procs),
-    );
+    )
+    .with_watch_probe(Arc::new(crate::watch::NoProbe));
     (t, e)
 }
 
@@ -372,6 +374,7 @@ fn scan_requests_are_deduplicated() {
     assert_eq!(e.pending_jobs(), vec![Job::Scan]);
     let mut ctx = ScanCtx {
         last_scan: Some(Instant::now()),
+        last_watch: None,
     };
     e.scan_tick(&mut ctx, Duration::ZERO);
     assert!(e.pending_jobs().is_empty());
@@ -946,4 +949,205 @@ fn actions_take_the_previewed_start_times() {
     );
     let _ = b.kill();
     let _ = b.wait();
+}
+
+// ------------------------------------------------------------------ watch
+
+struct FakeProbe(Vec<crate::watch::Listener>);
+
+impl crate::watch::WatchProbe for FakeProbe {
+    fn listeners(&self) -> Option<Vec<crate::watch::Listener>> {
+        Some(self.0.clone())
+    }
+    fn signature(&self, _: &Path) -> Option<crate::watch::SigStatus> {
+        None
+    }
+    fn quarantined(&self, _: &Path) -> bool {
+        false
+    }
+}
+
+fn fact(
+    pid: u32,
+    ppid: u32,
+    uid: u32,
+    name: &str,
+    exe: Option<PathBuf>,
+) -> crate::process::ProcFacts {
+    crate::process::ProcFacts {
+        pid,
+        ppid,
+        uid: Some(uid),
+        name: name.into(),
+        exe,
+        cmd: vec![name.into(), "--password".into(), "hunter2hunter2".into()],
+        cwd: Some(PathBuf::from("/")),
+        start_time: 1_000 + pid as u64,
+    }
+}
+
+#[test]
+fn watch_findings_reach_state_health_and_the_journal_and_can_be_dismissed() {
+    use crate::consumers::Severity;
+    use crate::watch::{FindingKind, Listener};
+    let dir = tempfile::tempdir().unwrap();
+    // A tempdir is under the system temporary directory.
+    let exe = dir.path().canonicalize().unwrap().join("payload");
+    std::fs::write(&exe, b"x").unwrap();
+    let mut procs = FakeProcesses::empty();
+    let uid = procs.uid;
+    procs
+        .procs
+        .push(fact(10, 5, uid, "payload", Some(exe.clone())));
+    let (_t, e) = engine_with_procs(Config::default(), procs);
+    let e = e.with_watch_probe(Arc::new(FakeProbe(vec![Listener {
+        pid: 10,
+        addr: "0.0.0.0".into(),
+        port: 4444,
+    }])));
+    let f = e.run_watch();
+    let kinds: Vec<FindingKind> = f.iter().map(|f| f.kind).collect();
+    assert!(kinds.contains(&FindingKind::TempExecutable), "{f:#?}");
+    assert!(kinds.contains(&FindingKind::ExposedListener), "{f:#?}");
+    let temp = f
+        .iter()
+        .find(|f| f.kind == FindingKind::TempExecutable)
+        .unwrap();
+    assert_eq!(
+        temp.severity,
+        Severity::High,
+        "listening beyond loopback from a temp dir"
+    );
+    assert!(!temp.evidence.cmd.as_deref().unwrap().contains("hunter2"));
+
+    let st = e.snapshot_state();
+    assert_eq!(st.findings.len(), f.len());
+    assert!(st.findings_unix.is_some());
+    assert_eq!(e.health_summary().findings.high, 1);
+    let journaled: Vec<&Action> = st.actions.iter().filter(|a| a.kind == "finding").collect();
+    assert_eq!(journaled.len(), f.len());
+    assert!(journaled.iter().all(|a| a.source == "watch"));
+
+    // A second run journals nothing new and keeps first_seen.
+    let again = e.run_watch();
+    assert_eq!(again[0].first_seen_unix, f[0].first_seen_unix);
+    let n = e
+        .snapshot_state()
+        .actions
+        .iter()
+        .filter(|a| a.kind == "finding")
+        .count();
+    assert_eq!(n, f.len());
+
+    // Dismiss: saved in the config, applied now and on later runs.
+    let id = temp.id.clone();
+    let until = e.dismiss_finding(&id, Some(2)).unwrap();
+    assert!(until > now_unix() + 86_400);
+    assert_eq!(e.config().watch.dismissed.len(), 1);
+    assert!(Config::load_from(e.paths()).config.watch.dismissed[0].id == id);
+    assert_eq!(e.health_summary().findings.high, 0);
+    assert_eq!(e.health_summary().findings.dismissed, 1);
+    e.run_watch();
+    assert!(e
+        .findings(None, None, true)
+        .iter()
+        .any(|f| f.id == id && f.dismissed));
+    assert!(!e.findings(None, None, false).iter().any(|f| f.id == id));
+    assert_eq!(
+        e.dismiss_finding(&id, Some(0)).unwrap_err().0,
+        "invalid_body"
+    );
+    assert!(e.undismiss_finding(&id).unwrap());
+    assert!(!e.undismiss_finding(&id).unwrap());
+    assert_eq!(e.health_summary().findings.high, 1);
+
+    // Turning watch off clears findings.
+    let mut cfg = e.config();
+    cfg.watch.enabled = false;
+    e.set_config(cfg).unwrap();
+    assert!(e.run_watch().is_empty());
+    assert!(e.snapshot_state().findings.is_empty());
+}
+
+#[test]
+fn findings_that_go_away_are_journaled() {
+    let dir = tempfile::tempdir().unwrap();
+    let exe = dir.path().canonicalize().unwrap().join("payload");
+    std::fs::write(&exe, b"x").unwrap();
+    let mut procs = FakeProcesses::empty();
+    let uid = procs.uid;
+    procs.procs.push(fact(10, 5, uid, "payload", Some(exe)));
+    let (_t, e) = engine_with_procs(Config::default(), procs);
+    assert!(!e.run_watch().is_empty());
+    // Same engine state, a process table without it.
+    let e2 = Engine {
+        procs: Arc::new(FakeProcesses::empty()),
+        ..e.clone()
+    };
+    assert!(e2.run_watch().is_empty());
+    assert!(e2
+        .snapshot_state()
+        .actions
+        .iter()
+        .any(|a| a.kind == "finding" && a.detail.starts_with("No longer seen")));
+}
+
+#[test]
+fn dismissing_is_refused_while_the_config_file_is_broken() {
+    let t = tempfile::tempdir().unwrap();
+    let paths = Paths::under(t.path());
+    let e = Engine::with_processes(
+        paths,
+        LoadedConfig {
+            config: Config::default(),
+            error: Some(ConfigError::Invalid(vec!["x".into()])),
+        },
+        Arc::new(FakeProcesses::empty()),
+    )
+    .with_watch_probe(Arc::new(crate::watch::NoProbe));
+    assert_eq!(
+        e.dismiss_finding("a", None).unwrap_err().0,
+        "config_not_loaded"
+    );
+    let f = e.run_watch();
+    assert!(f
+        .iter()
+        .any(|f| f.kind == crate::watch::FindingKind::ConfigNotLoaded));
+}
+
+#[test]
+fn process_detail_shows_the_family_and_hides_other_users_command_lines() {
+    let mut procs = FakeProcesses::empty();
+    let uid = procs.uid;
+    procs
+        .procs
+        .push(fact(2, 1, uid, "shell", Some("/bin/zsh".into())));
+    procs
+        .procs
+        .push(fact(3, 2, uid, "node", Some("/usr/local/bin/node".into())));
+    procs.procs.push(fact(4, 3, uid, "esbuild", None));
+    procs.procs.push(fact(5, 3, uid, "vite", None));
+    procs.procs.push(fact(6, 1, uid + 1, "theirs", None));
+    let (_t, e) = engine_with_procs(Config::default(), procs);
+    let d = e.process_detail(3).unwrap();
+    assert!(d.own);
+    assert_eq!(d.start_time, 1_003);
+    assert_eq!(
+        d.parents.iter().map(|p| p.pid).collect::<Vec<_>>(),
+        vec![2],
+        "pid 1 is not in the fake table"
+    );
+    assert_eq!(
+        d.children.iter().map(|c| c.pid).collect::<Vec<_>>(),
+        vec![4, 5]
+    );
+    assert_eq!(d.cmd, vec!["node", "--password", crate::redact::REDACTED]);
+    assert!(d.protected.is_none());
+    assert_eq!(d.listening, None, "unknown before a watch run");
+    let o = e.process_detail(6).unwrap();
+    assert!(!o.own && o.cmd.is_empty() && o.cwd.is_none());
+    assert_eq!(o.protected.as_deref(), Some("another user's process"));
+    assert!(e.process_detail(99).is_none());
+    let v = serde_json::to_value(&d).unwrap();
+    assert_eq!(v["parents"][0]["name"], "shell");
 }

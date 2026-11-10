@@ -246,7 +246,8 @@ fn engine() -> (tempfile::TempDir, Engine) {
             error: None,
         },
         Arc::new(FakeProcesses::empty()),
-    );
+    )
+    .with_watch_probe(Arc::new(crate::watch::NoProbe));
     (t, e)
 }
 
@@ -915,4 +916,141 @@ fn process_route_takes_an_expected_start_time() {
         r#"{"path": "/nope", "action": "pause", "pids": [{"pid": 4000321, "expected_start_time": 5}]}"#,
     );
     assert_eq!((code, v["code"].as_str()), (400, Some("action_refused")));
+}
+
+// ------------------------------------------------------- findings, config
+
+#[test]
+fn findings_routes_with_both_tokens() {
+    let r = running(Limits::default());
+    let ro = format!("Bearer {}", read_read_only_token(r.engine.paths()).unwrap());
+    let full = format!("Bearer {}", r.token);
+    // A broken posture to find: the config dir open to others.
+    std::fs::set_permissions(
+        &r.engine.paths().config_dir,
+        std::fs::Permissions::from_mode(0o755),
+    )
+    .unwrap();
+    let found = r.engine.run_watch();
+    let id = found
+        .iter()
+        .find(|f| f.kind == crate::watch::FindingKind::InsecurePermissions)
+        .unwrap()
+        .id
+        .clone();
+    std::fs::set_permissions(
+        &r.engine.paths().config_dir,
+        std::fs::Permissions::from_mode(0o700),
+    )
+    .unwrap();
+
+    let (code, v) = send(r.port, "GET", "/v1/findings", Some(&ro), "");
+    assert_eq!(code, 200, "{v}");
+    assert_eq!(v["counts"]["high"], 1);
+    assert_eq!(v["enabled"], true);
+    assert_eq!(v["findings"][0]["kind"], "insecure_permissions");
+    let (code, v) = send(
+        r.port,
+        "GET",
+        "/v1/findings?severity=high&kind=insecure_permissions",
+        Some(&ro),
+        "",
+    );
+    assert_eq!((code, v["findings"].as_array().unwrap().len()), (200, 1));
+    let (_, v) = send(
+        r.port,
+        "GET",
+        "/v1/findings?kind=exposed_listener",
+        Some(&ro),
+        "",
+    );
+    assert!(v["findings"].as_array().unwrap().is_empty());
+    let (code, v) = send(r.port, "GET", "/v1/findings?severity=dire", Some(&ro), "");
+    assert_eq!((code, v["code"].as_str()), (400, Some("invalid_query")));
+
+    let body = json!({ "id": id, "days": 7 }).to_string();
+    let (code, v) = send(r.port, "POST", "/v1/findings/dismiss", Some(&ro), &body);
+    assert_eq!((code, v["code"].as_str()), (403, Some("read_only_token")));
+    let (code, v) = send(r.port, "POST", "/v1/findings/dismiss", Some(&full), &body);
+    assert_eq!(code, 200, "{v}");
+    assert!(v["until_unix"].as_u64().unwrap() > crate::monitor::now_unix());
+    let (_, v) = send(r.port, "GET", "/v1/findings", Some(&ro), "");
+    assert!(v["findings"].as_array().unwrap().is_empty());
+    assert_eq!(v["counts"]["dismissed"], 1);
+    let (_, v) = send(r.port, "GET", "/v1/findings?dismissed=1", Some(&ro), "");
+    assert_eq!(v["findings"][0]["dismissed"], true);
+    let (code, _) = send(r.port, "POST", "/v1/findings/undismiss", Some(&ro), &body);
+    assert_eq!(code, 403);
+    let (code, v) = send(r.port, "POST", "/v1/findings/undismiss", Some(&full), &body);
+    assert_eq!((code, v["was_dismissed"].as_bool()), (200, Some(true)));
+    let (code, v) = send(
+        r.port,
+        "POST",
+        "/v1/findings/dismiss",
+        Some(&full),
+        r#"{"id":"x","days":99999}"#,
+    );
+    assert_eq!((code, v["code"].as_str()), (400, Some("invalid_body")));
+}
+
+#[test]
+fn process_detail_route() {
+    let r = running(Limits::default());
+    let ro = format!("Bearer {}", read_read_only_token(r.engine.paths()).unwrap());
+    let (code, v) = send(r.port, "GET", "/v1/process/abc", Some(&ro), "");
+    assert_eq!((code, v["code"].as_str()), (400, Some("invalid_pid")));
+    let (code, v) = send(r.port, "GET", "/v1/process/4000000", Some(&ro), "");
+    assert_eq!((code, v["code"].as_str()), (404, Some("unknown_pid")));
+    // The plan route is still a POST route.
+    let (code, v) = send(r.port, "GET", "/v1/process/plan", Some(&ro), "");
+    assert_eq!(
+        (code, v["code"].as_str()),
+        (405, Some("method_not_allowed"))
+    );
+    let (code, _) = send(r.port, "POST", "/v1/process/12", Some(&ro), "{}");
+    assert_eq!(code, 403);
+}
+
+#[test]
+fn config_routes_with_both_tokens() {
+    let r = running(Limits::default());
+    let ro = format!("Bearer {}", read_read_only_token(r.engine.paths()).unwrap());
+    let full = format!("Bearer {}", r.token);
+    let (code, v) = send(r.port, "GET", "/v1/config", Some(&ro), "");
+    assert_eq!(code, 200, "{v}");
+    assert_eq!(v["config"]["watch"]["interval_secs"], 60);
+    assert!(v["config_error"].is_null());
+    let mut cfg = v["config"].clone();
+    cfg["watch"]["stale_process_hours"] = json!(24);
+    let body = json!({ "config": cfg }).to_string();
+    let (code, v) = send(r.port, "PUT", "/v1/config", Some(&ro), &body);
+    assert_eq!((code, v["code"].as_str()), (403, Some("read_only_token")));
+    let (code, v) = send(r.port, "PUT", "/v1/config", Some(&full), "{}");
+    assert_eq!((code, v["code"].as_str()), (400, Some("config_required")));
+    let mut bad = cfg.clone();
+    bad["watch"]["interval_secs"] = json!(1);
+    let (code, v) = send(
+        r.port,
+        "PUT",
+        "/v1/config",
+        Some(&full),
+        &json!({ "config": bad }).to_string(),
+    );
+    assert_eq!(
+        (code, v["code"].as_str()),
+        (400, Some("invalid_config")),
+        "{v}"
+    );
+    assert_eq!(r.engine.config().watch.interval_secs, 60, "unchanged");
+    let (code, v) = send(r.port, "PUT", "/v1/config", Some(&full), &body);
+    assert_eq!(code, 200, "{v}");
+    assert_eq!(r.engine.config().watch.stale_process_hours, 24);
+    assert_eq!(
+        Config::load_from(r.engine.paths())
+            .config
+            .watch
+            .stale_process_hours,
+        24,
+        "saved"
+    );
 }

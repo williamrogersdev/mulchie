@@ -124,7 +124,10 @@ impl WatchConfig {
             e.push("watch.memory_growth_mb must be between 16 and 1048576".into());
         }
         if let Some(p) = self.allow_exes.iter().find(|p| !p.is_absolute()) {
-            e.push(format!("watch.allow_exes entry {} is not absolute", p.display()));
+            e.push(format!(
+                "watch.allow_exes entry {} is not absolute",
+                p.display()
+            ));
         }
         if self.allow_ids.len() + self.dismissed.len() > 10_000 {
             e.push("watch.allow_ids and watch.dismissed hold at most 10000 ids".into());
