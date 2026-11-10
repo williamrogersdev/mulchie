@@ -23,17 +23,12 @@ const jsonLd = {
   sameAs: [REPO],
 };
 
-const mcp = `{
-  "mcpServers": {
-    "mulchie": { "command": "mulchie", "args": ["mcp"] }
-  }
-}`;
 ---
 <Base title={title} description={description} jsonLd={jsonLd} ogImage="home">
   <div class="wrap hero">
     <div>
       <h1>Keep your machine usable while AI agents build on it.</h1>
-      <p class="lede">Mulchie watches CPU, memory and disk per repo and worktree, queues heavy builds, and cleans up what agents leave behind.</p>
+      <p class="lede">Mulchie shows what uses CPU, memory and disk per repo and worktree, queues heavy builds, and cleans up what agents leave behind, with a plan you approve first.</p>
       <p class="who">For developers who run Claude Code, Codex, Cursor agents and similar tools side by side on one Mac or Linux box.</p>
       <div class="cta">
         <a class="btn primary" href="/install/">Install Mulchie</a>
@@ -42,20 +37,18 @@ const mcp = `{
     </div>
     {/* TODO: replace this rendering with a real dashboard screenshot once one exists.
          Use an <img> with explicit width and height to avoid layout shift. */}
-    {/* VERIFY: sample output below is illustrative; match column names and formatting to real `mulchie status` output. */}
+    {/* The sample output below has the format of the real command; the figures are made up and the figure says so. */}
     <figure class="term-fig" style="margin:0">
       <div class="term" role="group" aria-label="Example output of mulchie status">
         <div class="term-bar"><i></i><i></i><i></i><span>illustrative output</span></div>
         <pre tabindex="0"><code><span class="p">$</span> <span class="k">mulchie status</span>
-<span class="d">disk  </span> 142 GB free of 460 GB   <span class="a">full in about 6 h</span>
-<span class="d">memory</span> 11.2 of 16 GB used     <span class="a">swap 3.1 GB</span>
-<span class="d">cpu   </span> load 14.2 on 10 cores  <span class="r">builds throttled</span>
+health <span class="a">strained</span>  ·  disk 142 GB free of 460 GB  ·  memory 6% free  ·  cpu 94% (10 cores)  ·  swap 3.1 GB
+4 agent process(es), 5 build process(es) across 4 workspace(s)
 
-<span class="d">WORKSPACE         CPU    MEM   AGENT   BUILD</span>
-api/wt-auth       <span class="a">310%</span>   2.1G  claude  cargo
-api/wt-billing    <span class="a">280%</span>   1.8G  codex   cargo
-web/wt-search     190%   1.4G  cursor  next
-api/wt-old-spike   <span class="g">0%</span>   0.0G  none    none
+  api/wt-auth                                        310% cpu    2.1 GB  1 agent · 2 build
+  api/wt-billing                                     280% cpu    1.8 GB  1 agent · 2 build
+  web/wt-search                                      190% cpu    1.4 GB  1 agent · 1 build
+  api/wt-old-spike                                     0% cpu    0 KB  0 agent · 0 build
 
 <span class="p">$</span> <span class="caret"></span></code></pre>
       </div>
@@ -80,41 +73,40 @@ api/wt-old-spike   <span class="g">0%</span>   0.0G  none    none
       <div class="row">
         <div>
           <h3>Monitor</h3>
-          <p>Samples every 3 seconds and keeps 30 minutes of history. Every process is attributed to its repo or worktree from its working directory, then classified as an agent, a build or a runtime. It forecasts when the disk will fill.</p>
+          <p>Samples every 3 seconds and keeps 30 minutes of history. Every process is attributed to its repo or worktree from its working directory, then classified as an agent, a build or a runtime. <code>mulchie top</code> groups processes by app, workspace and program, and <code>mulchie diagnose</code> explains what is going on and what to do about it.</p>
         </div>
-        <div class="term" role="group" aria-label="Example output of mulchie top">
-          <pre tabindex="0"><code><span class="p">$</span> <span class="k">mulchie top --sort cpu -n 3</span>
-<span class="d"> PID    CPU   MEM   WORKSPACE       KIND</span>
- 48211  <span class="a">212%</span>  1.4G  api/wt-auth     build
- 48907  <span class="a">188%</span>  1.1G  api/wt-billing  build
- 39120   41%  0.9G  web/wt-search   agent</code></pre>
+        <div class="term" role="group" aria-label="Example output of mulchie top --processes">
+          <pre tabindex="0"><code><span class="p">$</span> <span class="k">mulchie top --processes -n 3</span>
+<span class="d">    PID   CPU%       MEM      IO/s   NI KIND     NAME             GROUP</span>
+  48211  <span class="a">212.0</span>    1.4 GB      0 KB   10 build    rustc            api/wt-auth
+  48907  <span class="a">188.0</span>    1.1 GB    12 KB   10 build    rustc            api/wt-billing
+  39120   41.0    0.9 GB      0 KB    0 agent    node             web/wt-search</code></pre>
         </div>
       </div>
       <div class="row">
         <div>
           <h3>Optimize</h3>
-          <p>Lowers the priority of build processes when CPU or memory is under pressure. Runs a machine-wide build queue: <code>mulchie run</code> waits for a free slot and sets a fair <code>CARGO_BUILD_JOBS</code>. Ask it whether now is a good time for heavy work and get reasons back.</p>
+          <p>Lowers the priority of build processes when CPU or memory is under pressure. Runs a machine-wide build queue: <code>mulchie run</code> waits for a free slot and sets a fair <code>CARGO_BUILD_JOBS</code>. <code>mulchie advice</code> says whether now is a good time for heavy work, with reasons.</p>
         </div>
         <div class="term" role="group" aria-label="Example output of mulchie run and mulchie advice">
           <pre tabindex="0"><code><span class="p">$</span> <span class="k">mulchie advice</span>
-<span class="a">not now</span>: 3 heavy jobs running, memory free 6%
+<span class="a">wait</span>: all 4 build slots are taken
 <span class="p">$</span> <span class="k">mulchie run -- cargo build</span>
-<span class="d">waiting for a build slot (position 2)</span>
-<span class="g">slot granted</span>, running with 4 jobs</code></pre>
+<span class="d">mulchie: waiting for a build slot: 1 job(s) ahead in the queue</span>
+<span class="d">mulchie: slot granted after 41s</span></code></pre>
         </div>
       </div>
       <div class="row">
         <div>
           <h3>Reclaim</h3>
-          <p>Finds stale build caches and idle git worktrees, and shows size, idle days, uncommitted files and merged state for each. "Idle" means no file changes outside <code>target/</code>, <code>node_modules/</code> and <code>.git/</code> and no recent commit, not the folder timestamp. It also prunes npm, bun, pnpm, uv, Homebrew, Go and simulator stores with each tool's own command.</p>
+          <p>Finds stale build caches and idle git worktrees, and shows size, idle days, uncommitted files and a verdict for each. "Idle" means no file changes outside <code>target/</code>, <code>node_modules/</code> and <code>.git/</code> and no recent commit, not the folder timestamp. <code>mulchie prune</code> runs a package manager's own prune command for npm, bun, pnpm, yarn, uv, pip, Homebrew, Go and simulators.</p>
         </div>
-        {/* VERIFY: sample worktrees table is illustrative; match columns and verdict wording to real `mulchie worktrees` output. */}
+        {/* Format matches the real `mulchie worktrees` output; the figures are made up. */}
         <div class="term" role="group" aria-label="Example output of mulchie worktrees">
           <pre tabindex="0"><code><span class="p">$</span> <span class="k">mulchie worktrees</span>
-<span class="d">WORKTREE             SIZE    IDLE  DIRTY  MERGED  VERDICT</span>
-api/wt-auth         6.4 GB    0d      3  no      <span class="g">in use</span>
-api/wt-old-spike    4.1 GB   21d      0  yes     <span class="a">remove</span>
-web/wt-checkout     2.2 GB   14d      4  no      <span class="a">back up, remove</span></code></pre>
+   6.4 GB    0d   0 dirty  api › wt-auth      <span class="g">agent or process running here</span>
+   4.1 GB   21d   0 dirty  api › wt-old-spike <span class="a">clean and merged; safe to remove</span>
+   2.2 GB   14d   4 dirty  web › wt-checkout  <span class="a">idle 14d with 4 uncommitted file(s); removal saves a patch first</span></code></pre>
         </div>
       </div>
     </div>
@@ -123,28 +115,26 @@ web/wt-checkout     2.2 GB   14d      4  no      <span class="a">back up, remove
   <section class="sec wrap split flip" aria-labelledby="safety">
     <div>
       <h2 id="safety">It deletes things, so it checks first</h2>
-      <p>Cleaning up after agents only works if you can trust it with your repos. Every delete is decided from facts read at the moment it runs, not from an earlier scan.</p>
-      {/* VERIFY: backup details (tar.gz of ignored files, backup/ branch for detached HEAD, actions.jsonl) come from docs/ARCHITECTURE.md and must match the shipped behaviour. */}
+      <p>Cleaning up after agents only works if you can trust it with your repos. You see a plan first, and every item is checked again at the moment it runs, not decided from an earlier scan.</p>
       <ul class="facts">
         <li><strong>Backups before removal.</strong>Uncommitted changes are saved as a patch. Ignored files such as <code>.env</code> are archived. A detached <code>HEAD</code> gets a <code>backup/</code> branch. Branches are never deleted.</li>
         <li><strong>Projects in use are left alone.</strong>If a process runs anywhere in a project, nothing in it is cleaned or removed.</li>
         <li><strong>Narrow deletes.</strong>Only recognised build caches under your scan roots, by canonical paths, never through symlinks.</li>
-        <li><strong>Careful signals.</strong>Only your own processes. Never pid 1, never Mulchie itself.</li>
-        <li><strong>Localhost only.</strong>The API listens on <code>127.0.0.1</code>, needs a bearer token with mode <code>0600</code>, and refuses requests that carry a browser <code>Origin</code> header.</li>
+        <li><strong>Careful signals.</strong>Only your own processes, after a plan you confirm. Never pid 1, never Mulchie itself, never operating-system programs.</li>
+        <li><strong>Localhost only.</strong>The API listens on <code>127.0.0.1</code>, needs a bearer token with mode <code>0600</code>, and refuses requests that carry a browser <code>Origin</code> header. A read-only token can read and plan but not change anything.</li>
       </ul>
       <p class="note"><a href="/docs/safety/">Read the full safety model</a></p>
     </div>
     <div>
       <div class="term" role="group" aria-label="Example output of mulchie sweep --dry-run">
-        <div class="term-bar"><i></i><i></i><i></i><span>illustrative output</span></div>
+        <div class="term-bar"><i></i><i></i><i></i><span>example output</span></div>
         <pre tabindex="0"><code><span class="p">$</span> <span class="k">mulchie sweep --dry-run</span>
-would remove 2 worktrees, 6.3 GB
-  api/wt-old-spike   idle 21d  merged, clean
-  web/wt-checkout    idle 14d  <span class="a">4 dirty files, patch first</span>
-skipped 1
-  api/wt-auth        <span class="g">a process is running in it</span>
-
-<span class="d">dry run: nothing was changed</span></code></pre>
+Plan: remove 2 worktree(s), 6.3 GB
+  remove     4.1 GB  api › wt-old-spike  (idle 21d; removable)
+  remove     2.2 GB  web › wt-checkout  (idle 14d; removable)
+                    <span class="a">saves patch of 4 changed file(s)</span>
+Not ready (1):
+  skip   api › wt-auth  <span class="g">node (pid 39120) is working in /Users/me/dev/api/wt-auth</span> [busy]</code></pre>
       </div>
     </div>
   </section>
@@ -152,14 +142,15 @@ skipped 1
   <section class="sec wrap split" aria-labelledby="agents">
     <div>
       <h2 id="agents">Agents use it too</h2>
-      <p>Agents talk to the same engine you do. Add the MCP server so they can ask whether to start a build, request a slot and see what is reclaimable. Or wrap a heavy command and skip the setup.</p>
+      <p>Agents talk to the same engine you do. One command adds the MCP server to Claude Code, Claude Desktop, Cursor or Codex. Agents start with a diagnosis, ask whether to start a build, take a build slot, and plan cleanups that you approve. Deleting is always two calls: a plan, then execute. Add <code>--read-only</code> for an agent that should look but not act.</p>
       <p>The dashboard has a ready-made snippet for your <code>AGENTS.md</code>. There is also a local HTTP API for scripts and <code>curl</code>.</p>
       <p class="note"><a href="/docs/mcp/">MCP tools</a> and <a href="/docs/http-api/">HTTP API</a></p>
     </div>
     <div class="stack" style="display:grid;gap:1.5rem">
-      <div class="term" role="group" aria-label="MCP server configuration">
-        <div class="term-bar"><i></i><i></i><i></i><span>mcp config</span></div>
-        <pre tabindex="0"><code>{mcp}</code></pre>
+      <div class="term" role="group" aria-label="Connect an agent over MCP">
+        <div class="term-bar"><i></i><i></i><i></i><span>connect an agent</span></div>
+        <pre tabindex="0"><code><span class="p">$</span> <span class="k">mulchie mcp install --client claude-code</span>
+<span class="p">$</span> <span class="k">mulchie mcp install --client cursor --read-only</span></code></pre>
       </div>
       <div class="term" role="group" aria-label="Queue a build">
         <pre tabindex="0"><code><span class="p">$</span> <span class="k">mulchie run -- cargo build</span>

@@ -29,8 +29,7 @@ const description =
     </table>
 
     <h2 id="dmg">DMG (macOS app)</h2>
-    <p>Download <code>Mulchie_X.Y.Z_universal.dmg</code> from the <a href={RELEASES}>latest release</a>. Open it and drag Mulchie to Applications. The DMG is signed and notarized, so it opens without a Gatekeeper warning.</p>
-    {/* VERIFY: confirm the DMG is published with a checksum file; the architecture doc only lists .sha256 files for the CLI tarballs. */}
+    <p>Download <code>Mulchie_X.Y.Z_universal.dmg</code> from the <a href={RELEASES}>latest release</a>. Open it and drag Mulchie to Applications. The DMG is signed and notarized, so it opens without a Gatekeeper warning. The release also has a <code>SHA256SUMS</code> file that covers the DMG (see <a href="#verify">Verify a download</a>).</p>
 
     <h2 id="cask">Homebrew cask (macOS app)</h2>
     <pre><code>brew install --cask williamrogersdev/tap/mulchie</code></pre>
@@ -40,8 +39,17 @@ const description =
 
     <h2 id="script">Install script (CLI)</h2>
     <pre><code>curl -fsSL https://mulchie.com/install.sh | sh</code></pre>
-    <p>The script picks the release tarball for your OS and CPU. To read it first, run <code>curl -fsSL https://mulchie.com/install.sh | less</code>, or open <a href="/install.sh">/install.sh</a>.</p>
-    {/* VERIFY: install location, whether it verifies the .sha256, and supported env vars or flags, once scripts/install.sh is final. */}
+    <p>The script picks the release tarball for your OS and CPU, downloads it with its <code>.sha256</code> file, and installs nothing if the checksum does not match. It installs to <code>~/.local/bin/mulchie</code> and needs no <code>sudo</code>. To read it first, run <code>curl -fsSL https://mulchie.com/install.sh | less</code>, or open <a href="/install.sh">/install.sh</a>.</p>
+    <p>Two environment variables change what it does:</p>
+    <table>
+      <thead><tr><th scope="col">Variable</th><th scope="col">Meaning</th></tr></thead>
+      <tbody>
+        <tr><td><code>MULCHIE_VERSION</code></td><td>The version to install, such as <code>0.3.0</code> or <code>v0.3.0</code>. The default is the latest release.</td></tr>
+        <tr><td><code>MULCHIE_INSTALL_DIR</code></td><td>Where to put the binary. The default is <code>$HOME/.local/bin</code>.</td></tr>
+      </tbody>
+    </table>
+    <pre><code>curl -fsSL https://mulchie.com/install.sh | MULCHIE_VERSION=0.3.0 sh</code></pre>
+    <p>If the install directory is not on your <code>PATH</code>, the script prints the line to add.</p>
 
     <h2 id="cargo">Cargo (CLI)</h2>
     <pre><code>cargo install mulchie</code></pre>
@@ -60,24 +68,23 @@ open target/release/bundle/macos/Mulchie.app</code></pre>
     <ol>
       <li>Open Mulchie. It adds an icon to the menu bar and starts the engine.</li>
       <li>Click the icon for the panel, then open the dashboard for per-worktree detail.</li>
-      <li>In the dashboard, open <strong>Agent API → Link mulchie</strong> to put the CLI on your <code>PATH</code> at <code>~/.local/bin/mulchie</code>. Make sure that directory is on your <code>PATH</code>.</li>
-      <li>Run <code>mulchie status</code> in a terminal. It uses the running app and says so if it falls back to a local scan.</li>
-      <li>Check the setup with <code>mulchie doctor</code>.</li>
+      <li>In the dashboard, open <strong>Agent API</strong> and choose <strong>Link mulchie into ~/.local/bin</strong> to put the CLI on your <code>PATH</code>. Make sure that directory is on your <code>PATH</code>.</li>
+      <li>Run <code>mulchie status</code> in a terminal. It uses the running app and says so on stderr if it falls back to a local look.</li>
+      <li>Check the setup with <code>mulchie doctor</code>. It prints pass, warn or fail for each check and changes nothing.</li>
+      <li>Connect your agents with <code>mulchie mcp install --client claude-code</code> (or <code>claude-desktop</code>, <code>cursor</code>, <code>codex</code>). See <a href="/docs/mcp/">MCP</a>.</li>
     </ol>
-    {/* VERIFY: `mulchie doctor` is described in docs/ARCHITECTURE.md but not in the README; confirm it ships. */}
     <p>Mulchie scans folders such as <code>~/Developer</code>, <code>~/Projects</code> and <code>~/code</code> by default. Change them in Settings or in <a href="/docs/configuration/">the config file</a>. For a machine without a menu bar, see <a href="/docs/headless/">running headless</a>.</p>
 
     <h2 id="verify">Verify a download</h2>
-    <p>Each CLI tarball on the release page has a matching <code>.sha256</code> file. Download both into one folder and check:</p>
+    <p>Each CLI tarball on the release page has a matching <code>.sha256</code> file, and the release has a <code>SHA256SUMS</code> file that covers the tarballs and the DMG. Download the files into one folder and check:</p>
     <pre><code>shasum -a 256 -c mulchie-aarch64-apple-darwin.tar.gz.sha256</code></pre>
-    <p>On Linux, use <code>sha256sum -c</code> with the same file. For the app, check that macOS accepts the signature:</p>
+    <p>On Linux, use <code>sha256sum -c</code> with the same file. <code>SHA256SUMS</code> lists the files in the format that <code>sha256sum -c</code> reads. For the app, check that macOS accepts the signature:</p>
     <pre><code>spctl --assess --verbose /Applications/Mulchie.app</code></pre>
-    <p>The expected output ends with <code>accepted</code> and <code>source=Notarized Developer ID</code>.</p>
-    {/* VERIFY: exact tarball names and spctl output against a real release. */}
+    <p>A signed and notarized app is reported as <code>accepted</code>.</p>
 
     <h2 id="update">Update</h2>
     <ul>
-      <li>App: it checks the latest GitHub release and offers updates itself.</li>
+      <li>App: choose <strong>Check for Updates…</strong> in its menu bar menu. If your build has no update key, it says so and points to the releases page.</li>
       <li>Cask: <code>brew upgrade --cask williamrogersdev/tap/mulchie</code></li>
       <li>Formula: <code>brew upgrade williamrogersdev/tap/mulchie-cli</code></li>
       <li>Install script: run it again.</li>
@@ -86,9 +93,9 @@ open target/release/bundle/macos/Mulchie.app</code></pre>
 
     <h2 id="uninstall">Uninstall</h2>
     <ol>
-      <li>Quit Mulchie from the menu bar. If you set up a background service, remove it first (see <a href="/docs/headless/">running headless</a>).</li>
+      <li>Quit Mulchie from the menu bar. If you set up a background service, run <code>mulchie service uninstall</code> first (see <a href="/docs/headless/">running headless</a>). If you connected an agent, run <code>mulchie mcp uninstall --client &lt;app&gt;</code> for each one.</li>
       <li>Remove the program: <code>brew uninstall --cask mulchie</code>, <code>brew uninstall mulchie-cli</code>, <code>cargo uninstall mulchie</code>, or delete <code>/Applications/Mulchie.app</code> and <code>~/.local/bin/mulchie</code>.</li>
-      <li>Optional: delete <code>~/.config/mulchie</code>. It holds your config, API token, action log and <strong>worktree backups</strong>. Keep the <code>backups</code> folder until you are sure you do not need any patch in it.</li>
+      <li>Optional: delete <code>~/.config/mulchie</code>. It holds your config, API tokens, action log and <strong>worktree backups</strong>. Keep the <code>backups</code> folder until you are sure you do not need any patch in it.</li>
     </ol>
     <p>Source and issues live on <a href={REPO}>GitHub</a>.</p>
   </div>

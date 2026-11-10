@@ -1,11 +1,13 @@
 ---
 title: Mulchie documentation
-description: "Guides and reference for Mulchie, the monitor, build queue and safe cleaner for machines that run many AI coding agents."
+description: "Guides and reference for Mulchie, which keeps a machine healthy while several AI coding agents share it: a CLI, a menu bar app and an MCP server."
 ---
 
-Mulchie keeps one machine healthy while many AI coding agents run on it. It shows what uses CPU, memory, disk I/O and disk space by repo and worktree, queues heavy builds, and reclaims space from build caches and idle worktrees without losing work.
+Use these pages to install Mulchie, see what is using your machine, queue heavy builds, reclaim space safely and connect your agents.
 
-It runs as a macOS menu bar app with a dashboard, a CLI, a local HTTP API and an MCP server. The engine, CLI and API also run headless on Linux.
+Mulchie keeps one machine healthy while several AI coding agents work on it. It shows what uses CPU, memory, disk I/O and disk space by repo and worktree. It queues heavy builds, notices processes that look left over or out of place, and reclaims space from build caches and idle worktrees without losing work.
+
+It ships as the `mulchie` command, a macOS menu bar app with a dashboard, and an MCP server (`mulchie mcp`). The engine also serves a local HTTP API. The engine, CLI and MCP server run on macOS and Linux. The app is macOS only.
 
 ## Start here
 
@@ -15,15 +17,14 @@ It runs as a macOS menu bar app with a dashboard, a CLI, a local HTTP API and an
 ## Reference
 
 - [CLI reference](/docs/cli/): every `mulchie` command.
-- [MCP](/docs/mcp/): the tools agents can call.
+- [MCP](/docs/mcp/): connect an agent, and the tools it can call.
+- [Findings](/docs/watch/): what Mulchie's watch reports and what each kind means.
 - [HTTP API](/docs/http-api/): endpoints for scripts and `curl`.
 - [Configuration](/docs/configuration/): the config file and its settings.
 
 ## Guides
 
 - [Safety model](/docs/safety/): what Mulchie checks before it deletes or signals anything.
-- [Running headless](/docs/headless/): systemd on Linux, launchd on macOS.
+- [Running headless](/docs/headless/): the engine as a background service on Linux or a Mac without the app.
 - [Troubleshooting](/docs/troubleshooting/)
 - [FAQ](/docs/faq/)
-
-<!-- VERIFY: all pages were written from README.md and docs/ARCHITECTURE.md; a later pass checks them against `mulchie --help`. -->

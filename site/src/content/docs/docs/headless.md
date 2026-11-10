@@ -1,54 +1,57 @@
 ---
 title: Running headless
-description: "Run the Mulchie engine and API without the menu bar app, on Linux with a systemd user unit or on macOS with a launchd agent."
+description: "Run the Mulchie engine without the menu bar app: mulchie serve, or mulchie service install for a launchd agent on macOS or a systemd user unit on Linux."
 ---
 
-The core, CLI, API and MCP server run without the app. Use this on Linux, on a build server, or on a Mac without a menu bar.
+Use this page to run Mulchie on Linux, on a build server, or on a Mac without the menu bar app. The engine, CLI, API and MCP server all run without the app.
 
 ## Start the engine
 
-```bash
+```sh
 mulchie serve
 ```
 
-This runs the engine and the local API in the foreground. It handles SIGTERM and SIGINT and exits cleanly.
+This runs the engine and the local API in the foreground. It stops cleanly on SIGINT or SIGTERM. The port is `api_port` from the config, or `MULCHIE_PORT` for this process.
 
-Exactly one engine runs per user. `mulchie serve` and the app both take a lock on `~/.config/mulchie/engine.lock`. The one that loses the lock becomes a client of the other, so you can run either without conflicts.
+Exactly one engine runs per user. `mulchie serve` and the app both take a lock on `engine.lock` in the config directory. If an engine is already running, a second `mulchie serve` exits with status 1.
 
-## Install as a service
+## Run it at login
 
-```bash
+```sh
 mulchie service install
 mulchie service status
 mulchie service uninstall
 ```
 
-<!-- VERIFY: `mulchie service` is described in docs/ARCHITECTURE.md; confirm subcommands, unit names and paths against the shipped CLI. -->
+`install` writes the service file and loads it. It runs `mulchie serve` by the absolute path of the binary, so it does not depend on your shell's `PATH`. It does not replace an existing file with different content unless you pass `--force`. Use `--dry-run` on `install` and `uninstall` to see the file and the commands without running them.
 
-This sets up a systemd user unit on Linux and a launchd agent on macOS.
+On macOS the menu bar app already runs the engine, so a service is only for a Mac without the app.
 
-## Linux: systemd user unit
+### Linux: systemd user unit
 
-If you prefer to write the unit yourself, create `~/.config/systemd/user/mulchie.service`:
+`mulchie service install` writes `~/.config/systemd/user/mulchie.service`. The unit it writes is equivalent to this one, with `ExecStart` set to the binary's path:
 
 ```ini
 [Unit]
-Description=Mulchie engine
+Description=Mulchie engine (monitor, build queue, reclaim)
+Documentation=https://mulchie.com/docs/
 After=default.target
 
 [Service]
+Type=simple
 ExecStart=%h/.local/bin/mulchie serve
 Restart=on-failure
+RestartSec=5
+Nice=10
+NoNewPrivileges=yes
 
 [Install]
 WantedBy=default.target
 ```
 
-<!-- VERIFY: ExecStart path depends on where the install script puts the binary. -->
+To manage it yourself:
 
-Then enable it:
-
-```bash
+```sh
 systemctl --user daemon-reload
 systemctl --user enable --now mulchie.service
 journalctl --user -u mulchie.service -f
@@ -56,39 +59,31 @@ journalctl --user -u mulchie.service -f
 
 To keep it running after you log out, enable lingering with `loginctl enable-linger $USER`.
 
-## macOS: launchd agent
+### macOS: launchd agent
 
-Create `~/Library/LaunchAgents/com.mulchie.engine.plist`:
+`mulchie service install` writes `~/Library/LaunchAgents/dev.mulchie.serve.plist` and loads it with `launchctl bootstrap`. The agent starts at login, restarts if `mulchie serve` exits with an error, and logs to `~/Library/Logs/mulchie-serve.log`.
 
-```xml
-<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<plist version="1.0">
-<dict>
-  <key>Label</key><string>com.mulchie.engine</string>
-  <key>ProgramArguments</key>
-  <array>
-    <string>/opt/homebrew/bin/mulchie</string>
-    <string>serve</string>
-  </array>
-  <key>RunAtLoad</key><true/>
-  <key>KeepAlive</key><true/>
-</dict>
-</plist>
+To remove it yourself:
+
+```sh
+launchctl bootout "gui/$(id -u)/dev.mulchie.serve"
 ```
 
-<!-- VERIFY: label and binary path. Homebrew installs to /opt/homebrew/bin on Apple silicon and /usr/local/bin on Intel. -->
+A reference copy of the plist, with the placeholders `@MULCHIE_BIN@` and `@HOME@` to fill in, is `packaging/launchd/dev.mulchie.serve.plist` in the repository.
 
-```bash
-launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.mulchie.engine.plist
+## Check it
+
+```sh
+mulchie service status
+mulchie doctor
 ```
 
-Do not run the app and a launchd engine expecting two engines: the second becomes a client of the first.
+`service status` shows whether the service is installed, current and loaded. `doctor` also checks the engine itself: the lock holder, port, health and the age of the last sample.
 
 ## Notifications
 
-On macOS, `serve` sends low-disk notifications with `osascript`. On Linux it uses `notify-send` when it is installed.
+On macOS, `serve` sends low-disk notifications with `osascript`. On Linux it uses `notify-send` when it is installed, and otherwise sends none.
 
 ## Use it from another tool
 
-With the engine running, the CLI, `mulchie mcp` and the [HTTP API](/docs/http-api/) all talk to it. Read commands work without an engine by falling back to a local scan.
+With the engine running, the CLI, `mulchie mcp` and the [HTTP API](/docs/http-api/) all talk to it. Read commands also work without an engine by looking at the machine locally. `signal`, `group` and the build queue need the engine.
