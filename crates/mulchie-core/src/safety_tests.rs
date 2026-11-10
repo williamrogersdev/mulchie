@@ -1361,3 +1361,62 @@ fn journal_failures_are_reported_on_the_result() {
         .is_none());
     assert!(ok.last_error().is_none());
 }
+
+/// A process table that changes after its first read.
+struct SecondReadBusy {
+    reads: std::sync::atomic::AtomicUsize,
+    later: FakeProcesses,
+}
+
+impl ProcessSource for SecondReadBusy {
+    fn list(&self) -> Vec<ProcFacts> {
+        if self.reads.fetch_add(1, Ordering::SeqCst) == 0 {
+            Vec::new()
+        } else {
+            self.later.procs.clone()
+        }
+    }
+    fn current_uid(&self) -> u32 {
+        self.later.uid
+    }
+    fn self_pid(&self) -> u32 {
+        u32::MAX
+    }
+}
+
+/// C11: the cache busy check reads the process table again just before the
+/// rename, not only the view used by the checks (up to 2 s old).
+#[test]
+fn cache_deletion_rereads_processes_right_before_acting() {
+    let env = Env::new();
+    let target = env.cargo_project("p");
+    let procs = SecondReadBusy {
+        reads: Default::default(),
+        later: FakeProcesses::empty().with(7, "cargo", Some(target.parent().unwrap().into()), 1),
+    };
+    let g = Gate::new(&env.cfg, &env.paths, &procs, env.now);
+    let r = g.execute_one(&cache(&target), "t");
+    assert_eq!(reason(&r), Some(SkipReason::Busy), "{r:?}");
+    assert!(target.exists());
+    assert!(procs.reads.load(Ordering::SeqCst) >= 2);
+}
+
+/// An own process whose cwd cannot be read but whose arguments name the
+/// project counts as busy.
+#[test]
+fn unreadable_cwd_with_the_project_on_its_command_line_is_busy() {
+    let mut env = Env::new();
+    let target = env.cargo_project("p");
+    let project = target.parent().unwrap().to_path_buf();
+    let mut p = FakeProcesses::empty().with(9, "cargo", None, 1);
+    p.procs[0].cmd = vec![
+        "cargo".into(),
+        format!("--manifest-path={}/Cargo.toml", project.display()),
+    ];
+    env.procs = p;
+    let r = env.gate().execute_one(&cache(&target), "t");
+    assert_eq!(reason(&r), Some(SkipReason::Busy), "{r:?}");
+    // Unrelated arguments: not busy.
+    env.procs.procs[0].cmd = vec!["cargo".into(), "/elsewhere/Cargo.toml".into()];
+    assert!(done(&env.gate().execute_one(&cache(&target), "t")));
+}

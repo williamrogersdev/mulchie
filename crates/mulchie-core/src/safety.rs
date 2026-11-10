@@ -418,6 +418,11 @@ pub struct Gate<'a> {
 struct CacheFacts {
     kind: ItemKind,
     bytes: u64,
+    /// The directory whose users make the cache busy, and how to match them;
+    /// rechecked with a fresh process read just before the rename.
+    busy_root: PathBuf,
+    nested: bool,
+    xcode: bool,
 }
 
 struct WorktreeFacts {
@@ -853,14 +858,7 @@ impl<'a> Gate<'a> {
             if !self.config.include_xcode {
                 return skip(SkipReason::XcodeDisabled, "include_xcode is off");
             }
-            if let Some((p, _)) = self.procs_view(false).iter().find(|(p, _)| {
-                matches!(p.name.to_ascii_lowercase().as_str(), "xcode" | "xcodebuild")
-            }) {
-                return skip(
-                    SkipReason::Busy,
-                    format!("{} (pid {}) is running", p.name, p.pid),
-                );
-            }
+            self.xcode_check(false)?;
             self.busy_check(path, false)?;
             if require_stale {
                 self.stale_check(path, false)?;
@@ -868,6 +866,9 @@ impl<'a> Gate<'a> {
             return Ok(CacheFacts {
                 kind: ItemKind::XcodeDerivedData,
                 bytes: dir_size(path),
+                busy_root: path.to_path_buf(),
+                nested: false,
+                xcode: true,
             });
         }
 
@@ -895,7 +896,24 @@ impl<'a> Gate<'a> {
         Ok(CacheFacts {
             kind,
             bytes: dir_size(path),
+            busy_root: project,
+            nested: true,
+            xcode: false,
         })
+    }
+
+    fn xcode_check(&self, fresh: bool) -> Result<(), Skip> {
+        if let Some((p, _)) = self
+            .procs_view(fresh)
+            .iter()
+            .find(|(p, _)| matches!(p.name.to_ascii_lowercase().as_str(), "xcode" | "xcodebuild"))
+        {
+            return skip(
+                SkipReason::Busy,
+                format!("{} (pid {}) is running", p.name, p.pid),
+            );
+        }
+        Ok(())
     }
 
     /// Skip when an own process's working directory, read now, is at or under
@@ -908,9 +926,32 @@ impl<'a> Gate<'a> {
     fn busy_check_with(&self, root: &Path, nested: bool, fresh: bool) -> Result<(), Skip> {
         let root = root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
         let view = self.procs_view(fresh);
+        let uid = self.procs.current_uid();
         let found = view
             .iter()
             .find(|(_, c)| c.as_deref().is_some_and(|c| cwd_in(c, &root, nested)));
+        // An own process whose working directory cannot be read cannot be
+        // cleared by it; when its arguments name a path under `root`, count it
+        // as busy.
+        let unreadable = view.iter().find(|(p, c)| {
+            c.is_none()
+                && p.uid == Some(uid)
+                && p.cmd.iter().skip(1).any(|a| {
+                    let a = a.split_once('=').map(|(_, v)| v).unwrap_or(a);
+                    Path::new(a).is_absolute() && Path::new(a).starts_with(&root)
+                })
+        });
+        if let Some((p, _)) = unreadable {
+            return skip(
+                SkipReason::Busy,
+                format!(
+                    "{} (pid {}) names {} on its command line and its working directory cannot be read",
+                    p.name,
+                    p.pid,
+                    root.display()
+                ),
+            );
+        }
         if let Some((p, _)) = found {
             return skip(
                 SkipReason::Busy,
@@ -944,6 +985,12 @@ impl<'a> Gate<'a> {
 
     fn delete_cache(&self, path: &Path, require_stale: bool) -> Result<Outcome, Skip> {
         let facts = self.check_cache(path, require_stale)?;
+        // The checks above may have used a process view up to
+        // PROC_VIEW_MAX_AGE old; read the table again right before acting.
+        if facts.xcode {
+            self.xcode_check(true)?;
+        }
+        self.busy_check_with(&facts.busy_root, facts.nested, true)?;
         let parent = path.parent().unwrap_or(path);
         let name = file_name(path);
         let suffix = random_hex(6).map_err(|e| Skip {
