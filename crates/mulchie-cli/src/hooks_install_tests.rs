@@ -28,6 +28,11 @@ fn read(p: &Path) -> Value {
 
 const EXE: &str = "'/opt/my tools/bin/mulchie'";
 
+/// The command install writes for the test binary.
+fn cmd(c: HookClient, neutral: &str, guard: Option<GuardMode>) -> String {
+    command_for(Path::new("/opt/my tools/bin/mulchie"), c, neutral, guard)
+}
+
 #[test]
 fn the_files_and_entries_each_client_gets() {
     let t = t();
@@ -54,11 +59,11 @@ fn the_files_and_entries_each_client_gets() {
     assert_eq!(
         claude["hooks"]["PreToolUse"],
         json!([{ "matcher": "Bash", "hooks": [{ "type": "command",
-            "command": format!("{EXE} hook claude-code pre_tool"), "timeout": 5 }] }])
+            "command": cmd(ClaudeCode, "pre_tool", None), "timeout": 5 }] }])
     );
     assert_eq!(
         claude["hooks"]["SessionStart"],
-        json!([{ "hooks": [{ "type": "command", "command": format!("{EXE} hook claude-code session_start"), "timeout": 5 }] }])
+        json!([{ "hooks": [{ "type": "command", "command": cmd(ClaudeCode, "session_start", None), "timeout": 5 }] }])
     );
     let codex = read(&h.join(".codex/hooks.json"));
     assert_eq!(codex["hooks"]["SessionEnd"][0]["hooks"][0]["timeout"], 2);
@@ -66,19 +71,19 @@ fn the_files_and_entries_each_client_gets() {
     assert_eq!(cursor["version"], 1);
     assert_eq!(
         cursor["hooks"]["beforeShellExecution"],
-        json!([{ "command": format!("{EXE} hook cursor pre_tool"), "timeout": 5 }])
+        json!([{ "command": cmd(Cursor, "pre_tool", None), "timeout": 5 }])
     );
     let gemini = read(&h.join(".gemini/settings.json"));
     assert_eq!(
         gemini["hooks"]["BeforeTool"],
         json!([{ "matcher": "run_shell_command", "hooks": [{ "name": "mulchie", "type": "command",
-            "command": format!("{EXE} hook gemini pre_tool"), "timeout": 5000 }] }])
+            "command": cmd(Gemini, "pre_tool", None), "timeout": 5000 }] }])
     );
     let copilot = read(&h.join(".copilot/hooks/mulchie.json"));
     assert_eq!(copilot["version"], 1);
     assert_eq!(
         copilot["hooks"]["preToolUse"],
-        json!([{ "type": "command", "bash": format!("{EXE} hook copilot pre_tool"), "timeoutSec": 5 }])
+        json!([{ "type": "command", "bash": cmd(Copilot, "pre_tool", None), "timeoutSec": 5 }])
     );
     // The commands run `mulchie hook` with the words they were written with.
     let w = sh_words(&format!("{EXE} hook copilot pre_tool --guard warn"));
@@ -137,7 +142,7 @@ fn user_hooks_and_other_keys_are_kept_and_restored_exactly() {
     );
     assert_eq!(
         pre[1]["hooks"][0]["command"],
-        format!("{EXE} hook claude-code pre_tool --guard warn")
+        cmd(ClaudeCode, "pre_tool", Some(GuardMode::Warn))
     );
     assert_eq!(
         v["hooks"]["Notification"][0]["hooks"][0]["command"],
@@ -182,7 +187,7 @@ fn a_user_hook_sharing_a_group_with_ours_is_kept() {
     let t = t();
     let f = t.env.file(Gemini);
     std::fs::create_dir_all(f.parent().unwrap()).unwrap();
-    let ours = format!("{EXE} hook gemini pre_tool");
+    let ours = cmd(Gemini, "pre_tool", None);
     let old = json!({ "hooks": { "BeforeTool": [{ "matcher": "run_shell_command", "hooks": [
         { "name": "mine", "type": "command", "command": "./check.sh" },
         { "name": "mulchie", "type": "command", "command": "/old/path/mulchie hook gemini pre_tool", "timeout": 5000 },
@@ -291,7 +296,8 @@ fn dry_run_prints_the_exact_diff_and_writes_nothing() {
     );
     assert!(
         msg.contains(&format!(
-            "+        \"bash\": \"{EXE} hook copilot pre_tool\","
+            "+        \"bash\": {},",
+            serde_json::to_string(&cmd(Copilot, "pre_tool", None)).unwrap()
         )),
         "{msg}"
     );
@@ -351,11 +357,14 @@ fn status_lists_each_client() {
 #[test]
 fn only_exactly_our_commands_are_ours() {
     for (cmd, ours) in [
+        (cmd(ClaudeCode, "pre_tool", None), true),
+        // Written before the missing-binary guard.
         (format!("{EXE} hook claude-code pre_tool"), true),
         (
             format!("{EXE} hook claude-code pre_tool --guard warn"),
             true,
         ),
+        (cmd(ClaudeCode, "pre_tool", Some(GuardMode::Warn)), true),
         ("mulchie hook claude-code stop".to_string(), true),
         (
             format!("{EXE} hook claude-code pre_tool && ~/bin/my-audit"),
@@ -369,9 +378,9 @@ fn only_exactly_our_commands_are_ours() {
             format!("{EXE} hook claude-code pre_tool --guard bogus"),
             false,
         ),
-        (format!("{EXE} hook claude-code nosuch"), false),
+        (cmd(ClaudeCode, "nosuch", None), false),
         (format!("{EXE} hook claude-code pre_tool extra"), false),
-        (format!("{EXE} hook cursor pre_tool"), false),
+        (cmd(Cursor, "pre_tool", None), false),
     ] {
         assert_eq!(
             is_ours(&json!({ "command": cmd }), ClaudeCode),
@@ -435,5 +444,44 @@ fn an_update_changes_only_our_handler_in_a_shared_group() {
     assert_eq!(
         read(&f)["hooks"]["PreToolUse"],
         json!([{ "matcher": "Bash|Edit", "hooks": [{ "type": "command", "command": "~/bin/mine.sh" }] }])
+    );
+}
+
+#[test]
+fn a_missing_binary_allows_and_a_present_one_decides() {
+    let d = tempfile::tempdir().unwrap();
+    let gone = d.path().join("gone/mulchie");
+    let run = |cmd: &str| {
+        std::process::Command::new("/bin/sh")
+            .arg("-c")
+            .arg(cmd)
+            .stdin(std::process::Stdio::null())
+            .output()
+            .unwrap()
+    };
+    for c in ALL {
+        for spec in events_for(c) {
+            let o = run(&command_for(&gone, c, spec.neutral, None));
+            assert_eq!(o.status.code(), Some(0), "{c:?} {}", spec.native);
+            assert_eq!(
+                String::from_utf8_lossy(&o.stdout),
+                crate::hook::fail_open(c, spec.neutral).stdout,
+                "{c:?} {}",
+                spec.native
+            );
+        }
+    }
+    // When the binary is there, its own status and output stand (Codex
+    // blocks a prompt with exit 2).
+    let exe = d.path().join("bin/mulchie");
+    std::fs::create_dir_all(exe.parent().unwrap()).unwrap();
+    std::fs::write(&exe, "#!/bin/sh\necho \"$@\" >&2\nexit 2\n").unwrap();
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(&exe, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let o = run(&command_for(&exe, Codex, "prompt", None));
+    assert_eq!(o.status.code(), Some(2));
+    assert_eq!(
+        String::from_utf8_lossy(&o.stderr).trim(),
+        "hook codex prompt"
     );
 }

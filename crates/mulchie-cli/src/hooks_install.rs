@@ -239,8 +239,28 @@ pub fn hook_command(
     command_for(exe, c, spec.neutral, guard)
 }
 
-/// The command for a client-neutral event name.
+/// The command for a client-neutral event name: `mulchie hook …`, after a
+/// guard that allows the action when the binary is gone (uninstalled
+/// without `mulchie hooks uninstall`). Copilot denies a tool call when a
+/// preToolUse hook exits non-zero, and a missing binary exits 127; the
+/// guard instead exits 0 with the client's fail-open output (Cursor's
+/// permission JSON, Codex's `{}` from Stop).
 fn command_for(exe: &Path, c: HookClient, neutral: &str, guard: Option<GuardMode>) -> String {
+    let q = sh_quote(&exe.to_string_lossy());
+    let fallback = crate::hook::fail_open(c, neutral).stdout;
+    let or_else = match fallback.trim() {
+        "" => "exit 0".to_string(),
+        out => format!("{{ printf '%s\\n' {}; exit 0; }}", sh_quote(out)),
+    };
+    format!(
+        "[ -x {q} ] || {or_else}; {}",
+        plain_command(exe, c, neutral, guard)
+    )
+}
+
+/// `mulchie hook <client> <event> [--guard <mode>]`, as written before the
+/// guard was added.
+fn plain_command(exe: &Path, c: HookClient, neutral: &str, guard: Option<GuardMode>) -> String {
     let mut s = format!(
         "{} hook {} {}",
         sh_quote(&exe.to_string_lossy()),
@@ -281,7 +301,10 @@ pub fn ours_exe(cmd: &str, c: HookClient) -> Option<String> {
 
 /// Every command text Mulchie has written for one event.
 fn forms(exe: &Path, c: HookClient, neutral: &str, guard: Option<GuardMode>) -> Vec<String> {
-    vec![command_for(exe, c, neutral, guard)]
+    vec![
+        command_for(exe, c, neutral, guard),
+        plain_command(exe, c, neutral, guard),
+    ]
 }
 
 fn command_of(handler: &Value) -> Option<&str> {

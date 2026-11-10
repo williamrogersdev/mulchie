@@ -26,7 +26,30 @@ fn main() {
     unsafe {
         libc::signal(libc::SIGPIPE, libc::SIG_DFL);
     }
-    let cli = Cli::parse();
+    let args: Vec<String> = std::env::args_os()
+        .map(|a| a.to_string_lossy().into_owned())
+        .collect();
+    let cli = if args.get(1).map(String::as_str) == Some("hook") {
+        // A hook must never block its client over a usage error.
+        match Cli::try_parse_from(&args) {
+            Ok(c) => c,
+            Err(e)
+                if matches!(
+                    e.kind(),
+                    clap::error::ErrorKind::DisplayHelp | clap::error::ErrorKind::DisplayVersion
+                ) =>
+            {
+                e.exit()
+            }
+            Err(e) => {
+                let out = hook::usage_error(&Paths::from_env(), &args, &e.to_string());
+                hook::emit(&out);
+                std::process::exit(0);
+            }
+        }
+    } else {
+        Cli::parse()
+    };
     let paths = Paths::from_env();
     let code = match cli.command {
         None => commands::status(&paths, false),

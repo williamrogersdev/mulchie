@@ -202,12 +202,28 @@ fn run_without_engine_says_so_and_keeps_the_status() {
     assert_eq!(o.status.code(), Some(127));
 }
 
+/// Wait until `pid` has a child, so `mulchie run` has started its command
+/// (and set up its signal forwarding) before a test signals it.
+fn wait_for_child(pid: u32) {
+    for _ in 0..100 {
+        let o = Command::new("pgrep")
+            .args(["-P", &pid.to_string()])
+            .output()
+            .unwrap();
+        if o.status.success() {
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    panic!("{pid} started no child");
+}
+
 #[test]
 fn run_forwards_sigterm_and_sigint() {
     let h = Home::new();
     // SIGTERM: `sleep` dies of it, so the status is 128 + 15.
     let mut c = h.cmd(&["run", "--", "sleep", "30"]).spawn().unwrap();
-    std::thread::sleep(Duration::from_millis(400));
+    wait_for_child(c.id());
     signal(c.id(), libc::SIGTERM);
     let o = wait_timeout(&mut c, Duration::from_secs(10));
     assert_eq!(
@@ -228,7 +244,8 @@ fn run_forwards_sigterm_and_sigint() {
         ])
         .spawn()
         .unwrap();
-    std::thread::sleep(Duration::from_millis(400));
+    wait_for_child(c.id());
+    std::thread::sleep(Duration::from_millis(200));
     signal(c.id(), libc::SIGINT);
     let o = wait_timeout(&mut c, Duration::from_secs(10));
     assert_eq!(o.status.code(), Some(42), "{}", text(&o.stderr));
@@ -948,6 +965,38 @@ fn sessions_limits_updates_and_guard_through_the_engine() {
     let o = h.run(&["guard", "check", "--json", "--", "ls", "-la"]);
     assert_eq!(o.status.code(), Some(0), "{}", text(&o.stdout));
     server.stop();
+}
+
+#[test]
+fn a_hook_this_build_cannot_read_still_allows() {
+    let h = Home::new();
+    let ev = r#"{"session_id":"s","tool_name":"Bash","tool_input":{"command":"ls"}}"#;
+    for (args, want_out) in [
+        (
+            &["hook", "claude-code", "pre_tool", "--guard", "bogus"][..],
+            "",
+        ),
+        (&["hook", "nosuch", "pre_tool"][..], ""),
+        (
+            &["hook", "claude-code", "pre_tool", "--from-the-future"][..],
+            "",
+        ),
+        (&["hook"][..], ""),
+        (
+            &["hook", "cursor", "beforeShellExecution", "--guard", "bogus"][..],
+            r#"{"permission":"allow"}"#,
+        ),
+        (&["hook", "codex", "Stop", "--new-flag"][..], "{}"),
+    ] {
+        let (code, out, err, _) = hook(&h, args, Some(ev));
+        assert_eq!(code, Some(0), "{args:?} {err}");
+        assert_eq!(out.trim(), want_out, "{args:?}");
+    }
+    let log = std::fs::read_to_string(h.paths().config_dir.join("hook.log")).unwrap();
+    assert!(log.contains("cannot read these arguments"), "{log}");
+    // Help still works.
+    let o = h.run(&["hook", "--help"]);
+    assert!(o.status.success());
 }
 
 #[test]

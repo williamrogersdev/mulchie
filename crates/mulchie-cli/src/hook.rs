@@ -458,6 +458,34 @@ pub fn command(paths: &Paths, client: HookClient, event: &str, guard: Option<Gua
             fail_open(client, event)
         }
     };
+    emit(&out)
+}
+
+/// `mulchie hook …` with arguments this build cannot read: settings written
+/// by a newer Mulchie, run by an older binary. A usage error would exit 2,
+/// which Claude Code and Codex read as a block, so instead log it, print the
+/// client's fail-open output when the client is known (nothing otherwise),
+/// and exit 0. `args` is the whole command line, program name first.
+pub fn usage_error(paths: &Paths, args: &[String], err: &str) -> Out {
+    use clap::ValueEnum;
+    let client = args.get(2).and_then(|c| HookClient::from_str(c, true).ok());
+    let event = args.get(3).map(String::as_str).unwrap_or("");
+    let first = err.lines().next().unwrap_or("").trim();
+    log_failure(
+        paths,
+        &format!(
+            "hook {}: allowed; this mulchie cannot read these arguments ({first}); is an older mulchie first on the PATH?",
+            args.get(2..).map(|a| a.join(" ")).unwrap_or_default()
+        ),
+    );
+    match client {
+        Some(c) => fail_open(c, event),
+        None => Out::default(),
+    }
+}
+
+/// Print `out` and return its exit status.
+pub fn emit(out: &Out) -> i32 {
     use std::io::Write;
     let _ = std::io::stdout().write_all(out.stdout.as_bytes());
     let _ = std::io::stdout().flush();
