@@ -10,7 +10,7 @@ import { GROUP_ACTIONS, groupAction, signalPids, reniceProc, planAndRun, canLowe
 import { allProcs, findConsumer, ranked, cores, cpuSummary, memSummary, KIND_TEXT } from './consumers.js';
 import { SEV_LVL, SEV_TEXT, suggestionLabel, watchFindings, CATEGORY, CATEGORY_ORDER, planApi, sessionApi, runCommand, updateItems } from './findings.js';
 import { act } from './act.js';
-import { coresText } from './views/sessions.js';
+import { coresText, notEnforcedText, isHookOnly } from './views/sessions.js';
 
 // ------------------------------------------------------------------ helpers
 
@@ -471,7 +471,8 @@ function rSession(id) {
   const paused = d?.paused_by_mulchie || [];
   const procs = d?.processes || [];
   const MBt = mb => B((mb || 0) * 1048576);
-  const html = `${x.source === 'hook' ? '<p class="why-s warn">Registered by an agent hook, not found in the process table. Limits report on it but never lower its priority, pause or stop it.</p>' : ''}
+  const notEnf = running ? notEnforcedText(x) : null;
+  const html = `${isHookOnly(x) && notEnf ? `<p class="why-s warn">${esc(notEnf)}</p>` : ''}
     ${sd.err && d === undefined ? `<p class="why-s warn">Could not read the full session: ${esc(sd.err)}</p>` : ''}
     ${kv([['agent', esc(x.agent)], ['status', running ? '<span class="ok">running</span>' : `ended ${x.ended_unix ? esc(ago(x.ended_unix)) + ' ago' : ''}`], ['found by', x.source === 'hook' ? 'an agent hook' : 'the process table'],
       x.client && ['client', esc(x.client)], ['workspace', x.workspace ? (ws ? link('ws', ws.path, tilde(x.workspace)) : esc(tilde(x.workspace))) : '<span class="dim">none</span>'],
@@ -482,7 +483,7 @@ function rSession(id) {
     ${sec('Usage', kv([['cpu', running ? `${esc(coresText(u.cpu_cores))} cores` : '—'], ['memory', running ? MBt(u.memory_mb) : '—'], ['processes', running ? String(u.processes ?? '—') : '—'], ['build slots', String(u.build_slots ?? 0)],
       ['written', !writes ? '<span class="dim">not reported on this system</span>' : u.bytes_written != null ? `${B(u.bytes_written)}${u.write_mb_per_hour != null ? ` · ${MBt(u.write_mb_per_hour)}/h` : ''}` : '—'],
       s.peak && ['peaks', `${esc(coresText(s.peak.cpu_cores))} cores · ${MBt(s.peak.memory_mb)} · ${s.peak.processes} processes${s.peak.write_mb_per_hour != null ? ` · ${MBt(s.peak.write_mb_per_hour)}/h written` : ''}`]]))}
-    ${sec(`Limits (${breaches.length})`, breaches.length ? breaches.map(b => { const t = breachText(b); return `<div class="bkrow"><span class="${t.cleared ? 'dim' : 'bad'}">${t.cleared ? 'cleared' : 'over'}</span> ${esc(t.what)}<div class="dim">${esc(t.act)} · since ${esc(ago(b.breached_unix || b.over_since_unix))} ago</div></div>`; }).join('') : '<div class="dim">Not over any limit.</div>')}
+    ${sec(`Limits (${breaches.length})`, (notEnf && !isHookOnly(x) ? `<p class="why-s">${esc(notEnf)}</p>` : '') + (breaches.length ? breaches.map(b => { const t = breachText(b); return `<div class="bkrow"><span class="${t.cleared ? 'dim' : 'bad'}">${t.cleared ? 'cleared' : 'over'}</span> ${esc(t.what)}<div class="dim">${esc(t.act)} · since ${esc(ago(b.breached_unix || b.over_since_unix))} ago</div></div>`; }).join('') : '<div class="dim">Not over any limit.</div>'))}
     ${paused.length ? sec(`Paused by Mulchie (${paused.length})`, `${paused.map(p => `<div class="bkrow">${link('proc', p.pid, `pid ${p.pid}`)} <span class="dim">since ${esc(ago(p.since_unix))} ago</span></div>`).join('')}${actions([btn('Resume these…', da('resume-paused', paused.map(p => `${p.pid}:${p.start_time}`).join(',')))])}`) : ''}
     ${running && S().sessions?.enabled !== false ? sec('Act on this session', `${actions(SESSION_ACTIONS.map(a => btn(GROUP_ACTIONS[a].verb + '…', da('s-' + a, id), DANGER.has(a) ? 'danger' : '')))}
       <label class="chk"><input type="checkbox" id="sIncAgent" ${st.ui.sIncAgent ? 'checked' : ''}> Include the agent itself (pid ${esc(x.root_pid)})</label>

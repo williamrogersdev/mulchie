@@ -26,6 +26,22 @@ export function sessionNotes(S) {
   return out;
 }
 
+// Whether this engine would act on a breach of the session's limits
+// (`enforced`, `not_enforced_reason`), in words; null when it would. An
+// engine without the field: only hook-registered sessions are known not to be.
+const NOT_ENFORCED = {
+  hook_registered: 'Registered by an agent hook, not found in the process table, so limits report on it but never lower its priority, pause or stop it.',
+  not_automating: 'This engine does not act on limits now: another Mulchie engine holds the lock, or the settings file did not load.',
+  no_budget: 'No budget applies to its workspace, so a limit never acts on it.',
+  notify_only: 'Every cap of its budget only notifies, so nothing is signalled.',
+  ended: 'The session has ended.',
+};
+export const isHookOnly = r => r.not_enforced_reason === 'hook_registered' || (r.enforced == null && r.source === 'hook');
+export function notEnforcedText(r) {
+  if (r.enforced === false) return NOT_ENFORCED[r.not_enforced_reason] || `Limits are not enforced on it (${String(r.not_enforced_reason || 'no reason given').replace(/_/g, ' ')}).`;
+  return r.enforced == null && r.source === 'hook' ? NOT_ENFORCED.hook_registered : null;
+}
+
 const statusChip = r => r.status === 'running' ? '<span class="chip ok">running</span>' : '<span class="chip">ended</span>';
 
 function rowsHtml(rows, S, { ended }) {
@@ -34,9 +50,9 @@ function rowsHtml(rows, S, { ended }) {
     const n = by.get(r.id) || 0;
     const label = [`Session ${r.agent} in ${r.workspace ? tilde(r.workspace) : 'no workspace'}`, r.status === 'running' ? 'running' : 'ended',
       !ended && `CPU ${coresText(r.cpu_cores)} cores`, !ended && `memory ${MB(r.memory_mb)}`, !ended && `${r.processes} processes`,
-      n ? `${n} limit(s) exceeded` : 'not over a limit', r.source === 'hook' ? 'registered by a hook, reported only' : ''].filter(Boolean).join(', ');
+      n ? `${n} limit(s) exceeded` : 'not over a limit', isHookOnly(r) ? 'registered by a hook, reported only' : ''].filter(Boolean).join(', ');
     return `<tr class="click ${sel === r.id ? 'sel' : ''}" role="button" tabindex="0" data-d="session" data-dk="${esc(r.id)}" aria-label="${esc(label)}">
-      <td>${esc(r.agent)}${r.source === 'hook' ? ' <span class="chip" title="Registered by an agent hook: limits report on it but never act">hook</span>' : ''}</td>
+      <td>${esc(r.agent)}${isHookOnly(r) ? ' <span class="chip" title="Registered by an agent hook: limits report on it but never act">hook</span>' : ''}</td>
       <td title="${esc(r.workspace || '')}">${r.workspace ? esc(tilde(r.workspace)) : '<span class="dim">none</span>'}</td>
       <td class="c-md">${statusChip(r)}</td>
       <td class="n">${ended ? '<span class="dim">—</span>' : esc(coresText(r.cpu_cores))}</td>

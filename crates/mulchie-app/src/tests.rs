@@ -938,6 +938,12 @@ fn sessions_limits_and_updates_through_the_engine_and_a_client() {
         );
         let d = x.session_detail(&id).unwrap().expect("known");
         assert_eq!(d["session"]["id"], id, "{who}");
+        // A hook-registered session is reported on, never acted on.
+        assert_eq!(d["session"]["enforced"], false, "{who} {d}");
+        assert_eq!(
+            d["session"]["not_enforced_reason"], "hook_registered",
+            "{who} {d}"
+        );
         assert!(
             d["breaches"].is_array() && d["paused_by_mulchie"].is_array(),
             "{who} {d}"

@@ -14,6 +14,7 @@ import { invoke } from '../ipc.js';
 import { $, esc, ago, toast, tilde, B } from '../util.js';
 import { resumePaused } from '../signals.js';
 import { modal } from '../dialogs.js';
+import { isHookOnly } from './sessions.js';
 
 const CAPS = [
   ['cpu_cores', 'CPU (cores)', 'Cores in use by the session’s processes together.'],
@@ -220,7 +221,7 @@ export function overNewCaps(limits, S) {
       const what = c.action === 'pause'
         ? `Mulchie pauses ${them} and resumes them after ${b.resume_after_secs} s`
         : `Mulchie asks ${them} to quit, and force-quits what is left after ${b.stop_grace_secs} s`;
-      const then = r.source === 'hook' ? 'It was registered by an agent hook, so Mulchie only reports it; nothing is signalled.'
+      const then = isHookOnly(r) ? 'It was registered by an agent hook, so Mulchie only reports it; nothing is signalled.'
         : !enforcing ? `This engine is not enforcing now (${notEnforcingText()}), so nothing happens until it is.`
           : `If it stays over for ${c.sustain_secs} s from the next sample, ${what}.`;
       return [`${who}: ${capName(cap)} ${usageText(cap, v)}, over the new cap of ${c.max} ${CAP_UNIT[cap]}. ${then}`];
