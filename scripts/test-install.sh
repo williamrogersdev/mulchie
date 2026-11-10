@@ -116,6 +116,28 @@ else
   fail "uninstall failed: $out"
 fi
 
+# 6. MULCHIE_VERSION with a pre-release suffix (and a leading v) names the rc's own download URL,
+#    never releases/latest. The installer is run with a fake curl that records the URLs it is given.
+cshim="${work}/cshim"
+mkdir -p "$cshim"
+cat >"${cshim}/curl" <<'SHIM'
+#!/bin/sh
+for a in "$@"; do case "$a" in https://*) echo "$a" >>"${FAKE_CURL_LOG}" ;; esac; done
+exit 22
+SHIM
+chmod 755 "${cshim}/curl"
+for v in "0.3.0-rc.1" "v0.3.0-rc.1"; do
+  log="${work}/curl.log"
+  : >"$log"
+  PATH="${cshim}:${PATH}" FAKE_CURL_LOG="$log" MULCHIE_VERSION="$v" MULCHIE_INSTALL_DIR="${work}/bin6" sh "$installer" >/dev/null 2>&1 || true
+  want="https://github.com/williamrogersdev/mulchie/releases/download/v0.3.0-rc.1/${asset}"
+  if [ "$(head -n 1 "$log")" = "$want" ] && ! grep -q latest "$log"; then
+    pass "MULCHIE_VERSION=$v downloads from the rc tag"
+  else
+    fail "MULCHIE_VERSION=$v used the wrong URL: $(cat "$log")"
+  fi
+done
+
 if [ "$failures" -ne 0 ]; then
   echo "$failures check(s) failed"
   exit 1

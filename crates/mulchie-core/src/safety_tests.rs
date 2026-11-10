@@ -1545,11 +1545,14 @@ fn renice_requests_lower_only_and_protected_processes_are_refused() {
         expected_start_time: st,
     };
     if before < 18 {
-        let r = env.gate().execute_one(&req(before + 2, 54), "t");
-        assert_eq!(reason(&r), Some(SkipReason::StartTimeMismatch));
-        let r = env.gate().execute_one(&req(before + 2, 55), "t");
+        // A CI runner can start its jobs at a negative nice value; the gate
+        // only takes 0..=20, so aim at 0 or above.
+        let target = (before + 2).max(0);
+        let r = env.gate().execute_one(&req(target, 54), "t");
+        assert_eq!(reason(&r), Some(SkipReason::StartTimeMismatch), "{r:?}");
+        let r = env.gate().execute_one(&req(target, 55), "t");
         assert!(done(&r), "{r:?}");
-        assert_eq!(crate::engine::nice_of(pid), Some(before + 2));
+        assert_eq!(crate::engine::nice_of(pid), Some(target));
         let r = env.gate().execute_one(&req(before, 55), "t");
         assert_eq!(
             reason(&r),

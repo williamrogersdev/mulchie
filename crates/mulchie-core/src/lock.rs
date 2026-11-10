@@ -116,6 +116,26 @@ fn flock(f: &File, op: libc::c_int) -> std::io::Result<bool> {
     }
 }
 
+/// Release this open file's lock. Closing the file is not enough while a
+/// copy of the descriptor is open elsewhere: a child that another thread is
+/// spawning shares every descriptor until its exec closes the close-on-exec
+/// ones, and the lock lasts until the last copy closes. An explicit unlock
+/// ends it for every copy at once.
+fn unlock(f: &File) {
+    unsafe { libc::flock(f.as_raw_fd(), libc::LOCK_UN) };
+}
+
+/// Whether nobody holds the lock on `f`'s file. Takes a shared lock to find
+/// out and releases it explicitly (see [`unlock`]), so the probe never keeps
+/// an engine from taking the lock.
+fn unheld(f: &File) -> std::io::Result<bool> {
+    let free = flock(f, libc::LOCK_SH)?;
+    if free {
+        unlock(f);
+    }
+    Ok(free)
+}
+
 fn read_holder(mut f: &File) -> Option<Holder> {
     let mut s = String::new();
     f.seek(SeekFrom::Start(0)).ok()?;
@@ -170,6 +190,14 @@ impl EngineLock {
     }
 }
 
+impl Drop for EngineLock {
+    /// Release the lock before the file closes (see [`unlock`]), so it is
+    /// free the moment the holder is dropped.
+    fn drop(&mut self) {
+        unlock(&self.file);
+    }
+}
+
 /// The engine that holds the lock now, if one does. `None` when no file, the
 /// file is not ours or not private, or nobody holds the lock (a stale file left
 /// by a crashed engine).
@@ -181,8 +209,7 @@ pub fn running_engine(paths: &Paths) -> Option<Holder> {
         return None;
     }
     let f = open_lock_file(&path, false).ok()?;
-    match flock(&f, libc::LOCK_SH) {
-        // We got it, so nobody holds it. Dropping `f` releases it.
+    match unheld(&f) {
         Ok(true) => None,
         Ok(false) => read_holder(&f),
         Err(_) => None,
@@ -243,20 +270,33 @@ mod tests {
             .mode();
         assert_eq!(mode & 0o777, 0o600);
         drop(a);
-        // A stale file from an engine that is gone does not count. Another test
-        // thread's fork() can share the open file description until its exec
-        // closes it (O_CLOEXEC), holding the flock for a moment: wait for that.
-        let mut gone = false;
-        for _ in 0..200 {
-            if running_engine(&paths).is_none() {
-                gone = true;
-                break;
-            }
-            std::thread::sleep(std::time::Duration::from_millis(10));
-        }
-        assert!(gone, "the lock is released once the holder drops it");
+        // A stale file from an engine that is gone does not count.
+        assert_eq!(running_engine(&paths), None, "released once dropped");
         let b = EngineLock::acquire(&paths, 9).unwrap();
         assert_eq!(b.holder().started_unix, 9);
+    }
+
+    /// A copy of the descriptor (what a child being spawned by another thread
+    /// holds until its exec) keeps neither the holder's lock nor a probe's.
+    #[test]
+    fn the_lock_is_free_once_dropped_while_a_copy_of_the_file_is_open() {
+        let t = tempfile::tempdir().unwrap();
+        let paths = Paths::under(t.path());
+        let a = EngineLock::acquire(&paths, 1).unwrap();
+        let copy = a.file.try_clone().unwrap();
+        drop(a);
+        assert_eq!(running_engine(&paths), None, "the copy does not hold it");
+        let b = EngineLock::acquire(&paths, 2).unwrap();
+        drop(copy);
+        drop(b);
+
+        let probe = open_lock_file(&lock_path(&paths), false).unwrap();
+        let copy = probe.try_clone().unwrap();
+        assert!(unheld(&probe).unwrap());
+        drop(probe);
+        let c = EngineLock::acquire(&paths, 3);
+        assert!(c.is_ok(), "a probe's shared lock is gone: {c:?}");
+        drop(copy);
     }
 
     #[test]

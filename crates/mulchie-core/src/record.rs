@@ -492,7 +492,11 @@ impl Writer {
                 Msg::Limits(l) => self.limits = l,
                 Msg::Sweep { now, live } => self.sweep(now, &live),
                 Msg::Flush(done) => {
+                    // Off the count before the flusher wakes, so it sees
+                    // nothing pending once its flush returns.
+                    self.pending.fetch_sub(1, Ordering::SeqCst);
                     let _ = done.send(());
+                    continue;
                 }
             }
             self.pending.fetch_sub(1, Ordering::SeqCst);

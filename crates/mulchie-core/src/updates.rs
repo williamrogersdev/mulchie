@@ -369,6 +369,16 @@ pub fn newer(latest: &str, installed: &str) -> Option<bool> {
     Some(precedence(&l, &i) == std::cmp::Ordering::Greater)
 }
 
+/// Whether to offer `latest` to someone running `installed`: it must be newer, and a
+/// pre-release is never offered to a stable install (an rc install is offered the
+/// final release, which outranks it, and a later rc). Not semver gives `None`.
+fn mulchie_update_offered(latest: &str, installed: &str, flagged_prerelease: bool) -> Option<bool> {
+    let newer = newer(latest, installed)?;
+    let l_pre = !parse_version(latest)?.pre.is_empty();
+    let i_pre = !parse_version(installed)?.pre.is_empty();
+    Some(newer && !((l_pre || flagged_prerelease) && !i_pre))
+}
+
 // -------------------------------------------------------------- lockfiles
 
 /// One package version from a lockfile.
@@ -969,9 +979,12 @@ pub fn check(http: &dyn Http, run: &dyn Runner, inp: &CheckInput, prev: Option<&
                         .take(64)
                         .collect::<String>()
                 });
+                // GitHub's `releases/latest` already leaves out pre-releases and drafts;
+                // this keeps one from being offered to a stable install if that changes.
+                let flagged = v.get("prerelease").and_then(Value::as_bool) == Some(true);
                 let outdated = latest
                     .as_deref()
-                    .and_then(|l| newer(l, inp.version))
+                    .and_then(|l| mulchie_update_offered(l, inp.version, flagged))
                     .unwrap_or(false);
                 r.mulchie = Some(ToolVersion {
                     name: "mulchie".into(),
