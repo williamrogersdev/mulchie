@@ -1571,3 +1571,90 @@ fn deprioritize_rechecks_each_process_before_renicing() {
     let _ = child.kill();
     let _ = child.wait();
 }
+
+/// R17: only the lock holder writes the config; a non-holder refuses and
+/// picks up what the holder wrote. Dismissing says whether the id is known.
+#[test]
+fn only_the_lock_holder_writes_config_and_others_follow_it() {
+    let (_t, a) = engine();
+    let paths = a.paths().clone();
+    let b = Engine::with_processes(
+        paths.clone(),
+        Config::load_from(&paths),
+        Arc::new(FakeProcesses::empty()),
+    )
+    .with_watch_probe(Arc::new(crate::watch::NoProbe));
+    b.set_automation_enabled(false);
+
+    let mut c = b.config();
+    c.watch.interval_secs = 333;
+    assert!(matches!(
+        b.set_config(c),
+        Err(ConfigError::NotLockHolder(_))
+    ));
+    assert!(
+        !paths.config_file().exists(),
+        "the non-holder wrote nothing"
+    );
+    assert_eq!(
+        b.dismiss_finding("x", None).unwrap_err().0,
+        "not_lock_holder"
+    );
+    assert!(b
+        .patch_config(&json!({"watch": {"interval_secs": 120}}))
+        .is_err());
+
+    let mut c = a.config();
+    c.watch.interval_secs = 120;
+    a.set_config(c).unwrap();
+    std::thread::sleep(CONFIG_RECHECK + Duration::from_millis(100));
+    assert_eq!(b.config().watch.interval_secs, 120, "refreshed from disk");
+
+    // known: a current finding, one dismissed before, or neither.
+    let (_, known) = a
+        .dismiss_finding_known("nothing:like:this", Some(1))
+        .unwrap();
+    assert!(!known);
+    let (_, known) = a
+        .dismiss_finding_known("nothing:like:this", Some(1))
+        .unwrap();
+    assert!(known, "dismissed before");
+}
+
+/// PATCH semantics: objects merge, null resets to the default, the patch
+/// applies to the file's current content, invalid results are refused.
+#[test]
+fn config_patches_merge_into_the_files_content() {
+    let (_t, a) = engine();
+    let cfg = a
+        .patch_config(&json!({"watch": {"interval_secs": 120}, "limits": {"default": {"cpu_cores": {"max": 4.0}}}}))
+        .unwrap();
+    assert_eq!(cfg.watch.interval_secs, 120);
+    assert!(cfg.watch.enabled, "untouched keys keep their value");
+    assert_eq!(
+        cfg.limits.default.as_ref().unwrap().cpu_cores.unwrap().max,
+        4.0
+    );
+    // Someone else edits the file; the next patch merges into that.
+    let paths = a.paths().clone();
+    let mut on_disk = Config::load_from(&paths).config;
+    on_disk.alert_below_gb = 7;
+    on_disk.save_to(&paths, now_unix()).unwrap();
+    let cfg = a
+        .patch_config(&json!({"limits": {"default": null}}))
+        .unwrap();
+    assert_eq!(cfg.alert_below_gb, 7, "the outside edit is kept");
+    assert!(cfg.limits.default.is_none(), "null resets");
+    assert_eq!(cfg.watch.interval_secs, 120);
+    // Invalid: refused, nothing saved.
+    assert!(matches!(
+        a.patch_config(&json!({"watch": {"interval_secs": 0}})),
+        Err(ConfigError::Invalid(_))
+    ));
+    assert!(matches!(
+        a.patch_config(&json!({"watch": {"interval_secs": "x"}})),
+        Err(ConfigError::Parse(_))
+    ));
+    assert!(a.patch_config(&json!([1])).is_err());
+    assert_eq!(Config::load_from(&paths).config.watch.interval_secs, 120);
+}

@@ -1124,3 +1124,47 @@ fn an_execute_whose_client_hung_up_still_runs_and_is_recorded() {
     let (code, _) = send(r.port, "GET", "/v1/health", None, "");
     assert_eq!(code, 200);
 }
+
+/// PATCH /v1/config merges a partial object; the read-only token may not.
+/// Dismissing reports whether the id is known (R17).
+#[test]
+fn config_patch_and_dismiss_known_over_the_api() {
+    let r = running(Limits::default());
+    let full = format!("Bearer {}", r.token);
+    let ro = format!("Bearer {}", read_read_only_token(r.engine.paths()).unwrap());
+    let (code, v) = send(
+        r.port,
+        "PATCH",
+        "/v1/config",
+        Some(&full),
+        r#"{"watch":{"interval_secs":120}}"#,
+    );
+    assert_eq!(code, 200, "{v}");
+    assert_eq!(v["config"]["watch"]["interval_secs"], 120);
+    assert_eq!(v["config"]["watch"]["enabled"], true);
+    let (code, v) = send(
+        r.port,
+        "PATCH",
+        "/v1/config",
+        Some(&full),
+        r#"{"watch":{"interval_secs":1}}"#,
+    );
+    assert_eq!((code, v["code"].as_str()), (400, Some("invalid_config")));
+    let (code, _) = send(
+        r.port,
+        "PATCH",
+        "/v1/config",
+        Some(&ro),
+        r#"{"watch":{"interval_secs":60}}"#,
+    );
+    assert_eq!(code, 403);
+    assert_eq!(r.engine.config().watch.interval_secs, 120);
+    let (code, v) = send(
+        r.port,
+        "POST",
+        "/v1/findings/dismiss",
+        Some(&full),
+        r#"{"id":"no:such:finding"}"#,
+    );
+    assert_eq!((code, v["known"].as_bool()), (200, Some(false)), "{v}");
+}

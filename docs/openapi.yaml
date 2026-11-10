@@ -433,6 +433,8 @@ paths:
                   ok: { type: boolean }
                   id: { type: string }
                   until_unix: { type: integer }
+                  known: { type: boolean, description: "The id names a current finding or one dismissed before; false is probably a typo (the dismissal is saved anyway)" }
+        "409": { $ref: "#/components/responses/Error" }
         default: { $ref: "#/components/responses/Error" }
   /v1/findings/undismiss:
     post:
@@ -482,7 +484,9 @@ paths:
         When the file changed on disk since the engine loaded or wrote it (another engine, an
         editor), nothing is saved: 409 `config_changed`, and the engine takes the file's
         content. Read the config again and reapply the change. Dismissing or undismissing a
-        finding instead applies its edit to the file's current content.
+        finding instead applies its edit to the file's current content. Only the engine that
+        holds the engine lock writes the config: any other answers 409 `not_lock_holder`.
+        Prefer `PATCH`, which sends only the keys that change.
       requestBody:
         required: true
         content:
@@ -495,6 +499,33 @@ paths:
       responses:
         "200":
           description: Saved and applied
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  ok: { type: boolean }
+                  config: { type: object }
+        "409": { $ref: "#/components/responses/Error" }
+        default: { $ref: "#/components/responses/Error" }
+    patch:
+      summary: Change some config keys
+      description: |
+        The body is a JSON merge patch (RFC 7396) of the config: objects merge key by key, `null`
+        removes a key so it takes its default, anything else (arrays included) replaces. It is
+        applied to the config file's current content under the config lock (an edit made
+        elsewhere is kept, not refused), validated (400 `invalid_config`) and saved atomically.
+        A file that failed to load is not patched (400; replace it with `PUT`). Full token only;
+        409 `not_lock_holder` on an engine that does not hold the engine lock.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { type: object }
+            example: { "watch": { "interval_secs": 120 }, "limits": { "default": null } }
+      responses:
+        "200":
+          description: Saved and applied; the whole config now in use
           content:
             application/json:
               schema:

@@ -58,6 +58,8 @@ pub const WAITER_POLL_SECS: u64 = 30;
 /// backoff.
 const HEALTHY_RUN: Duration = Duration::from_secs(60);
 const MAX_BACKOFF: Duration = Duration::from_secs(60);
+/// A non-holder engine compares the config file with its copy this often.
+const CONFIG_RECHECK: Duration = Duration::from_secs(1);
 
 #[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -469,6 +471,26 @@ pub fn auto_reclaim_need(cfg: &Config, disk_free: u64) -> Option<u64> {
     (need > 0).then_some(need)
 }
 
+/// RFC 7396 JSON merge patch.
+pub fn merge_patch(target: &mut Value, patch: &Value) {
+    let Some(p) = patch.as_object() else {
+        *target = patch.clone();
+        return;
+    };
+    if !target.is_object() {
+        *target = Value::Object(serde_json::Map::new());
+    }
+    if let Some(t) = target.as_object_mut() {
+        for (k, v) in p {
+            if v.is_null() {
+                t.remove(k);
+            } else {
+                merge_patch(t.entry(k.clone()).or_insert(Value::Null), v);
+            }
+        }
+    }
+}
+
 /// Findings the watch run produces (every category but limits and updates,
 /// which the sample loop and the update checker keep).
 fn watch_owned(f: &Finding) -> bool {
@@ -655,6 +677,8 @@ pub struct Engine {
     /// The config file's bytes as this engine last loaded or wrote them
     /// (`None`: no file). Held across every config read-modify-write.
     config_disk: Arc<Mutex<Option<Vec<u8>>>>,
+    /// When a non-holder last compared the config file with its copy.
+    config_checked: Arc<Mutex<Option<Instant>>>,
     /// Sessions, limits and limit actions in flight (lock after `state`,
     /// never while holding it).
     sup: Arc<Mutex<Supervision>>,
@@ -731,6 +755,7 @@ impl Engine {
             probe: Arc::new(watch::SystemProbe),
             api_port: Arc::new(AtomicU64::new(0)),
             config_disk: Arc::new(Mutex::new(config_disk)),
+            config_checked: Arc::new(Mutex::new(None)),
             sup: Arc::new(Mutex::new(Supervision::default())),
             limit_wake: Arc::new(Condvar::new()),
             record: Arc::new(std::sync::OnceLock::new()),
@@ -827,7 +852,81 @@ impl Engine {
     }
 
     pub fn config(&self) -> Config {
+        self.refresh_config_if_changed();
         lock(&self.state).config.clone()
+    }
+
+    /// Only the engine that holds the engine lock writes the config file.
+    fn may_write_config(&self) -> Result<(), ConfigError> {
+        if self.automation_enabled.load(Ordering::SeqCst) {
+            return Ok(());
+        }
+        // Take whatever the running engine wrote, so a caller that reads
+        // again sees it.
+        let mut disk = lock(&self.config_disk);
+        let now_bytes = read_config_bytes(&self.paths);
+        if now_bytes != *disk {
+            self.adopt_disk_config(&mut disk, now_bytes);
+        }
+        Err(ConfigError::NotLockHolder(
+            "another Mulchie engine holds the engine lock and owns the config; send the change to it (PUT or PATCH /v1/config)".into(),
+        ))
+    }
+
+    /// An engine that does not hold the lock never writes the config; it
+    /// takes the file's content whenever the running engine changed it
+    /// (checked at most once a second, one small file read).
+    fn refresh_config_if_changed(&self) {
+        if self.automation_enabled.load(Ordering::SeqCst) {
+            return;
+        }
+        {
+            let mut at = lock(&self.config_checked);
+            if at.is_some_and(|t| t.elapsed() < CONFIG_RECHECK) {
+                return;
+            }
+            *at = Some(Instant::now());
+        }
+        // A writer holds it: it adopts the file itself.
+        let Ok(mut disk) = self.config_disk.try_lock() else {
+            return;
+        };
+        let now_bytes = read_config_bytes(&self.paths);
+        if now_bytes != *disk {
+            self.adopt_disk_config(&mut disk, now_bytes);
+        }
+    }
+
+    /// Apply a JSON merge patch (RFC 7396: objects merge, `null` removes a
+    /// key so it takes its default, anything else replaces) to the config
+    /// file's current content, validate, save and use it. Keys the patch
+    /// does not name keep their value, so clients never send the whole file.
+    pub fn patch_config(&self, patch: &Value) -> Result<Config, ConfigError> {
+        if !patch.is_object() {
+            return Err(ConfigError::Parse(
+                "a config patch is a JSON object of the keys to change".into(),
+            ));
+        }
+        self.may_write_config()?;
+        let mut disk = lock(&self.config_disk);
+        let now_bytes = read_config_bytes(&self.paths);
+        if now_bytes != *disk {
+            // A patch names only what it changes: apply it to the file's
+            // current content rather than refusing.
+            self.adopt_disk_config(&mut disk, now_bytes);
+        }
+        if let Some(e) = self.config_error() {
+            return Err(ConfigError::Invalid(vec![format!(
+                "the config file is not usable ({e}); replace it with PUT /v1/config"
+            )]));
+        }
+        let mut v = serde_json::to_value(lock(&self.state).config.clone())
+            .map_err(|e| ConfigError::Io(e.to_string()))?;
+        merge_patch(&mut v, patch);
+        let cfg: Config =
+            serde_json::from_value(v).map_err(|e| ConfigError::Parse(e.to_string()))?;
+        self.save_config_locked(&mut disk, cfg.clone())?;
+        Ok(cfg)
     }
 
     pub fn config_error(&self) -> Option<String> {
@@ -842,6 +941,7 @@ impl Engine {
     /// engine then takes the file's content, so a caller reads the config
     /// again and reapplies its change.
     pub fn set_config(&self, cfg: Config) -> Result<(), ConfigError> {
+        self.may_write_config()?;
         let mut disk = lock(&self.config_disk);
         let now_bytes = read_config_bytes(&self.paths);
         if now_bytes != *disk {
@@ -1668,6 +1768,22 @@ impl Engine {
         id: &str,
         days: Option<u64>,
     ) -> Result<u64, (&'static str, String)> {
+        self.dismiss_finding_known(id, days).map(|(until, _)| until)
+    }
+
+    /// As [`Engine::dismiss_finding`], also saying whether `id` names a
+    /// current finding or one dismissed before (`false`: probably a typo;
+    /// the dismissal is saved anyway, for a finding that may come back).
+    pub fn dismiss_finding_known(
+        &self,
+        id: &str,
+        days: Option<u64>,
+    ) -> Result<(u64, bool), (&'static str, String)> {
+        let known = {
+            let st = lock(&self.state);
+            st.findings.iter().any(|f| f.id == id)
+                || st.config.watch.dismissed.iter().any(|d| d.id == id)
+        };
         let days = days.unwrap_or(30);
         if !(1..=3650).contains(&days) {
             return Err(("invalid_body", "days must be 1 to 3650".into()));
@@ -1683,7 +1799,7 @@ impl Engine {
                 until_unix: Some(until),
             });
         })?;
-        Ok(until)
+        Ok((until, known))
     }
 
     /// Show finding `id` again. False when it was not dismissed.
@@ -1701,6 +1817,8 @@ impl Engine {
         &self,
         f: impl FnOnce(&mut Vec<crate::config::Dismissal>),
     ) -> Result<(), (&'static str, String)> {
+        self.may_write_config()
+            .map_err(|e| ("not_lock_holder", e.to_string()))?;
         if let Some(e) = self.config_error() {
             return Err((
                 "config_not_loaded",

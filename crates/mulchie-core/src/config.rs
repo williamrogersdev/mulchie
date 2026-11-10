@@ -604,6 +604,9 @@ pub enum ConfigError {
     /// The file changed on disk since this engine loaded or wrote it; the
     /// change was not saved, and the engine now uses the file's content.
     Changed(String),
+    /// This engine does not hold the engine lock: only the running engine
+    /// writes the config (send the change to its API instead).
+    NotLockHolder(String),
 }
 
 impl std::fmt::Display for ConfigError {
@@ -613,6 +616,7 @@ impl std::fmt::Display for ConfigError {
             ConfigError::Invalid(v) => write!(f, "config has invalid values: {}", v.join("; ")),
             ConfigError::Io(e) => write!(f, "config file error: {e}"),
             ConfigError::Changed(e) => write!(f, "config file changed on disk: {e}"),
+            ConfigError::NotLockHolder(e) => write!(f, "config not saved: {e}"),
         }
     }
 }

@@ -89,6 +89,7 @@ pub const ROUTES: &[(&str, &str)] = &[
     ("GET", "/v1/process/{pid}"),
     ("GET", "/v1/config"),
     ("PUT", "/v1/config"),
+    ("PATCH", "/v1/config"),
 ];
 
 // ------------------------------------------------------------------ token
@@ -1129,10 +1130,11 @@ fn route(req: &Req, engine: &Engine, read_only: bool) -> Resp {
             }
             ("POST", "/v1/findings/dismiss") => {
                 let b: DismissBody = body(req)?;
-                match engine.dismiss_finding(&b.id, b.days) {
-                    Ok(until) => {
-                        ok(&serde_json::json!({ "ok": true, "id": b.id, "until_unix": until }))
-                    }
+                match engine.dismiss_finding_known(&b.id, b.days) {
+                    Ok((until, known)) => ok(&serde_json::json!({
+                        "ok": true, "id": b.id, "until_unix": until, "known": known,
+                    })),
+                    Err((code @ "not_lock_holder", m)) => fail(409, code, m),
                     Err((code, m)) => fail(400, code, m),
                 }
             }
@@ -1142,6 +1144,7 @@ fn route(req: &Req, engine: &Engine, read_only: bool) -> Resp {
                     Ok(was) => {
                         ok(&serde_json::json!({ "ok": true, "id": b.id, "was_dismissed": was }))
                     }
+                    Err((code @ "not_lock_holder", m)) => fail(409, code, m),
                     Err((code, m)) => fail(400, code, m),
                 }
             }
@@ -1163,6 +1166,22 @@ fn route(req: &Req, engine: &Engine, read_only: bool) -> Resp {
                     Ok(()) => ok(&serde_json::json!({ "ok": true, "config": engine.config() })),
                     Err(e @ crate::config::ConfigError::Changed(_)) => {
                         fail(409, "config_changed", e.to_string())
+                    }
+                    Err(e @ crate::config::ConfigError::NotLockHolder(_)) => {
+                        fail(409, "not_lock_holder", e.to_string())
+                    }
+                    Err(e) => fail(400, "invalid_config", e.to_string()),
+                }
+            }
+            ("PATCH", "/v1/config") => {
+                let patch: serde_json::Value = body(req)?;
+                match engine.patch_config(&patch) {
+                    Ok(cfg) => ok(&serde_json::json!({ "ok": true, "config": cfg })),
+                    Err(e @ crate::config::ConfigError::NotLockHolder(_)) => {
+                        fail(409, "not_lock_holder", e.to_string())
+                    }
+                    Err(e @ crate::config::ConfigError::Io(_)) => {
+                        fail(500, "config_io", e.to_string())
                     }
                     Err(e) => fail(400, "invalid_config", e.to_string()),
                 }
