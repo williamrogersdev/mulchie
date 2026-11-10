@@ -1036,9 +1036,48 @@ fn nested_repositories_block_removal() {
     assert_eq!(reason(&r), Some(SkipReason::NestedRepo), "{r:?}");
     assert!(format!("{r:?}").contains("notes/deep/clone"), "{r:?}");
 
-    // A repo inside an ignored cache directory is a cache, as before.
+    // R2: location never exempts a nested repository. An ignored `build/`
+    // holding a repo with an unpushed commit and an untracked file blocks.
     std::fs::remove_dir_all(wt.join("notes")).unwrap();
-    std::fs::create_dir_all(wt.join("node_modules/dep/.git")).unwrap();
+    std::fs::write(wt.join(".gitignore"), "build/\nnode_modules/\n").unwrap();
+    let nested = wt.join("build/gen");
+    std::fs::create_dir_all(&nested).unwrap();
+    env.git(&nested, &["init", "-q", "-b", "main"]);
+    std::fs::write(nested.join("work.txt"), "unpushed").unwrap();
+    env.git(&nested, &["add", "-A"]);
+    env.git(&nested, &["commit", "-q", "-m", "local only"]);
+    std::fs::write(nested.join("scratch.txt"), "untracked").unwrap();
+    let r = env
+        .gate()
+        .execute_one(&env.remove_req(&wt, &env.head(&wt)), "t");
+    assert_eq!(reason(&r), Some(SkipReason::NestedRepo), "{r:?}");
+    assert!(nested.join("work.txt").exists());
+    std::fs::remove_dir_all(wt.join("build")).unwrap();
+
+    // A dependency cloned from a remote with nothing local is disposable...
+    let upstream = env._t.path().join("upstream-dep");
+    std::fs::create_dir_all(&upstream).unwrap();
+    env.git(&upstream, &["init", "-q", "-b", "main"]);
+    std::fs::write(upstream.join("index.js"), "x").unwrap();
+    env.git(&upstream, &["add", "-A"]);
+    env.git(&upstream, &["commit", "-q", "-m", "dep"]);
+    std::fs::create_dir_all(wt.join("node_modules")).unwrap();
+    env.git(
+        &wt.join("node_modules"),
+        &["clone", "-q", upstream.to_str().unwrap(), "dep"],
+    );
+    let dep = wt.join("node_modules/dep");
+    // ...but not with a local commit that is on no remote.
+    std::fs::write(dep.join("patch.js"), "local fix").unwrap();
+    env.git(&dep, &["add", "-A"]);
+    env.git(&dep, &["commit", "-q", "-m", "local fix"]);
+    let r = env
+        .gate()
+        .execute_one(&env.remove_req(&wt, &env.head(&wt)), "t");
+    assert_eq!(reason(&r), Some(SkipReason::NestedRepo), "{r:?}");
+    assert!(format!("{r:?}").contains("on none of its remotes"), "{r:?}");
+    env.git(&dep, &["reset", "-q", "--hard", "origin/main"]);
+    // Clean, no stash, everything on the remote: removable.
     let r = env
         .gate()
         .execute_one(&env.remove_req(&wt, &env.head(&wt)), "t");

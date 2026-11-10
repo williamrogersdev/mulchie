@@ -2156,16 +2156,14 @@ fn initialized_submodule(paths: &Paths, wt: &Path) -> Result<Option<String>, Ski
 
 /// At most this many directory entries are looked at for nested repositories;
 /// more than that and the check cannot complete, which is a skip.
-const NESTED_SCAN_BUDGET: usize = 200_000;
-
-fn is_cache_component(c: &std::ffi::OsStr) -> bool {
-    KNOWN_CACHE_DIRS.iter().any(|k| c == *k)
-}
+const NESTED_SCAN_BUDGET: usize = 1_000_000;
 
 /// A git repository inside `wt` that removing the worktree would destroy: a
 /// gitlink in the index whose directory holds a `.git`, or a `.git` (directory
-/// or file) at any depth under an untracked or ignored entry. Ignored entries
-/// under a [`KNOWN_CACHE_DIRS`] directory are not archived and not looked at.
+/// or file) at any depth under an untracked or ignored entry that is not
+/// provably disposable (see [`nested_disposable`]). Where the repository sits
+/// never exempts it: one inside an ignored `build/` or `node_modules/` is
+/// checked like any other. Returns the repository and why it blocks.
 fn nested_repo(paths: &Paths, wt: &Path) -> Result<Option<String>, Skip> {
     // Gitlinks recorded in the index, with or without `.gitmodules`.
     let staged = Git::new(paths, wt)
@@ -2191,35 +2189,17 @@ fn nested_repo(paths: &Paths, wt: &Path) -> Result<Option<String>, Skip> {
         .args(["ls-files", "-z", "--others", "--directory"])
         .run()
         .map_err(Gate::git_skip)?;
-    let ignored = Git::new(paths, wt)
-        .args([
-            "ls-files",
-            "-z",
-            "--others",
-            "--ignored",
-            "--exclude-standard",
-            "--directory",
-        ])
-        .run()
-        .map_err(Gate::git_skip)?;
-    let ignored: std::collections::HashSet<&[u8]> = ignored
-        .stdout
-        .split(|b| *b == 0)
-        .filter(|r| !r.is_empty())
-        .collect();
     let mut budget = NESTED_SCAN_BUDGET;
+    let mut found: Vec<PathBuf> = Vec::new();
     for raw in out.stdout.split(|b| *b == 0) {
         if raw.is_empty() {
             continue;
         }
         use std::os::unix::ffi::OsStrExt;
         let rel = Path::new(std::ffi::OsStr::from_bytes(raw));
-        let is_ignored = ignored.contains(raw);
-        if is_ignored && rel.components().any(|c| is_cache_component(c.as_os_str())) {
-            continue;
-        }
         if rel.file_name().is_some_and(|n| n == ".git") {
-            return Ok(Some(rel.display().to_string()));
+            found.push(wt.join(rel).parent().unwrap_or(wt).to_path_buf());
+            continue;
         }
         let abs = wt.join(rel);
         let Ok(m) = std::fs::symlink_metadata(&abs) else {
@@ -2242,27 +2222,77 @@ fn nested_repo(paths: &Paths, wt: &Path) -> Result<Option<String>, Skip> {
                 if budget == 0 {
                     return skip(
                         SkipReason::NestedRepo,
-                        "too many untracked files to check for nested repositories",
+                        "too many untracked or ignored files to check for nested repositories",
                     );
                 }
                 let name = e.file_name();
                 if name == ".git" {
-                    let p = e.path();
-                    let shown = p
-                        .parent()
-                        .and_then(|p| p.strip_prefix(wt).ok())
-                        .map(|p| p.display().to_string())
-                        .unwrap_or_default();
-                    return Ok(Some(shown));
+                    found.push(d.clone());
+                    if found.len() > MAX_NESTED_REPOS {
+                        return skip(
+                            SkipReason::NestedRepo,
+                            format!(
+                                "more than {MAX_NESTED_REPOS} nested repositories; too many to verify"
+                            ),
+                        );
+                    }
+                    continue;
                 }
                 let Ok(ft) = e.file_type() else { continue };
-                if ft.is_dir() && !(is_ignored && is_cache_component(&name)) {
+                if ft.is_dir() {
                     stack.push(e.path());
                 }
             }
         }
     }
+    for repo in found {
+        if let Err(why) = nested_disposable(paths, &repo) {
+            let shown = repo
+                .strip_prefix(wt)
+                .map(|p| p.display().to_string())
+                .unwrap_or_else(|_| repo.display().to_string());
+            return Ok(Some(format!("{shown} ({why})")));
+        }
+    }
     Ok(None)
+}
+
+/// Nested repositories verified per worktree; more is a skip.
+const MAX_NESTED_REPOS: usize = 32;
+
+/// A nested repository is disposable only when nothing in it exists anywhere
+/// else would be lost: a clean working tree (no changes, no untracked files),
+/// no stashes, and every commit reachable from one of its remotes' refs.
+/// Anything that cannot be checked (a `.git` file pointing elsewhere, git
+/// failing) is not disposable.
+fn nested_disposable(paths: &Paths, repo: &Path) -> Result<(), String> {
+    let git = |args: &[&str]| -> Result<Vec<u8>, String> {
+        let o = Git::new(paths, repo)
+            .args(args.iter().copied())
+            .run()
+            .map_err(|e| format!("git could not read it: {e}"))?;
+        Ok(o.stdout)
+    };
+    // The repository git sees must be this directory, not an enclosing one.
+    let top = git(&["rev-parse", "--show-toplevel"])?;
+    let top = PathBuf::from(String::from_utf8_lossy(&top).trim());
+    let same = match (top.canonicalize(), repo.canonicalize()) {
+        (Ok(a), Ok(b)) => a == b,
+        _ => false,
+    };
+    if !same {
+        return Err("git does not read it as its own repository".into());
+    }
+    if !git(&["status", "--porcelain", "--untracked-files=all"])?.is_empty() {
+        return Err("it has uncommitted changes or untracked files".into());
+    }
+    if !git(&["stash", "list"])?.is_empty() {
+        return Err("it has stashes".into());
+    }
+    if !git(&["rev-list", "--all", "--not", "--remotes", "--max-count=1"])?.is_empty() {
+        return Err("it has commits that are on none of its remotes".into());
+    }
+    Ok(())
 }
 
 /// Files marked skip-worktree (`S`) or assume-unchanged (a lowercase tag) whose
