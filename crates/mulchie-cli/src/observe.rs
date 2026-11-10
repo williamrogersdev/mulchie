@@ -575,6 +575,22 @@ pub fn set_key(cfg: &Value, key: &str, raw: &str) -> Result<Value, String> {
     Ok(new)
 }
 
+/// The value of `key` in the config the engine saved. An older engine drops
+/// keys it does not know, so a missing key means the setting did not take.
+pub fn saved_value<'a>(saved: &'a Value, key: &str) -> Result<&'a Value, String> {
+    let parts: Vec<&str> = key.split('.').collect();
+    if !cfg_has_path(saved, &parts) {
+        return Err(format!(
+            "the engine does not know `{key}`, so it was not saved; update the engine (and restart it) to use this setting"
+        ));
+    }
+    let mut got = saved;
+    for p in parts {
+        got = &got[p];
+    }
+    Ok(got)
+}
+
 /// How often, and how far apart, `config set` tries for the engine lock.
 const LOCK_TRIES: usize = 15;
 const LOCK_WAIT: std::time::Duration = std::time::Duration::from_millis(200);
@@ -710,10 +726,10 @@ fn config_set_with(
             held_by.unwrap_or_else(|| "another process".into())
         ));
     };
-    let mut got = &saved;
-    for p in key.split('.') {
-        got = &got[p];
-    }
+    let got = match saved_value(&saved, key) {
+        Ok(v) => v,
+        Err(e) => return fail(e),
+    };
     if json_out {
         let mut m = Map::new();
         m.insert("ok".into(), json!(true));
@@ -790,6 +806,20 @@ mod tests {
         // The engine saved it; a direct write would not have reached it.
         assert_ne!(std::fs::read(paths.config_file()).unwrap(), before);
         server.stop();
+    }
+
+    #[test]
+    fn a_key_the_engine_dropped_is_not_reported_as_saved() {
+        let saved = json!({ "worktree_idle_days": 9, "guard": { "rules": {} } });
+        assert_eq!(
+            saved_value(&saved, "worktree_idle_days").unwrap(),
+            &json!(9)
+        );
+        let e = saved_value(&saved, "guard.rules.sudo").unwrap_err();
+        assert!(e.contains("does not know `guard.rules.sudo`"), "{e}");
+        // A key set to null is still a key the engine kept.
+        let saved = json!({ "limits": { "default": null } });
+        assert!(saved_value(&saved, "limits.default").unwrap().is_null());
     }
 
     #[test]
