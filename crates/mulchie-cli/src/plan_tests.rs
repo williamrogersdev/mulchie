@@ -369,3 +369,24 @@ fn empty_plans_do_nothing() {
     let v: serde_json::Value = serde_json::from_str(&c.out).unwrap();
     assert_eq!(v["executed"], false);
 }
+
+#[test]
+fn local_execute_holds_the_engine_lock() {
+    let env = Env::new();
+    let a = env.cache("a");
+    let job = Job::CleanPaths(vec![a.clone()]);
+    let local = Backend::Local(env.engine());
+    let plan = local.plan(&job).unwrap();
+    // An engine that started after the plan was made holds the lock.
+    let other = env.engine();
+    let held = other.acquire_lock().unwrap();
+    let err = local.execute(&job, &plan.approved()).unwrap_err();
+    assert!(err.contains("nothing was changed"), "{err}");
+    assert!(a.exists());
+    drop(held);
+    let r = local.execute(&job, &plan.approved()).unwrap();
+    assert!(r[0].is_done(), "{r:?}");
+    assert!(!a.exists());
+    // Released afterwards.
+    drop(other.acquire_lock().unwrap());
+}

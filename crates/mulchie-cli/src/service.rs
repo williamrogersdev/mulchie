@@ -10,6 +10,7 @@ use crate::commands::print_json;
 use mulchie_core::{lock, Paths};
 use serde_json::json;
 use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
 
 pub const LAUNCHD_TEMPLATE: &str = include_str!("../service/dev.mulchie.serve.plist");
 pub const SYSTEMD_TEMPLATE: &str = include_str!("../service/mulchie.service");
@@ -154,8 +155,32 @@ fn uid() -> u32 {
     unsafe { libc::getuid() }
 }
 
-fn install_cmds(platform: Platform, file: &Path, reload: bool) -> Vec<Vec<String>> {
-    let s = |v: &[&str]| v.iter().map(|x| x.to_string()).collect::<Vec<_>>();
+/// How long to wait for launchd to finish unloading the old job.
+const UNLOAD_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// One step of installing.
+#[derive(Debug, PartialEq)]
+enum Step {
+    Run(Vec<String>),
+    /// Wait until launchd no longer has the job: `bootout` returns before
+    /// the old job is torn down, and an immediate `bootstrap` can fail.
+    WaitUnloaded,
+}
+
+impl Step {
+    fn show(&self) -> String {
+        match self {
+            Step::Run(c) => show_cmd(c),
+            Step::WaitUnloaded => format!(
+                "(wait up to {} s until launchd no longer lists {LAUNCHD_LABEL})",
+                UNLOAD_TIMEOUT.as_secs()
+            ),
+        }
+    }
+}
+
+fn install_cmds(platform: Platform, file: &Path, reload: bool) -> Vec<Step> {
+    let s = |v: &[&str]| Step::Run(v.iter().map(|x| x.to_string()).collect::<Vec<_>>());
     match platform {
         Platform::Launchd => {
             let mut v = Vec::new();
@@ -165,6 +190,7 @@ fn install_cmds(platform: Platform, file: &Path, reload: bool) -> Vec<Vec<String
                     "bootout",
                     &format!("gui/{}/{LAUNCHD_LABEL}", uid()),
                 ]));
+                v.push(Step::WaitUnloaded);
             }
             v.push(s(&[
                 "launchctl",
@@ -179,6 +205,24 @@ fn install_cmds(platform: Platform, file: &Path, reload: bool) -> Vec<Vec<String
             s(&["systemctl", "--user", "enable", SYSTEMD_UNIT]),
             s(&["systemctl", "--user", "restart", SYSTEMD_UNIT]),
         ],
+    }
+}
+
+/// Poll `still_there` until it says false or `timeout` passes; true when gone.
+fn wait_until_gone(
+    mut still_there: impl FnMut() -> bool,
+    timeout: Duration,
+    every: Duration,
+) -> bool {
+    let until = Instant::now() + timeout;
+    loop {
+        if !still_there() {
+            return true;
+        }
+        if Instant::now() >= until {
+            return false;
+        }
+        std::thread::sleep(every);
     }
 }
 
@@ -339,7 +383,7 @@ fn install(paths: &Paths, platform: Platform, force: bool, dry_run: bool) -> i32
         }
         println!("\nWould run:");
         for c in &cmds {
-            println!("  {}", show_cmd(c));
+            println!("  {}", c.show());
         }
         return 0;
     }
@@ -359,7 +403,27 @@ fn install(paths: &Paths, platform: Platform, force: bool, dry_run: bool) -> i32
         }
         println!("Wrote {}", file.display());
     }
-    for c in &cmds {
+    for step in &cmds {
+        let c = match step {
+            Step::Run(c) => c,
+            Step::WaitUnloaded => {
+                let gone = wait_until_gone(
+                    || loaded(platform).unwrap_or(false),
+                    UNLOAD_TIMEOUT,
+                    Duration::from_millis(200),
+                );
+                if !gone {
+                    eprintln!(
+                        "mulchie: launchd still lists the old {LAUNCHD_LABEL} job after {} s, so the new one was not loaded. \
+                         The new file is written; run `mulchie service install` again in a moment, or check `launchctl print gui/{}/{LAUNCHD_LABEL}`.",
+                        UNLOAD_TIMEOUT.as_secs(),
+                        uid()
+                    );
+                    return 1;
+                }
+                continue;
+            }
+        };
         // `bootout` of a job that is not loaded fails harmlessly.
         let r = run_cmd(c);
         match r {
@@ -643,5 +707,40 @@ mod tests {
         assert_eq!(shell_quote("gui/501"), "gui/501");
         assert_eq!(shell_quote("/a b"), "'/a b'");
         assert_eq!(systemd_word("/a/$x"), "/a/$$x");
+    }
+
+    #[test]
+    fn reload_waits_for_the_old_job_before_bootstrap() {
+        let f = Path::new("/h/Library/LaunchAgents/dev.mulchie.serve.plist");
+        let steps = install_cmds(Platform::Launchd, f, true);
+        assert!(matches!(&steps[0], Step::Run(c) if c[1] == "bootout"));
+        assert_eq!(steps[1], Step::WaitUnloaded);
+        assert!(matches!(&steps[2], Step::Run(c) if c[1] == "bootstrap"));
+        assert!(steps[1].show().contains("wait up to 5 s"));
+        // Nothing loaded: no bootout, no wait.
+        let steps = install_cmds(Platform::Launchd, f, false);
+        assert_eq!(steps.len(), 1);
+        assert!(!install_cmds(Platform::Systemd, f, true).contains(&Step::WaitUnloaded));
+    }
+
+    #[test]
+    fn waiting_for_unload_is_bounded() {
+        let mut n = 0;
+        assert!(wait_until_gone(
+            || {
+                n += 1;
+                n < 3
+            },
+            Duration::from_secs(5),
+            Duration::from_millis(1)
+        ));
+        assert_eq!(n, 3);
+        let started = Instant::now();
+        assert!(!wait_until_gone(
+            || true,
+            Duration::from_millis(50),
+            Duration::from_millis(5)
+        ));
+        assert!(started.elapsed() < Duration::from_secs(1));
     }
 }

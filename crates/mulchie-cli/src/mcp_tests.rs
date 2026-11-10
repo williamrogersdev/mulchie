@@ -784,10 +784,8 @@ fn modern_requests() {
         .as_array()
         .unwrap()
         .contains(&json!(MODERN_VERSION)));
-    assert!(res["supportedVersions"]
-        .as_array()
-        .unwrap()
-        .contains(&json!("2025-06-18")));
+    // Only versions this `_meta` path accepts, so no dual-era loop.
+    assert_eq!(res["supportedVersions"], json!([MODERN_VERSION]));
     assert!(res["capabilities"]["tools"].is_object());
     assert!(res["capabilities"]["prompts"].is_object());
     assert_eq!(res["_meta"][META_SERVER]["name"], "mulchie");
@@ -806,7 +804,13 @@ fn modern_requests() {
     let r = one(&f, req(3, "tools/list", p));
     assert_eq!(r["error"]["code"], UNSUPPORTED_VERSION);
     assert_eq!(r["error"]["data"]["requested"], "2099-01-01");
-    assert!(r["error"]["data"]["supported"].is_array());
+    assert_eq!(r["error"]["data"]["supported"], json!([MODERN_VERSION]));
+    // A legacy version in `_meta` is not offered back as supported.
+    let mut p = modern_meta();
+    p["_meta"][META_VERSION] = json!("2025-11-25");
+    let r = one(&f, req(6, "tools/list", p));
+    assert_eq!(r["error"]["code"], UNSUPPORTED_VERSION);
+    assert_eq!(r["error"]["data"]["supported"], json!([MODERN_VERSION]));
 
     // Missing required _meta field.
     let mut p = modern_meta();
@@ -876,4 +880,27 @@ fn against_a_real_engine() {
     assert_eq!(r["result"]["isError"], false);
     assert!(engine.snapshot_state().slots.active.is_empty());
     server.stop();
+}
+
+#[test]
+fn prune_cache_previews_by_default() {
+    let f = Fake::default()
+        .with(
+            "GET /v1/state",
+            json!({ "diskmap": { "categories": [
+                { "key": "npm", "name": "npm", "path": "/h/.npm", "bytes": 3_000_000_000u64, "hint": "npm cache clean", "prunable": true }
+            ] } }),
+        )
+        .with("POST /v1/prune", json!({ "ok": true, "freed": 1 }));
+    let v = result(&one(&f, call(1, "prune_cache", json!({ "key": "npm" }))));
+    assert_eq!(v["preview"], true);
+    assert_eq!(v["path"], "/h/.npm");
+    assert!(f.posted("/v1/prune").is_empty(), "a preview must not prune");
+    let r = one(&f, call(2, "prune_cache", json!({ "key": "nope" })));
+    assert_eq!(r["result"]["isError"], true);
+    result(&one(
+        &f,
+        call(3, "prune_cache", json!({ "key": "npm", "execute": true })),
+    ));
+    assert_eq!(f.posted("/v1/prune"), vec![json!({ "key": "npm" })]);
 }

@@ -416,6 +416,7 @@ pub fn build(state: &Value, advice: &Value, origin: Origin) -> Value {
             gain_bytes: Some(u(c, "bytes")),
             gain: format!("up to {}", sz(u(c, "bytes"))),
             risk: "low",
+            // A preview: nothing runs until prune_cache is called again with execute=true.
             next_call: call("prune_cache", json!({ "key": c["key"] })),
             command: Some(format!("mulchie prune {}", c["key"].as_str().unwrap_or(""))),
         });
@@ -506,7 +507,7 @@ fn finish(
         "health": health,
         "engine_problems": problems,
         "recommendations": recs.iter().map(Rec::to_json).collect::<Vec<_>>(),
-        "safety": "Recommendations that change things start with a plan call; nothing is deleted until execute_plan is called with items from that plan, and each item is re-checked first. Worktree removals save uncommitted work as a patch and keep branches.",
+        "safety": "Every next_call here changes nothing. Caches and worktrees are deleted only by execute_plan with items from a plan the user saw, and each item is re-checked first; worktree removals save uncommitted work as a patch and keep branches. prune_cache, workspace_action and process_action only preview until called again with execute=true, after the user agrees.",
     });
     if let (Some(r), Some(o)) = (rest, out.as_object_mut()) {
         for (k, v) in r.as_object().cloned().unwrap_or_default() {
@@ -716,6 +717,10 @@ mod tests {
             |r| r["id"] == "prune_package_cache" && r["next_call"]["arguments"]["key"] == "npm"
         ));
         for r in recs {
+            // A next call only ever looks or previews.
+            let args = &r["next_call"]["arguments"];
+            assert!(args.get("execute").is_none(), "{r}");
+            assert_ne!(r["next_call"]["name"], "execute_plan", "{r}");
             assert!(r["reason"].as_str().unwrap().len() > 10);
             assert!(["none", "low", "medium", "high"].contains(&r["risk"].as_str().unwrap()));
         }

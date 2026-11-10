@@ -85,7 +85,15 @@ impl Backend {
                 serde_json::from_value(v)
                     .map_err(|e| format!("unexpected results from the engine: {e}"))
             }
-            Backend::Local(e) => Ok(e.execute(items, "cli")),
+            Backend::Local(e) => {
+                // Hold the engine lock while acting, so an engine (the app
+                // or `mulchie serve`) cannot start and act on the same items
+                // at the same time. The lock is released when this returns.
+                let _lock = e.acquire_lock().map_err(|err| {
+                    format!("{err}; nothing was changed. Run the command again so it goes through that engine")
+                })?;
+                Ok(e.execute(items, "cli"))
+            }
         }
     }
 }

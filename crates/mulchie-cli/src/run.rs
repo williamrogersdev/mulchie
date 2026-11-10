@@ -147,16 +147,50 @@ fn queue(client: Client, label: &str) -> Queued {
     }
 }
 
+/// The queue label every agent can see: the directory name, the program's
+/// name and at most one plain word after it (a subcommand such as `build`).
+/// Flags, values that follow flags, paths and URLs are never included, so
+/// tokens on the command line do not leak.
 fn default_label(cmd: &[String]) -> String {
     let cwd = std::env::current_dir()
         .ok()
         .and_then(|d| d.file_name().map(|n| n.to_string_lossy().to_string()))
         .unwrap_or_default();
-    let mut c = cmd.join(" ");
-    if c.chars().count() > 120 {
-        c = c.chars().take(119).collect::<String>() + "…";
+    format!("{cwd}: {}", command_label(cmd))
+}
+
+fn command_label(cmd: &[String]) -> String {
+    let Some((program, rest)) = cmd.split_first() else {
+        return String::new();
+    };
+    let name = std::path::Path::new(program)
+        .file_name()
+        .map(|n| n.to_string_lossy().to_string())
+        .unwrap_or_default();
+    let plain = |a: &str| {
+        (1..=32).contains(&a.len())
+            && a.chars()
+                .all(|c| c.is_ascii_alphanumeric() || "._:-".contains(c))
+    };
+    let mut after_flag = false;
+    let mut word = None;
+    for a in rest {
+        if a.starts_with('-') {
+            // `--x=v` carries its value; `--x v` may be followed by one.
+            after_flag = !a.contains('=');
+            continue;
+        }
+        if !after_flag {
+            word = Some(a.as_str()).filter(|a| plain(a));
+            break;
+        }
+        after_flag = false;
     }
-    format!("{cwd}: {c}")
+    let name: String = name.chars().take(64).collect();
+    match word {
+        Some(w) => format!("{name} {w}"),
+        None => name,
+    }
 }
 
 pub fn run(paths: &Paths, args: &RunArgs) -> i32 {
@@ -203,7 +237,14 @@ pub fn run(paths: &Paths, args: &RunArgs) -> i32 {
     code
 }
 
+/// How long a terminal's own SIGINT gets to stop the child before ours.
+const SIGINT_GRACE: Duration = Duration::from_millis(100);
+
 fn spawn_and_wait(cmd: &mut Command, program: &str) -> i32 {
+    wait_forwarding(cmd, program, tty_delivers_sigint)
+}
+
+fn wait_forwarding(cmd: &mut Command, program: &str, tty: impl Fn() -> bool) -> i32 {
     // A signal that arrived before the child existed still applies to it.
     let mut child = match cmd.spawn() {
         Ok(c) => c,
@@ -216,9 +257,14 @@ fn spawn_and_wait(cmd: &mut Command, program: &str) -> i32 {
         }
     };
     let pid = child.id() as libc::pid_t;
+    // A SIGINT that the terminal probably also sent to the child: forwarded
+    // only if the child is still running after SIGINT_GRACE, so a
+    // `kill -INT` aimed at this process alone still reaches it.
+    let mut held_int: Option<Instant> = None;
     loop {
         for sig in take_pending() {
-            if sig == libc::SIGINT && tty_delivers_sigint() {
+            if sig == libc::SIGINT && tty() {
+                held_int.get_or_insert_with(Instant::now);
                 continue;
             }
             unsafe {
@@ -227,7 +273,15 @@ fn spawn_and_wait(cmd: &mut Command, program: &str) -> i32 {
         }
         match child.try_wait() {
             Ok(Some(st)) => return exit_code(st),
-            Ok(None) => std::thread::sleep(Duration::from_millis(25)),
+            Ok(None) => {
+                if held_int.is_some_and(|t| t.elapsed() >= SIGINT_GRACE) {
+                    held_int = None;
+                    unsafe {
+                        libc::kill(pid, libc::SIGINT);
+                    }
+                }
+                std::thread::sleep(Duration::from_millis(25))
+            }
             Err(e) => {
                 eprintln!("mulchie: lost track of {program}: {e}");
                 return 1;
@@ -261,5 +315,47 @@ mod tests {
     fn label_is_bounded() {
         let long: Vec<String> = (0..100).map(|i| format!("arg{i}")).collect();
         assert!(default_label(&long).chars().count() < 200);
+    }
+
+    fn label(c: &[&str]) -> String {
+        command_label(&c.iter().map(|s| s.to_string()).collect::<Vec<_>>())
+    }
+
+    #[test]
+    fn label_never_carries_flag_values_or_paths() {
+        assert_eq!(label(&["cargo", "build", "--release"]), "cargo build");
+        assert_eq!(label(&["/usr/bin/make", "-j8"]), "make");
+        assert_eq!(
+            label(&["npm", "--token", "SECRET", "publish"]),
+            "npm publish"
+        );
+        assert_eq!(label(&["deploy", "--key=SECRET", "prod"]), "deploy prod");
+        assert_eq!(label(&["curl", "https://user:SECRET@host/x"]), "curl");
+        assert_eq!(label(&["sh", "-c", "export T=SECRET; make"]), "sh");
+        assert_eq!(label(&["env", "TOKEN=SECRET", "cargo"]), "env");
+        for l in [
+            label(&["npm", "--token", "SECRET", "publish"]),
+            label(&["x", "-p", "SECRET"]),
+        ] {
+            assert!(!l.contains("SECRET"), "{l}");
+        }
+    }
+
+    #[test]
+    fn a_sigint_for_this_process_alone_still_reaches_the_child() {
+        // As if a terminal owned us but only this process got the SIGINT.
+        let mut c = Command::new("sh");
+        c.args([
+            "-c",
+            "trap 'exit 3' INT; i=0; while [ $i -lt 200 ]; do sleep 0.02; i=$((i+1)); done; exit 9",
+        ]);
+        let t = std::thread::spawn(|| {
+            std::thread::sleep(Duration::from_millis(300));
+            on_signal(libc::SIGINT);
+        });
+        let started = Instant::now();
+        assert_eq!(wait_forwarding(&mut c, "sh", || true), 3);
+        assert!(started.elapsed() < Duration::from_secs(3));
+        t.join().unwrap();
     }
 }

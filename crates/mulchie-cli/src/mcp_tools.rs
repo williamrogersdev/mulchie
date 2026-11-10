@@ -152,7 +152,7 @@ pub fn tool_list() -> Vec<Tool> {
         Tool {
             name: "execute_plan",
             title: "Execute approved plan items",
-            description: "Carry out items from a plan made by plan_cache_cleanup, plan_worktree_removal or plan_worktree_sweep in this session. items must be targets of ready items in that plan; anything else is refused. Only call this after the user has seen the plan and approved these items. Each item is re-checked just before it runs and skipped if anything changed. The result lists what was done, what was skipped and why, every backup with its path, and how to restore. A plan can be executed once and expires after 30 minutes.",
+            description: "Carry out items from a plan made by plan_cache_cleanup, plan_worktree_removal or plan_worktree_sweep on this server. Plans are kept in this server process's memory, so they are lost if the server restarts. items must be targets of ready items in that plan; anything else is refused. Only call this after the user has seen the plan and approved these items. Each item is re-checked just before it runs and skipped if anything changed. The result lists what was done, what was skipped and why, every backup with its path, and how to restore. A plan can be executed once and expires after 30 minutes.",
             props: json!({
                 "plan_id": { "type": "string", "description": "From the plan tool's result" },
                 "items": { "type": "array", "items": { "type": "string" }, "minItems": 1, "description": "Targets of the approved ready items" }
@@ -165,8 +165,11 @@ pub fn tool_list() -> Vec<Tool> {
         Tool {
             name: "prune_cache",
             title: "Prune a package manager cache",
-            description: "Run a package manager's own prune command for one cache key from disk_breakdown or diagnose (npm, bun, pnpm, yarn, uv, pip, homebrew, go, simulators). The tool re-downloads anything it needs later. Refused while that tool is running. Ask the user first.",
-            props: json!({ "key": { "type": "string", "description": "The cache key" } }),
+            description: "Run a package manager's own prune command for one cache key from disk_breakdown or diagnose (npm, bun, pnpm, yarn, uv, pip, homebrew, go, simulators). Without execute=true it only shows the cache, its size and what pruning does; show that to the user and call again with execute=true only if they agree. The package manager re-downloads anything it needs later. Refused while that tool is running.",
+            props: json!({
+                "key": { "type": "string", "description": "The cache key" },
+                "execute": { "type": "boolean", "description": "Prune, instead of only showing what would be pruned" }
+            }),
             required: &["key"],
             read_only: false,
             destructive: true,
@@ -341,7 +344,7 @@ struct StoredPlan {
     items: Vec<Value>,
 }
 
-/// Plans shown in this session, by id. Execution needs one of these.
+/// Plans shown by this server process, by id (in memory only). Execution needs one of these.
 #[derive(Default)]
 pub struct Plans {
     map: HashMap<String, StoredPlan>,
@@ -490,7 +493,7 @@ fn execute(api: &dyn Api, plans: &mut Plans, a: &Map<String, Value>) -> ToolResu
     let id = a.get("plan_id").and_then(Value::as_str).unwrap_or("");
     let Some(plan) = plans.take(id) else {
         return Err(format!(
-            "no plan {id:?} in this session (plans can be executed once); make a new plan with plan_cache_cleanup, plan_worktree_removal or plan_worktree_sweep"
+            "no plan {id:?} on this server: plans live in this server process's memory, are lost when it restarts, and can be executed once; make a new plan with plan_cache_cleanup, plan_worktree_removal or plan_worktree_sweep"
         ));
     };
     if plan.created.elapsed() > PLAN_TTL {
@@ -741,7 +744,40 @@ pub fn call_tool(cx: &mut Ctx, name: &str, a: &Map<String, Value>) -> ToolResult
             Ok(present(cx.plans, PlanKind::Sweep, plan, cx.read_only))
         }
         "execute_plan" => execute(api, cx.plans, a),
-        "prune_cache" => post("/v1/prune", json!({ "key": arg("key") })),
+        "prune_cache" => {
+            if !flag("execute") {
+                let st = get("/v1/state")?;
+                let key = arg("key");
+                let cats = st["diskmap"]["categories"]
+                    .as_array()
+                    .cloned()
+                    .unwrap_or_default();
+                let Some(c) = cats.iter().find(|c| c["key"] == key) else {
+                    let known: Vec<&str> = cats.iter().filter_map(|c| c["key"].as_str()).collect();
+                    return Err(format!(
+                        "no cache with key {key}; known keys: {}",
+                        if known.is_empty() {
+                            "none yet (the engine has not mapped the disk)".into()
+                        } else {
+                            known.join(", ")
+                        }
+                    ));
+                };
+                if c["prunable"] == false {
+                    return Err(format!("{key} has no prune command Mulchie can run"));
+                }
+                return Ok(json!({
+                    "preview": true,
+                    "key": key,
+                    "name": c["name"],
+                    "path": c["path"],
+                    "size": human_bytes(c["bytes"].as_u64().unwrap_or(0)),
+                    "what_pruning_does": c["hint"],
+                    "next": "Nothing was done. Show this to the user; if they agree, call prune_cache again with execute=true.",
+                }));
+            }
+            post("/v1/prune", json!({ "key": arg("key") }))
+        }
         "workspace_action" => {
             if !flag("execute") {
                 let st = get("/v1/state")?;

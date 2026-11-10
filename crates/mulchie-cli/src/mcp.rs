@@ -58,8 +58,8 @@ before it runs. Before a worktree is removed, uncommitted changes are saved as a
 non-cache files as a tar.gz archive, and a detached HEAD on a backup/<name> branch, all under \
 Mulchie's backups directory; execute_plan's result lists each backup's path and how to restore. \
 Branches are never deleted. Build caches are not backed up: the next build recreates them. \
-workspace_action and process_action only preview unless execute=true; ask the user before \
-executing them or prune_cache. \
+prune_cache, workspace_action and process_action only preview unless execute=true; show the \
+preview and ask the user before calling them again with execute=true. \
 Before heavy builds or test suites, call can_i_build, and when other agents share the machine \
 wrap the work in acquire_build_slot / release_build_slot (poll with the ticket until granted, \
 renew before ttl_secs passes, release as soon as the work ends).";
@@ -69,12 +69,6 @@ but cannot delete, signal or prune; the user can carry out a plan with the mulch
 
 fn server_info() -> Value {
     json!({ "name": "mulchie", "title": "Mulchie", "version": env!("CARGO_PKG_VERSION") })
-}
-
-fn all_versions() -> Vec<&'static str> {
-    std::iter::once(MODERN_VERSION)
-        .chain(LEGACY_VERSIONS.iter().copied())
-        .collect()
 }
 
 // ------------------------------------------------------------- engine access
@@ -174,7 +168,8 @@ pub struct Session<'a> {
     pub negotiated: Option<String>,
     /// Only tools that change nothing (plus build slots).
     pub read_only: bool,
-    /// Plans shown in this session; execute_plan needs one.
+    /// Plans shown by this server process (in memory, lost on restart);
+    /// execute_plan needs one.
     pub plans: Plans,
 }
 
@@ -327,7 +322,11 @@ impl<'a> Session<'a> {
             return Err(RpcError {
                 code: UNSUPPORTED_VERSION,
                 message: "Unsupported protocol version".into(),
-                data: Some(json!({ "supported": all_versions(), "requested": meta[META_VERSION] })),
+                // Only what this path accepts: listing the legacy versions here
+                // would invite a dual-era client to retry them in `_meta`.
+                data: Some(
+                    json!({ "supported": [MODERN_VERSION], "requested": meta[META_VERSION] }),
+                ),
             });
         }
         if !meta[META_CAPS].is_object() {
@@ -338,7 +337,7 @@ impl<'a> Session<'a> {
         }
         if method == "server/discover" {
             return Ok(json!({
-                "supportedVersions": all_versions(),
+                "supportedVersions": [MODERN_VERSION],
                 "capabilities": capabilities(),
                 "instructions": self.instructions(),
             }));
