@@ -113,7 +113,16 @@ pub fn describe(e: &ApiError) -> String {
         "plan_required" | "items_required" | "expected_head_required" => {
             "this Mulchie CLI and the engine disagree; are they the same version?"
         }
-        "not_found" | "method_not_allowed" => {
+        "updates_off" => {
+            "update checks are off; turn them on with `mulchie config set updates.check on`"
+        }
+        "not_lock_holder" => {
+            "this engine does not hold the engine lock (another one does), so it cannot save the config; `mulchie doctor` shows which engine runs"
+        }
+        "invalid_config" => "the engine kept the config as it was; nothing changed",
+        "unknown_session" => "`mulchie sessions` lists the sessions the engine knows",
+        "invalid_session_id" => "a session id looks like s-<start time>-<pid>, from `mulchie sessions`",
+                "not_found" | "method_not_allowed" => {
             "the engine does not know this request; is it an older version?"
         }
         _ => "",

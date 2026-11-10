@@ -43,6 +43,24 @@ pub fn sample() -> mulchie_core::Snapshot {
 }
 
 /// An engine for one command, without loops, lock or API.
+/// The config for an engine a test starts: no build throttling, no limit
+/// budgets and no update checks, so a test engine can neither renice the
+/// user's real processes nor reach the network. Keeps what is already in
+/// the temp home's config file.
+#[cfg(test)]
+pub fn safe_test_config(paths: &Paths) -> mulchie_core::LoadedConfig {
+    let mut cfg = Config::load_from(paths).config;
+    cfg.throttle_builds = false;
+    cfg.limits = mulchie_core::config::LimitsConfig::default();
+    cfg.limits.default = None;
+    cfg.limits.workspaces.clear();
+    cfg.updates.check = mulchie_core::config::UpdateCheck::Off;
+    cfg.save_to(paths, 0).expect("write the test config");
+    let loaded = Config::load_from(paths);
+    assert!(loaded.error.is_none(), "{:?}", loaded.error);
+    loaded
+}
+
 pub fn local_engine(paths: &Paths, scan: bool) -> Engine {
     let engine = Engine::new(paths.clone(), Config::load_from(paths));
     engine.set_snapshot(sample());

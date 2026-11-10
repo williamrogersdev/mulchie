@@ -31,9 +31,10 @@ impl Env {
     }
 
     fn engine(&self) -> Engine {
-        let loaded = Config::load_from(&self.paths);
-        assert!(loaded.error.is_none(), "{:?}", loaded.error);
-        Engine::new(self.paths.clone(), loaded)
+        Engine::new(
+            self.paths.clone(),
+            crate::commands::safe_test_config(&self.paths),
+        )
     }
 
     fn git(&self, dir: &Path, args: &[&str]) -> String {

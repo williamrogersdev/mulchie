@@ -17,6 +17,19 @@ use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
 use std::sync::mpsc;
 use std::time::Duration;
 
+/// Before a test engine starts: no build throttling, no limit budgets and no
+/// update checks in the temp home's config, so it can neither renice the
+/// user's real processes nor reach the network.
+fn safe_config(paths: &Paths) -> mulchie_core::LoadedConfig {
+    let mut cfg = Config::load_from(paths).config;
+    cfg.throttle_builds = false;
+    cfg.limits.default = None;
+    cfg.limits.workspaces.clear();
+    cfg.updates.check = mulchie_core::config::UpdateCheck::Off;
+    cfg.save_to(paths, 0).expect("write the test config");
+    Config::load_from(paths)
+}
+
 struct Home {
     _t: tempfile::TempDir,
     home: PathBuf,
@@ -44,7 +57,7 @@ impl Home {
     /// An engine for this HOME in this process: the API, no loops.
     fn engine(&self) -> (Engine, mulchie_core::lock::EngineLock, api::Server) {
         let paths = self.paths();
-        let engine = Engine::new(paths.clone(), Config::load_from(&paths));
+        let engine = Engine::new(paths.clone(), safe_config(&paths));
         let mut lk = engine.acquire_lock().unwrap();
         let server = api::serve(engine.clone(), 0).unwrap();
         lk.set_port(Some(server.port())).unwrap();

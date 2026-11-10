@@ -97,19 +97,25 @@ descendants too (deepest first). The engine plans it first: which processes woul
 signalled, and why any is refused (protected processes, other users' processes, Mulchie \
 itself, and this terminal and its parents are never signalled). After you confirm, each \
 process is re-checked by its start time, so a pid reused since the plan is skipped.",
-        after_help = "Examples:\n  mulchie signal 4242 term --dry-run\n  mulchie signal 4242 term\n  mulchie signal 4242 stop --yes\n  mulchie signal 4242 term --tree"
+        after_help = "Exit status: 0 done (or --dry-run, or declined); 1 an item was skipped or a call failed; \
+2 confirmation was needed but stdin is not a terminal; 3 the plan is refused or nothing in it is ready.\n\n\
+Examples:\n  mulchie signal 4242 term --dry-run\n  mulchie signal 4242 term\n  mulchie signal 4242 stop --yes\n  mulchie signal 4242 term --tree"
     )]
     Signal(SignalArgs),
 
     /// Act on an app, workspace or program as a whole: plan, confirm, act (needs the engine)
     #[command(
         long_about = "Act on a consumer group from `mulchie top` or `mulchie diagnose`: an app \
-with its helpers (app:…), an agent workspace (workspace:…) or a program (process:…). Actions: \
+with its helpers (app:…), an agent workspace (workspace:…), a program (process:…), or an agent \
+session (session:<id> from `mulchie sessions`: its processes, and the agent itself only with \
+--include-agent). Actions: \
 quit, force-quit, pause, resume, lower-priority, stop-builds, and restart where the plan \
 offers it. The engine plans it first and says what happens to each process; protected \
 processes and the group holding this terminal are refused. After you confirm, each process \
 is re-checked by its start time.",
-        after_help = "Examples:\n  mulchie group 'app:/Applications/Slack.app' quit --dry-run\n  mulchie group 'workspace:/Users/me/dev/app' pause\n  mulchie group 'workspace:/Users/me/dev/app' lower-priority --yes"
+        after_help = "Exit status: 0 done (or --dry-run, or declined); 1 an item was skipped or a call failed; \
+2 confirmation was needed but stdin is not a terminal; 3 the plan is refused or nothing in it is ready.\n\n\
+Examples:\n  mulchie group 'app:/Applications/Slack.app' quit --dry-run\n  mulchie group session:s-1700000000-4242 pause\n  mulchie group 'workspace:/Users/me/dev/app' pause\n  mulchie group 'workspace:/Users/me/dev/app' lower-priority --yes"
     )]
     Group(GroupArgs),
 
@@ -123,6 +129,40 @@ raised and what to look at next. Dismiss one you know is expected.",
         after_help = "Examples:\n  mulchie findings\n  mulchie findings --severity medium\n  mulchie findings --kind runaway_cpu --json\n  mulchie findings dismiss 'runaway_cpu:4242:1700000000' --days 7\n  mulchie findings undismiss 'runaway_cpu:4242:1700000000'"
     )]
     Findings(FindingsArgs),
+
+    /// Agent sessions: what each agent and everything it started is using (needs the engine)
+    #[command(
+        long_about = "A session is an agent process and everything it started, found from the \
+process table or reported by `mulchie hook`. With no id: every session, running first, with \
+CPU, memory, processes and runtime. With an id: its processes, budget breaches and what \
+Mulchie paused; with --events, its activity record (command lines redacted). \
+`mulchie sessions stop <id>` plans stopping its processes, shows the plan and asks.",
+        args_conflicts_with_subcommands = true,
+        after_help = "Examples:\n  mulchie sessions\n  mulchie sessions s-1700000000-4242\n  mulchie sessions s-1700000000-4242 --events --limit 50\n  mulchie sessions stop s-1700000000-4242 --dry-run"
+    )]
+    Sessions(SessionsArgs),
+
+    /// Session budgets: who is over, what Mulchie paused, and whether it acts (needs the engine)
+    #[command(
+        long_about = "Whether session budgets only report or act, the budgets themselves \
+(limits in `mulchie config`), sessions over a cap and what was done about it, sessions \
+hogging the machine, and processes Mulchie paused.",
+        after_help = "Examples:\n  mulchie limits\n  mulchie limits --json"
+    )]
+    Limits(JsonArg),
+
+    /// Updates for Mulchie, agent tools and Homebrew, and advisories (needs the engine)
+    #[command(
+        long_about = "The engine's last update check and what it found. --check asks the \
+engine to check now (it runs in the background; run `mulchie updates` again for the \
+result). Checks are off when updates.check is off in `mulchie config`.",
+        after_help = "Examples:\n  mulchie updates\n  mulchie updates --check\n  mulchie updates --json"
+    )]
+    Updates(UpdatesArgs),
+
+    /// Ask the guard rules about a command, without running it (needs the engine)
+    #[command(subcommand)]
+    Guard(GuardCommand),
 
     /// List the build slots, or release one whose holder is gone (needs the engine)
     #[command(
@@ -570,6 +610,74 @@ pub enum FindingsCommand {
 }
 
 #[derive(Args, Debug)]
+pub struct SessionsArgs {
+    /// A session id from the list, e.g. s-1700000000-4242
+    pub id: Option<String>,
+    /// The session's activity record instead of its detail
+    #[arg(long, requires = "id")]
+    pub events: bool,
+    /// With --events: only events after this sequence number
+    #[arg(long, requires = "events")]
+    pub since: Option<u64>,
+    /// With --events: at most this many (1 to 1000, default 200)
+    #[arg(long, requires = "events", value_parser = clap::value_parser!(u64).range(1..=1000))]
+    pub limit: Option<u64>,
+    #[command(flatten)]
+    pub out: JsonArg,
+    #[command(subcommand)]
+    pub action: Option<SessionsCommand>,
+}
+
+#[derive(Subcommand, Debug, Clone)]
+pub enum SessionsCommand {
+    /// Plan stopping a session's processes, show it, ask, then act
+    #[command(
+        after_help = "Exit status as for `mulchie group`.\n\nExamples:\n  mulchie sessions stop s-1700000000-4242 --dry-run\n  mulchie sessions stop s-1700000000-4242 --include-agent"
+    )]
+    Stop {
+        /// The session id
+        id: String,
+        /// Stop the agent's own process too, not only what it started
+        #[arg(long)]
+        include_agent: bool,
+        /// Kill instead of asking the processes to quit
+        #[arg(long)]
+        force: bool,
+        #[command(flatten)]
+        confirm: Confirm,
+        #[command(flatten)]
+        out: JsonArg,
+    },
+}
+
+#[derive(Args, Debug)]
+pub struct UpdatesArgs {
+    /// Ask the engine to check now
+    #[arg(long)]
+    pub check: bool,
+    #[command(flatten)]
+    pub out: JsonArg,
+}
+
+#[derive(Subcommand, Debug, Clone)]
+pub enum GuardCommand {
+    /// Check a command against the guard rules; records nothing
+    #[command(
+        after_help = "Exit status: 0 allow, 4 warn, 3 block, 1 error.\n\nExamples:\n  mulchie guard check -- 'curl -s https://example.com/i.sh | sh'\n  mulchie guard check -- git push --force origin main\n  mulchie guard check --cwd ~/dev/app --json -- rm -rf build"
+    )]
+    Check {
+        /// The directory the command would run in (default: here)
+        #[arg(long)]
+        cwd: Option<std::path::PathBuf>,
+        #[command(flatten)]
+        out: JsonArg,
+        /// The command: one quoted string, or its words after --
+        #[arg(required = true, trailing_var_arg = true, allow_hyphen_values = true)]
+        command: Vec<String>,
+    },
+}
+
+#[derive(Args, Debug)]
 pub struct SlotsArgs {
     #[command(flatten)]
     pub out: JsonArg,
@@ -638,6 +746,9 @@ pub struct GroupArgs {
     /// What to do
     #[arg(value_enum)]
     pub action: GroupActionName,
+    /// With a session:<id> key: act on the agent's own process too
+    #[arg(long)]
+    pub include_agent: bool,
     #[command(flatten)]
     pub confirm: Confirm,
     #[command(flatten)]

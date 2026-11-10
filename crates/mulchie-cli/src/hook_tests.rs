@@ -543,6 +543,27 @@ fn the_guard_ceiling_lowers_decisions() {
 }
 
 #[test]
+fn the_engines_reply_and_limits_fit() {
+    // The reply as the core sends it (api_tests: sessions_hooks_and_updates_over_the_api).
+    let r: HookReply = serde_json::from_str(
+        r#"{"breaches":[],"context":[],"decision":"warn","reason":"pipes a download straight into sh","rule":"pipe_to_shell","session_id":null}"#,
+    )
+    .unwrap();
+    assert_eq!(r.decision(), Decision::Warn);
+    assert_eq!(r.rule.as_deref(), Some("pipe_to_shell"));
+    // The engine counts bytes: a long multibyte session id stays within 512.
+    let long = "é".repeat(400);
+    let input =
+        json!({ "session_id": long, "tool_name": "Bash", "tool_input": { "command": "ls" } });
+    let req = request(ClaudeCode, "pre_tool", &input, 1);
+    assert!(req.client_session_id.as_ref().unwrap().len() <= 512);
+    assert!(!req.client.is_empty() && req.client.len() <= 64);
+    // Absent fields are left out, not sent as null.
+    let v = serde_json::to_value(request(ClaudeCode, "stop", &json!({}), 1)).unwrap();
+    assert!(v.get("client_session_id").is_none(), "{v}");
+}
+
+#[test]
 fn bad_input_and_errors_fail() {
     let ok = |_: &HookRequest| -> Result<Value, String> { Ok(json!({ "decision": "block" })) };
     let calls = RefCell::new(0);

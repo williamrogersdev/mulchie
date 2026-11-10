@@ -63,11 +63,12 @@ fn str_at<'a>(v: &'a Value, keys: &[&str]) -> Option<&'a str> {
         .filter(|s| !s.is_empty())
 }
 
-fn cap(s: &str, n: usize) -> String {
+/// At most `n` bytes, the ellipsis included: the engine counts bytes.
+pub fn cap(s: &str, n: usize) -> String {
     if s.len() <= n {
         return s.to_string();
     }
-    let mut end = n;
+    let mut end = n.saturating_sub('…'.len_utf8());
     while !s.is_char_boundary(end) {
         end -= 1;
     }

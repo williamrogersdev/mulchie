@@ -1,14 +1,16 @@
-//! The request and reply of `POST /v1/hook`, kept in one place so they are
-//! easy to adjust to the core.
+//! The request and reply of `POST /v1/hook` (docs/openapi.yaml), kept in one
+//! place.
 //!
-//! Assumed shape (the route is being added to the core):
-//! - request: `{client, client_session_id, event, pid, cwd, tool?, command?, detail?}`
-//!   where `event` is one of [`EVENTS`] and `pid` is the hook process's parent
-//!   (the agent, or the shell it ran the hook through);
+//! - request: `{client, client_session_id?, event, pid, cwd?, tool?, command?,
+//!   detail?}`. `client` is 1 to 64 bytes and `client_session_id` at most
+//!   512, or the engine answers 400 `invalid_body`. `event` is one of
+//!   [`EVENTS`] (others are recorded as `other`), and `pid` is the hook
+//!   process's parent (the agent, or the shell it ran the hook through).
 //! - reply: `{session_id, decision: allow|warn|block, reason?, rule?,
-//!   context: [string], breaches: [...]}`.
+//!   context: [string], breaches: [Breach]}`.
 //!
-//! The request goes with the read-only token: a hook only reports and asks.
+//! The request goes with the read-only token, which the engine accepts on
+//! this route: a hook only reports and asks.
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -29,9 +31,11 @@ pub const ROUTE: &str = "/v1/hook";
 #[derive(Debug, Clone, Serialize, PartialEq)]
 pub struct HookRequest {
     pub client: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub client_session_id: Option<String>,
     pub event: String,
     pub pid: u32,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub cwd: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tool: Option<String>,
@@ -48,9 +52,14 @@ pub enum Decision {
     Block,
 }
 
-/// The reply; `session_id` is not needed by the hook and is ignored.
+/// The reply.
 #[derive(Debug, Clone, Deserialize, Default)]
 pub struct HookReply {
+    /// The session the event was mapped to; null when sessions are off.
+    /// Not needed to answer the client; kept so the shape is whole.
+    #[serde(default)]
+    #[allow(dead_code)]
+    pub session_id: Option<String>,
     /// `allow`, `warn` or `block`; anything else is read as `allow`.
     #[serde(default)]
     pub decision: Option<String>,

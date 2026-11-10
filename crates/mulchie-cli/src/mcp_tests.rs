@@ -156,7 +156,7 @@ fn tools_have_titles_and_annotations() {
     let f = Fake::default();
     let r = one(&f, req(1, "tools/list", json!({})));
     let tools = r["result"]["tools"].as_array().unwrap();
-    assert_eq!(tools.len(), 19);
+    assert_eq!(tools.len(), 25);
     assert_eq!(tools[0]["name"], "diagnose", "diagnose comes first");
     for t in tools {
         let name = t["name"].as_str().unwrap();
@@ -203,9 +203,18 @@ fn tools_have_titles_and_annotations() {
         "plan_process_action",
         "list_findings",
         "inspect_process",
+        "list_sessions",
+        "get_session",
+        "limits_status",
+        "list_updates",
+        "check_command",
     ] {
         assert_eq!(ann(n)["readOnlyHint"], true, "{n}");
+        assert_eq!(ann(n)["openWorldHint"], false, "{n}");
     }
+    assert_eq!(ann("check_updates")["readOnlyHint"], false);
+    assert_eq!(ann("check_updates")["destructiveHint"], false);
+    assert_eq!(ann("check_updates")["openWorldHint"], true);
     // No one-step deletion or signal is offered.
     let names = tool_names(&r);
     for gone in [
@@ -249,8 +258,13 @@ fn read_only_mode_hides_and_refuses_destructive_tools() {
     let mut s = Session::read_only(&f);
     let r = s.handle(req(1, "tools/list", json!({}))).unwrap();
     let names = tool_names(&r);
-    assert_eq!(names.len(), 16, "{names:?}");
-    for n in ["execute_plan", "prune_cache", "dismiss_finding"] {
+    assert_eq!(names.len(), 21, "{names:?}");
+    for n in [
+        "execute_plan",
+        "prune_cache",
+        "dismiss_finding",
+        "check_updates",
+    ] {
         assert!(!names.contains(&n.to_string()), "{n}");
     }
     for n in [
@@ -1063,7 +1077,8 @@ fn against_a_real_engine() {
     let dir = tempfile::tempdir().unwrap();
     let paths = Paths::under(dir.path());
     std::fs::create_dir_all(&paths.home).unwrap();
-    let engine = mulchie_core::Engine::new(paths.clone(), mulchie_core::Config::load_from(&paths));
+    let engine =
+        mulchie_core::Engine::new(paths.clone(), crate::commands::safe_test_config(&paths));
     let mut lk = engine.acquire_lock().unwrap();
     let server = mulchie_core::api::serve(engine.clone(), 0).unwrap();
     lk.set_port(Some(server.port())).unwrap();
@@ -1195,7 +1210,8 @@ fn read_only_mode_uses_the_read_only_token() {
     let dir = tempfile::tempdir().unwrap();
     let paths = Paths::under(dir.path());
     std::fs::create_dir_all(&paths.home).unwrap();
-    let engine = mulchie_core::Engine::new(paths.clone(), mulchie_core::Config::load_from(&paths));
+    let engine =
+        mulchie_core::Engine::new(paths.clone(), crate::commands::safe_test_config(&paths));
     let mut lk = engine.acquire_lock().unwrap();
     let server = mulchie_core::api::serve(engine.clone(), 0).unwrap();
     lk.set_port(Some(server.port())).unwrap();
@@ -1477,4 +1493,102 @@ fn read_only_diagnose_suggests_only_tools_it_offers() {
     }
     // The CLI command is kept: the user may run it.
     assert!(t.contains("mulchie prune npm"), "{t}");
+}
+
+#[test]
+fn sessions_limits_updates_and_guard_tools() {
+    let detail = json!({ "session": { "id": "s-500-100", "agent": "claude", "status": "running" },
+        "processes": [], "breaches": [], "paused_by_mulchie": [] });
+    let f = Fake::default()
+        .with("GET /v1/sessions", json!({ "enabled": true, "sessions": [{ "id": "s-500-100" }] }))
+        .with("GET /v1/sessions/s-500-100", detail)
+        .with(
+            "GET /v1/sessions/s-500-100/events?since=3&limit=5",
+            json!({ "events": [{ "seq": 4, "t": 1, "type": "hook_pre_tool" }], "next_since": 4, "session_id": "s-500-100" }),
+        )
+        .with("GET /v1/limits/status", json!({ "report_only": true, "enforcing": true, "breaches": [] }))
+        .with("GET /v1/updates", json!({ "enabled": true, "available": 1 }))
+        .with(
+            "GET /v1/findings",
+            json!({ "findings": [{ "id": "u", "category": "update", "title": "claude 2 is out" }, { "id": "x", "category": "hygiene" }] }),
+        )
+        .with("POST /v1/guard/check", json!({ "decision": "warn", "rule": "sudo", "reason": "elevated" }))
+        .with("POST /v1/process/plan", process_plan(true));
+    assert_eq!(
+        result(&one(&f, call(1, "list_sessions", json!({}))))["sessions"][0]["id"],
+        "s-500-100"
+    );
+    let v = result(&one(
+        &f,
+        call(
+            2,
+            "get_session",
+            json!({ "id": "s-500-100", "events": true, "since": 3, "limit": 5 }),
+        ),
+    ));
+    assert_eq!(v["events"][0]["seq"], 4);
+    assert_eq!(v["next_since"], 4);
+    // An id that is not a session id never reaches a path.
+    let r = one(
+        &f,
+        call(3, "get_session", json!({ "id": "s-1-2/../../v1/config" })),
+    );
+    assert_eq!(r["result"]["isError"], true);
+    assert_eq!(
+        result(&one(&f, call(4, "limits_status", json!({}))))["report_only"],
+        true
+    );
+    let v = result(&one(&f, call(5, "list_updates", json!({}))));
+    assert_eq!(v["updates"].as_array().unwrap().len(), 1, "{v}");
+    let v = result(&one(
+        &f,
+        call(
+            6,
+            "check_command",
+            json!({ "command": "sudo ls", "cwd": "/tmp" }),
+        ),
+    ));
+    assert_eq!(v["decision"], "warn");
+    assert_eq!(
+        f.posted("/v1/guard/check")[0],
+        json!({ "command": "sudo ls", "cwd": "/tmp" })
+    );
+    // A session plan goes to the plan route with the session.
+    result(&one(
+        &f,
+        call(
+            7,
+            "plan_process_action",
+            json!({ "session": "s-500-100", "action": "pause", "include_agent": true }),
+        ),
+    ));
+    let asked = &f.posted("/v1/process/plan")[0];
+    assert_eq!(asked["session"], "s-500-100");
+    assert_eq!(asked["include_agent"], true);
+    assert_eq!(asked["caller_pid"], std::process::id());
+    let r = one(
+        &f,
+        call(
+            8,
+            "plan_process_action",
+            json!({ "session": "s-500-100", "pid": 4, "action": "quit" }),
+        ),
+    );
+    assert_eq!(r["result"]["isError"], true);
+    // check_updates: queued, or off explained.
+    let f = Fake::default().with(
+        "POST /v1/updates/check",
+        json!({ "ok": true, "queued": true }),
+    );
+    assert_eq!(
+        result(&one(&f, call(1, "check_updates", json!({}))))["queued"],
+        true
+    );
+    let f = Fake::default().failing(
+        "POST /v1/updates/check",
+        ApiError::new(409, "updates_off", "update checks are off"),
+    );
+    let r = one(&f, call(1, "check_updates", json!({})));
+    assert_eq!(r["result"]["isError"], true);
+    assert!(text(&r).contains("Only the user"), "{r}");
 }

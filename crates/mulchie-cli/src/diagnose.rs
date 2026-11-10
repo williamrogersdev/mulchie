@@ -135,6 +135,7 @@ pub fn finding_brief(f: &Value) -> Value {
     json!({
         "id": f["id"],
         "kind": f["kind"],
+        "category": f["category"],
         "severity": f["severity"],
         "title": f["title"],
         "why": f["why"],
@@ -547,6 +548,8 @@ pub fn build(state: &Value, advice: &Value, origin: Origin) -> Value {
         "top": found.iter().take(TOP_FINDINGS).map(|f| finding_brief(f)).collect::<Vec<_>>(),
     });
     let consumers = crate::mcp_tools::consumers_brief(snap, TOP_GROUPS);
+    let sessions = sessions_brief(&state["sessions"], &mut recs);
+    let updates = updates_brief(&state["updates"], &state["findings"], &mut recs);
 
     let machine = json!({
         "cpu_pct": (f(snap, "cpu_pct") * 10.0).round() / 10.0,
@@ -568,6 +571,8 @@ pub fn build(state: &Value, advice: &Value, origin: Origin) -> Value {
     let rest = json!({
         "consumers": consumers,
         "findings": findings,
+        "sessions": sessions,
+        "updates": updates,
         "machine": machine,
         "workspaces": { "total": ws_total, "top": top_ws },
         "top_processes": top_procs,
@@ -575,6 +580,142 @@ pub fn build(state: &Value, advice: &Value, origin: Origin) -> Value {
         "reclaimable": reclaimable,
     });
     finish(source, state, health, problems, recs, Some(rest))
+}
+
+/// Running sessions, active breaches, hogs and what Mulchie paused, from
+/// `state.sessions`, with a recommendation for each that needs a look.
+fn sessions_brief(ss: &Value, recs: &mut Vec<Rec>) -> Value {
+    if !ss.is_object() {
+        return Value::Null;
+    }
+    let running: Vec<Value> = ss["list"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter(|x| x["status"] == "running")
+        .take(TOP_WORKSPACES)
+        .map(|x| {
+            json!({
+                "id": x["id"], "agent": x["agent"], "workspace": x["workspace"],
+                "cpu_cores": x["cpu_cores"], "memory_mb": x["memory_mb"],
+                "processes": x["processes"], "runtime_secs": x["runtime_secs"],
+                "next_call": { "name": "get_session", "arguments": { "id": x["id"] } },
+                "cli": format!("mulchie sessions {}", q(x["id"].as_str().unwrap_or(""))),
+            })
+        })
+        .collect();
+    let breaches: Vec<Value> = ss["breaches"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter(|b| !b["cleared_unix"].is_u64())
+        .cloned()
+        .collect();
+    for b in breaches.iter().take(3) {
+        let sid = b["session_id"].as_str().unwrap_or("");
+        recs.push(Rec {
+            priority: 1,
+            id: "session_over_budget",
+            title: format!(
+                "{} session {sid} is over its {} budget",
+                b["agent"].as_str().unwrap_or("An agent"),
+                b["cap"].as_str().unwrap_or("")
+            ),
+            reason: crate::sessions::breach_line(b),
+            gain_bytes: None,
+            gain: "the session back within its budget".into(),
+            risk: "none",
+            next_call: call("get_session", json!({ "id": sid })),
+            command: Some(format!("mulchie sessions {}", q(sid))),
+        });
+    }
+    let hogs = ss["hogs"].as_array().cloned().unwrap_or_default();
+    for h in hogs.iter().take(2) {
+        let sid = h["session_id"].as_str().unwrap_or("");
+        recs.push(Rec {
+            priority: 2,
+            id: "session_hog",
+            title: format!(
+                "{} session {sid} is using {:.0}% of the machine's {}",
+                h["agent"].as_str().unwrap_or("An agent"),
+                h["share_pct"].as_f64().unwrap_or(0.0),
+                h["resource"].as_str().unwrap_or("")
+            ),
+            reason: "One session is taking most of a strained machine; look at what it runs before pausing or stopping it.".into(),
+            gain_bytes: None,
+            gain: "room for everything else".into(),
+            risk: "none",
+            next_call: call("get_session", json!({ "id": sid })),
+            command: Some(format!("mulchie sessions {}", q(sid))),
+        });
+    }
+    let left = ss["paused_left"].as_array().cloned().unwrap_or_default();
+    if let Some(sid) = left.first().and_then(|p| p["session_id"].as_str()) {
+        recs.push(Rec {
+            priority: 1,
+            id: "resume_paused",
+            title: format!("{} process(es) are still paused by an earlier Mulchie", left.len()),
+            reason: "An earlier engine paused them for a budget and this one did not resume them; they wait until resumed.".into(),
+            gain_bytes: None,
+            gain: "the paused work continues".into(),
+            risk: "low",
+            next_call: call("plan_process_action", json!({ "session": sid, "action": "resume" })),
+            command: Some(format!("mulchie group {} resume", q(&format!("session:{sid}")))),
+        });
+    }
+    json!({
+        "running": ss["running"],
+        "top": running,
+        "breaches_active": breaches.len(),
+        "breaches": breaches.iter().take(5).map(crate::sessions::breach_line).collect::<Vec<_>>(),
+        "hogs": hogs,
+        "paused_by_mulchie": ss["paused_by_mulchie"].as_array().map_or(0, Vec::len),
+        "paused_left": left.len(),
+        "limits_report_only": ss["limits_report_only"],
+        "next_call": { "name": "limits_status", "arguments": {} },
+    })
+}
+
+/// Available updates, from `state.updates` and the update findings.
+fn updates_brief(us: &Value, findings: &Value, recs: &mut Vec<Rec>) -> Value {
+    if !us.is_object() {
+        return Value::Null;
+    }
+    let titles: Vec<Value> = findings
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter(|f| f["category"] == "update" && f["dismissed"] != true)
+        .take(5)
+        .map(|f| f["title"].clone())
+        .collect();
+    let n = us["available"].as_u64().unwrap_or(titles.len() as u64);
+    if n > 0 {
+        recs.push(Rec {
+            priority: 4,
+            id: "review_updates",
+            title: format!("{n} update(s) available"),
+            reason: titles
+                .first()
+                .and_then(Value::as_str)
+                .map(|t| format!("First: {t}."))
+                .unwrap_or_else(|| {
+                    "Mulchie's update check found newer versions or advisories.".into()
+                }),
+            gain_bytes: None,
+            gain: "current tools and fixed advisories".into(),
+            risk: "none",
+            next_call: call("list_updates", json!({})),
+            command: Some("mulchie updates".into()),
+        });
+    }
+    json!({
+        "enabled": us["enabled"],
+        "available": n,
+        "titles": titles,
+        "checked_unix": us["checked_unix"],
+        "next_call": { "name": "list_updates", "arguments": {} },
+    })
 }
 
 fn finish(
@@ -774,6 +915,52 @@ pub fn render(d: &Value) -> String {
             s.push_str("\nReclaimable: not scanned yet.\n");
         }
     }
+    let ss = &d["sessions"];
+    if ss.is_object() {
+        let top = ss["top"].as_array().cloned().unwrap_or_default();
+        s.push_str(&format!(
+            "\nAgent sessions: {} running",
+            ss["running"].as_u64().unwrap_or(0)
+        ));
+        let br = ss["breaches_active"].as_u64().unwrap_or(0);
+        if br > 0 {
+            s.push_str(&format!(", {br} over budget"));
+        }
+        let paused = ss["paused_by_mulchie"].as_u64().unwrap_or(0);
+        if paused > 0 {
+            s.push_str(&format!(", {paused} process(es) paused by Mulchie"));
+        }
+        s.push('\n');
+        for x in &top {
+            s.push_str(&format!(
+                "  {:<22} {:<10} {:>5.1} cores {:>7.0} MB  {}\n",
+                x["id"].as_str().unwrap_or(""),
+                x["agent"].as_str().unwrap_or(""),
+                x["cpu_cores"].as_f64().unwrap_or(0.0),
+                x["memory_mb"].as_f64().unwrap_or(0.0),
+                x["workspace"].as_str().unwrap_or("")
+            ));
+        }
+        for b in ss["breaches"].as_array().into_iter().flatten() {
+            s.push_str(&format!("  ! {}\n", b.as_str().unwrap_or("")));
+        }
+        for h in ss["hogs"].as_array().into_iter().flatten() {
+            s.push_str(&format!(
+                "  hog: {} {} {:.0}% of {}\n",
+                h["agent"].as_str().unwrap_or(""),
+                h["session_id"].as_str().unwrap_or(""),
+                h["share_pct"].as_f64().unwrap_or(0.0),
+                h["resource"].as_str().unwrap_or("")
+            ));
+        }
+    }
+    let up = &d["updates"];
+    if up["available"].as_u64().unwrap_or(0) > 0 {
+        s.push_str(&format!(
+            "\nUpdates: {} available (`mulchie updates`)\n",
+            up["available"]
+        ));
+    }
     let fs = d["findings"]["top"].as_array().cloned().unwrap_or_default();
     if !fs.is_empty() {
         s.push_str(&format!(
@@ -911,6 +1098,57 @@ mod tests {
         // Small enough for a context window.
         assert!(d.to_string().len() < 12_000, "{}", d.to_string().len());
         assert!(render(&d).contains("Recommendations:"));
+    }
+
+    #[test]
+    fn sessions_breaches_and_updates_name_the_next_call() {
+        let mut st = state();
+        st["sessions"] = json!({ "enabled": true, "running": 1, "ended": 0,
+            "list": [{ "id": "s-500-100", "agent": "claude", "status": "running", "workspace": "/code/a",
+                "cpu_cores": 2.5, "memory_mb": 900.0, "processes": 7, "runtime_secs": 60 }],
+            "breaches": [{ "id": "b", "session_id": "s-500-100", "agent": "claude", "cap": "memory_mb",
+                "max": 500.0, "value": 900.0, "action": "notify", "action_state": "notify_only" }],
+            "breaches_active": 1, "hogs": [{ "session_id": "s-500-100", "agent": "claude", "resource": "cpu", "share_pct": 80.0, "since_unix": 1 }],
+            "paused_by_mulchie": [], "paused_left": [{ "pid": 9, "session_id": "s-500-100", "since_unix": 1 }],
+            "limits_report_only": true });
+        st["updates"] = json!({ "enabled": true, "available": 1 });
+        st["findings"] = json!([{ "id": "u:claude", "kind": "agent_outdated", "category": "update",
+            "severity": "low", "title": "claude 2.0 is out", "why": "", "evidence": {}, "suggested": [] }]);
+        let d = build(&st, &json!({}), Origin::Engine);
+        assert_eq!(d["sessions"]["top"][0]["next_call"]["name"], "get_session");
+        assert_eq!(d["sessions"]["breaches_active"], 1);
+        assert_eq!(d["updates"]["available"], 1);
+        assert_eq!(d["findings"]["top"][0]["category"], "update");
+        let recs = d["recommendations"].as_array().unwrap();
+        let by = |id: &str| {
+            recs.iter()
+                .find(|r| r["id"] == id)
+                .unwrap_or_else(|| panic!("no {id}: {recs:?}"))
+                .clone()
+        };
+        assert_eq!(
+            by("session_over_budget")["next_call"]["name"],
+            "get_session"
+        );
+        assert_eq!(
+            by("session_hog")["next_call"]["arguments"]["id"],
+            "s-500-100"
+        );
+        assert_eq!(
+            by("resume_paused")["next_call"]["arguments"]["session"],
+            "s-500-100"
+        );
+        assert_eq!(
+            by("resume_paused")["cli"],
+            "mulchie group session:s-500-100 resume"
+        );
+        assert_eq!(by("review_updates")["next_call"]["name"], "list_updates");
+        let t = render(&d);
+        assert!(
+            t.contains("Agent sessions: 1 running, 1 over budget"),
+            "{t}"
+        );
+        assert!(t.contains("Updates: 1 available"), "{t}");
     }
 
     #[test]

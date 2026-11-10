@@ -51,7 +51,9 @@ impl Tool {
                 "readOnlyHint": self.read_only,
                 "destructiveHint": self.destructive,
                 "idempotentHint": self.idempotent,
-                "openWorldHint": false,
+                // Only an update check reaches outside this machine (from
+                // the engine, to GitHub, npm and OSV.dev).
+                "openWorldHint": self.name == "check_updates",
             },
         })
     }
@@ -148,13 +150,15 @@ pub fn tool_list() -> Vec<Tool> {
         read(
             "plan_process_action",
             "Plan acting on processes",
-            "Plan an action on one process (pid with signal term/kill/stop/cont, tree=true for its descendants too) or on a whole consumer group (group key from get_status or diagnose, with action quit, force_quit, pause, resume, lower_priority, stop_builds or restart; restart is offered only where the plan says so). Changes nothing. Returns a plan_id, what would happen to each process, and why anything is refused (protected processes, including this agent's own app and terminal, are never acted on). Show the plan to the user; to carry it out, call execute_plan with the plan_id and the approved targets (all ready targets for the whole action). Each process is re-checked by its start time, so a reused pid is skipped.",
+            "Plan an action on one process (pid with signal term/kill/stop/cont, tree=true for its descendants too), on a whole consumer group (group key from get_status or diagnose), or on an agent session (session id from list_sessions: its processes, the agent itself only with include_agent=true), with action quit, force_quit, pause, resume, lower_priority, stop_builds or restart (restart is offered only where the plan says so). Changes nothing. Returns a plan_id, what would happen to each process, and why anything is refused (protected processes, including this agent's own app and terminal, are never acted on). Show the plan to the user; to carry it out, call execute_plan with the plan_id and the approved targets (all ready targets for the whole action). Each process is re-checked by its start time, so a reused pid is skipped.",
             json!({
                 "pid": { "type": "integer", "minimum": 2, "description": "One process, instead of group" },
                 "signal": { "type": "string", "enum": ["term", "kill", "stop", "cont"], "description": "With pid (default term)" },
                 "tree": { "type": "boolean", "description": "With pid: its descendants too, deepest first" },
                 "group": { "type": "string", "description": "A consumer group key, instead of pid" },
-                "action": { "type": "string", "enum": ["quit", "force_quit", "pause", "resume", "lower_priority", "stop_builds", "restart"], "description": "With group" }
+                "session": { "type": "string", "description": "A session id from list_sessions, instead of pid or group" },
+                "include_agent": { "type": "boolean", "description": "With session: the agent's own process too" },
+                "action": { "type": "string", "enum": ["quit", "force_quit", "pause", "resume", "lower_priority", "stop_builds", "restart"], "description": "With group or session" }
             }),
         ),
         read(
@@ -167,6 +171,50 @@ pub fn tool_list() -> Vec<Tool> {
                 "include_dismissed": { "type": "boolean" }
             }),
         ),
+        read(
+            "list_sessions",
+            "Agent sessions",
+            "Agent sessions: each agent process and everything it started, running first, with CPU cores, memory, process count, build slots and runtime, and the workspace. Changes nothing. get_session shows one in detail.",
+            json!({}),
+        ),
+        Tool {
+            required: &["id"],
+            ..read(
+                "get_session",
+                "One agent session",
+                "One session: its processes (command lines redacted), budget breaches and what Mulchie paused. With events=true, also its activity record (oldest first; pass next_since back as since to page). Changes nothing. To stop or pause it, use plan_process_action with session.",
+                json!({
+                    "id": { "type": "string", "description": "A session id from list_sessions, s-<start time>-<pid>" },
+                    "events": { "type": "boolean", "description": "Include the activity record" },
+                    "since": { "type": "integer", "minimum": 0, "description": "With events: only events after this seq" },
+                    "limit": { "type": "integer", "minimum": 1, "maximum": 1000, "description": "With events: at most this many (default 200)" }
+                }),
+            )
+        },
+        read(
+            "limits_status",
+            "Session budgets",
+            "Whether session budgets only report or act (report_only, enforcing), the budgets, sessions over a cap and what was done, sessions hogging the machine, and processes Mulchie paused (paused_left: paused by an earlier engine and not resumed; resume them with plan_process_action). Changes nothing.",
+            json!({}),
+        ),
+        read(
+            "list_updates",
+            "Available updates",
+            "The engine's last update check (Mulchie itself, agent tools, Homebrew, and advisories for lockfile packages when turned on) and the update findings it raised, with the command that updates each where known. Changes nothing; check_updates asks for a new check.",
+            json!({}),
+        ),
+        Tool {
+            required: &["command"],
+            ..read(
+                "check_command",
+                "Check a command against the guard rules",
+                "Ask Mulchie's guard rules about a shell command before running it: allow, warn or block, with the reason and every rule that matched, and build advice while heavy work is not advised. Records nothing and runs nothing.",
+                json!({
+                    "command": { "type": "string", "description": "The shell command line" },
+                    "cwd": { "type": "string", "description": "The directory it would run in (default: this server's)" }
+                }),
+            )
+        },
         Tool {
             required: &["pid"],
             ..read(
@@ -219,6 +267,16 @@ pub fn tool_list() -> Vec<Tool> {
                 "force": { "type": "boolean", "description": "Dismiss an id that is not a current finding" }
             }),
             required: &["id"],
+            read_only: false,
+            destructive: false,
+            idempotent: true,
+        },
+        Tool {
+            name: "check_updates",
+            title: "Check for updates now",
+            description: "Ask the engine to check for updates now. It runs in the background on the engine; call list_updates after a minute for the result. Refused when update checks are off (updates.check), which only the user should change. Contacts GitHub, npm and, when advisories are on, OSV.dev from the engine.",
+            props: json!({}),
+            required: &[],
             read_only: false,
             destructive: false,
             idempotent: true,
@@ -1012,6 +1070,27 @@ pub fn call_tool(cx: &mut Ctx, name: &str, a: &Map<String, Value>) -> ToolResult
         }
         "plan_process_action" => {
             let mut body = Map::new();
+            if let Some(sid) = a.get("session").and_then(Value::as_str) {
+                if a.contains_key("pid") || a.contains_key("group") {
+                    return Err("pass one of pid, group or session".into());
+                }
+                if a.contains_key("signal") || a.contains_key("tree") {
+                    return Err("with session, use action; signal and tree are for pid".into());
+                }
+                crate::sessions::check_session_id(sid)?;
+                let Some(action) = a.get("action") else {
+                    return Err("a session needs an action".into());
+                };
+                body.insert("session".into(), json!(sid));
+                body.insert("action".into(), action.clone());
+                body.insert("include_agent".into(), json!(flag("include_agent")));
+                body.insert("caller_pid".into(), json!(std::process::id()));
+                let plan = post("/v1/process/plan", Value::Object(body))?;
+                return Ok(present_process(cx.plans, plan, cx.read_only));
+            }
+            if a.contains_key("include_agent") {
+                return Err("include_agent goes with session".into());
+            }
             match (a.get("pid"), a.get("group")) {
                 (Some(pid), None) => {
                     if a.contains_key("action") {
@@ -1087,6 +1166,47 @@ pub fn call_tool(cx: &mut Ctx, name: &str, a: &Map<String, Value>) -> ToolResult
         "inspect_process" => {
             let pid = a.get("pid").and_then(Value::as_u64).unwrap_or(0);
             get(&format!("/v1/process/{pid}"))
+        }
+        "list_sessions" => get("/v1/sessions"),
+        "get_session" => {
+            let id = a.get("id").and_then(Value::as_str).unwrap_or("");
+            crate::sessions::check_session_id(id)?;
+            let mut v = get(&format!("/v1/sessions/{id}"))?;
+            if flag("events") {
+                let ev = get(&crate::sessions::events_path(
+                    id,
+                    a.get("since").and_then(Value::as_u64),
+                    a.get("limit").and_then(Value::as_u64),
+                ))?;
+                v["events"] = ev["events"].clone();
+                v["next_since"] = ev["next_since"].clone();
+            }
+            Ok(v)
+        }
+        "limits_status" => get("/v1/limits/status"),
+        "list_updates" => {
+            let status = get("/v1/updates")?;
+            let found = get("/v1/findings")
+                .map(|f| crate::sessions::update_findings(&f))
+                .unwrap_or_default();
+            Ok(json!({ "status": status, "updates": found }))
+        }
+        "check_updates" => match api.call("POST", "/v1/updates/check", None) {
+            Ok(v) => Ok(json!({ "queued": v["queued"], "next": "The check runs on the engine; call list_updates in a minute for its result." })),
+            Err(e) if e.code == "updates_off" => Err("Update checks are off (updates.check in Mulchie's config), so nothing was checked. Only the user should turn them on.".into()),
+            Err(e) => Err(api_err(e)),
+        },
+        "check_command" => {
+            let cwd = a
+                .get("cwd")
+                .and_then(Value::as_str)
+                .map(String::from)
+                .or_else(|| std::env::current_dir().ok().map(|d| d.display().to_string()))
+                .unwrap_or_else(|| "/".into());
+            post(
+                "/v1/guard/check",
+                json!({ "command": a.get("command").and_then(Value::as_str).unwrap_or(""), "cwd": cwd }),
+            )
         }
         // A TTL, never this server's pid: `mulchie mcp` lives as long as the
         // agent session, so a forgotten release would hold the slot for hours.

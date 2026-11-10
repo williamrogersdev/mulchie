@@ -575,6 +575,23 @@ pub fn set_key(cfg: &Value, key: &str, raw: &str) -> Result<Value, String> {
     Ok(new)
 }
 
+/// The RFC 7396 merge patch that sets `key` (dotted) to its value in
+/// `edited`: `{"a": {"b": value}}`.
+pub fn merge_patch(key: &str, edited: &Value) -> Value {
+    let parts: Vec<&str> = key.split('.').collect();
+    let mut at = edited;
+    for p in &parts {
+        at = &at[*p];
+    }
+    let mut patch = at.clone();
+    for p in parts.iter().rev() {
+        let mut m = Map::new();
+        m.insert((*p).to_string(), patch);
+        patch = Value::Object(m);
+    }
+    patch
+}
+
 /// Whether every part of `parts` is a key, object by object, in `v`.
 fn cfg_has_path(v: &Value, parts: &[&str]) -> bool {
     let mut at = v;
@@ -588,10 +605,22 @@ fn cfg_has_path(v: &Value, parts: &[&str]) -> bool {
 }
 
 pub fn config_set(paths: &Paths, key: &str, raw: &str, json_out: bool) -> i32 {
+    config_set_with(paths, key, raw, json_out, &conn::connect)
+}
+
+/// [`config_set`] with the connection made by `connect`, so a test can
+/// stage an engine starting between the look and the write.
+fn config_set_with(
+    paths: &Paths,
+    key: &str,
+    raw: &str,
+    json_out: bool,
+    connect: &dyn Fn(&Paths) -> Conn,
+) -> i32 {
     let mut done = None;
     // Twice at most: an engine that starts while we look is used instead.
     for _ in 0..2 {
-        match conn::connect(paths) {
+        match connect(paths) {
             Conn::Engine(c) => {
                 let cur = match conn::call(&c, "GET", "/v1/config", None) {
                     Ok(v) => v,
@@ -603,11 +632,21 @@ pub fn config_set(paths: &Paths, key: &str, raw: &str, json_out: bool) -> i32 {
                         s(&cur, "path")
                     ));
                 }
+                // The edit is checked against the engine's config here; what
+                // is sent is only the change, as a JSON merge patch.
                 let edited = match set_key(&cur["config"], key, raw) {
                     Ok(c) => c,
                     Err(e) => return fail(e),
                 };
-                match conn::call(&c, "PUT", "/v1/config", Some(&json!({ "config": edited }))) {
+                let patch = merge_patch(key, &edited);
+                let r = match conn::call(&c, "PATCH", "/v1/config", Some(&patch)) {
+                    // An engine from before PATCH: send the whole edited config.
+                    Err(e) if e.code == "method_not_allowed" || e.code == "not_found" => {
+                        conn::call(&c, "PUT", "/v1/config", Some(&json!({ "config": edited })))
+                    }
+                    r => r,
+                };
+                match r {
                     Ok(v) => {
                         done = Some((v["config"].clone(), "through the engine; in effect now"))
                     }
@@ -692,6 +731,62 @@ mod tests {
         assert!(set_key(&cur, "", "1").is_err());
         let c = set_key(&cur, "watch.enabled", "false").unwrap();
         assert_eq!(c["watch"]["enabled"], false);
+    }
+
+    /// The race: no engine when we look, one holding the lock by the time
+    /// we would write. The edit must go through that engine, not the file.
+    #[test]
+    fn a_config_edit_goes_through_an_engine_that_started_after_the_look() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = Paths::under(tmp.path());
+        std::fs::create_dir_all(&paths.home).unwrap();
+        let engine = Engine::new(paths.clone(), crate::commands::safe_test_config(&paths));
+        let mut lk = engine.acquire_lock().unwrap();
+        let server = mulchie_core::api::serve(engine.clone(), 0).unwrap();
+        lk.set_port(Some(server.port())).unwrap();
+        let before = std::fs::read(paths.config_file()).unwrap();
+        let looks = std::cell::Cell::new(0);
+        // The first look misses the engine, as if it started just after.
+        let connect = |p: &Paths| {
+            looks.set(looks.get() + 1);
+            if looks.get() == 1 {
+                Conn::NotRunning
+            } else {
+                conn::connect(p)
+            }
+        };
+        assert_eq!(
+            config_set_with(&paths, "worktree_idle_days", "13", false, &connect),
+            0
+        );
+        assert_eq!(
+            looks.get(),
+            2,
+            "it looked again after failing to take the lock"
+        );
+        assert_eq!(
+            engine.config().worktree_idle_days,
+            13,
+            "the running engine has the edit"
+        );
+        // The engine saved it; a direct write would not have reached it.
+        assert_ne!(std::fs::read(paths.config_file()).unwrap(), before);
+        server.stop();
+    }
+
+    #[test]
+    fn config_set_sends_only_the_change() {
+        let cur = serde_json::to_value(Config::default()).unwrap();
+        let edited = set_key(&cur, "guard.rules.sudo", "block").unwrap();
+        assert_eq!(
+            merge_patch("guard.rules.sudo", &edited),
+            json!({ "guard": { "rules": { "sudo": "block" } } })
+        );
+        let edited = set_key(&cur, "scan_roots", r#"["/a"]"#).unwrap();
+        assert_eq!(
+            merge_patch("scan_roots", &edited),
+            json!({ "scan_roots": ["/a"] })
+        );
     }
 
     #[test]

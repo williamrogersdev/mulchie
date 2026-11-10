@@ -23,3 +23,9 @@ toml_edit = "0.25.19"
 
 [dev-dependencies]
 tempfile.workspace = true
+
+[features]
+default = ["network"]
+# Update checks over HTTPS in the engine (`mulchie serve`). Without it the
+# engine reports that this build has no network support.
+network = ["mulchie-core/network"]

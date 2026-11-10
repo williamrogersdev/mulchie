@@ -386,7 +386,7 @@ mod tests {
         let paths = Paths::under(dir.path());
         std::fs::create_dir_all(&paths.home).unwrap();
         let engine =
-            mulchie_core::Engine::new(paths.clone(), mulchie_core::Config::load_from(&paths));
+            mulchie_core::Engine::new(paths.clone(), crate::commands::safe_test_config(&paths));
         let mut lk = engine.acquire_lock().unwrap();
         let server = mulchie_core::api::serve(engine.clone(), 0).unwrap();
         lk.set_port(Some(server.port())).unwrap();

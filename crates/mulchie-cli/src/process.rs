@@ -22,6 +22,12 @@ pub enum Target {
     },
     /// A consumer group: `app:…`, `workspace:…` or `process:…`.
     Group { key: String, action: String },
+    /// An agent session's processes; the agent itself with `include_agent`.
+    Session {
+        id: String,
+        action: String,
+        include_agent: bool,
+    },
 }
 
 impl Target {
@@ -36,6 +42,33 @@ impl Target {
             Target::Group { key, action } => {
                 json!({ "group": key, "action": action, "caller_pid": me })
             }
+            Target::Session {
+                id,
+                action,
+                include_agent,
+            } => json!({
+                "session": id, "action": action, "include_agent": include_agent, "caller_pid": me,
+            }),
+        }
+    }
+
+    /// A `mulchie group` key: `session:<id>` names a session, anything else
+    /// a consumer group.
+    pub fn from_key(key: &str, action: &str, include_agent: bool) -> Result<Target, String> {
+        match key.strip_prefix("session:") {
+            Some(id) => {
+                crate::sessions::check_session_id(id)?;
+                Ok(Target::Session {
+                    id: id.into(),
+                    action: action.into(),
+                    include_agent,
+                })
+            }
+            None if include_agent => Err("--include-agent goes with a session:<id> key".into()),
+            None => Ok(Target::Group {
+                key: key.into(),
+                action: action.into(),
+            }),
         }
     }
 
@@ -43,6 +76,7 @@ impl Target {
         match self {
             Target::Pid { .. } => "`mulchie signal`",
             Target::Group { .. } => "`mulchie group`",
+            Target::Session { .. } => "`mulchie sessions stop`",
         }
     }
 }
@@ -455,6 +489,26 @@ mod tests {
             dry_run: true,
         };
         assert_eq!(go(&rig, dry, true, false, false).0, 3);
+    }
+
+    #[test]
+    fn a_session_key_plans_the_session() {
+        let t = Target::from_key("session:s-500-100", "pause", true).unwrap();
+        let b = t.body();
+        assert_eq!(b["session"], "s-500-100");
+        assert_eq!(b["action"], "pause");
+        assert_eq!(b["include_agent"], true);
+        assert_eq!(b["caller_pid"], std::process::id());
+        assert!(b.get("group").is_none());
+        assert!(Target::from_key("session:../x", "quit", false).is_err());
+        assert!(Target::from_key("app:/A.app", "quit", true).is_err());
+        assert_eq!(
+            Target::from_key("app:/A.app", "quit", false).unwrap(),
+            Target::Group {
+                key: "app:/A.app".into(),
+                action: "quit".into()
+            }
+        );
     }
 
     #[test]

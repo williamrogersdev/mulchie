@@ -14,6 +14,7 @@ mod plan;
 mod process;
 mod run;
 mod service;
+mod sessions;
 mod slots;
 
 use clap::{CommandFactory, Parser};
@@ -60,15 +61,51 @@ fn dispatch(paths: &Paths, cmd: Command) -> i32 {
             s.confirm,
             s.out.json,
         ),
-        Command::Group(g) => process::command(
-            paths,
-            process::Target::Group {
-                key: g.key,
-                action: g.action.as_str().into(),
-            },
-            g.confirm,
-            g.out.json,
-        ),
+        Command::Group(g) => {
+            let target = match process::Target::from_key(&g.key, g.action.as_str(), g.include_agent)
+            {
+                Ok(t) => t,
+                Err(e) => return commands::fail(e),
+            };
+            process::command(paths, target, g.confirm, g.out.json)
+        }
+        Command::Sessions(a) => match a.action {
+            Some(cli::SessionsCommand::Stop {
+                id,
+                include_agent,
+                force,
+                confirm,
+                out,
+            }) => {
+                if let Err(e) = sessions::check_session_id(&id) {
+                    return commands::fail(e);
+                }
+                let action = if force { "force_quit" } else { "quit" };
+                process::command(
+                    paths,
+                    process::Target::Session {
+                        id,
+                        action: action.into(),
+                        include_agent,
+                    },
+                    confirm,
+                    out.json,
+                )
+            }
+            None => sessions::sessions(
+                paths,
+                a.id.as_deref(),
+                a.events,
+                a.since,
+                a.limit,
+                a.out.json,
+            ),
+        },
+        Command::Limits(j) => sessions::limits(paths, j.json),
+        Command::Updates(u) => sessions::updates(paths, u.check, u.out.json),
+        Command::Guard(cli::GuardCommand::Check { cwd, out, command }) => {
+            sessions::guard_check(paths, &command, cwd.as_deref(), out.json)
+        }
         Command::Findings(f) => match &f.action {
             Some(a) => observe::findings_action(paths, a),
             None => observe::findings(paths, f.severity, f.kind.as_deref(), f.all, f.out.json),
