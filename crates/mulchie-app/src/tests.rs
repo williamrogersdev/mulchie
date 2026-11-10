@@ -1086,6 +1086,14 @@ fn config_refusals_carry_the_api_codes_on_both_sides() {
     assert!(a.patch_config(patch.clone(), Some("not hex!")).is_err());
     let r1 = b.config_revision().unwrap().unwrap();
     assert_ne!(r0, r1);
+    // The whole-config save (the main Settings form) checks it the same way.
+    let mut whole = serde_json::to_value(mulchie_core::Config::default()).unwrap();
+    whole["low_disk_gb"] = json!(7);
+    for (who, x) in [("engine", &a), ("client", &b)] {
+        let err = x.set_config_at(whole.clone(), Some(&r0)).unwrap_err();
+        assert!(err.contains("revision"), "{who}: {err}");
+    }
+    assert_ne!(a.state().unwrap()["config"]["low_disk_gb"], 7);
     let ok = b.patch_config(patch, Some(&r1)).unwrap();
     assert_eq!(ok["guard"]["rules"]["sudo"], "block");
     drop(b);

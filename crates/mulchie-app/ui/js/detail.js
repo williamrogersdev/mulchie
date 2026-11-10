@@ -422,11 +422,14 @@ const ACTION_WORDS = { notify: 'notify only', deprioritize: 'lower priority', pa
 const STATE_WORDS = { pending: 'waiting to act', done: 'done', partial: 'done for some processes', skipped: 'nothing was done', notify_only: 'noted, nothing signalled', not_enforced: 'not enforced here' };
 const num = v => v == null ? '—' : Number(v) >= 100 ? Math.round(v).toString() : Number(v).toFixed(1).replace(/\.0$/, '');
 
-// One record event in plain words.
 const UPDATE_SOURCE = { github: 'GitHub', npm: 'npm', homebrew: 'Homebrew', 'osv.dev': 'advisory' };
 const OUTCOME_WORDS = { paused: 'paused', stopped: 'stopped', killed: 'force-quit', deprioritized: 'lowered the priority of', resumed: 'resumed', restored: 'restored the priority of', restore_failed: 'could not restore the priority of', refused: 'did not act on' };
 
-export function eventText(e) {
+// One record event in plain words, saying when it came from a caller other
+// than the client the session is bound to (`unbound`).
+export const eventText = e => eventWords(e) + (e.unbound ? ` · reported by another caller${e.client ? ` (${e.client})` : ''}, not the agent this session is bound to` : '');
+
+function eventWords(e) {
   const t = e.type || '';
   const cmd = c => c ? `: ${c}` : '';
   switch (t) {
@@ -484,7 +487,7 @@ function rSession(id) {
       ['written', !writes ? '<span class="dim">not reported on this system</span>' : u.bytes_written != null ? `${B(u.bytes_written)}${u.write_mb_per_hour != null ? ` · ${MBt(u.write_mb_per_hour)}/h` : ''}` : '—'],
       s.peak && ['peaks', `${esc(coresText(s.peak.cpu_cores))} cores · ${MBt(s.peak.memory_mb)} · ${s.peak.processes} processes${s.peak.write_mb_per_hour != null ? ` · ${MBt(s.peak.write_mb_per_hour)}/h written` : ''}`]]))}
     ${sec(`Limits (${breaches.length})`, (notEnf && !isHookOnly(x) ? `<p class="why-s">${esc(notEnf)}</p>` : '') + (breaches.length ? breaches.map(b => { const t = breachText(b); return `<div class="bkrow"><span class="${t.cleared ? 'dim' : 'bad'}">${t.cleared ? 'cleared' : 'over'}</span> ${esc(t.what)}<div class="dim">${esc(t.act)} · since ${esc(ago(b.breached_unix || b.over_since_unix))} ago</div></div>`; }).join('') : '<div class="dim">Not over any limit.</div>'))}
-    ${paused.length ? sec(`Paused by Mulchie (${paused.length})`, `${paused.map(p => `<div class="bkrow">${link('proc', p.pid, `pid ${p.pid}`)} <span class="dim">since ${esc(ago(p.since_unix))} ago</span></div>`).join('')}${actions([btn('Resume these…', da('resume-paused', paused.map(p => `${p.pid}:${p.start_time}`).join(',')))])}`) : ''}
+    ${paused.length ? sec(`Paused by Mulchie (${paused.length})`, `${paused.map(p => `<div class="bkrow">${link('proc', p.pid, `pid ${p.pid}`)} <span class="dim">since ${esc(ago(p.since_unix))} ago</span>${p.pausing ? ' <span class="warn">pause not confirmed yet</span>' : ''}</div>`).join('')}${actions([btn('Resume these…', da('resume-paused', paused.map(p => `${p.pid}:${p.start_time}`).join(',')))])}`) : ''}
     ${running && S().sessions?.enabled !== false ? sec('Act on this session', `${actions(SESSION_ACTIONS.map(a => btn(GROUP_ACTIONS[a].verb + '…', da('s-' + a, id), DANGER.has(a) ? 'danger' : '')))}
       <label class="chk"><input type="checkbox" id="sIncAgent" ${st.ui.sIncAgent ? 'checked' : ''}> Include the agent itself (pid ${esc(x.root_pid)})</label>
       <div class="dim">Without it, only what the agent started is affected and the agent keeps running. Each action is planned first and lists the processes before anything is sent.</div>`) : ''}

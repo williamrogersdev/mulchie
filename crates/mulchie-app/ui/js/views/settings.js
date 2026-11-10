@@ -127,7 +127,9 @@ export async function saveCfg() {
   const c = structuredClone(fresh.config);
   c.watch = c.watch || {};
   for (const [inWatch, k, v] of changes) (inWatch ? c.watch : c)[k] = v;
-  const r = await act(() => invoke('set_config', { config: c }).then(() => true), 'Settings saved');
+  // Only while the file is still as just read (an engine without
+  // revisions writes as before).
+  const r = await act(() => invoke('set_config', { config: c, ifRevision: fresh.revision || null }).then(() => true), 'Settings saved');
   if (r) {
     st.cfg = { ...fresh, config: c };
     st.cfgRev = null;

@@ -196,8 +196,8 @@ async fn patch_config(
 }
 
 #[tauri::command]
-async fn set_config(b: B<'_>, config: Value) -> Result<(), String> {
-    blocking(&b, move |b| b.set_config(config)).await
+async fn set_config(b: B<'_>, config: Value, if_revision: Option<String>) -> Result<(), String> {
+    blocking(&b, move |b| b.set_config_at(config, if_revision.as_deref())).await
 }
 
 #[derive(Serialize)]

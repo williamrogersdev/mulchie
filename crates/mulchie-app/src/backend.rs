@@ -882,7 +882,20 @@ impl Backend {
     /// engine's `PUT /v1/config`, which saves its file the same way. The
     /// config stays JSON until this engine parses it, so a client passes on
     /// keys that a newer engine knows and this build does not.
+    #[cfg(test)]
     pub fn set_config(&self, cfg: Value) -> Result<(), String> {
+        self.set_config_at(cfg, None)
+    }
+
+    /// [`Backend::set_config`], only while the settings file is at
+    /// `if_revision` (from `get_config`), when given: otherwise nothing is
+    /// saved and the error names `config_changed`.
+    pub fn set_config_at(&self, cfg: Value, if_revision: Option<&str>) -> Result<(), String> {
+        if let Some(r) = if_revision {
+            if r.is_empty() || !r.chars().all(|c| c.is_ascii_alphanumeric()) {
+                return Err(format!("{r:?} is not a config revision"));
+            }
+        }
         match self.conn() {
             Conn::Local(e) => {
                 let parsed: Config = serde_json::from_value(cfg.clone())
@@ -892,11 +905,32 @@ impl Backend {
                 if let Some(k) = mulchie_core::config::unknown_key(&cfg, &parsed) {
                     return Err(mulchie_core::config::ConfigError::UnknownKey(k).to_string());
                 }
-                e.set_config(parsed).map_err(|e| e.to_string())
+                e.set_config_if(parsed, if_revision)
+                    .map(|_| ())
+                    .map_err(|e| e.to_string())
             }
-            Conn::Remote(c) => self
-                .remote(&c, "PUT", "/v1/config", Some(config_put_body(cfg)))
-                .map(|_| ()),
+            Conn::Remote(c) => {
+                let path = match if_revision {
+                    Some(r) => format!("/v1/config?if_revision={r}"),
+                    None => "/v1/config".to_string(),
+                };
+                let body = config_put_body(cfg);
+                match c.request(
+                    "PUT",
+                    &path,
+                    Some(&body),
+                    api::timeout_for("PUT", "/v1/config"),
+                ) {
+                    Ok(_) => {
+                        self.note_ok();
+                        Ok(())
+                    }
+                    Err(e) => {
+                        self.note_failure(&e);
+                        Err(e.message)
+                    }
+                }
+            }
             Conn::Down => Err(self.down_error()),
         }
     }

@@ -172,7 +172,7 @@ async function save(card, patch, which) {
       try { const fresh = await invoke('get_config'); if (drawn[which]) drawn[which].revision = fresh.revision || null; } catch (err) { /* the next save says why */ }
       showErrors(card, '', CHANGED_HELP);
     } else if (code === 'not_lock_holder') showErrors(card, '', LOCK_HELP);
-    else if (code === 'invalid_config') showErrors(card, msg);
+    else if (code === 'invalid_config' || code === 'unknown_key') showErrors(card, msg);
     else showErrors(card, '', `Not saved: ${msg}`);
     toast('Not saved', true);
   } finally { btn.disabled = !st.cfg?.editable; }
@@ -297,8 +297,10 @@ function readLimits(card) {
 // Why this engine does not act on budgets: the engine's own reason when it
 // gives one, else what the state shows.
 function notEnforcingText() {
-  const S = st.S || {};
-  if (lstat?.not_enforcing_reason) return lstat.not_enforcing_reason;
+  const S = st.S || {}, why = lstat?.not_enforcing_reason;
+  if (why === 'not_lock_holder') return `another Mulchie engine${S.lock_held_by_other ? ` (pid ${S.lock_held_by_other})` : ''} holds the engine lock and acts on the budgets`;
+  if (why === 'config_error') return `the settings file did not load, so nothing acts until it is fixed${S.config_error ? ` (${S.config_error})` : ''}`;
+  if (why) return String(why).replace(/_/g, ' ');
   if (S.config_error) return `the settings file has an error, so automatic actions are off until it is fixed (${S.config_error})`;
   if (S.lock_held_by_other) return `another Mulchie engine (pid ${S.lock_held_by_other}) holds the engine lock and acts on the budgets`;
   return 'automatic actions are off in this engine';
@@ -315,7 +317,7 @@ function limitsStatusHtml() {
     ? 'Report only: no budget is set, so Mulchie only reports sessions that hog the machine.'
     : l?.enforcing === false ? `Budgets are set, but this engine does not act on them: ${notEnforcingText()}. It reports breaches only.`
       : 'Enforcing: budgets are set and this engine acts on them as configured.';
-  const pausedRow = (list, title, hint) => list.length ? `<h4 class="cat-h">${esc(title)} (${list.length})</h4>${list.map(p => `<div class="bkrow"><a class="lnk" role="button" tabindex="0" data-d="proc" data-dk="${p.pid}">pid ${p.pid}</a> · ${sLink(p.session_id, sessName(p.session_id))} <span class="dim">since ${esc(ago(p.since_unix))} ago</span></div>`).join('')}<div class="actions"><button class="btn sm" data-lim="resume" data-pids="${list.map(p => `${p.pid}:${p.start_time}`).join(',')}">Resume ${list.length === 1 ? 'it' : 'them'}…</button></div>${hint ? `<div class="dim">${esc(hint)}</div>` : ''}` : '';
+  const pausedRow = (list, title, hint) => list.length ? `<h4 class="cat-h">${esc(title)} (${list.length})</h4>${list.map(p => `<div class="bkrow"><a class="lnk" role="button" tabindex="0" data-d="proc" data-dk="${p.pid}">pid ${p.pid}</a> · ${sLink(p.session_id, sessName(p.session_id))} <span class="dim">since ${esc(ago(p.since_unix))} ago</span>${p.pausing ? ' <span class="warn">pause not confirmed yet</span>' : ''}</div>`).join('')}<div class="actions"><button class="btn sm" data-lim="resume" data-pids="${list.map(p => `${p.pid}:${p.start_time}`).join(',')}">Resume ${list.length === 1 ? 'it' : 'them'}…</button></div>${hint ? `<div class="dim">${esc(hint)}</div>` : ''}` : '';
   return `<p class="why-s ${l?.enforcing === false && !(l?.report_only) ? 'warn' : ''}">${esc(mode)}</p>
     ${lstatErr ? `<p class="warn">Could not read the limits status: ${esc(lstatErr)}</p>` : ''}
     <h4 class="cat-h">Over a limit now (${active.length})</h4>${active.length ? active.map(b => `<div class="bkrow">${sLink(b.session_id, b.agent || sessName(b.session_id))}: ${esc(b.cap.replace(/_/g, ' '))} ${esc(+Number(b.value).toFixed(1))} against ${esc(b.max)} · <span class="dim">${esc(b.action)}, ${esc(String(b.action_state).replace(/_/g, ' '))}</span></div>`).join('') : '<div class="dim">No session is over a limit.</div>'}
