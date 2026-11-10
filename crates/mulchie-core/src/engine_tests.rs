@@ -393,7 +393,15 @@ fn scan_requests_are_deduplicated() {
 
 #[test]
 fn shutdown_stops_both_loops() {
-    let (_t, e) = engine();
+    // A started engine samples the real process table and holds the lock in
+    // its temp home, so it automates: with throttling on, a busy test run
+    // (CPU over `throttle_cpu_pct`) would renice the user's real builds and
+    // other tests' children. Nothing else it starts acts on real processes
+    // (no limit budgets, no update sources under test).
+    let (_t, e) = engine_with(Config {
+        throttle_builds: false,
+        ..Config::default()
+    });
     e.start();
     std::thread::sleep(Duration::from_millis(200));
     let t = Instant::now();

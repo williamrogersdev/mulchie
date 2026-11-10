@@ -254,7 +254,8 @@ fn deprioritize_lowers_priority_and_restores_it_after_clearing() {
     ];
     e.observe_sessions(1_000, &busy, M, &c);
     e.run_limit_jobs(1_000);
-    assert_eq!(only_breach(&e).action_state, ActionState::Done);
+    let b = only_breach(&e);
+    assert_eq!(b.action_state, ActionState::Done, "{:?}", b.action_detail);
     assert_eq!(nice_of(w), Some(c.build_nice.max(10)));
     let idle = [
         proc(77_777, 1, 500, Some("claude"), 0.0),
