@@ -38,8 +38,8 @@ Each entry runs `mulchie hook <client> <event>` by the absolute path of the bina
 After installing:
 
 - **Claude Code** reloads `settings.json` on its own. Sessions already running may need a restart.
-- **Codex** runs new or changed hooks only after you review and trust them. Run `/hooks` in Codex (or Settings, Hooks, in the app) and trust the Mulchie hooks. How Codex treats a hook that exits with an unexpected code is unconfirmed. Mulchie's hook exits 0 whenever it fails open (see below).
-- **Cursor**: restart it if it does not pick the hooks up. **Gemini CLI**: restart it. **Copilot CLI**: new sessions load the hooks.
+- **Codex** runs a hook that is not managed only after you review and trust it. Run `/hooks` in Codex (or Settings, Hooks, in the app) and trust the Mulchie hooks. A changed hook command (for example after the Mulchie binary moves and you re-run `hooks install`) is skipped until you trust it again. How Codex treats a hook that exits with an unexpected code is unconfirmed. Mulchie's hook exits 0 whenever it fails open (see below).
+- **Cursor**: restart it if it does not pick the hooks up. **Gemini CLI**: restart it. Gemini CLI 0.18.x runs hooks only when `tools.enableHooks` is true in `~/.gemini/settings.json`; newer versions may not need it. Mulchie does not set it: `hooks install --client gemini` and `hooks status` print a note when it is not `true`. **Copilot CLI**: new sessions load the hooks.
 
 Mulchie has no hook support for Windsurf, Antigravity, opencode or Aider. It supports only clients whose hook mechanism it has written to. Sessions of `aider` and `opencode` are still found in the process table (see [Sessions](/docs/sessions/)), without hooks.
 
@@ -106,6 +106,8 @@ The exit status is 0 for allow, 4 for warn, 3 for block and 1 for an error. Agen
 | Copilot CLI | Asks you to confirm. | Refuses it. |
 | Codex | No confirmation. The command runs, and the warning goes to you and the agent as text. | Refuses it. |
 | Gemini CLI | No confirmation. The command runs, and you see the warning. | Refuses it. |
+
+In Copilot CLI's autopilot mode no prompt is shown, so an "ask" decision is denied and a guard `warn` becomes a refusal there.
 
 `--guard` on `hooks install` (or on `mulchie hook`) sets a ceiling per app: `off` never asks or blocks, and a warning becomes advice to the agent. `warn` turns a `block` into a warning, which for Codex and Gemini CLI is only text. `block` follows the engine.
 

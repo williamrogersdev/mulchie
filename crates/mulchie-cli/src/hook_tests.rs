@@ -278,6 +278,61 @@ fn requests_are_client_neutral() {
     assert_eq!(neutral_event(Codex, "Interrupt"), "other");
 }
 
+/// Payloads as the clients' docs show them, fed straight to `request`.
+/// Existing fixtures cover the same shapes with other values; these pin the
+/// documented examples exactly.
+#[test]
+fn documented_pre_tool_payloads_parse() {
+    let cases = [
+        (
+            Copilot,
+            "preToolUse",
+            r#"{"timestamp":1,"cwd":"/w","sessionId":"s1","toolName":"bash","toolArgs":"{\"command\":\"ls\"}"}"#,
+            Some("s1"),
+            "bash",
+        ),
+        // Old Copilot versions send no sessionId: the session id is absent
+        // and the engine binds by the hook's process instead.
+        (
+            Copilot,
+            "preToolUse",
+            r#"{"timestamp":1,"cwd":"/w","toolName":"bash","toolArgs":"{\"command\":\"ls\"}"}"#,
+            None,
+            "bash",
+        ),
+        (
+            Cursor,
+            "beforeShellExecution",
+            r#"{"conversation_id":"c1","workspace_roots":["/w"],"command":"ls","cwd":"/w","hook_event_name":"beforeShellExecution"}"#,
+            Some("c1"),
+            "shell",
+        ),
+        (
+            Gemini,
+            "BeforeTool",
+            r#"{"session_id":"g1","cwd":"/w","hook_event_name":"BeforeTool","tool_name":"run_shell_command","tool_input":{"command":"ls"}}"#,
+            Some("g1"),
+            "run_shell_command",
+        ),
+        (
+            Codex,
+            "PreToolUse",
+            r#"{"session_id":"x1","cwd":"/w","hook_event_name":"PreToolUse","tool_name":"Bash","tool_input":{"command":"ls"}}"#,
+            Some("x1"),
+            "Bash",
+        ),
+    ];
+    for (c, event, body, sid, tool) in cases {
+        let input: Value = serde_json::from_str(body).unwrap();
+        let req = request(c, event, &input, 7);
+        assert_eq!(req.event, "pre_tool", "{c:?}");
+        assert_eq!(req.client_session_id.as_deref(), sid, "{c:?} {body}");
+        assert_eq!(req.cwd.as_deref(), Some("/w"), "{c:?}");
+        assert_eq!(req.tool.as_deref(), Some(tool), "{c:?}");
+        assert_eq!(req.command.as_deref(), Some("ls"), "{c:?}");
+    }
+}
+
 const ALL: [HookClient; 5] = [ClaudeCode, Codex, Cursor, Gemini, Copilot];
 
 #[test]

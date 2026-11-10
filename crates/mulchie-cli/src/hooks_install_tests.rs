@@ -503,3 +503,35 @@ fn a_file_that_would_change_on_rewrite_is_left_alone() {
         assert_eq!(std::fs::read_to_string(&f).unwrap(), text);
     }
 }
+
+#[test]
+fn gemini_note_depends_on_tools_enable_hooks() {
+    for (settings, noted) in [
+        (None, true),
+        (Some(r#"{"tools":{"enableHooks":false}}"#), true),
+        (Some(r#"{"tools":{"enableHooks":true}}"#), false),
+    ] {
+        let t = t();
+        let f = t.env.file(Gemini);
+        if let Some(s) = settings {
+            std::fs::create_dir_all(f.parent().unwrap()).unwrap();
+            std::fs::write(&f, s).unwrap();
+        }
+        for dry in [true, false] {
+            let msg = install_in(&t.env, Gemini, dry, None).unwrap();
+            assert_eq!(
+                msg.contains("tools.enableHooks"),
+                noted,
+                "{settings:?} {msg}"
+            );
+        }
+        let status = render_status(&status_in(&t.env));
+        assert_eq!(status.contains("tools.enableHooks"), noted, "{status}");
+        // The key itself is never written.
+        let v = read(&f);
+        assert_eq!(
+            v["tools"]["enableHooks"] == true,
+            settings.is_some_and(|s| s.contains("true"))
+        );
+    }
+}

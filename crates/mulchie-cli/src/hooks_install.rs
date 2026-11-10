@@ -682,11 +682,25 @@ pub fn diff(old: &str, new: &str, path: &Path) -> String {
 fn after_note(c: HookClient) -> &'static str {
     match c {
         HookClient::ClaudeCode => "Claude Code reloads settings.json on its own; `/hooks` in Claude Code lists them. Sessions already running may need a restart.",
-        HookClient::Codex => "Codex runs new or changed hooks only after you review and trust them: run `/hooks` in Codex (or Settings > Hooks in the app) and trust the mulchie hooks.",
+        HookClient::Codex => "Codex runs a hook that is not managed only after you review and trust it: run `/hooks` in Codex (or Settings > Hooks in the app) and trust the mulchie hooks. A changed hook command (for example after the mulchie binary moves and you re-run `hooks install`) is skipped until you trust it again.",
         HookClient::Cursor => "If Cursor does not pick up the hooks, restart it.",
         HookClient::Gemini => "Restart Gemini CLI so it loads the hooks.",
         HookClient::Copilot => "New Copilot CLI sessions load the hooks.",
     }
+}
+
+/// Said after a Gemini CLI install and in `hooks status`.
+const GEMINI_ENABLE_NOTE: &str = "Gemini CLI 0.18.x runs hooks only when `tools.enableHooks` is true in settings.json; newer versions may not need it. Mulchie does not set it.";
+
+/// The Gemini note, unless `tools.enableHooks` is already `true` in `path`.
+fn gemini_enable_note(path: &Path) -> Option<&'static str> {
+    let on = resolve(path)
+        .and_then(|t| read_text(&t))
+        .ok()
+        .flatten()
+        .and_then(|s| serde_json::from_str::<Value>(&s).ok())
+        .is_some_and(|v| v["tools"]["enableHooks"] == true);
+    (!on).then_some(GEMINI_ENABLE_NOTE)
 }
 
 /// Back up and write, or show the diff.
@@ -759,11 +773,17 @@ pub fn install_in(
     let old = read_text(&target)?;
     let change = plan_install(old.as_deref(), &path, c, &env.exe, guard)?;
     let (msg, wrote) = apply(&path, &target, old.as_deref(), change, dry_run)?;
-    Ok(if wrote {
+    let mut out = if wrote {
         format!("{msg}\n{}", after_note(c))
     } else {
         msg
-    })
+    };
+    if c == HookClient::Gemini {
+        if let Some(n) = gemini_enable_note(&path) {
+            out.push_str(&format!("\n{n}"));
+        }
+    }
+    Ok(out)
 }
 
 pub fn uninstall_in(env: &HookEnv, c: HookClient, dry_run: bool) -> Result<String, String> {
@@ -825,6 +845,12 @@ pub fn status_in(env: &HookEnv) -> Value {
                     v["runs"] = json!(exes);
                     v["runs_this_binary"] =
                         json!(!exes.is_empty() && exes.iter().all(|e| *e == current));
+                    if c == HookClient::Gemini && !v["events"].as_array().is_none_or(Vec::is_empty)
+                    {
+                        if let Some(n) = gemini_enable_note(&path) {
+                            v["note"] = json!(n);
+                        }
+                    }
                 }
             },
         }
@@ -860,6 +886,9 @@ fn render_status(v: &Value) -> String {
         };
         s.push_str(&line);
         s.push('\n');
+        if let Some(n) = c["note"].as_str() {
+            s.push_str(&format!("{:<12} note: {n}\n", ""));
+        }
     }
     s
 }
