@@ -684,6 +684,12 @@ paths:
         hook payload is redacted before it is stored. Pass `next_since` back as `since` to page.
         A session that is neither known nor recorded is 404 `unknown_session`.
 
+        Every limit action is a `limit_action` event: `breach_id`, `cap`, `action` (the cap's
+        action), `outcome` (`paused`, `stopped`, `killed`, `deprioritized`, `resumed`, `restored`,
+        `restore_failed` or `refused`), `state` (the breach's `action_state`), `detail`, and
+        `reason` when refused. `cap`, `action` and `state` are null for a resume whose breach is
+        gone (sessions or limits were turned off).
+
         To read backwards, pass `tail=N` for the last N events, then `before=<prev_before>` for
         the page before that; events are still oldest first. `prev_before` is null when the page
         starts at the first event. `before` without `tail` takes `limit` events. `since` does not

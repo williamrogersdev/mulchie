@@ -164,6 +164,48 @@ fn pause_spares_the_agent_and_resumes_after_resume_after_secs() {
     assert!(only_breach(&e).restored);
     assert!(load_paused(e.paths()).unwrap().is_empty());
     assert!(e.snapshot_state().sessions.paused_by_mulchie.is_empty());
+    // A1: both actions are in the session's activity record.
+    let acts = limit_actions(&e, &Session::id_for(a, 500));
+    let outcomes: Vec<&str> = acts.iter().filter_map(|v| v["outcome"].as_str()).collect();
+    assert_eq!(outcomes, ["paused", "resumed"], "{acts:?}");
+    assert_eq!(acts[0]["action"], "pause");
+    assert_eq!(acts[0]["state"], "done");
+    assert_eq!(acts[0]["cap"], "cpu_cores");
+    assert!(acts[0]["breach_id"].is_string());
+    assert!(acts[0].get("reason").is_none());
+    assert!(acts[1]["detail"]
+        .as_str()
+        .unwrap()
+        .contains("resumed 1 of 1"));
+}
+
+/// The `limit_action` events of a session's record.
+fn limit_actions(e: &Engine, id: &str) -> Vec<serde_json::Value> {
+    e.flush_record();
+    e.session_events(id, 0, 1000)
+        .unwrap()
+        .into_iter()
+        .filter(|v| v["type"] == "limit_action")
+        .collect()
+}
+
+/// A1: an action that did nothing is recorded as refused, with the reason.
+#[test]
+fn refused_limit_actions_are_recorded_with_the_reason() {
+    let c = cfg(LimitAction::Pause, false);
+    let (_t, e) = engine(&c, &[]);
+    let busy = [proc(77_777, 1, 500, Some("claude"), 300.0)];
+    e.observe_sessions(1_000, &busy, M, &c);
+    e.run_limit_jobs(1_000);
+    assert_eq!(only_breach(&e).action_state, ActionState::Skipped);
+    let acts = limit_actions(&e, &Session::id_for(77_777, 500));
+    assert_eq!(acts.len(), 1, "{acts:?}");
+    assert_eq!(acts[0]["outcome"], "refused");
+    assert_eq!(acts[0]["state"], "skipped");
+    assert!(
+        acts[0]["reason"].as_str().unwrap().contains("spared"),
+        "{acts:?}"
+    );
 }
 
 /// include_agent lets a pause reach the agent's own process.
@@ -237,6 +279,9 @@ fn stop_terms_then_kills_after_the_grace_period() {
     assert_eq!(st.signal(), Some(libc::SIGKILL));
     let d = only_breach(&e).action_detail.unwrap_or_default();
     assert!(d.contains("SIGKILL to 1 of 1"), "{d}");
+    let acts = limit_actions(&e, &Session::id_for(77_777, 500));
+    let outcomes: Vec<&str> = acts.iter().filter_map(|v| v["outcome"].as_str()).collect();
+    assert_eq!(outcomes, ["stopped", "killed"], "{acts:?}");
 }
 
 /// Deprioritize lowers the priority through the gate; clearing restores it
@@ -288,6 +333,14 @@ fn deprioritize_lowers_priority_and_restores_it_after_clearing() {
     } else {
         assert!(!b.restored && d.contains("needs privilege"), "{d}");
     }
+    let acts = limit_actions(&e, &Session::id_for(77_777, 500));
+    let outcomes: Vec<&str> = acts.iter().filter_map(|v| v["outcome"].as_str()).collect();
+    let back = if b.restored {
+        "restored"
+    } else {
+        "restore_failed"
+    };
+    assert_eq!(outcomes, ["deprioritized", back], "{acts:?}");
     // N6: the restore (or the attempt) is journaled.
     assert!(e
         .snapshot_state()

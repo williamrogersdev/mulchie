@@ -620,11 +620,14 @@ impl Engine {
             };
             let Some(job) = job else { return };
             match job {
-                LimitJob::Act { breach_id } => self.act(&breach_id, now),
+                LimitJob::Act { breach_id } => {
+                    self.act(&breach_id, now);
+                    self.record_act(&breach_id, now);
+                }
                 LimitJob::Kill {
                     breach_id, targets, ..
-                } => self.kill_survivors(&breach_id, &targets),
-                LimitJob::Restore { breach_id } => self.restore_breach(&breach_id),
+                } => self.kill_survivors(&breach_id, &targets, now),
+                LimitJob::Restore { breach_id } => self.restore_breach(&breach_id, now),
                 LimitJob::Resume { breach_id } => self.resume_breach(&breach_id, "limits"),
                 LimitJob::ResumeEntries { entries, why } => {
                     self.log(
@@ -652,6 +655,63 @@ impl Engine {
                 "limits",
             );
         }
+    }
+
+    /// A1: a limit action in the session's activity record, as a
+    /// `limit_action` event: `breach_id`, `action` (the cap's action),
+    /// `outcome` (paused, stopped, killed, deprioritized, resumed, restored,
+    /// restore_failed or refused), `state` and `detail`, and `reason` when
+    /// refused. `cap`, `action` and `state` are null when the breach is gone
+    /// (a resume after sessions or limits were turned off). Written only
+    /// where records are (the lock holder).
+    fn record_limit_action(
+        &self,
+        session_id: &str,
+        breach_id: &str,
+        b: Option<&Breach>,
+        now: u64,
+        outcome: &str,
+        detail: &str,
+    ) {
+        let cfg = self.config();
+        if !self.records_on(&cfg) {
+            return;
+        }
+        let mut ev = json!({
+            "breach_id": breach_id,
+            "cap": b.map(|b| b.cap),
+            "action": b.map(|b| b.action),
+            "outcome": outcome,
+            "state": b.map(|b| b.action_state),
+            // Mulchie's own words (counts, pids, gate reasons): no user
+            // text, so nothing to redact.
+            "detail": detail,
+        });
+        if outcome == "refused" {
+            ev["reason"] = ev["detail"].clone();
+        }
+        self.record_writer()
+            .event(session_id, now, "limit_action", ev);
+    }
+
+    /// After `act`: what it did (or why it did nothing) into the record.
+    fn record_act(&self, breach_id: &str, now: u64) {
+        let Some(b) = lock(&self.sup).limits.get(breach_id).cloned() else {
+            return;
+        };
+        let outcome = match (b.action_state, b.action) {
+            (ActionState::Pending | ActionState::NotifyOnly, _) | (_, LimitAction::Notify) => {
+                return
+            }
+            (ActionState::Done | ActionState::Partial, LimitAction::Pause) => "paused",
+            (ActionState::Done | ActionState::Partial, LimitAction::Stop) => "stopped",
+            (ActionState::Done | ActionState::Partial, LimitAction::Deprioritize) => {
+                "deprioritized"
+            }
+            (ActionState::Skipped | ActionState::NotEnforced, _) => "refused",
+        };
+        let detail = b.action_detail.clone().unwrap_or_default();
+        self.record_limit_action(&b.session_id, &b.id, Some(&b), now, outcome, &detail);
     }
 
     fn set_action(&self, breach_id: &str, state: ActionState, detail: Option<String>) {
@@ -867,7 +927,7 @@ impl Engine {
 
     /// SIGKILL the processes of a `stop` still running after the grace
     /// period (same pid and start time; the gate checks again).
-    fn kill_survivors(&self, breach_id: &str, targets: &[(u32, u64)]) {
+    fn kill_survivors(&self, breach_id: &str, targets: &[(u32, u64)], now: u64) {
         let alive: Vec<(u32, u64)> = targets
             .iter()
             .copied()
@@ -890,21 +950,31 @@ impl Engine {
             let results = self.execute(&reqs, "limits");
             let killed = results.iter().filter(|r| r.is_done()).count();
             note.push_str(&format!("; SIGKILL to {killed} of {}", alive.len()));
+            let sk = skipped_words(&results);
+            if !sk.is_empty() {
+                note.push_str(&format!(" (skipped {sk})"));
+            }
         }
-        let mut sup = lock(&self.sup);
-        if let Some(b) = sup.limits.get_mut(breach_id) {
-            let d = b.action_detail.take().unwrap_or_default();
-            b.action_detail = Some(if d.is_empty() {
-                note
-            } else {
-                format!("{d}; {note}")
-            });
+        let b = {
+            let mut sup = lock(&self.sup);
+            sup.limits.get_mut(breach_id).map(|b| {
+                let d = b.action_detail.take().unwrap_or_default();
+                b.action_detail = Some(if d.is_empty() {
+                    note.clone()
+                } else {
+                    format!("{d}; {note}")
+                });
+                b.clone()
+            })
+        };
+        if let Some(b) = b {
+            self.record_limit_action(&b.session_id, &b.id, Some(&b), now, "killed", &note);
         }
     }
 
     /// Put back the priorities a `deprioritize` lowered. Raising priority
     /// usually needs privilege, so this often fails; the breach says so.
-    fn restore_breach(&self, breach_id: &str) {
+    fn restore_breach(&self, breach_id: &str, now: u64) {
         let lowered = lock(&self.sup)
             .lowered
             .remove(breach_id)
@@ -930,22 +1000,33 @@ impl Engine {
             }
             self.log("limit", text, 0, None, "limits");
         }
-        let mut sup = lock(&self.sup);
-        if let Some(b) = sup.limits.get_mut(breach_id) {
-            b.restored = failed == 0;
-            let note = if failed == 0 {
-                format!("priority restored for {ok} process(es)")
+        let note = if failed == 0 {
+            format!("priority restored for {ok} process(es)")
+        } else {
+            format!(
+                "priority restored for {ok}, not for {failed} process(es): raising priority needs privilege, so they keep the lower priority until they exit"
+            )
+        };
+        let b = {
+            let mut sup = lock(&self.sup);
+            sup.limits.get_mut(breach_id).map(|b| {
+                b.restored = failed == 0;
+                let d = b.action_detail.take().unwrap_or_default();
+                b.action_detail = Some(if d.is_empty() {
+                    note.clone()
+                } else {
+                    format!("{d}; {note}")
+                });
+                b.clone()
+            })
+        };
+        if let Some(b) = b {
+            let outcome = if failed == 0 {
+                "restored"
             } else {
-                format!(
-                    "priority restored for {ok}, not for {failed} process(es): raising priority needs privilege, so they keep the lower priority until they exit"
-                )
+                "restore_failed"
             };
-            let d = b.action_detail.take().unwrap_or_default();
-            b.action_detail = Some(if d.is_empty() {
-                note
-            } else {
-                format!("{d}; {note}")
-            });
+            self.record_limit_action(&b.session_id, &b.id, Some(&b), now, outcome, &note);
         }
     }
 
@@ -1003,6 +1084,23 @@ impl Engine {
             text.push_str(&format!(" (skipped {failed})"));
         }
         self.log("limit", text, 0, None, source);
+        // Into each breach's session record: how many of its processes.
+        let mut per: BTreeMap<(&str, &str), (usize, usize)> = BTreeMap::new();
+        for (p, r) in entries.iter().zip(&results) {
+            let c = per
+                .entry((p.session_id.as_str(), p.breach_id.as_str()))
+                .or_default();
+            c.1 += 1;
+            if r.is_done() {
+                c.0 += 1;
+            }
+        }
+        let now = crate::monitor::now_unix();
+        for ((session_id, breach_id), (done, total)) in per {
+            let b = lock(&self.sup).limits.get(breach_id).cloned();
+            let d = format!("resumed {done} of {total} process(es) ({source})");
+            self.record_limit_action(session_id, breach_id, b.as_ref(), now, "resumed", &d);
+        }
         resumed
     }
 
