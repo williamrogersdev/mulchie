@@ -1255,6 +1255,12 @@ fn route(req: &Req, engine: &Engine, read_only: bool) -> Resp {
                         "expected {\"config\": {...}}: the whole config from GET /v1/config with your changes",
                     ));
                 };
+                let raw: serde_json::Value =
+                    serde_json::from_slice(&req.body).unwrap_or(serde_json::Value::Null);
+                if let Some(k) = crate::config::unknown_key(&raw["config"], &cfg) {
+                    let e = crate::config::ConfigError::UnknownKey(k);
+                    return Ok(fail(400, "unknown_key", e.to_string()));
+                }
                 match engine.set_config(cfg) {
                     Ok(()) => ok(&serde_json::json!({ "ok": true, "config": engine.config() })),
                     Err(e @ crate::config::ConfigError::Changed(_)) => {
@@ -1270,6 +1276,9 @@ fn route(req: &Req, engine: &Engine, read_only: bool) -> Resp {
                 let patch: serde_json::Value = body(req)?;
                 match engine.patch_config(&patch) {
                     Ok(cfg) => ok(&serde_json::json!({ "ok": true, "config": cfg })),
+                    Err(e @ crate::config::ConfigError::UnknownKey(_)) => {
+                        fail(400, "unknown_key", e.to_string())
+                    }
                     Err(e @ crate::config::ConfigError::NotLockHolder(_)) => {
                         fail(409, "not_lock_holder", e.to_string())
                     }

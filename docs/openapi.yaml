@@ -496,6 +496,8 @@ paths:
         content. Read the config again and reapply the change. Dismissing or undismissing a
         finding instead applies its edit to the file's current content. Only the engine that
         holds the engine lock writes the config: any other answers 409 `not_lock_holder`.
+        A key the config does not have is 400 `unknown_key`, naming its path (for example
+        `guard.rulez`); nothing is saved.
         Prefer `PATCH`, which sends only the keys that change.
       requestBody:
         required: true
@@ -527,6 +529,9 @@ paths:
         elsewhere is kept, not refused), validated (400 `invalid_config`) and saved atomically.
         A file that failed to load is not patched (400; replace it with `PUT`). Full token only;
         409 `not_lock_holder` on an engine that does not hold the engine lock.
+        A key the config does not have, at any depth, is 400 `unknown_key` naming its path
+        (`watch.intervl_secs`, `limits.workspaces[0].budget.bogus`); keys set to null are not
+        checked. Nothing is saved.
       requestBody:
         required: true
         content:

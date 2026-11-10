@@ -1337,3 +1337,63 @@ fn sessions_hooks_and_updates_over_the_api() {
         "{v}"
     );
 }
+
+/// N8: a key the config does not have is refused with 400 `unknown_key`
+/// naming its path, for PATCH and PUT; nothing is saved.
+#[test]
+fn unknown_config_keys_are_refused() {
+    let r = running(Limits::default());
+    let full = format!("Bearer {}", r.token);
+    let before = r.engine.config();
+    for (patch, path) in [
+        (r#"{"bogus":1}"#, "bogus"),
+        (r#"{"watch":{"intervl_secs":120}}"#, "watch.intervl_secs"),
+        (
+            r#"{"limits":{"workspaces":[{"path":"/code/a","budget":{"stop_grace_secs":5,"bogus":1}}]}}"#,
+            "limits.workspaces[0].budget.bogus",
+        ),
+    ] {
+        let (code, v) = send(r.port, "PATCH", "/v1/config", Some(&full), patch);
+        assert_eq!(
+            (code, v["code"].as_str()),
+            (400, Some("unknown_key")),
+            "{patch}: {v}"
+        );
+        assert!(v["error"].as_str().unwrap().contains(path), "{v}");
+    }
+    assert_eq!(r.engine.config(), before, "nothing saved");
+    // Known keys and nulls pass.
+    let (code, v) = send(
+        r.port,
+        "PATCH",
+        "/v1/config",
+        Some(&full),
+        r#"{"watch":{"interval_secs":120},"limits":{"default":null}}"#,
+    );
+    assert_eq!(code, 200, "{v}");
+    // PUT: the whole config with one stray key.
+    let mut whole = serde_json::to_value(r.engine.config()).unwrap();
+    whole["guard"]["rulez"] = json!({});
+    let (code, v) = send(
+        r.port,
+        "PUT",
+        "/v1/config",
+        Some(&full),
+        &json!({ "config": whole }).to_string(),
+    );
+    assert_eq!(
+        (code, v["code"].as_str()),
+        (400, Some("unknown_key")),
+        "{v}"
+    );
+    assert!(v["error"].as_str().unwrap().contains("guard.rulez"), "{v}");
+    whole["guard"].as_object_mut().unwrap().remove("rulez");
+    let (code, v) = send(
+        r.port,
+        "PUT",
+        "/v1/config",
+        Some(&full),
+        &json!({ "config": whole }).to_string(),
+    );
+    assert_eq!(code, 200, "{v}");
+}

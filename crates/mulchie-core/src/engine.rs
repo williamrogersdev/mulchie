@@ -967,6 +967,9 @@ impl Engine {
         merge_patch(&mut v, patch);
         let cfg: Config =
             serde_json::from_value(v).map_err(|e| ConfigError::Parse(e.to_string()))?;
+        if let Some(k) = crate::config::unknown_key(patch, &cfg) {
+            return Err(ConfigError::UnknownKey(k));
+        }
         self.save_config_locked(&mut disk, cfg.clone())?;
         Ok(cfg)
     }

@@ -607,6 +607,9 @@ pub enum ConfigError {
     /// This engine does not hold the engine lock: only the running engine
     /// writes the config (send the change to its API instead).
     NotLockHolder(String),
+    /// A key the config does not have, by its path (`watch.intervl_secs`,
+    /// `limits.workspaces[0].bogus`). Nothing was saved.
+    UnknownKey(String),
 }
 
 impl std::fmt::Display for ConfigError {
@@ -617,11 +620,50 @@ impl std::fmt::Display for ConfigError {
             ConfigError::Io(e) => write!(f, "config file error: {e}"),
             ConfigError::Changed(e) => write!(f, "config file changed on disk: {e}"),
             ConfigError::NotLockHolder(e) => write!(f, "config not saved: {e}"),
+            ConfigError::UnknownKey(p) => write!(
+                f,
+                "config has no key {p}; nothing was saved (GET /v1/config lists the keys)"
+            ),
         }
     }
 }
 
 impl std::error::Error for ConfigError {}
+
+/// The first key in `given` (a whole config or a merge patch, as JSON) that
+/// `cfg`, parsed from it, does not have: serde drops unknown keys, so a key
+/// missing after a round trip is one the config does not know. Keys set to
+/// null (a patch's removal, an unset option) are not checked; maps keyed by
+/// user data keep their keys and pass.
+pub fn unknown_key(given: &serde_json::Value, cfg: &Config) -> Option<String> {
+    let kept = serde_json::to_value(cfg).ok()?;
+    fn walk(g: &serde_json::Value, k: &serde_json::Value, at: &str) -> Option<String> {
+        use serde_json::Value;
+        match (g, k) {
+            (Value::Object(gm), Value::Object(km)) => gm.iter().find_map(|(key, gv)| {
+                if gv.is_null() {
+                    return None;
+                }
+                let p = if at.is_empty() {
+                    key.clone()
+                } else {
+                    format!("{at}.{key}")
+                };
+                match km.get(key) {
+                    None => Some(p),
+                    Some(kv) => walk(gv, kv, &p),
+                }
+            }),
+            (Value::Array(ga), Value::Array(ka)) => ga
+                .iter()
+                .zip(ka)
+                .enumerate()
+                .find_map(|(i, (gv, kv))| walk(gv, kv, &format!("{at}[{i}]"))),
+            _ => None,
+        }
+    }
+    walk(given, &kept, "")
+}
 
 /// The result of loading: the config to run with, and the problem with the file
 /// if there was one. On a problem the config is the defaults with every
