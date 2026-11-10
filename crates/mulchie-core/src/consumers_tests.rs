@@ -34,6 +34,7 @@ fn ctx<'a>(ancestors: &'a [u32], ids: &'a HashMap<PathBuf, Option<String>>) -> G
         ancestors,
         macos: true,
         bundle_ids: ids,
+        user_managers: &[],
     }
 }
 
@@ -395,4 +396,82 @@ fn memory_headlines_follow_thresholds() {
         "critical"
     );
     assert_eq!(linux_pressure("some avg10=0.10\nfull avg10=0.00"), "normal");
+}
+
+/// R6: Linux session and desktop services are protected, including names
+/// Linux shortened to 15 bytes, and a direct child of `systemd --user`
+/// outside a workspace protects its group.
+#[test]
+fn linux_session_services_are_protected() {
+    let me = 9999;
+    for name in [
+        "dbus-daemon",
+        "dbus-broker",
+        "pipewire",
+        "wireplumber",
+        "pulseaudio",
+        "kwin_x11",
+        "kwin_wayland",
+        "sway",
+        "mutter",
+        "gnome-session-binary",
+        "gnome-session-b",
+        "gnome-session-c",
+        "xdg-desktop-portal",
+        "xdg-desktop-portal-gtk",
+        "xdg-desktop-por",
+        "ssh-agent",
+        "gpg-agent",
+    ] {
+        assert!(protected_reason(500, name, None, me).is_some(), "{name}");
+    }
+    // Exe base names count too; ordinary names do not.
+    assert!(protected_reason(500, "x", Some(Path::new("/usr/bin/gpg-agent")), me).is_some());
+    for name in [
+        "node",
+        "gnome-calculator",
+        "xdg-open",
+        "sshd-session",
+        "agent",
+    ] {
+        assert!(protected_reason(500, name, None, me).is_none(), "{name}");
+    }
+
+    assert!(is_user_manager(
+        "systemd",
+        &["/usr/lib/systemd/systemd".into(), "--user".into()]
+    ));
+    assert!(!is_user_manager("systemd", &["/sbin/init".into()]));
+    assert!(!is_user_manager("node", &["node".into(), "--user".into()]));
+
+    let ids = HashMap::new();
+    let mut c = ctx(&[], &ids);
+    let managers = [700];
+    c.user_managers = &managers;
+    let svc = ProcSample {
+        pid: 701,
+        ppid: 700,
+        own: true,
+        name: "evolution-sourc".into(),
+        exe: None,
+        workspace: None,
+        kind: ProcKind::Other,
+        cpu_pct: 1.0,
+        mem_bytes: 1,
+        start_time: 1,
+        stopped: false,
+    };
+    let r = group_protection(GroupKind::Process, std::slice::from_ref(&svc), &c);
+    assert!(
+        r.as_deref().is_some_and(|r| r.contains("systemd --user")),
+        "{r:?}"
+    );
+    // In a workspace (a dev server started as a user unit), or with another
+    // parent, it is not.
+    let mut in_ws = svc.clone();
+    in_ws.workspace = Some((PathBuf::from("/code/a"), "a".into()));
+    assert_eq!(group_protection(GroupKind::Workspace, &[in_ws], &c), None);
+    let mut other = svc;
+    other.ppid = 1234;
+    assert_eq!(group_protection(GroupKind::Process, &[other], &c), None);
 }

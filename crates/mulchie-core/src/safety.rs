@@ -933,6 +933,20 @@ impl<'a> Gate<'a> {
 
     // ------------------------------------------------------------------ cache
 
+    /// A direct child of `systemd --user` whose working directory is in no
+    /// scan root: a user service of the desktop session.
+    pub(crate) fn user_service(&self, p: &ProcFacts) -> Option<String> {
+        let parent = self.procs.get(p.ppid)?;
+        if !crate::consumers::is_user_manager(&parent.name, &parent.cmd) {
+            return None;
+        }
+        let in_workspace = p.cwd.as_deref().is_some_and(|c| {
+            let c = c.canonicalize().unwrap_or_else(|_| c.to_path_buf());
+            self.canonical_roots().iter().any(|r| c.starts_with(r))
+        });
+        (!in_workspace).then(|| crate::consumers::user_service_reason(&p.name))
+    }
+
     fn canonical_roots(&self) -> Vec<PathBuf> {
         self.config
             .roots(self.paths)
@@ -1835,6 +1849,9 @@ impl<'a> Gate<'a> {
             p.exe.as_deref(),
             self.procs.self_pid(),
         ) {
+            return skip(SkipReason::ProtectedProcess, r);
+        }
+        if let Some(r) = self.user_service(&p) {
             return skip(SkipReason::ProtectedProcess, r);
         }
         if self.engine_ancestors().contains(&pid) {

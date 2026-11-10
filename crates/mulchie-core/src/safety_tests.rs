@@ -1634,3 +1634,27 @@ fn reopen_needs_a_quit_in_the_same_batch_and_waits_without_the_lock() {
     let _ = a.wait();
     let _ = b.wait();
 }
+
+/// R6: the gate refuses to signal a direct child of `systemd --user` whose
+/// working directory is in no scan root, and allows one in a workspace.
+#[test]
+fn user_services_of_systemd_user_are_not_signalled() {
+    let mut env = Env::new();
+    let ws = env.root.join("proj");
+    std::fs::create_dir_all(&ws).unwrap();
+    env.procs = FakeProcesses::empty()
+        .with(700, "systemd", None, 10)
+        .with(701, "tracker-miner-f", Some(env.paths.home.clone()), 11)
+        .with(702, "node", Some(ws), 12)
+        .with(703, "node", Some(env.paths.home.clone()), 13);
+    env.procs.procs[0].cmd = vec!["/usr/lib/systemd/systemd".into(), "--user".into()];
+    env.procs.procs[1].ppid = 700;
+    env.procs.procs[2].ppid = 700;
+    let plan = env.gate().plan(&[sig(701, 11), sig(702, 12), sig(703, 13)]);
+    let i = &plan.items;
+    assert!(!i[0].ready, "{:?}", i[0]);
+    assert_eq!(i[0].reason, Some(SkipReason::ProtectedProcess));
+    assert!(i[0].verdict.contains("systemd --user"), "{}", i[0].verdict);
+    assert!(i[1].ready, "in a workspace: {:?}", i[1]);
+    assert!(i[2].ready, "another parent: {:?}", i[2]);
+}

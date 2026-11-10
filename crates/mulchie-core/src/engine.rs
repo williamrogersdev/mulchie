@@ -1635,6 +1635,9 @@ impl Engine {
             p.exe.as_deref(),
             self.procs.self_pid(),
         );
+        if protected.is_none() {
+            protected = self.gate_run(|g| g.user_service(p));
+        }
         if protected.is_none() && !own {
             protected = Some("another user's process".into());
         }
@@ -2028,6 +2031,11 @@ impl Engine {
                     );
                 }
                 let ctx_ids = HashMap::new();
+                let user_managers: Vec<u32> = procs
+                    .iter()
+                    .filter(|p| crate::consumers::is_user_manager(&p.name, &p.cmd))
+                    .map(|p| p.pid)
+                    .collect();
                 let ctx = crate::consumers::GroupCtx {
                     cores: 1,
                     mem_total: 0,
@@ -2035,6 +2043,7 @@ impl Engine {
                     ancestors: &ancestors,
                     macos: cfg!(target_os = "macos"),
                     bundle_ids: &ctx_ids,
+                    user_managers: &user_managers,
                 };
                 if let Some(r) = crate::consumers::group_protection(kind, &members, &ctx) {
                     return ProcessPlan::refused(now, key, &act, "protected", r);

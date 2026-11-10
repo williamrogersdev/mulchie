@@ -192,9 +192,48 @@ pub const PROTECTED_NAMES: &[&str] = &[
     "gnome-shell",
     "plasmashell",
     "kwin_wayland",
+    "kwin_x11",
+    "sway",
+    "mutter",
+    "dbus-daemon",
+    "dbus-broker",
+    "pipewire",
+    "pipewire-pulse",
+    "wireplumber",
+    "pulseaudio",
+    "ssh-agent",
+    "gpg-agent",
     "mulchie",
     "Mulchie",
 ];
+
+/// Name prefixes that are never acted on (`gnome-session-binary`,
+/// `xdg-desktop-portal-gtk`, …).
+pub const PROTECTED_NAME_PREFIXES: &[&str] = &["gnome-session", "xdg-desktop-portal"];
+
+/// Linux shortens a process name to 15 bytes; a name of exactly that length
+/// matches a longer protected name it begins.
+const COMM_LEN: usize = 15;
+
+fn protected_name(name: &str) -> bool {
+    let truncated = |p: &str| name.len() == COMM_LEN && p.starts_with(name);
+    PROTECTED_NAMES.iter().any(|p| *p == name || truncated(p))
+        || PROTECTED_NAME_PREFIXES
+            .iter()
+            .any(|p| name.starts_with(p) || truncated(p))
+}
+
+/// Whether a process is a per-user service manager (`systemd --user`), whose
+/// direct children outside a workspace are the desktop's user services.
+pub fn is_user_manager(name: &str, cmd: &[String]) -> bool {
+    name == "systemd" && cmd.iter().skip(1).any(|a| a == "--user")
+}
+
+/// Why a direct child of `systemd --user` outside every workspace may not be
+/// acted on.
+pub fn user_service_reason(name: &str) -> String {
+    format!("{name} is a user service started by systemd --user")
+}
 
 /// Executables under these directories belong to the operating system.
 /// `/System/Applications/` (Terminal, Music, …) is not among them: those are
@@ -220,10 +259,7 @@ pub fn protected_reason(pid: u32, name: &str, exe: Option<&Path>, self_pid: u32)
     let base = exe
         .and_then(|e| e.file_name())
         .map(|n| n.to_string_lossy().to_string());
-    if PROTECTED_NAMES
-        .iter()
-        .any(|n| *n == name || base.as_deref() == Some(*n))
-    {
+    if protected_name(name) || base.as_deref().is_some_and(protected_name) {
         return Some(format!("{name} is part of the desktop or system"));
     }
     if let Some(e) = exe {
@@ -351,6 +387,9 @@ pub struct GroupCtx<'a> {
     pub macos: bool,
     /// Bundle ids already known (bundle path → id); see [`bundle_id`].
     pub bundle_ids: &'a HashMap<PathBuf, Option<String>>,
+    /// Pids of `systemd --user` ([`is_user_manager`]): their direct children
+    /// outside a workspace are protected.
+    pub user_managers: &'a [u32],
 }
 
 /// Group the processes, total them, and keep the members for planning.
@@ -505,6 +544,9 @@ pub fn group_protection(kind: GroupKind, ms: &[ProcSample], ctx: &GroupCtx) -> O
     for p in ms {
         if let Some(r) = protected_reason(p.pid, &p.name, p.exe.as_deref(), ctx.self_pid) {
             return Some(r);
+        }
+        if p.workspace.is_none() && ctx.user_managers.contains(&p.ppid) {
+            return Some(user_service_reason(&p.name));
         }
     }
     None

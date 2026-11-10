@@ -564,6 +564,13 @@ impl Monitor {
         }
         let cpu_count = self.sys.cpus().len();
         let mem_total = self.sys.total_memory();
+        let user_managers: Vec<u32> = self
+            .sys
+            .processes()
+            .iter()
+            .filter(|(_, p)| p.name() == "systemd" && p.cmd().iter().skip(1).any(|a| a == "--user"))
+            .map(|(pid, _)| pid.as_u32())
+            .collect();
         let (consumers, members) = consumers::group(
             &samples,
             &consumers::GroupCtx {
@@ -573,6 +580,7 @@ impl Monitor {
                 ancestors: &ancestors,
                 macos: cfg!(target_os = "macos"),
                 bundle_ids: &self.bundle_ids,
+                user_managers: &user_managers,
             },
         );
         let cpu_pct = self.sys.global_cpu_usage();
