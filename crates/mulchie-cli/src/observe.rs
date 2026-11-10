@@ -575,6 +575,10 @@ pub fn set_key(cfg: &Value, key: &str, raw: &str) -> Result<Value, String> {
     Ok(new)
 }
 
+/// How often, and how far apart, `config set` tries for the engine lock.
+const LOCK_TRIES: usize = 15;
+const LOCK_WAIT: std::time::Duration = std::time::Duration::from_millis(200);
+
 /// The RFC 7396 merge patch that sets `key` (dotted) to its value in
 /// `edited`: `{"a": {"b": value}}`.
 pub fn merge_patch(key: &str, edited: &Value) -> Value {
@@ -618,8 +622,14 @@ fn config_set_with(
     connect: &dyn Fn(&Paths) -> Conn,
 ) -> i32 {
     let mut done = None;
-    // Twice at most: an engine that starts while we look is used instead.
-    for _ in 0..2 {
+    let mut held_by = None;
+    // An engine that starts while we look is used instead. Another process
+    // holding the lock without a listener (an engine starting, or another
+    // `mulchie config set`) is waited for, briefly.
+    for attempt in 0..LOCK_TRIES {
+        if attempt > 0 {
+            std::thread::sleep(LOCK_WAIT);
+        }
         match connect(paths) {
             Conn::Engine(c) => {
                 let cur = match conn::call(&c, "GET", "/v1/config", None) {
@@ -655,6 +665,13 @@ fn config_set_with(
                 break;
             }
             Conn::NotRunning => {
+                // Take the engine lock first, then read the file: an edit
+                // made by another process before we held the lock is kept.
+                let engine = Engine::new(paths.clone(), Config::load_from(paths));
+                let Ok(_lock) = engine.acquire_lock() else {
+                    held_by = Some("another process".to_string());
+                    continue;
+                };
                 let loaded = Config::load_from(paths);
                 if let Some(e) = loaded.error {
                     return fail(format!(
@@ -662,35 +679,36 @@ fn config_set_with(
                         paths.config_file().display()
                     ));
                 }
-                // Hold the engine lock while writing, so an engine cannot
-                // start and write the file at the same time.
                 let cur = serde_json::to_value(&loaded.config).unwrap_or(Value::Null);
-                let engine = Engine::new(paths.clone(), loaded);
-                let Ok(_lock) = engine.acquire_lock() else {
-                    continue;
-                };
                 let edited = match set_key(&cur, key, raw) {
                     Ok(c) => c,
                     Err(e) => return fail(e),
                 };
-                let cfg: Config = match serde_json::from_value(edited) {
-                    Ok(c) => c,
+                // The core's checked write: it re-reads the file under its
+                // own lock and applies only this change.
+                match engine.patch_config(&merge_patch(key, &edited)) {
+                    Ok(cfg) => {
+                        done = Some((
+                            serde_json::to_value(&cfg).unwrap_or(Value::Null),
+                            "in the file (no engine is running; it applies when one starts)",
+                        ))
+                    }
                     Err(e) => return fail(e),
-                };
-                if let Err(e) = cfg.save_to(paths, mulchie_core::monitor::now_unix()) {
-                    return fail(e);
                 }
-                done = Some((
-                    serde_json::to_value(&cfg).unwrap_or(Value::Null),
-                    "in the file (no engine is running; it applies when one starts)",
-                ));
                 break;
+            }
+            Conn::Unreachable { pid, reason } if reason.contains("no API listener") => {
+                held_by = Some(format!("pid {pid}"));
+                continue;
             }
             other => return fail(other.explain_required("`mulchie config set`")),
         }
     }
     let Some((saved, how)) = done else {
-        return fail("an engine is starting; try again in a moment");
+        return fail(format!(
+            "{} holds the engine lock (an engine starting, or another `mulchie config set`), so nothing was changed; try again in a moment",
+            held_by.unwrap_or_else(|| "another process".into())
+        ));
     };
     let mut got = &saved;
     for p in key.split('.') {

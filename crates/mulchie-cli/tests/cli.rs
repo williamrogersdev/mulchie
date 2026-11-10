@@ -1021,6 +1021,46 @@ fn hook_logs_why_the_engine_was_not_used_and_drains_big_input() {
 }
 
 #[test]
+fn concurrent_local_config_sets_keep_both_edits() {
+    let h = Home::new();
+    for round in 0..5 {
+        let a_val = (10 + round).to_string();
+        let b_val = if round % 2 == 0 { "false" } else { "true" };
+        let a = h
+            .cmd(&["config", "set", "worktree_idle_days", &a_val])
+            .spawn()
+            .unwrap();
+        let b = h
+            .cmd(&["config", "set", "watch.enabled", b_val])
+            .spawn()
+            .unwrap();
+        let (oa, ob) = (a.wait_with_output().unwrap(), b.wait_with_output().unwrap());
+        assert!(oa.status.success(), "{}", text(&oa.stderr));
+        assert!(ob.status.success(), "{}", text(&ob.stderr));
+        let cfg = Config::load_from(&h.paths()).config;
+        assert_eq!(cfg.worktree_idle_days.to_string(), a_val, "round {round}");
+        assert_eq!(cfg.watch.enabled.to_string(), b_val, "round {round}");
+    }
+}
+
+#[test]
+fn config_set_waits_for_a_lock_held_without_a_listener_and_says_so() {
+    let h = Home::new();
+    let paths = h.paths();
+    let engine = Engine::new(paths.clone(), safe_config(&paths));
+    let lk = engine.acquire_lock().unwrap();
+    let o = h.run(&["config", "set", "worktree_idle_days", "4"]);
+    assert_eq!(o.status.code(), Some(1));
+    let e = text(&o.stderr);
+    assert!(
+        e.contains("holds the engine lock") && e.contains("try again"),
+        "{e}"
+    );
+    assert!(!e.contains("no API listener"), "{e}");
+    drop(lk);
+}
+
+#[test]
 fn hooks_install_uses_only_the_temp_home() {
     let h = Home::new();
     let o = h.run(&["hooks", "install", "--client", "cursor", "--dry-run"]);
