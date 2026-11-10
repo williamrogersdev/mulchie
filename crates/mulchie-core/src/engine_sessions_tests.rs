@@ -248,6 +248,11 @@ fn deprioritize_lowers_priority_and_restores_it_after_clearing() {
     let c = cfg(LimitAction::Deprioritize, false);
     let (_t, e) = engine(&c, &[(w, 1000)]);
     let before = nice_of(w).unwrap();
+    // The test may itself run niced (a background job): the gate only
+    // lowers, so there is nothing to show then.
+    if before >= c.build_nice.max(10) {
+        return;
+    }
     let busy = [
         proc(77_777, 1, 500, Some("claude"), 0.0),
         proc(w, 77_777, 1000, None, 300.0),
@@ -255,7 +260,19 @@ fn deprioritize_lowers_priority_and_restores_it_after_clearing() {
     e.observe_sessions(1_000, &busy, M, &c);
     e.run_limit_jobs(1_000);
     let b = only_breach(&e);
-    assert_eq!(b.action_state, ActionState::Done, "{:?}", b.action_detail);
+    let journal: Vec<String> = e
+        .snapshot_state()
+        .actions
+        .iter()
+        .map(|a| a.detail.clone())
+        .collect();
+    assert_eq!(
+        b.action_state,
+        ActionState::Done,
+        "{:?}; nice before {before}, now {:?}; journal {journal:?}",
+        b.action_detail,
+        nice_of(w)
+    );
     assert_eq!(nice_of(w), Some(c.build_nice.max(10)));
     let idle = [
         proc(77_777, 1, 500, Some("claude"), 0.0),
