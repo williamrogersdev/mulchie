@@ -248,7 +248,7 @@ fn state_of(done: usize, total: usize) -> ActionState {
 }
 
 impl Engine {
-    fn record_writer(&self) -> &Record {
+    pub(crate) fn record_writer(&self) -> &Record {
         self.record.get_or_init(|| {
             let cfg = self.config();
             Record::new(
@@ -259,7 +259,7 @@ impl Engine {
     }
 
     /// Records are written by the engine that holds the lock only.
-    fn records_on(&self, cfg: &Config) -> bool {
+    pub(crate) fn records_on(&self, cfg: &Config) -> bool {
         cfg.sessions.enabled && self.automation_enabled.load(Ordering::SeqCst)
     }
 

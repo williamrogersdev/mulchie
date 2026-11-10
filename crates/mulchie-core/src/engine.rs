@@ -33,6 +33,10 @@ use serde_json::{json, Value};
 #[path = "engine_sessions.rs"]
 mod sessions;
 use sessions::Supervision;
+
+#[path = "engine_hook.rs"]
+mod hook;
+pub use hook::{GuardCheckReply, GuardCheckRequest, HookEvent, HookReply, HookRequest};
 pub use sessions::{
     LimitsStatus, PausedProc, SessionBrief, SessionDetail, SessionMember, SessionsState,
     PAUSED_FILE, STATE_SESSIONS_KEPT,
