@@ -999,3 +999,57 @@ fn one_process_table_read_serves_a_whole_plan() {
     assert!(plan.items.iter().all(|i| i.ready), "{plan:?}");
     assert_eq!(g.process_table_reads(), 1);
 }
+
+// ------------------------------------------------- review fixes (C1–C5)
+
+/// C1: `git init vendor` (untracked, not ignored) inside a worktree used to be
+/// recorded as a gitlink patch and destroyed by `worktree remove --force`.
+#[test]
+fn nested_repositories_block_removal() {
+    let env = Env::new();
+    let repo = env.repo("repo");
+    let wt = env.worktree(&repo, "agent-x", false);
+    let vendor = wt.join("vendor");
+    std::fs::create_dir_all(&vendor).unwrap();
+    env.git(&vendor, &["init", "-q", "-b", "main"]);
+    std::fs::write(vendor.join("a.txt"), "nested work").unwrap();
+    env.git(&vendor, &["add", "-A"]);
+    env.git(&vendor, &["commit", "-q", "-m", "nested"]);
+    let r = env
+        .gate()
+        .execute_one(&env.remove_req(&wt, &env.head(&wt)), "t");
+    assert_eq!(reason(&r), Some(SkipReason::NestedRepo), "{r:?}");
+    assert!(vendor.join(".git").exists() && vendor.join("a.txt").exists());
+    assert!(
+        !env.paths.backups_dir.exists(),
+        "nothing written for a skip"
+    );
+
+    // Deeper, inside an ignored (non-cache) directory, and as a `.git` file.
+    std::fs::rename(&vendor, env._t.path().join("moved-vendor")).unwrap();
+    std::fs::create_dir_all(wt.join("notes/deep/clone")).unwrap();
+    std::fs::write(wt.join("notes/deep/clone/.git"), "gitdir: /elsewhere\n").unwrap();
+    let r = env
+        .gate()
+        .execute_one(&env.remove_req(&wt, &env.head(&wt)), "t");
+    assert_eq!(reason(&r), Some(SkipReason::NestedRepo), "{r:?}");
+    assert!(format!("{r:?}").contains("notes/deep/clone"), "{r:?}");
+
+    // A repo inside an ignored cache directory is a cache, as before.
+    std::fs::remove_dir_all(wt.join("notes")).unwrap();
+    std::fs::create_dir_all(wt.join("node_modules/dep/.git")).unwrap();
+    let r = env
+        .gate()
+        .execute_one(&env.remove_req(&wt, &env.head(&wt)), "t");
+    assert!(done(&r), "{r:?}");
+}
+
+#[test]
+fn gitlink_patches_are_refused() {
+    let p = b"diff --git a/vendor b/vendor\nnew file mode 160000\nindex 0000000..1234567\n--- /dev/null\n+++ b/vendor\n@@ -0,0 +1 @@\n+Subproject commit 1234567\n";
+    assert!(patch_has_gitlink(p));
+    let p = b"diff --git a/v b/v\nindex 1111111..2222222 160000\n";
+    assert!(patch_has_gitlink(p));
+    let p = b"diff --git a/x b/x\nnew file mode 100644\n+mode 160000 text\n";
+    assert!(!patch_has_gitlink(p));
+}

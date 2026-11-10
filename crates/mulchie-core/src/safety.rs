@@ -114,6 +114,12 @@ pub enum SkipReason {
     TimedOut,
     /// A command ran and failed.
     CommandFailed,
+    /// A worktree contains another git repository (an untracked clone, a
+    /// `git init`, a gitlink) whose history and files a patch cannot hold.
+    NestedRepo,
+    /// A worktree has changes git hides from `status` (skip-worktree or
+    /// assume-unchanged files that differ from the index).
+    HiddenChanges,
 }
 
 impl SkipReason {
@@ -1017,6 +1023,14 @@ impl<'a> Gate<'a> {
                 format!("submodule {sub} is checked out; its changes cannot be backed up"),
             );
         }
+        if let Some(nested) = nested_repo(self.paths, &canon)? {
+            return skip(
+                SkipReason::NestedRepo,
+                format!(
+                    "{nested} is a separate git repository; its commits and files would be lost"
+                ),
+            );
+        }
         let status = git::git(
             self.paths,
             &canon,
@@ -1241,6 +1255,11 @@ impl<'a> Gate<'a> {
                 "{} file(s) are changed but the patch came out empty",
                 f.dirty_files
             ));
+        }
+        if patch_has_gitlink(&out.stdout) {
+            return Err(
+                "the patch records a nested repository (a gitlink), not its contents".into(),
+            );
         }
         let p = dir.join("changes.patch");
         create_private_file(&p, &out.stdout).map_err(|e| e.to_string())?;
@@ -1661,6 +1680,133 @@ fn initialized_submodule(paths: &Paths, wt: &Path) -> Result<Option<String>, Ski
         }
     }
     Ok(None)
+}
+
+/// At most this many directory entries are looked at for nested repositories;
+/// more than that and the check cannot complete, which is a skip.
+const NESTED_SCAN_BUDGET: usize = 200_000;
+
+fn is_cache_component(c: &std::ffi::OsStr) -> bool {
+    KNOWN_CACHE_DIRS.iter().any(|k| c == *k)
+}
+
+/// A git repository inside `wt` that removing the worktree would destroy: a
+/// gitlink in the index whose directory holds a `.git`, or a `.git` (directory
+/// or file) at any depth under an untracked or ignored entry. Ignored entries
+/// under a [`KNOWN_CACHE_DIRS`] directory are not archived and not looked at.
+fn nested_repo(paths: &Paths, wt: &Path) -> Result<Option<String>, Skip> {
+    // Gitlinks recorded in the index, with or without `.gitmodules`.
+    let staged = Git::new(paths, wt)
+        .args(["ls-files", "-z", "--stage"])
+        .run()
+        .map_err(Gate::git_skip)?;
+    for raw in staged.stdout.split(|b| *b == 0) {
+        let Ok(line) = std::str::from_utf8(raw) else {
+            continue;
+        };
+        if !line.starts_with("160000 ") {
+            continue;
+        }
+        if let Some((_, p)) = line.split_once('\t') {
+            if std::fs::symlink_metadata(wt.join(p).join(".git")).is_ok() {
+                return Ok(Some(p.to_string()));
+            }
+        }
+    }
+    // Untracked and ignored entries (no exclude rules: everything not tracked),
+    // directories collapsed.
+    let out = Git::new(paths, wt)
+        .args(["ls-files", "-z", "--others", "--directory"])
+        .run()
+        .map_err(Gate::git_skip)?;
+    let ignored = Git::new(paths, wt)
+        .args([
+            "ls-files",
+            "-z",
+            "--others",
+            "--ignored",
+            "--exclude-standard",
+            "--directory",
+        ])
+        .run()
+        .map_err(Gate::git_skip)?;
+    let ignored: std::collections::HashSet<&[u8]> = ignored
+        .stdout
+        .split(|b| *b == 0)
+        .filter(|r| !r.is_empty())
+        .collect();
+    let mut budget = NESTED_SCAN_BUDGET;
+    for raw in out.stdout.split(|b| *b == 0) {
+        if raw.is_empty() {
+            continue;
+        }
+        use std::os::unix::ffi::OsStrExt;
+        let rel = Path::new(std::ffi::OsStr::from_bytes(raw));
+        let is_ignored = ignored.contains(raw);
+        if is_ignored && rel.components().any(|c| is_cache_component(c.as_os_str())) {
+            continue;
+        }
+        if rel.file_name().is_some_and(|n| n == ".git") {
+            return Ok(Some(rel.display().to_string()));
+        }
+        let abs = wt.join(rel);
+        let Ok(m) = std::fs::symlink_metadata(&abs) else {
+            continue;
+        };
+        if !m.is_dir() {
+            continue;
+        }
+        let mut stack = vec![abs];
+        while let Some(d) = stack.pop() {
+            let rd = std::fs::read_dir(&d).map_err(|e| Skip {
+                reason: SkipReason::NestedRepo,
+                detail: format!(
+                    "could not check {} for nested repositories: {e}",
+                    d.display()
+                ),
+            })?;
+            for e in rd.flatten() {
+                budget = budget.saturating_sub(1);
+                if budget == 0 {
+                    return skip(
+                        SkipReason::NestedRepo,
+                        "too many untracked files to check for nested repositories",
+                    );
+                }
+                let name = e.file_name();
+                if name == ".git" {
+                    let p = e.path();
+                    let shown = p
+                        .parent()
+                        .and_then(|p| p.strip_prefix(wt).ok())
+                        .map(|p| p.display().to_string())
+                        .unwrap_or_default();
+                    return Ok(Some(shown));
+                }
+                let Ok(ft) = e.file_type() else { continue };
+                if ft.is_dir() && !(is_ignored && is_cache_component(&name)) {
+                    stack.push(e.path());
+                }
+            }
+        }
+    }
+    Ok(None)
+}
+
+/// Whether a binary patch records a gitlink (mode 160000): such a patch holds
+/// only a commit id, not the nested repository's history or files.
+fn patch_has_gitlink(patch: &[u8]) -> bool {
+    patch.split(|b| *b == b'\n').any(|l| {
+        let Ok(l) = std::str::from_utf8(l) else {
+            return false;
+        };
+        let header = l.starts_with("new file mode ")
+            || l.starts_with("deleted file mode ")
+            || l.starts_with("old mode ")
+            || l.starts_with("new mode ")
+            || l.starts_with("index ");
+        header && l.trim_end().ends_with(" 160000")
+    })
 }
 
 /// Gitignored entries in `wt` that are not under a [`KNOWN_CACHE_DIRS`] directory,
