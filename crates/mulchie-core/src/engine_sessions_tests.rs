@@ -242,6 +242,29 @@ fn sessions_say_whether_limits_are_enforced() {
     assert_eq!(reason(&e), (false, Some("not_automating".into())));
 }
 
+/// A7: limits status says why this engine does not enforce.
+#[test]
+fn limits_status_says_why_it_does_not_enforce() {
+    let c = cfg(LimitAction::Pause, false);
+    let (_t, e) = engine(&c, &[]);
+    let st = e.limits_status();
+    assert!(st.enforcing);
+    assert_eq!(st.not_enforcing_reason, None);
+    let v = serde_json::to_value(&st).unwrap();
+    assert!(v.get("not_enforcing_reason").is_none());
+
+    lock(&e.state).config_error = Some("bad json".into());
+    let st = e.limits_status();
+    assert!(!st.enforcing);
+    assert_eq!(st.not_enforcing_reason.as_deref(), Some("config_error"));
+    lock(&e.state).config_error = None;
+
+    e.set_automation_enabled(false);
+    let v = serde_json::to_value(e.limits_status()).unwrap();
+    assert_eq!(v["enforcing"], false);
+    assert_eq!(v["not_enforcing_reason"], "not_lock_holder");
+}
+
 /// The `limit_action` events of a session's record.
 fn limit_actions(e: &Engine, id: &str) -> Vec<serde_json::Value> {
     e.flush_record();

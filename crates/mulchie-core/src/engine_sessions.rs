@@ -254,6 +254,11 @@ pub struct LimitsStatus {
     pub paused_left: Vec<PausedProc>,
     /// Limit actions run only on the engine that automates.
     pub enforcing: bool,
+    /// A7: why not, when `enforcing` is false: `not_lock_holder` (another
+    /// engine holds the lock) or `config_error` (the config file did not
+    /// load).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub not_enforcing_reason: Option<String>,
 }
 
 fn paused_path(paths: &Paths) -> PathBuf {
@@ -1375,6 +1380,14 @@ impl Engine {
 
     pub fn limits_status(&self) -> LimitsStatus {
         let cfg = self.config();
+        // Read before `sup` (they take `state`, which comes first).
+        let reason = if !self.automation_enabled.load(Ordering::SeqCst) {
+            Some("not_lock_holder")
+        } else if self.config_error().is_some() {
+            Some("config_error")
+        } else {
+            None
+        };
         let sup = lock(&self.sup);
         let mut breaches: Vec<Breach> = sup.limits.breaches().cloned().collect();
         breaches.sort_by_key(|b| std::cmp::Reverse(b.breached_unix));
@@ -1385,7 +1398,8 @@ impl Engine {
             hogs: sup.limits.hogs().to_vec(),
             paused_by_mulchie: sup.paused.clone(),
             paused_left: sup.paused_left.clone(),
-            enforcing: self.automation_allowed(),
+            enforcing: reason.is_none(),
+            not_enforcing_reason: reason.map(String::from),
         }
     }
 

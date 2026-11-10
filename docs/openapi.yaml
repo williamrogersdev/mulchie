@@ -765,6 +765,13 @@ paths:
                 properties:
                   report_only: { type: boolean }
                   enforcing: { type: boolean }
+                  not_enforcing_reason:
+                    type: string
+                    enum: [not_lock_holder, config_error]
+                    description: >-
+                      Present when `enforcing` is false. `not_lock_holder`: another engine holds
+                      the engine lock (it acts; this one reports). `config_error`: the config file
+                      did not load, so nothing acts until it is fixed.
                   config: { type: object, description: The `limits` section of config }
                   breaches: { type: array, items: { $ref: "#/components/schemas/Breach" } }
                   hogs:
