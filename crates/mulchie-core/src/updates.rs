@@ -256,6 +256,25 @@ impl Runner for SystemRunner {
     }
 }
 
+/// Runs nothing and finds nothing.
+pub struct NoCommands;
+
+impl Runner for NoCommands {
+    fn find(&self, _: &str) -> Option<PathBuf> {
+        None
+    }
+    fn run(
+        &self,
+        _: &Path,
+        _: &[&str],
+        _: &[(&str, &str)],
+        _: Duration,
+        _: usize,
+    ) -> Option<(bool, String)> {
+        None
+    }
+}
+
 // --------------------------------------------------------------- versions
 
 /// A semver version, tolerating a leading `v`. `None` for anything else.
@@ -1291,4 +1310,4 @@ pub fn next_check(now: u64, interval_secs: u64, failures: u32) -> u64 {
 
 #[cfg(test)]
 #[path = "updates_tests.rs"]
-mod tests;
+pub(crate) mod tests;

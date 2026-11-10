@@ -37,10 +37,15 @@ use sessions::Supervision;
 #[path = "engine_hook.rs"]
 mod hook;
 pub use hook::{GuardCheckReply, GuardCheckRequest, HookEvent, HookReply, HookRequest};
+
+#[path = "engine_updates.rs"]
+mod updates_glue;
 pub use sessions::{
     LimitsStatus, PausedProc, SessionBrief, SessionDetail, SessionMember, SessionsState,
     PAUSED_FILE, STATE_SESSIONS_KEPT,
 };
+use updates_glue::Updates;
+pub use updates_glue::UpdatesStatus;
 
 const HISTORY_LEN: usize = 600;
 pub const SAMPLE_SECS: u64 = 3;
@@ -339,6 +344,8 @@ pub struct HealthSummary {
     pub sessions_running: usize,
     /// Limit breaches not yet cleared (see `GET /v1/limits/status`).
     pub breaches_active: usize,
+    /// Open update and advisory findings (see `GET /v1/updates`).
+    pub updates_available: usize,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -384,6 +391,8 @@ pub struct State {
     pub findings_unix: Option<u64>,
     /// Agent sessions, limit breaches and the activity record, compact.
     pub sessions: SessionsState,
+    /// Update checks, compact (the full report: `GET /v1/updates`).
+    pub updates: UpdatesStatus,
 }
 
 impl State {
@@ -473,6 +482,23 @@ pub fn auto_reclaim_need(cfg: &Config, disk_free: u64) -> Option<u64> {
     let target = cfg.auto_reclaim_target_gb.saturating_mul(1_000_000_000);
     let need = target.saturating_sub(disk_free);
     (need > 0).then_some(need)
+}
+
+/// The real update sources; in this crate's tests none (no test reaches
+/// the network or runs a version command unless it passes fakes).
+fn update_sources(home: PathBuf) -> Updates {
+    if cfg!(test) {
+        let _ = home;
+        Updates::new(
+            Arc::new(crate::updates::NoNetwork),
+            Arc::new(crate::updates::NoCommands),
+        )
+    } else {
+        Updates::new(
+            crate::updates::default_http(),
+            Arc::new(crate::updates::SystemRunner { home }),
+        )
+    }
 }
 
 /// RFC 7396 JSON merge patch.
@@ -690,6 +716,8 @@ pub struct Engine {
     limit_wake: Arc<Condvar>,
     /// The activity record writer, started on first use.
     record: Arc<std::sync::OnceLock<crate::record::Record>>,
+    /// Update checks: sources, cache and the worker's state.
+    updates: Arc<Updates>,
 }
 
 impl Engine {
@@ -712,6 +740,7 @@ impl Engine {
     ) -> Self {
         let journal = Journal::new(&paths);
         let config_disk = read_config_bytes(&paths);
+        let home_for_runner = paths.home.clone();
         let actions: VecDeque<Action> = journal.tail(ACTIONS_KEPT).into_iter().rev().collect();
         let config_error = loaded.error.map(|e| e.to_string());
         let state = State {
@@ -740,6 +769,7 @@ impl Engine {
             finding_counts: FindingCounts::default(),
             findings_unix: None,
             sessions: SessionsState::default(),
+            updates: UpdatesStatus::default(),
         };
         Self {
             state: Arc::new(Mutex::new(state)),
@@ -763,6 +793,7 @@ impl Engine {
             sup: Arc::new(Mutex::new(Supervision::default())),
             limit_wake: Arc::new(Condvar::new()),
             record: Arc::new(std::sync::OnceLock::new()),
+            updates: Arc::new(update_sources(home_for_runner)),
         }
     }
 
@@ -805,6 +836,7 @@ impl Engine {
             .filter(|r| r.restore_failed)
             .count();
         st.sessions = self.sessions_state(&st.config);
+        st.updates = self.updates_status(false);
         st
     }
 
@@ -813,6 +845,7 @@ impl Engine {
         let now = now_unix();
         let adv = self.advice();
         let (sessions_running, breaches_active) = self.session_counts();
+        let updates_available = self.updates_available();
         let st = lock(&self.state);
         let s = &st.snapshot;
         let health = st.health_at(now);
@@ -840,6 +873,7 @@ impl Engine {
             findings: st.finding_counts,
             sessions_running,
             breaches_active,
+            updates_available,
         }
     }
 
@@ -1061,6 +1095,7 @@ impl Engine {
             threads.push(h);
         }
         self.start_limits_worker(&mut threads);
+        self.start_updates(&mut threads);
     }
 
     pub fn is_shut_down(&self) -> bool {
@@ -1074,6 +1109,7 @@ impl Engine {
         self.shutdown.store(true, Ordering::SeqCst);
         self.jobs.ready.notify_all();
         self.limit_wake.notify_all();
+        self.updates.wake.notify_all();
         let handles: Vec<JoinHandle<()>> = lock(&self.threads).drain(..).collect();
         let deadline = Instant::now() + wait;
         for h in handles {
