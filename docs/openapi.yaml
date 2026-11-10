@@ -11,8 +11,9 @@ info:
     Authentication: every route except `GET /v1/health` needs `Authorization: Bearer <token>`.
     - The full token is in `<config dir>/token` (`mulchie token` prints the path).
     - A read-only token is in `<config dir>/token.read` (`mulchie token --read-only`). It is
-      accepted on every `GET` route and on `POST /v1/clean/plan` and `POST /v1/worktree/plan`;
-      any other route answers 403 `read_only_token`.
+      accepted on every `GET` route, on `POST /v1/clean/plan`, `POST /v1/worktree/plan` and
+      `POST /v1/process/plan`, and on `POST /v1/lease` (with `ttl_secs` and no `pid`) and
+      `POST /v1/release`; any other route answers 403 `read_only_token`.
     Both files are mode 0600 in a 0700 directory; a token file with looser permissions is refused.
 
     Requests must send `Host: 127.0.0.1:<port>` or `localhost:<port>` and no `Origin` header,
@@ -63,10 +64,19 @@ paths:
                   ok_to_start_heavy_work: { type: boolean }
                   reclaimable_stale: { type: integer }
                   restarts: { type: integer }
+                  journal_error: { type: string, description: Why the action journal could not be written; absent when it can }
+                  scan_age_secs: { type: [integer, "null"] }
+                  scan_stale: { type: boolean, description: The last scan is older than twice the scan interval plus 10 minutes }
+                  findings: { $ref: "#/components/schemas/FindingCounts" }
   /v1/state:
     get:
       summary: Everything the engine knows
-      description: The latest snapshot (machine figures, top processes, workspaces), health, config error, build slots, forecast, last scan, disk map and recent actions.
+      description: |
+        The latest snapshot (machine figures, top processes, workspaces, `consumers` groups,
+        `cpu_summary` and `mem_summary` in words), health, config error, build slots, forecast,
+        last scan, disk map and recent actions. Also `journal_error`, `restore_failed`,
+        `scan_age_secs`, `scan_stale`, `findings` (as in `GET /v1/findings?dismissed=1`),
+        `finding_counts` and `findings_unix`. Command lines and lease labels are redacted.
       responses:
         "200": { $ref: "#/components/responses/Json" }
         default: { $ref: "#/components/responses/Error" }
@@ -152,7 +162,7 @@ paths:
         default: { $ref: "#/components/responses/Error" }
     post:
       summary: Remove approved idle agent worktrees
-      description: Send `{"items": [...]}` from `GET /v1/sweep` (each `remove_worktree` or `prune_worktree`), or `{"auto": true}`.
+      description: "Send `{\"items\": [...]}` from `GET /v1/sweep` (each `remove_worktree` or `prune_worktree`), or `{\"auto\": true}`."
       requestBody:
         required: true
         content:
@@ -180,7 +190,7 @@ paths:
   /v1/worktree/remove:
     post:
       summary: Remove approved worktrees
-      description: Send `{"items": [...]}` from `POST /v1/worktree/plan`. Each item names the HEAD seen when planning; a worktree whose HEAD moved is skipped.
+      description: "Send `{\"items\": [...]}` from `POST /v1/worktree/plan`. Each item names the HEAD seen when planning; a worktree whose HEAD moved is skipped."
       requestBody:
         required: true
         content:
@@ -217,6 +227,15 @@ paths:
               properties:
                 path: { type: string }
                 action: { type: string, enum: [pause, resume, deprioritize, stop_builds, kill_all] }
+                pids:
+                  description: The previewed processes. When given, only these are acted on, each only if it still has this start time; the reply then has `results`.
+                  type: array
+                  items:
+                    type: object
+                    required: [pid, expected_start_time]
+                    properties:
+                      pid: { type: integer }
+                      expected_start_time: { type: integer }
       responses:
         "200":
           description: Done
@@ -227,6 +246,7 @@ paths:
                 properties:
                   ok: { type: boolean }
                   processes: { type: integer }
+                  results: { type: array, items: { $ref: "#/components/schemas/ActionResult" } }
         default: { $ref: "#/components/responses/Error" }
   /v1/process:
     post:
@@ -242,13 +262,251 @@ paths:
                 pid: { type: integer }
                 action: { type: string, enum: [term, kill, stop, cont, renice] }
                 nice: { type: integer, description: For renice }
+                expected_start_time:
+                  type: integer
+                  description: "The start time the caller saw. With it, a different process at this pid is skipped and the reply is `{\"ok\": false, \"result\": ActionResult}` with status 200."
       responses:
         "200": { $ref: "#/components/responses/Json" }
+        default: { $ref: "#/components/responses/Error" }
+  /v1/process/plan:
+    post:
+      summary: Plan acting on a process, a process tree or a consumer group
+      description: |
+        Either `pid` (with `signal`, default `term`, and `tree` for its descendants, deepest first)
+        or `group` (a key from `snapshot.consumers.groups`) with `action`. Each item's `request`
+        carries the start time seen now; send the ready ones to `POST /v1/process/execute`.
+        Groups holding the engine, `caller_pid` or their ancestors are refused (`protected`).
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                pid: { type: integer }
+                signal: { type: string, enum: [term, kill, stop, cont] }
+                tree: { type: boolean }
+                group: { type: string }
+                action: { type: string, enum: [quit, force_quit, pause, resume, lower_priority, stop_builds, restart] }
+                caller_pid: { type: integer }
+      responses:
+        "200":
+          description: The plan; nothing was changed
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  created_unix: { type: integer }
+                  target: { type: string }
+                  name: { type: string }
+                  action: { type: string }
+                  ready: { type: boolean }
+                  refused: { type: string, enum: [protected, unknown_group, unknown_pid, restart_unavailable, no_builds, invalid_request] }
+                  detail: { type: string }
+                  items:
+                    type: array
+                    items:
+                      type: object
+                      properties:
+                        request: { $ref: "#/components/schemas/Request" }
+                        ready: { type: boolean }
+                        reason: { type: [string, "null"] }
+                  affected:
+                    type: array
+                    items:
+                      type: object
+                      properties:
+                        pid: { type: integer }
+                        name: { type: string }
+                        start_time: { type: integer }
+                        how: { type: string, enum: [signalled, exits_with_app, reniced] }
+                  restart: { type: string }
+        default: { $ref: "#/components/responses/Error" }
+  /v1/process/execute:
+    post:
+      summary: Run approved process requests from a plan
+      description: "Send `{\"items\": [...]}`, the `request` objects (signal, renice or reopen_app) of approved items from `POST /v1/process/plan`. Each is re-checked; a pid with a different start time is skipped."
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/Items" }
+      responses:
+        "200": { $ref: "#/components/responses/Results" }
+        default: { $ref: "#/components/responses/Error" }
+  /v1/process/{pid}:
+    get:
+      summary: Everything known about one process
+      description: |
+        Read now. argv is redacted, and empty (with `cwd` null) for other users' processes.
+        `listening` comes from the last watch run (`listening_unix`) and is null when unknown;
+        `signature` is set once the watch has checked the executable (macOS).
+      parameters:
+        - name: pid
+          in: path
+          required: true
+          schema: { type: integer, minimum: 0 }
+      responses:
+        "200":
+          description: The process
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  pid: { type: integer }
+                  ppid: { type: integer }
+                  name: { type: string }
+                  own: { type: boolean }
+                  exe: { type: [string, "null"] }
+                  cmd: { type: array, items: { type: string } }
+                  cwd: { type: [string, "null"] }
+                  workspace: { type: [string, "null"] }
+                  workspace_label: { type: [string, "null"] }
+                  group: { type: [string, "null"] }
+                  kind: { type: [string, "null"], enum: [agent, build, runtime, other, null] }
+                  start_time: { type: integer }
+                  age_secs: { type: [integer, "null"] }
+                  cpu_pct: { type: [number, "null"] }
+                  mem_bytes: { type: [integer, "null"] }
+                  stopped: { type: boolean }
+                  parents: { type: array, items: { type: object, properties: { pid: { type: integer }, name: { type: string } } } }
+                  children: { type: array, items: { type: object, properties: { pid: { type: integer }, name: { type: string }, start_time: { type: integer } } } }
+                  listening: { type: [array, "null"], items: { type: string } }
+                  listening_unix: { type: [integer, "null"] }
+                  signature: { type: [string, "null"], enum: [apple, app_store, developer_id, development, other_signed, ad_hoc, unsigned, unknown, null] }
+                  quarantined: { type: [boolean, "null"] }
+                  protected: { type: [string, "null"] }
+                  findings: { type: array, items: { $ref: "#/components/schemas/Finding" } }
+        "400": { $ref: "#/components/responses/Error" }
+        "404": { $ref: "#/components/responses/Error" }
+        default: { $ref: "#/components/responses/Error" }
+  /v1/findings:
+    get:
+      summary: What the watch detectors found
+      description: |
+        Observations, not verdicts: leftover, runaway, exposed or oddly placed processes, and
+        problems with Mulchie's own setup. No malware detection, no network lookups. Updated
+        on the scan loop every `watch.interval_secs`. Dismissed findings are left out unless
+        `dismissed=1`.
+      parameters:
+        - { name: severity, in: query, required: false, description: Minimum severity, schema: { type: string, enum: [info, low, medium, high] } }
+        - { name: kind, in: query, required: false, schema: { $ref: "#/components/schemas/FindingKind" } }
+        - { name: dismissed, in: query, required: false, schema: { type: string, enum: ["1", "true"] } }
+      responses:
+        "200":
+          description: The findings, most severe first
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  findings: { type: array, items: { $ref: "#/components/schemas/Finding" } }
+                  counts: { $ref: "#/components/schemas/FindingCounts" }
+                  updated_unix: { type: [integer, "null"] }
+                  enabled: { type: boolean }
+        default: { $ref: "#/components/responses/Error" }
+  /v1/findings/dismiss:
+    post:
+      summary: Hide a finding for a number of days
+      description: Saved in the config (`watch.dismissed`). Refused with `config_not_loaded` while the config file is broken.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [id]
+              properties:
+                id: { type: string }
+                days: { type: integer, minimum: 1, maximum: 3650, default: 30 }
+      responses:
+        "200":
+          description: Dismissed
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  ok: { type: boolean }
+                  id: { type: string }
+                  until_unix: { type: integer }
+        default: { $ref: "#/components/responses/Error" }
+  /v1/findings/undismiss:
+    post:
+      summary: Show a dismissed finding again
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [id]
+              properties:
+                id: { type: string }
+      responses:
+        "200":
+          description: Done
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  ok: { type: boolean }
+                  id: { type: string }
+                  was_dismissed: { type: boolean }
+        default: { $ref: "#/components/responses/Error" }
+  /v1/config:
+    get:
+      summary: The config in use, why the file was not used (if so), and its path
+      responses:
+        "200":
+          description: The config
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  config: { type: object }
+                  config_error: { type: [string, "null"] }
+                  path: { type: string }
+        default: { $ref: "#/components/responses/Error" }
+    put:
+      summary: Replace the config
+      description: |
+        Send `{"config": {...}}`, the whole config from `GET /v1/config` with your changes;
+        fields left out take their defaults. Validated (400 `invalid_config`) and saved
+        atomically; a file that failed to load is moved aside, not overwritten. Full token only.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [config]
+              properties:
+                config: { type: object }
+      responses:
+        "200":
+          description: Saved and applied
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  ok: { type: boolean }
+                  config: { type: object }
         default: { $ref: "#/components/responses/Error" }
   /v1/lease:
     post:
       summary: Join the build queue, poll a ticket, or renew a slot
-      description: A lease needs a live `pid`, a `ttl_secs`, or both. Poll with the returned `ticket` until `granted`.
+      description: |
+        A lease needs a live `pid`, a `ttl_secs`, or both. Poll with the returned `ticket` until
+        `granted`. The reply that creates a ticket carries `release_secret`, which only that caller
+        sees; keep it for `POST /v1/release`. The read-only token may take a lease only with
+        `ttl_secs` and no `pid` (403 `read_only_token` otherwise). A `pid` of 0 or 1, another
+        user's process or a dead one is refused with `pid_not_allowed`. Labels are redacted.
       requestBody:
         required: true
         content:
@@ -274,10 +532,12 @@ paths:
                   position: { type: integer }
                   reason: { type: string }
                   expires_unix: { type: [integer, "null"] }
+                  release_secret: { type: string, description: Only on the reply that created the ticket }
         default: { $ref: "#/components/responses/Error" }
   /v1/release:
     post:
       summary: Release a slot or leave the queue
+      description: A lease with a release secret needs it; without it the reply is 403 `release_secret_required`, with a wrong one 403 `wrong_release_secret`.
       requestBody:
         required: true
         content:
@@ -287,6 +547,7 @@ paths:
               required: [ticket]
               properties:
                 ticket: { type: integer }
+                secret: { type: string, description: The `release_secret` from the reply that created the ticket }
       responses:
         "200":
           description: Released
@@ -345,13 +606,20 @@ components:
       type: object
       required: [action]
       properties:
-        action: { type: string, enum: [delete_cache, remove_worktree, prune_worktree, signal] }
+        action: { type: string, enum: [delete_cache, remove_worktree, prune_worktree, signal, renice, reopen_app] }
         path: { type: string }
         require_stale: { type: boolean }
         expected_head: { type: string }
         allow_dirty: { type: boolean }
         require_idle: { type: boolean }
         repo: { type: string }
+        pid: { type: integer }
+        signal: { type: string, enum: [term, kill, stop, cont] }
+        expected_start_time: { type: integer }
+        nice: { type: integer, description: For renice; only lowers priority }
+        bundle_id: { type: string, description: For reopen_app (macOS `open -b`) }
+        after_pid: { type: integer }
+        after_start_time: { type: integer }
     Plan:
       type: object
       properties:
@@ -381,7 +649,7 @@ components:
       type: object
       required: [action, target, status]
       properties:
-        action: { type: string, enum: [delete_cache, remove_worktree, prune_worktree, signal] }
+        action: { type: string, enum: [delete_cache, remove_worktree, prune_worktree, signal, renice, reopen_app] }
         target: { type: string }
         status: { type: string, enum: [done, skipped] }
         freed_bytes: { type: integer }
@@ -394,3 +662,75 @@ components:
               location: { type: string, description: A file path, or a branch name for kind branch }
         reason: { type: string }
         detail: { type: string }
+        journal_error: { type: string, description: Set when the action ran but could not be written to the journal }
+    FindingKind:
+      type: string
+      enum:
+        - orphaned_process
+        - missing_working_directory
+        - executable_changed
+        - stale_process
+        - stopped_process
+        - runaway_cpu
+        - growing_memory
+        - exposed_listener
+        - temp_executable
+        - hidden_dir_executable
+        - system_name_mismatch
+        - unsigned_executable
+        - quarantined_executable
+        - insecure_permissions
+        - api_exposed
+        - engine_lock_not_held
+        - config_not_loaded
+    FindingCounts:
+      type: object
+      properties:
+        info: { type: integer }
+        low: { type: integer }
+        medium: { type: integer }
+        high: { type: integer }
+        dismissed: { type: integer }
+    Finding:
+      type: object
+      required: [id, kind, severity, title, why, evidence, suggested, first_seen_unix, last_seen_unix, dismissed]
+      properties:
+        id: { type: string, description: "Stable while the cause lasts: <kind>:<pid>:<start_time>, or <kind>:<path or name>" }
+        kind: { $ref: "#/components/schemas/FindingKind" }
+        severity: { type: string, enum: [info, low, medium, high] }
+        title: { type: string, description: One sentence, an observation }
+        why: { type: string }
+        evidence:
+          type: object
+          description: Only the fields that apply are present. `cmd` is redacted.
+          properties:
+            pid: { type: integer }
+            start_time: { type: integer }
+            name: { type: string }
+            exe: { type: string }
+            cmd: { type: string }
+            cwd: { type: string }
+            workspace: { type: string }
+            age_secs: { type: integer }
+            parent: { type: object, properties: { pid: { type: integer }, name: { type: string } } }
+            listen: { type: array, items: { type: string } }
+            signature: { type: string, enum: [apple, app_store, developer_id, development, other_signed, ad_hoc, unsigned, unknown] }
+            quarantined: { type: boolean }
+            cpu_pct: { type: number }
+            mem_bytes: { type: integer }
+            path: { type: string }
+            mode: { type: string }
+            detail: { type: string }
+        suggested:
+          type: array
+          items:
+            type: object
+            properties:
+              label: { type: string }
+              request: { $ref: "#/components/schemas/Request" }
+              api: { type: string, description: Another route to call, e.g. the dismiss route }
+              reversible: { type: boolean }
+        first_seen_unix: { type: integer }
+        last_seen_unix: { type: integer }
+        dismissed: { type: boolean }
+        dismissed_until: { type: integer }
