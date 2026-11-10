@@ -750,6 +750,47 @@ pub struct WatchInput<'a> {
     /// Temporary and download directories, canonical where possible.
     pub temp_dirs: &'a [PathBuf],
     pub posture: &'a Posture,
+    /// Processes the service manager started (launchd or systemd jobs; see
+    /// [`started_by_service_manager`]): never orphans.
+    pub service_started: &'a HashSet<u32>,
+    /// Pids of `systemd --user`, which adopts orphans of the user session.
+    pub subreapers: &'a [u32],
+}
+
+/// Whether the service manager started `pid` rather than a shell that has
+/// since exited. A launchd or systemd job runs in launchd's session or its
+/// own (session id 1 or its pid); an orphan from a terminal keeps the
+/// session of the shell that started it. On Linux a `*.service` cgroup also
+/// counts. When the session cannot be read the answer is yes (no finding).
+pub fn started_by_service_manager(pid: u32) -> bool {
+    #[cfg(target_os = "linux")]
+    {
+        if let Ok(cg) = std::fs::read_to_string(format!("/proc/{pid}/cgroup")) {
+            let service = cg.lines().any(|l| {
+                l.rsplit('/')
+                    .next()
+                    .is_some_and(|c| c.trim().ends_with(".service"))
+            });
+            if service {
+                return true;
+            }
+        }
+    }
+    let Ok(p) = libc::pid_t::try_from(pid) else {
+        return true;
+    };
+    let sid = unsafe { libc::getsid(p) };
+    sid < 0 || sid == 1 || sid == p
+}
+
+/// Whether a path is gone: only "not found" counts. A permission error or
+/// any other failure is unknown (`None`), which raises no finding.
+fn path_gone(p: &Path) -> Option<bool> {
+    match std::fs::symlink_metadata(p) {
+        Ok(_) => Some(false),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Some(true),
+        Err(_) => None,
+    }
 }
 
 /// Temporary and downloads directories for `home`.
@@ -1120,10 +1161,13 @@ pub fn detect(i: &WatchInput) -> Vec<Finding> {
 
 fn detect_leftovers(d: &mut Det, p: &ProcFacts) {
     let i = d.i;
-    // Orphaned: parent exited (reparented to launchd/init), still working in a
-    // workspace or scan root, and a kind people start by hand.
+    // Orphaned: parent exited (reparented to launchd/init, or on Linux to the
+    // `systemd --user` subreaper), not a service the service manager started,
+    // still working in a workspace or scan root, and a kind people start by
+    // hand.
     let kind = d.kind_of(p);
-    if p.ppid == 1
+    if (p.ppid == 1 || i.subreapers.contains(&p.ppid))
+        && !i.service_started.contains(&p.pid)
         && d.in_workspace_or_root(p)
         && matches!(kind, ProcKind::Agent | ProcKind::Build | ProcKind::Runtime)
     {
@@ -1145,7 +1189,8 @@ fn detect_leftovers(d: &mut Det, p: &ProcFacts) {
     // Working directory gone.
     if let Some(cwd) = p.cwd.as_deref() {
         let s = cwd.to_string_lossy();
-        let deleted = s.ends_with(" (deleted)") || (cwd.is_absolute() && !cwd.exists());
+        let deleted =
+            s.ends_with(" (deleted)") || (cwd.is_absolute() && path_gone(cwd) == Some(true));
         if deleted && (under(cwd, i.roots) || cwd.starts_with(i.home)) {
             d.push_proc(
                 p,
@@ -1159,8 +1204,15 @@ fn detect_leftovers(d: &mut Det, p: &ProcFacts) {
     }
     // Executable deleted or replaced after start.
     if let Some((exe, deleted_mark)) = exe_path(p) {
-        let gone = deleted_mark || (exe.is_absolute() && !exe.exists());
-        let replaced = !gone
+        let state = if deleted_mark {
+            Some(true)
+        } else if exe.is_absolute() {
+            path_gone(&exe)
+        } else {
+            Some(false)
+        };
+        let gone = state == Some(true);
+        let replaced = state == Some(false)
             && p.start_time > 0
             && std::fs::metadata(&exe)
                 .and_then(|m| m.modified())
@@ -1168,7 +1220,19 @@ fn detect_leftovers(d: &mut Det, p: &ProcFacts) {
                 .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
                 .is_some_and(|t| t.as_secs() > p.start_time + 60);
         if gone || replaced {
-            let how = if gone { "was deleted" } else { "was replaced" };
+            // Only deletion is certain; a newer mtime says the file was
+            // modified, not that the running code differs.
+            let (how, why) = if gone {
+                (
+                    "a file that was deleted",
+                    "The file it was started from is no longer on disk (an update, rebuild or uninstall); restart it to run the current version.",
+                )
+            } else {
+                (
+                    "a file that was modified",
+                    "The file it was started from was modified after the process started (usually an update or rebuild), so it may be running an older version; restart it to run the current one.",
+                )
+            };
             let sev = if under(&exe, i.temp_dirs) {
                 Severity::Medium
             } else {
@@ -1178,8 +1242,11 @@ fn detect_leftovers(d: &mut Det, p: &ProcFacts) {
                 p,
                 FindingKind::ExecutableChanged,
                 sev,
-                format!("The program {} (pid {}) runs from {how} after it started", p.name, p.pid),
-                "It is running an older copy than the one on disk (an update or rebuild happened); restart it to run the current version.",
+                format!(
+                    "The program {} (pid {}) runs from {how} after it started",
+                    p.name, p.pid
+                ),
+                why,
                 vec![quit(p)],
             );
         }

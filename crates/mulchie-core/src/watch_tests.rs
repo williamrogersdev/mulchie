@@ -52,6 +52,8 @@ struct World {
     sigs: HashMap<PathBuf, SigStatus>,
     quar: HashSet<PathBuf>,
     posture: Posture,
+    services: HashSet<u32>,
+    subreapers: Vec<u32>,
 }
 
 impl World {
@@ -74,6 +76,8 @@ impl World {
             sigs: HashMap::new(),
             quar: HashSet::new(),
             posture: Posture::default(),
+            services: HashSet::new(),
+            subreapers: Vec::new(),
         }
     }
 
@@ -112,6 +116,8 @@ impl World {
             roots: &roots,
             temp_dirs: &temps,
             posture: &self.posture,
+            service_started: &self.services,
+            subreapers: &self.subreapers,
         };
         detect(&i)
     }
@@ -256,7 +262,7 @@ fn a_replaced_executable_is_reported() {
     let f = w.run();
     assert!(one(&f, FindingKind::ExecutableChanged)
         .title
-        .contains("was replaced"));
+        .contains("a file that was modified after it started"));
 }
 
 fn feed(t: &mut Tracker, p: &ProcSample, from: u64, to: u64, f: impl Fn(u64, &mut ProcSample)) {
@@ -979,4 +985,135 @@ fn probe_failures_are_unknown_and_keep_findings() {
     let mut ids: Vec<&str> = raw.iter().map(|f| f.id.as_str()).collect();
     ids.sort();
     assert_eq!(ids, ["api", "l1"]);
+}
+
+/// R10: only "not found" means gone. A working directory or executable that
+/// cannot be read (permission denied) raises nothing; a dangling symlink as
+/// the path is not "deleted".
+#[test]
+fn unreadable_paths_are_unknown_not_gone() {
+    use std::os::unix::fs::PermissionsExt;
+    let mut w = World::new();
+    let locked = w.root.join("locked");
+    std::fs::create_dir_all(locked.join("inner")).unwrap();
+    let exe = w.exe("code/locked/inner/tool");
+    let link = w.root.join("link");
+    std::os::unix::fs::symlink(w.root.join("nowhere"), &link).unwrap();
+    std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o000)).unwrap();
+    if std::fs::symlink_metadata(locked.join("inner")).is_ok() {
+        // Running as root: permissions do not apply.
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o755)).unwrap();
+        return;
+    }
+    let ok = w.exe("bin/ok");
+    w.add(
+        facts(10, 5, "a", &ok, Some(&locked.join("inner")), NOW - 600),
+        ProcKind::Other,
+        None,
+    );
+    w.add(
+        facts(11, 5, "b", &exe, None, NOW - 600),
+        ProcKind::Other,
+        None,
+    );
+    w.add(
+        facts(12, 5, "c", &ok, Some(&link), NOW - 600),
+        ProcKind::Other,
+        None,
+    );
+    let f = w.run();
+    std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o755)).unwrap();
+    assert!(
+        !f.iter().any(|f| matches!(
+            f.kind,
+            FindingKind::MissingWorkingDirectory | FindingKind::ExecutableChanged
+        )),
+        "{f:#?}"
+    );
+}
+
+/// R10: a deleted executable says deleted; a newer mtime says modified,
+/// not replaced.
+#[test]
+fn executable_wording_says_what_is_known() {
+    let mut w = World::new();
+    let exe = w.exe("bin/server");
+    let fh = std::fs::File::options().write(true).open(&exe).unwrap();
+    fh.set_modified(std::time::UNIX_EPOCH + Duration::from_secs(NOW - 60))
+        .unwrap();
+    w.add(
+        facts(10, 5, "server", &exe, None, NOW - 3600),
+        ProcKind::Other,
+        None,
+    );
+    let gone = w.tmp.path().canonicalize().unwrap().join("bin/gone");
+    w.add(
+        facts(11, 5, "old", &gone, None, NOW - 3600),
+        ProcKind::Other,
+        None,
+    );
+    let f = w.run();
+    let by = |pid| {
+        f.iter()
+            .find(|f| f.kind == FindingKind::ExecutableChanged && f.evidence.pid == Some(pid))
+            .unwrap_or_else(|| panic!("no finding for {pid}: {f:#?}"))
+    };
+    assert!(by(10)
+        .title
+        .contains("a file that was modified after it started"));
+    assert!(by(10).why.contains("may be running an older version"));
+    assert!(!by(10).title.contains("replaced"));
+    assert!(by(11)
+        .title
+        .contains("a file that was deleted after it started"));
+}
+
+/// R10: orphans exclude what launchd or systemd started, and on Linux a
+/// process adopted by the `systemd --user` subreaper is an orphan too.
+#[test]
+fn orphans_exclude_services_and_include_the_user_subreaper() {
+    let mut w = World::new();
+    let exe = w.exe("bin/node");
+    let ws = w.root.join("repo");
+    std::fs::create_dir_all(&ws).unwrap();
+    // 10: parent pid 1, a launchd/systemd job. 11: adopted by systemd --user.
+    // 12: parent pid 1, left behind by a closed terminal.
+    for (pid, ppid) in [(10, 1), (11, 700), (12, 1)] {
+        w.add(
+            facts(pid, ppid, "node", &exe, Some(&ws), NOW - 600),
+            ProcKind::Runtime,
+            Some(&ws),
+        );
+    }
+    w.services.insert(10);
+    w.subreapers = vec![700];
+    let mut got: Vec<u32> = w
+        .run()
+        .iter()
+        .filter(|f| f.kind == FindingKind::OrphanedProcess)
+        .filter_map(|f| f.evidence.pid)
+        .collect();
+    got.sort();
+    assert_eq!(got, vec![11, 12]);
+    // Without the subreaper, 11 has a living parent.
+    w.subreapers.clear();
+    assert_eq!(
+        w.run()
+            .iter()
+            .filter(|f| f.kind == FindingKind::OrphanedProcess)
+            .count(),
+        1
+    );
+}
+
+/// The real session check: this test process was started by cargo, not by
+/// the service manager; pid 1 counts as started by it (sid 1 or itself).
+#[test]
+fn session_check_on_the_real_system() {
+    assert!(!started_by_service_manager(std::process::id()) || unsafe { libc::getsid(0) } == 1);
+    assert!(started_by_service_manager(1));
+    assert!(
+        started_by_service_manager(u32::MAX),
+        "unreadable counts as a service"
+    );
 }

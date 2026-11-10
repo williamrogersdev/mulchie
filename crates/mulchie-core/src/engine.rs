@@ -1429,6 +1429,19 @@ impl Engine {
             config_error,
         };
 
+        // Orphan candidates: who adopted them, and whether a service manager
+        // started them (one getsid, and on Linux one cgroup read, each).
+        let subreapers: Vec<u32> = procs
+            .iter()
+            .filter(|p| crate::consumers::is_user_manager(&p.name, &p.cmd))
+            .map(|p| p.pid)
+            .collect();
+        let service_started: HashSet<u32> = procs
+            .iter()
+            .filter(|p| p.uid == Some(uid) && (p.ppid == 1 || subreapers.contains(&p.ppid)))
+            .filter(|p| self.procs.service_started(p.pid))
+            .map(|p| p.pid)
+            .collect();
         let listeners_unknown = cfg.watch.check_listeners && listeners.is_none();
         let mut raw = {
             let mut w = lock(&self.watch);
@@ -1452,6 +1465,8 @@ impl Engine {
                 roots: &roots,
                 temp_dirs: &temps,
                 posture: &posture,
+                service_started: &service_started,
+                subreapers: &subreapers,
             };
             watch::detect(&input)
         };

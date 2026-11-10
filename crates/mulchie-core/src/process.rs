@@ -29,6 +29,12 @@ pub trait ProcessSource: Send + Sync {
     }
     fn current_uid(&self) -> u32;
     fn self_pid(&self) -> u32;
+    /// Whether the service manager (launchd, systemd) started `pid`, rather
+    /// than a shell that has since exited. See
+    /// [`crate::watch::started_by_service_manager`].
+    fn service_started(&self, pid: u32) -> bool {
+        crate::watch::started_by_service_manager(pid)
+    }
 }
 
 /// The real process table via `sysinfo`. Every call refreshes.
@@ -114,6 +120,9 @@ pub struct FakeProcesses {
     pub procs: Vec<ProcFacts>,
     pub uid: u32,
     pub pid: u32,
+    /// Pids the fake service manager started (see
+    /// [`ProcessSource::service_started`]).
+    pub services: Vec<u32>,
 }
 
 impl FakeProcesses {
@@ -123,6 +132,7 @@ impl FakeProcesses {
             procs: Vec::new(),
             uid: unsafe { libc::getuid() },
             pid: u32::MAX,
+            services: Vec::new(),
         }
     }
 
@@ -151,6 +161,9 @@ impl ProcessSource for FakeProcesses {
     }
     fn self_pid(&self) -> u32 {
         self.pid
+    }
+    fn service_started(&self, pid: u32) -> bool {
+        self.services.contains(&pid)
     }
 }
 
