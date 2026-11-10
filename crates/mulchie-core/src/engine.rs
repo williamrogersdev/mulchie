@@ -2273,8 +2273,7 @@ impl Engine {
             pid.map(|p| format!("pid {p}"))
                 .unwrap_or_else(|| "lease".into())
         } else {
-            let l = crate::redact::redact_command_line(&req.label);
-            l.chars().take(200).collect()
+            crate::redact::redact_label(&req.label)
         };
         let mut st = lock(&self.state);
         expire_leases(&mut st.slots, now, &|p, s| self.lease_pid_alive(p, s));
