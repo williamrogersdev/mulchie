@@ -40,6 +40,16 @@ const FIXED_CONFIG: &[&str] = &[
     "core.hooksPath=/dev/null",
     "log.showSignature=false",
     "core.pager=cat",
+    // Output we parse or store (patches) must not depend on user taste.
+    "color.ui=false",
+    "color.diff=false",
+    "color.status=false",
+    "diff.noprefix=false",
+    "diff.mnemonicPrefix=false",
+    "diff.srcPrefix=a/",
+    "diff.dstPrefix=b/",
+    "diff.relative=false",
+    "diff.suppressBlankEmpty=false",
 ];
 
 /// Inherited variables that would redirect git away from the directory we name.

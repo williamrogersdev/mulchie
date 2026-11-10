@@ -1252,7 +1252,17 @@ impl<'a> Gate<'a> {
                 .map_err(|e| format!("could not stage a backup: {e}"))?;
             Git::new(self.paths, &f.path)
                 .env("GIT_INDEX_FILE", &index)
-                .args(["diff", "--cached", "--binary", "HEAD"])
+                .args([
+                    "diff",
+                    "--cached",
+                    "--binary",
+                    "--no-color",
+                    "--no-ext-diff",
+                    "--no-textconv",
+                    "--src-prefix=a/",
+                    "--dst-prefix=b/",
+                    "HEAD",
+                ])
                 .timeout(BACKUP_TIMEOUT)
                 .run()
                 .map_err(|e| format!("could not write the patch: {e}"))
@@ -1272,7 +1282,32 @@ impl<'a> Gate<'a> {
         }
         let p = dir.join("changes.patch");
         create_private_file(&p, &out.stdout).map_err(|e| e.to_string())?;
+        self.verify_patch(f, dir, &p)?;
         Ok(p)
+    }
+
+    /// The patch must apply cleanly to HEAD: `git apply --cached --check` against
+    /// a fresh index read from HEAD. A patch that does not verify is a failed
+    /// backup, so nothing is removed.
+    fn verify_patch(&self, f: &WorktreeFacts, dir: &Path, patch: &Path) -> Result<(), String> {
+        let index = dir.join("verify.index.tmp");
+        let res = (|| {
+            Git::new(self.paths, &f.path)
+                .env("GIT_INDEX_FILE", &index)
+                .args(["read-tree", &f.head])
+                .timeout(BACKUP_TIMEOUT)
+                .run()
+                .map_err(|e| format!("could not prepare to verify the patch: {e}"))?;
+            Git::new(self.paths, &f.path)
+                .env("GIT_INDEX_FILE", &index)
+                .args(["apply", "--cached", "--check", "--whitespace=nowarn"])
+                .arg(patch)
+                .timeout(BACKUP_TIMEOUT)
+                .run()
+                .map_err(|e| format!("the patch does not apply to {}: {e}", short(&f.head)))
+        })();
+        let _ = std::fs::remove_file(&index);
+        res.map(|_| ())
     }
 
     fn ensure_backup_branch(&self, f: &WorktreeFacts) -> Result<String, String> {

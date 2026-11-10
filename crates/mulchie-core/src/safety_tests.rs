@@ -1099,3 +1099,88 @@ fn hidden_skip_worktree_and_assume_unchanged_edits_block_removal() {
         .execute_one(&env.remove_req(&wt, &env.head(&wt)), "t");
     assert!(done(&r), "{r:?}");
 }
+
+/// C3: user diff/colour settings used to leak into `changes.patch` (ANSI codes,
+/// missing or odd prefixes), so `git apply` could not restore it.
+#[test]
+fn user_diff_config_does_not_change_the_patch() {
+    let env = Env::new();
+    let repo = env.repo("repo");
+    for kv in [
+        ("color.ui", "always"),
+        ("color.diff", "always"),
+        ("diff.noprefix", "true"),
+        ("diff.mnemonicPrefix", "true"),
+        ("diff.srcPrefix", "SRC/"),
+        ("diff.dstPrefix", "DST/"),
+        ("diff.relative", "true"),
+        ("apply.whitespace", "error"),
+    ] {
+        env.git(&repo, &["config", kv.0, kv.1]);
+    }
+    let wt = env.worktree(&repo, "agent-x", false);
+    let head = env.head(&wt);
+    std::fs::write(wt.join("lib.rs"), "fn main() { changed() }   \n").unwrap();
+    std::fs::create_dir_all(wt.join("sub")).unwrap();
+    std::fs::write(wt.join("sub/new.txt"), "new\n").unwrap();
+    let r = env.gate().execute_one(&env.remove_req(&wt, &head), "t");
+    assert!(done(&r), "{r:?}");
+    let patch = PathBuf::from(backup_of(&r, BackupKind::Patch).unwrap());
+    let bytes = std::fs::read(&patch).unwrap();
+    assert!(!bytes.contains(&0x1b), "no ANSI escapes");
+    let text = String::from_utf8(bytes).unwrap();
+    assert!(text.contains("diff --git a/lib.rs b/lib.rs"), "{text}");
+    assert!(text.contains("+++ b/sub/new.txt"), "{text}");
+
+    let again = env.root.join("restored");
+    env.git(
+        &repo,
+        &[
+            "worktree",
+            "add",
+            "-q",
+            "--detach",
+            again.to_str().unwrap(),
+            &head,
+        ],
+    );
+    env.git(
+        &again,
+        &[
+            "apply",
+            "--index",
+            "--whitespace=nowarn",
+            patch.to_str().unwrap(),
+        ],
+    );
+    assert_eq!(
+        std::fs::read_to_string(again.join("sub/new.txt")).unwrap(),
+        "new\n"
+    );
+}
+
+/// C3: a patch that does not apply to HEAD is a failed backup.
+#[test]
+fn a_patch_that_does_not_verify_is_a_failed_backup() {
+    let env = Env::new();
+    let repo = env.repo("repo");
+    let wt = env.worktree(&repo, "agent-x", false);
+    let facts = env.gate().check_worktree(&wt, None, true, false).unwrap();
+    let dir = env._t.path().join("verify");
+    std::fs::create_dir_all(&dir).unwrap();
+    let bad = dir.join("bad.patch");
+    std::fs::write(
+        &bad,
+        "diff --git a/lib.rs b/lib.rs\n--- a/lib.rs\n+++ b/lib.rs\n@@ -1 +1 @@\n-not what is there\n+x\n",
+    )
+    .unwrap();
+    let e = env.gate().verify_patch(&facts, &dir, &bad).unwrap_err();
+    assert!(e.contains("does not apply"), "{e}");
+    let good = dir.join("good.patch");
+    std::fs::write(
+        &good,
+        "diff --git a/lib.rs b/lib.rs\n--- a/lib.rs\n+++ b/lib.rs\n@@ -1 +1 @@\n-fn main() {}\n+x\n",
+    )
+    .unwrap();
+    env.gate().verify_patch(&facts, &dir, &good).unwrap();
+}
