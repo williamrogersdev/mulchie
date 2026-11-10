@@ -2,7 +2,7 @@
 // through the same confirm-and-start-time path as everything else.
 import { st } from '../store.js';
 import { $, esc, B, BS, dur, sortRows, th, meter, kindChip } from '../util.js';
-import { signalPids, reniceProc } from '../signals.js';
+import { signalPids, reniceProcs } from '../signals.js';
 import { cores } from '../consumers.js';
 
 export function procRows() {
@@ -33,14 +33,11 @@ export function renderProcs() {
   $('#pBulkN').textContent = `${ui.pSel.size} selected`;
 }
 
-// Bulk actions on the selected rows: each process is planned, and the one
-// review lists them all. A renice has no plan, so it confirms each process.
+// Bulk actions on the selected rows: one plan and one review for them all.
+// A renice has no plan; one confirmation covers every selected process.
 export async function procBulk(action) {
   const top = st.S.snapshot.top, procs = [...st.ui.pSel].map(pid => top.find(p => p.pid === pid)).filter(Boolean);
   st.ui.pSel.clear();
-  if (action === 'renice') {
-    for (const p of procs) await reniceProc(p);
-    return;
-  }
+  if (action === 'renice') return reniceProcs(procs);
   return signalPids(procs.map(p => p.pid), action);
 }

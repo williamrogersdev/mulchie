@@ -130,37 +130,60 @@ impl PlanRequest {
 }
 
 /// The ready requests of the last plan issued for each batch kind (for
-/// process plans, the last plan for each target: a pid or a group). An execute
-/// must name only these, so the UI can approve a subset of a plan but never
-/// add to it.
+/// process plans, the last plan for each target: a pid, a group, or a bulk
+/// selection reviewed as one). An execute must name only these, so the UI can
+/// approve a subset of a plan but never add to it.
 #[derive(Debug, Default)]
 pub struct PlanBook {
-    ready: HashMap<(Batch, String), Vec<Request>>,
+    /// Each entry with the order it was recorded in.
+    ready: HashMap<(Batch, String), (u64, Vec<Request>)>,
+    seq: u64,
 }
 
-/// Process plans kept at once; the oldest beyond this are forgotten.
-const PROCESS_PLANS_KEPT: usize = 32;
+/// The most processes one bulk review may plan.
+pub const MAX_BULK: usize = 500;
+
+/// Process plans kept at once. Recording one more forgets only the oldest.
+pub const PROCESS_PLANS_KEPT: usize = 32;
 
 impl PlanBook {
     pub fn record(&mut self, batch: Batch, plan: &Plan) {
-        self.ready.insert((batch, String::new()), plan.approved());
+        self.seq += 1;
+        self.ready
+            .insert((batch, String::new()), (self.seq, plan.approved()));
     }
 
-    /// Record the ready items of a process plan for its `target`.
+    /// Record the ready items of a process plan for its `target`, replacing
+    /// that target's earlier plan. Beyond [`PROCESS_PLANS_KEPT`] the oldest
+    /// process plan is forgotten, one at a time.
     pub fn record_process(&mut self, target: &str, ready: Vec<Request>) {
-        let n = self.ready.keys().filter(|k| k.0 == Batch::Process).count();
-        if n >= PROCESS_PLANS_KEPT && !self.ready.contains_key(&(Batch::Process, target.into())) {
-            let drop: Vec<_> = self
+        self.seq += 1;
+        self.ready
+            .insert((Batch::Process, target.into()), (self.seq, ready));
+        while self.ready.keys().filter(|k| k.0 == Batch::Process).count() > PROCESS_PLANS_KEPT {
+            let oldest = self
                 .ready
-                .keys()
-                .filter(|k| k.0 == Batch::Process)
-                .cloned()
-                .collect();
-            for k in drop {
-                self.ready.remove(&k);
-            }
+                .iter()
+                .filter(|(k, _)| k.0 == Batch::Process)
+                .min_by_key(|(_, v)| v.0)
+                .map(|(k, _)| k.clone());
+            match oldest {
+                Some(k) => self.ready.remove(&k),
+                None => break,
+            };
         }
-        self.ready.insert((Batch::Process, target.into()), ready);
+    }
+
+    /// Forget every plan: the engine behind them changed (a takeover or a
+    /// reconnect), so none was checked by the engine that would run it.
+    pub fn clear(&mut self) {
+        self.ready.clear();
+    }
+
+    /// Whether a process plan for `target` is kept.
+    #[cfg(test)]
+    pub fn has_process(&self, target: &str) -> bool {
+        self.ready.contains_key(&(Batch::Process, target.into()))
     }
 
     /// Check `items` against the plans recorded for `batch`. On success the
@@ -179,7 +202,7 @@ impl PlanBook {
         let known = |r: &Request| {
             self.ready
                 .iter()
-                .any(|(k, list)| k.0 == batch && list.contains(r))
+                .any(|(k, (_, list))| k.0 == batch && list.contains(r))
         };
         if let Some(r) = items.iter().find(|r| !known(r)) {
             return Err(format!(
@@ -187,7 +210,7 @@ impl PlanBook {
                 r.target()
             ));
         }
-        for (k, list) in self.ready.iter_mut() {
+        for (k, (_, list)) in self.ready.iter_mut() {
             if k.0 == batch {
                 list.retain(|r| !items.contains(r));
             }
@@ -403,6 +426,7 @@ impl Backend {
             since_unix: now_unix(),
         };
         inner.conn = Conn::Local(engine);
+        guard(&self.plans).clear();
         inner.lock = Some(lk);
         inner.server = server;
         inner.down_since = None;
@@ -433,6 +457,7 @@ impl Backend {
                     since_unix: now_unix(),
                 };
                 inner.conn = Conn::Remote(c);
+                guard(&self.plans).clear();
                 inner.down_since = None;
                 inner.fails = 0;
             }
@@ -678,17 +703,31 @@ impl Backend {
     }
 
     /// Execute exactly `items`, which must be ready items of the last plan of
-    /// this kind. Each is re-checked by the safety gate now.
+    /// this kind. Each is re-checked by the safety gate now. The items leave
+    /// the plan book before they are sent, so a failure after that cannot be
+    /// retried blindly; [`execute_error`] says what may have happened.
     pub fn execute(&self, batch: Batch, items: Vec<Request>) -> Result<Vec<ActionResult>, String> {
+        let conn = self.conn();
+        if matches!(conn, Conn::Down) {
+            return Err(self.down_error());
+        }
         guard(&self.plans).take(batch, &items)?;
-        match self.conn() {
+        match conn {
             Conn::Local(e) => Ok(e.execute(&items, "manual")),
-            Conn::Remote(c) => from_value(self.remote(
-                &c,
-                "POST",
-                batch.route(),
-                Some(json!({ "items": items })),
-            )?),
+            Conn::Remote(c) => {
+                let path = batch.route();
+                let body = json!({ "items": items });
+                match c.request("POST", path, Some(&body), api::timeout_for("POST", path)) {
+                    Ok(v) => {
+                        self.note_ok();
+                        from_value(v)
+                    }
+                    Err(e) => {
+                        self.note_failure(&e);
+                        Err(execute_error(&e))
+                    }
+                }
+            }
             Conn::Down => Err(self.down_error()),
         }
     }
@@ -720,6 +759,40 @@ impl Backend {
         Ok(plan)
     }
 
+    /// Plan several requests (a bulk selection, or one action) for one
+    /// review. Each is planned from facts read now; their ready items are
+    /// kept as one entry, so a selection of any size is one stored plan.
+    /// Returns `{target, plans}`.
+    pub fn process_plans(&self, reqs: Vec<ProcessPlanRequest>) -> Result<Value, String> {
+        if reqs.is_empty() || reqs.len() > MAX_BULK {
+            return Err(format!("select between 1 and {MAX_BULK} processes"));
+        }
+        let mut plans = Vec::with_capacity(reqs.len());
+        for mut req in reqs {
+            req.caller_pid = Some(std::process::id());
+            plans.push(match self.conn() {
+                Conn::Local(e) => to_value(&e.process_plan(&req))?,
+                Conn::Remote(c) => {
+                    self.remote(&c, "POST", "/v1/process/plan", Some(to_value(&req)?))?
+                }
+                Conn::Down => return Err(self.down_error()),
+            });
+        }
+        let mut targets: Vec<&str> = plans.iter().filter_map(|p| p["target"].as_str()).collect();
+        targets.sort_unstable();
+        targets.dedup();
+        let target = targets.join(" + ");
+        let ready = plans.iter().flat_map(ready_requests).collect();
+        guard(&self.plans).record_process(&target, ready);
+        Ok(json!({ "target": target, "plans": plans }))
+    }
+
+    /// Whether the plan book keeps a process plan for `target`.
+    #[cfg(test)]
+    pub fn keeps_process_plan(&self, target: &str) -> bool {
+        guard(&self.plans).has_process(target)
+    }
+
     /// Lower one process's priority to `nice`, only if it is still the
     /// process started at `start_time` (the gate checks; a mismatch comes
     /// back as a skipped result). Process plans have no renice for a single
@@ -749,20 +822,12 @@ impl Backend {
             Conn::Local(e) => e.process_detail(pid).as_ref().map(to_value).transpose(),
             Conn::Remote(c) => {
                 let path = format!("/v1/process/{pid}");
-                match c.request("GET", &path, None, api::timeout_for("GET", &path)) {
-                    Ok(v) => {
-                        self.note_ok();
-                        Ok(Some(v))
-                    }
-                    Err(e) if e.status == 404 => {
-                        self.note_ok();
-                        Ok(None)
-                    }
-                    Err(e) => {
-                        self.note_failure(&e);
-                        Err(e.message)
-                    }
+                let r = c.request("GET", &path, None, api::timeout_for("GET", &path));
+                match &r {
+                    Err(e) if e.status != 404 => self.note_failure(e),
+                    _ => self.note_ok(),
                 }
+                detail_reply(r)
             }
             Conn::Down => Err(self.down_error()),
         }
@@ -805,15 +870,72 @@ impl Backend {
     }
 
     /// Save and apply settings: in this engine, or through the running
-    /// engine's `PUT /v1/config`, which saves its file the same way.
-    pub fn set_config(&self, cfg: Config) -> Result<(), String> {
+    /// engine's `PUT /v1/config`, which saves its file the same way. The
+    /// config stays JSON until this engine parses it, so a client passes on
+    /// keys that a newer engine knows and this build does not.
+    pub fn set_config(&self, cfg: Value) -> Result<(), String> {
         match self.conn() {
-            Conn::Local(e) => e.set_config(cfg).map_err(|e| e.to_string()),
+            Conn::Local(e) => {
+                let cfg: Config = serde_json::from_value(cfg)
+                    .map_err(|e| format!("the settings are not valid: {e}"))?;
+                e.set_config(cfg).map_err(|e| e.to_string())
+            }
             Conn::Remote(c) => self
-                .remote(&c, "PUT", "/v1/config", Some(json!({ "config": cfg })))
+                .remote(&c, "PUT", "/v1/config", Some(config_put_body(cfg)))
                 .map(|_| ()),
             Conn::Down => Err(self.down_error()),
         }
+    }
+
+    /// The settings file of the engine in use. As a client, the running
+    /// engine's (from `GET /v1/config`), which may be under another home.
+    pub fn config_path(&self) -> PathBuf {
+        if let Conn::Remote(c) = self.conn() {
+            if let Some(p) = self
+                .remote(&c, "GET", "/v1/config", None)
+                .ok()
+                .and_then(|v| v["path"].as_str().map(PathBuf::from))
+            {
+                return p;
+            }
+        }
+        self.paths.config_file()
+    }
+}
+
+/// The body of `PUT /v1/config`: the config exactly as given.
+pub fn config_put_body(cfg: Value) -> Value {
+    json!({ "config": cfg })
+}
+
+/// A remote execute failed after its items left the plan book. When the
+/// engine could not be reached nothing was sent; otherwise (a timeout, a
+/// broken connection, an error answer) the action may have run.
+pub fn execute_error(e: &ApiError) -> String {
+    if e.status == 0 && e.code == "unreachable" {
+        format!(
+            "Mulchie's engine could not be reached ({}), so nothing was sent. Review the plan again.",
+            e.message
+        )
+    } else {
+        format!(
+            "The request failed after it was sent ({}). The action may have run: check Activity before trying again.",
+            e.message
+        )
+    }
+}
+
+/// `GET /v1/process/{pid}` as `process_detail` returns it. Only the engine's
+/// `unknown_pid` means the process is gone; another 404 is an engine without
+/// the route.
+pub fn detail_reply(r: Result<Value, ApiError>) -> Result<Option<Value>, String> {
+    match r {
+        Ok(v) => Ok(Some(v)),
+        Err(e) if e.status == 404 && e.code == "unknown_pid" => Ok(None),
+        Err(e) if e.status == 404 => {
+            Err("process details are not supported by the running engine; update Mulchie".into())
+        }
+        Err(e) => Err(e.message),
     }
 }
 

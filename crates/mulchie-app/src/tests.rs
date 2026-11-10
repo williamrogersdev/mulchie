@@ -5,6 +5,7 @@
 use super::*;
 use mulchie_core::process::FakeProcesses;
 use mulchie_core::safety::CACHEDIR_TAG_SIGNATURE;
+use mulchie_core::Config;
 use std::collections::HashMap;
 
 struct Fixture {
@@ -112,18 +113,21 @@ fn second_backend_is_a_client_and_acts_through_the_api() {
     let mut cfg = a.state().unwrap()["config"].clone();
     cfg["low_disk_gb"] = json!(33);
     cfg["watch"]["allow_ids"] = json!(["runaway_cpu:1:2"]);
-    b.set_config(serde_json::from_value(cfg).unwrap()).unwrap();
+    b.set_config(cfg).unwrap();
     let saved = a.state().unwrap()["config"].clone();
     assert_eq!(saved["low_disk_gb"], 33);
     assert_eq!(saved["watch"]["allow_ids"][0], "runaway_cpu:1:2");
-    // An invalid config is refused with the engine's reason.
+    // An invalid config is refused with the engine's reason, by both paths.
     let mut bad = saved.clone();
     bad["watch"]["runaway_minutes"] = json!(0);
-    if let Ok(bad) = serde_json::from_value::<Config>(bad) {
-        if bad.validate().is_err() {
-            assert!(b.set_config(bad).is_err());
-        }
-    }
+    let parsed: Config = serde_json::from_value(bad.clone()).unwrap();
+    assert!(parsed.validate().is_err(), "a zero window is invalid");
+    assert!(b.set_config(bad.clone()).is_err());
+    assert!(a.set_config(bad).is_err());
+    assert_eq!(
+        a.state().unwrap()["config"]["watch"]["runaway_minutes"],
+        saved["watch"]["runaway_minutes"]
+    );
 
     // The engine journaled the client's action.
     let actions = a.state().unwrap()["actions"].clone();
@@ -408,16 +412,40 @@ fn failures_drop_the_connection_only_when_it_is_really_gone() {
 /// A throwaway child to signal, listed in the engine's (fake) process table
 /// with a start time of 1000.
 fn sleeper(f: &Fixture) -> (std::process::Child, Options) {
-    let child = std::process::Command::new("sleep")
-        .arg("30")
-        .spawn()
-        .unwrap();
-    let procs = FakeProcesses::empty().with(child.id(), "sleep", Some(f.root.clone()), 1000);
+    let (mut kids, opts) = sleepers(f, 1);
+    (kids.pop().unwrap(), opts)
+}
+
+/// `n` throwaway children, each listed with a start time of 1000.
+fn sleepers(f: &Fixture, n: usize) -> (Vec<std::process::Child>, Options) {
+    let kids: Vec<_> = (0..n)
+        .map(|_| {
+            std::process::Command::new("sleep")
+                .arg("30")
+                .spawn()
+                .unwrap()
+        })
+        .collect();
+    let procs = kids.iter().fold(FakeProcesses::empty(), |p, c| {
+        p.with(c.id(), "sleep", Some(f.root.clone()), 1000)
+    });
     let opts = Options {
         procs: Some(Arc::new(procs)),
         ..f.opts()
     };
-    (child, opts)
+    (kids, opts)
+}
+
+fn client_of(f: &Fixture, opts: Options) -> Backend {
+    let b = Backend::start(
+        f.paths.clone(),
+        Options {
+            takeover_after: Duration::from_secs(3600),
+            ..opts
+        },
+    );
+    assert_eq!(b.mode(), Mode::Client);
+    b
 }
 
 fn gone_within(child: &mut std::process::Child, secs: u64) -> bool {
@@ -502,8 +530,231 @@ fn process_detail_and_renice_check_the_process() {
     // A renice for a start time the process does not have is skipped.
     let r = a.renice(pid, 999, 10).unwrap();
     assert!(!r.is_done(), "{r:?}");
+    // The confirmed process is lowered, here and through a client.
+    let r = a.renice(pid, 1000, 10).unwrap();
+    assert!(r.is_done(), "{r:?}");
+    let b = Backend::start(
+        f.paths.clone(),
+        Options {
+            takeover_after: Duration::from_secs(3600),
+            procs: Some(Arc::new(FakeProcesses::empty())),
+            ..f.opts()
+        },
+    );
+    assert_eq!(b.mode(), Mode::Client);
+    let r = b.renice(pid, 1000, 12).unwrap();
+    assert!(r.is_done(), "{r:?}");
+    assert!(!b.renice(pid, 999, 12).unwrap().is_done());
+    // Process detail through the client: the process, and none for a pid
+    // that does not exist.
+    let d = b.process_detail(pid).unwrap().unwrap();
+    assert_eq!(d["pid"], pid);
+    assert_eq!(d["start_time"], 1000);
+    assert!(b.process_detail(u32::MAX - 1).unwrap().is_none());
+    drop(b);
     let _ = child.kill();
     let _ = child.wait();
+    a.shutdown();
+}
+
+#[test]
+fn process_detail_tells_an_exited_process_from_an_engine_without_the_route() {
+    use mulchie_core::api::ApiError;
+    let gone = backend::detail_reply(Err(ApiError::new(404, "unknown_pid", "no process 7")));
+    assert_eq!(gone, Ok(None));
+    let old = backend::detail_reply(Err(ApiError::new(404, "not_found", "no route")));
+    assert!(old.unwrap_err().contains("not supported"));
+    let other = backend::detail_reply(Err(ApiError::new(500, "internal", "boom")));
+    assert_eq!(other, Err("boom".to_string()));
+    assert_eq!(
+        backend::detail_reply(Ok(json!({"pid": 7}))),
+        Ok(Some(json!({"pid": 7})))
+    );
+}
+
+#[test]
+fn reveal_never_opens_an_app_or_a_file() {
+    let f = fixture();
+    let backups = f.paths.backups_dir.clone();
+    std::fs::create_dir_all(&backups).unwrap();
+    let patch = backups.join("w.patch");
+    std::fs::write(&patch, "x").unwrap();
+    let ws = f.root.join("ws");
+    let wt = f.root.join("wt");
+    let app = f.root.join("Flagged.app");
+    let cache = f.root.join("ws/target");
+    for d in [&ws, &wt, &app, &cache] {
+        std::fs::create_dir_all(d).unwrap();
+    }
+    let st = json!({
+        "snapshot": {"workspaces": [{"path": ws}], "consumers": {"by_cpu": [{"bundle_path": app, "workspace": null}], "by_mem": []}},
+        "scan": {"items": [{"path": cache}]},
+        "diskmap": {"worktrees": [{"path": wt}], "categories": []}
+    });
+    let args = |p: &Path, term| reveal_args(&st, p, &backups, term);
+    let os = |v: &[&dyn AsRef<std::ffi::OsStr>]| -> Vec<OsString> {
+        v.iter().map(|x| x.as_ref().to_os_string()).collect()
+    };
+    // Workspace and worktree folders and the backups folder open in place.
+    assert_eq!(args(&ws, false).unwrap(), os(&[&ws]));
+    assert_eq!(args(&wt, false).unwrap(), os(&[&wt]));
+    assert_eq!(args(&backups, false).unwrap(), os(&[&backups]));
+    assert_eq!(args(&ws, true).unwrap(), os(&[&"-a", &"Terminal", &ws]));
+    // An app bundle, a file and a cache folder are revealed, never opened.
+    for p in [&app, &patch, &cache] {
+        let a = args(p, false).unwrap();
+        assert_ne!(a, os(&[p]), "{p:?} would be opened");
+        if cfg!(target_os = "macos") {
+            assert_eq!(a, os(&[&"-R", p]));
+        }
+        assert!(args(p, true).is_err(), "{p:?} in Terminal");
+    }
+    // Even an app listed as a workspace is revealed.
+    let st2 = json!({"snapshot": {"workspaces": [{"path": app}]}});
+    assert!(!opens_in_place(&st2, &app, &backups));
+}
+
+#[test]
+fn plan_book_forgets_only_the_oldest_process_plan() {
+    use backend::PROCESS_PLANS_KEPT;
+    let sig = |pid| Request::Signal {
+        pid,
+        signal: mulchie_core::safety::Signal::Term,
+        expected_start_time: 7,
+    };
+    let mut book = backend::PlanBook::default();
+    let n = PROCESS_PLANS_KEPT as u32 + 1;
+    for pid in 1..=n {
+        book.record_process(&format!("pid {pid}"), vec![sig(pid)]);
+    }
+    assert!(!book.has_process("pid 1"), "the oldest is forgotten");
+    assert!(book.take(Batch::Process, &[sig(1)]).is_err());
+    for pid in 2..=n {
+        assert!(book.has_process(&format!("pid {pid}")), "pid {pid} kept");
+    }
+    // Re-recording a kept target refreshes it, so the next one out is pid 3.
+    book.record_process("pid 2", vec![sig(2)]);
+    book.record_process("pid 99", vec![sig(99)]);
+    assert!(book.has_process("pid 2") && !book.has_process("pid 3"));
+    book.take(Batch::Process, &(4..=n).map(sig).collect::<Vec<_>>())
+        .unwrap();
+    book.clear();
+    assert!(book.take(Batch::Process, &[sig(2)]).is_err(), "cleared");
+}
+
+#[test]
+fn a_bulk_selection_beyond_the_kept_plans_is_one_reviewed_plan() {
+    let f = fixture();
+    let n = backend::PROCESS_PLANS_KEPT + 8;
+    let (mut kids, opts) = sleepers(&f, n);
+    let a = Backend::start(f.paths.clone(), opts.clone());
+    let b = client_of(&f, opts);
+    let reqs: Vec<ProcessPlanRequest> = kids
+        .iter()
+        .map(|c| serde_json::from_value(json!({"pid": c.id(), "signal": "term"})).unwrap())
+        .collect();
+    let bulk = b.process_plans(reqs).unwrap();
+    let plans = bulk["plans"].as_array().unwrap();
+    assert_eq!(plans.len(), n);
+    assert!(b.keeps_process_plan(bulk["target"].as_str().unwrap()));
+    let items: Vec<Request> = plans.iter().flat_map(backend::ready_requests).collect();
+    assert_eq!(items.len(), n, "{bulk}");
+    let res = b.execute(Batch::Process, items.clone()).unwrap();
+    assert_eq!(res.iter().filter(|r| r.is_done()).count(), n, "{res:?}");
+    for k in kids.iter_mut() {
+        assert!(gone_within(k, 5));
+    }
+    assert!(b.execute(Batch::Process, items).is_err(), "used once");
+    assert!(b.process_plans(vec![]).is_err());
+    drop(b);
+    a.shutdown();
+}
+
+#[test]
+fn plans_are_forgotten_on_reconnect_and_on_takeover() {
+    let f = fixture();
+    let a = Backend::start(f.paths.clone(), f.opts());
+    let b = client_of(&f, f.opts());
+    // Reconnect: a plan made through the old engine is not executed by the new one.
+    let x = f.cache("x");
+    let items = b.plan(&clean(vec![x.clone()])).unwrap().approved();
+    a.shutdown();
+    b.tick();
+    assert_eq!(b.mode(), Mode::Disconnected);
+    let a2 = Backend::start(f.paths.clone(), f.opts());
+    b.tick();
+    assert_eq!(b.mode(), Mode::Client);
+    assert!(b
+        .execute(Batch::Clean, items)
+        .unwrap_err()
+        .contains("not a ready item"));
+    assert!(x.exists());
+    drop(b);
+    // Takeover: the client becomes the engine and forgets the plan too.
+    let c = Backend::start(f.paths.clone(), f.opts());
+    assert_eq!(c.mode(), Mode::Client);
+    let items = c.plan(&clean(vec![x.clone()])).unwrap().approved();
+    assert_eq!(items.len(), 1);
+    a2.shutdown();
+    c.tick();
+    c.tick();
+    assert_eq!(c.mode(), Mode::Engine);
+    assert!(c
+        .execute(Batch::Clean, items)
+        .unwrap_err()
+        .contains("not a ready item"));
+    assert!(x.exists(), "nothing ran without a new plan");
+    c.shutdown();
+}
+
+#[test]
+fn a_failed_execute_says_whether_the_action_may_have_run() {
+    use mulchie_core::api::ApiError;
+    let unreachable = backend::execute_error(&ApiError::new(0, "unreachable", "refused"));
+    assert!(unreachable.contains("nothing was sent"), "{unreachable}");
+    let timeout = backend::execute_error(&ApiError::new(0, "timeout", "timed out"));
+    assert!(
+        timeout.contains("may have run") && timeout.contains("Activity"),
+        "{timeout}"
+    );
+    // Through a client whose engine went away after the plan was shown.
+    let f = fixture();
+    let a = Backend::start(f.paths.clone(), f.opts());
+    let b = client_of(&f, f.opts());
+    let items = b.plan(&clean(vec![f.cache("x")])).unwrap().approved();
+    a.shutdown();
+    let e = b.execute(Batch::Clean, items).unwrap_err();
+    assert!(
+        e.contains("nothing was sent") || e.contains("may have run"),
+        "{e}"
+    );
+}
+
+#[test]
+fn client_settings_save_passes_on_keys_this_build_does_not_know() {
+    let cfg = Config {
+        low_disk_gb: 9,
+        ..Config::default()
+    };
+    let mut v = serde_json::to_value(&cfg).unwrap();
+    v["from_a_newer_engine"] = json!({"keep": [1, 2]});
+    v["watch"]["newer_detector"] = json!(true);
+    let body = backend::config_put_body(v.clone());
+    assert_eq!(body["config"], v, "sent unchanged");
+    // Saving it works through a client and as the engine (this engine
+    // ignores keys it does not know).
+    let f = fixture();
+    let a = Backend::start(f.paths.clone(), f.opts());
+    let b = client_of(&f, f.opts());
+    b.set_config(v.clone()).unwrap();
+    assert_eq!(a.state().unwrap()["config"]["low_disk_gb"], 9);
+    v["low_disk_gb"] = json!(10);
+    a.set_config(v).unwrap();
+    assert_eq!(a.state().unwrap()["config"]["low_disk_gb"], 10);
+    assert!(a.set_config(json!({"low_disk_gb": "lots"})).is_err());
+    // The client reports the running engine's settings file.
+    assert_eq!(b.config_path(), f.paths.config_file());
+    drop(b);
     a.shutdown();
 }
 

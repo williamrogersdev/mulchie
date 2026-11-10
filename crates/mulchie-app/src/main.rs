@@ -6,9 +6,10 @@ mod view;
 
 use backend::{Backend, Batch, ConnInfo, Mode, Options, PlanRequest, TrayInfo};
 use mulchie_core::procplan::ProcessPlanRequest;
-use mulchie_core::{human_bytes, ActionResult, Config, Paths, Plan, Request};
+use mulchie_core::{human_bytes, ActionResult, Paths, Plan, Request};
 use serde::Serialize;
 use serde_json::{json, Value};
+use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
@@ -63,7 +64,7 @@ async fn get_config(b: B<'_>) -> Result<Value, String> {
         // The engine here saves directly; a client saves through the running
         // engine's PUT /v1/config.
         v["editable"] = json!(b.mode() != Mode::Disconnected);
-        v["path"] = json!(b.paths().config_file());
+        v["path"] = json!(b.config_path());
         Ok(v)
     })
     .await
@@ -100,6 +101,12 @@ async fn process_plan(b: B<'_>, request: ProcessPlanRequest) -> Result<Value, St
     blocking(&b, move |b| b.process_plan(request)).await
 }
 
+/// Several requests reviewed as one plan (a bulk selection).
+#[tauri::command]
+async fn process_plans(b: B<'_>, requests: Vec<ProcessPlanRequest>) -> Result<Value, String> {
+    blocking(&b, move |b| b.process_plans(requests)).await
+}
+
 #[tauri::command]
 async fn renice(b: B<'_>, pid: u32, start_time: u64, nice: i32) -> Result<ActionResult, String> {
     blocking(&b, move |b| b.renice(pid, start_time, nice)).await
@@ -121,7 +128,7 @@ async fn undismiss_finding(b: B<'_>, id: String) -> Result<bool, String> {
 }
 
 #[tauri::command]
-async fn set_config(b: B<'_>, config: Config) -> Result<(), String> {
+async fn set_config(b: B<'_>, config: Value) -> Result<(), String> {
     blocking(&b, move |b| b.set_config(config)).await
 }
 
@@ -264,27 +271,71 @@ fn revealable(state: &Value, p: &Path, backups: &Path) -> bool {
     }
 }
 
+/// Directories the UI opens in place (a workspace, a worktree, the backups
+/// folder); everything else is revealed in its folder, so an app bundle or a
+/// file is never opened or launched.
+fn opens_in_place(state: &Value, p: &Path, backups: &Path) -> bool {
+    let is = |v: &Value| v.as_str().is_some_and(|s| Path::new(s) == p);
+    let listed = |list: &Value, key: &str| {
+        list.as_array()
+            .is_some_and(|l| l.iter().any(|x| is(&x[key])))
+    };
+    let bundle = p.extension().is_some_and(|e| {
+        ["app", "bundle", "framework", "pkg"]
+            .iter()
+            .any(|b| e == *b)
+    });
+    p.is_dir()
+        && !p.is_symlink()
+        && !bundle
+        && (p == backups
+            || listed(&state["snapshot"]["workspaces"], "path")
+            || listed(&state["diskmap"]["worktrees"], "path"))
+}
+
+/// The arguments for `open` (macOS) or `xdg-open` that reveal `p`.
+fn reveal_args(
+    state: &Value,
+    p: &Path,
+    backups: &Path,
+    terminal: bool,
+) -> Result<Vec<OsString>, String> {
+    let in_place = opens_in_place(state, p, backups);
+    if terminal {
+        if !in_place {
+            return Err("only a workspace or worktree folder opens in Terminal".into());
+        }
+        return Ok(vec!["-a".into(), "Terminal".into(), p.into()]);
+    }
+    if in_place {
+        Ok(vec![p.into()])
+    } else if cfg!(target_os = "macos") {
+        Ok(vec!["-R".into(), p.into()])
+    } else {
+        // xdg-open has no reveal: open the folder that holds it.
+        Ok(vec![p.parent().unwrap_or(p).into()])
+    }
+}
+
 #[tauri::command]
 async fn reveal(b: B<'_>, path: String, terminal: bool) -> Result<(), String> {
     blocking(&b, move |b| {
         let p = PathBuf::from(&path);
         let st = b.state().unwrap_or(Value::Null);
-        if !p.exists() || !revealable(&st, &p, &b.paths().backups_dir) {
+        let backups = &b.paths().backups_dir;
+        if !p.exists() || !revealable(&st, &p, backups) {
             return Err("unknown path".into());
         }
-        let mut cmd = std::process::Command::new(if cfg!(target_os = "macos") {
+        let args = reveal_args(&st, &p, backups, terminal && cfg!(target_os = "macos"))?;
+        std::process::Command::new(if cfg!(target_os = "macos") {
             "open"
         } else {
             "xdg-open"
-        });
-        if cfg!(target_os = "macos") {
-            if terminal {
-                cmd.args(["-a", "Terminal"]);
-            } else if p.is_file() {
-                cmd.arg("-R");
-            }
-        }
-        cmd.arg(&p).spawn().map(|_| ()).map_err(|e| e.to_string())
+        })
+        .args(args)
+        .spawn()
+        .map(|_| ())
+        .map_err(|e| e.to_string())
     })
     .await
 }
@@ -314,6 +365,17 @@ fn panel_height(want: f64) -> f64 {
 fn fit_panel(window: WebviewWindow, height: f64) {
     if window.label() == "panel" {
         let _ = window.set_size(tauri::LogicalSize::new(400.0, panel_height(height)));
+    }
+}
+
+/// Hide the tray panel (Escape in the panel). The panel also hides when it
+/// loses focus, but one opened without ever getting focus needs this or a
+/// click on the tray icon.
+#[tauri::command]
+fn hide_panel(window: WebviewWindow) {
+    if window.label() == "panel" {
+        let _ = window.hide();
+        set_visible(&window, false);
     }
 }
 
@@ -474,6 +536,7 @@ fn main() {
             execute,
             prune,
             process_plan,
+            process_plans,
             renice,
             process_detail,
             dismiss_finding,
@@ -485,6 +548,7 @@ fn main() {
             open_dashboard,
             window_visible,
             fit_panel,
+            hide_panel,
             quit
         ])
         .setup(move |app| {
@@ -551,9 +615,10 @@ fn main() {
         .build(context)
         .expect("failed to build Mulchie");
     // `--dashboard` opens the dashboard at launch instead of staying in the
-    // menu bar.
-    // `--panel` opens the tray panel instead (under the menu bar's left
-    // edge, as no icon position is known yet).
+    // menu bar. `--panel` (when `--dashboard` is absent) shows the tray panel
+    // wherever the window system places it, since tauri.conf.json gives it
+    // no position and no icon position is known yet. A click on the tray
+    // icon or Escape in the panel hides it, even if it never got focus.
     let open_at_launch = std::env::args().any(|a| a == "--dashboard");
     let panel_at_launch = std::env::args().any(|a| a == "--panel");
     app.run(move |app, event| match event {

@@ -74,7 +74,7 @@ async function refresh(force) {
         if (!st.cfg || S.config_rev !== st.cfgRev) {
           st.cfg = await invoke('get_config');
           st.cfgRev = st.cfg.rev;
-          if (st.view === 'settings') renderSettings(true);
+          if (st.view === 'settings') renderSettings();
         }
         S.config = st.cfg.config;
         const wantActs = MODE !== 'panel' && (st.view === 'activity' || NEEDS_ACTIONS.has(st.ui.detail?.type));
@@ -261,6 +261,7 @@ document.addEventListener('keydown', e => {
   if (e.key === 'Escape') {
     if (modalOpen()) dismissModal();
     else if (detailOpen()) closeDetail();
+    else if (MODE === 'panel') invoke('hide_panel').catch(() => {});
     return;
   }
   if (MODE === 'panel') return;

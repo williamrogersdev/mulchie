@@ -7,10 +7,26 @@ export const modalOpen = () => $('#modal').classList.contains('on');
 
 let closeModal = null;
 
-// Show the modal. `setup(body, yesButton)` may wire controls inside the body.
+const FOCUSABLE = 'button:not([disabled]),input:not([disabled]),select:not([disabled]),textarea:not([disabled]),a[href],[tabindex]:not([tabindex="-1"])';
+const focusables = () => [...$('#mBox').querySelectorAll(FOCUSABLE)].filter(el => el.offsetParent !== null);
+
+// Keep Tab and Shift-Tab inside the open dialog.
+function trapTab(e) {
+  if (e.key !== 'Tab' || !modalOpen()) return;
+  const f = focusables();
+  if (!f.length) return;
+  const first = f[0], last = f[f.length - 1];
+  if (e.shiftKey && (document.activeElement === first || !$('#mBox').contains(document.activeElement))) { e.preventDefault(); last.focus(); }
+  else if (!e.shiftKey && (document.activeElement === last || !$('#mBox').contains(document.activeElement))) { e.preventDefault(); first.focus(); }
+}
+document.addEventListener('keydown', trapTab);
+
+// Show the modal (a dialog: focus moves in, stays in, and returns to what
+// opened it). `setup(body, yesButton)` may wire controls inside the body.
 // Resolves true on confirm, false on cancel or Escape.
 export function modal({ title, html, yes = 'Confirm', danger = true, wide = false, cancel = 'Cancel', setup }) {
   if (closeModal) closeModal(false);
+  const opener = document.activeElement;
   return new Promise(res => {
     const yesB = $('#mYes'), noB = $('#mNo');
     $('#mBox').classList.toggle('wide', wide);
@@ -27,12 +43,17 @@ export function modal({ title, html, yes = 'Confirm', danger = true, wide = fals
       yesB.onclick = noB.onclick = null;
       $('#mBody').onchange = null;
       closeModal = null;
+      if (opener && opener.isConnected && typeof opener.focus === 'function') opener.focus({ preventScroll: true });
       res(v);
     };
     closeModal = done;
     yesB.onclick = () => done(true);
     noB.onclick = () => done(false);
     if (setup) setup($('#mBody'), yesB);
+    // A destructive action starts on Cancel; otherwise on the first control
+    // in the body, or the action button.
+    const start = danger || !yes ? noB : ($('#mBody').querySelector(FOCUSABLE) || yesB);
+    start.focus({ preventScroll: true });
   });
 }
 

@@ -12,7 +12,7 @@ import { modal, reasonText } from './dialogs.js';
 
 // Group actions the engine plans (`ConsumerGroup.actions`).
 export const GROUP_ACTIONS = {
-  quit: { verb: 'Quit', note: 'Asks the main process to quit (SIGTERM) so it can save and exit cleanly; its helpers exit with it.', danger: true },
+  quit: { verb: 'Quit', note: 'Asks the main process to quit (SIGTERM) so it can save and exit cleanly; its helper processes are expected to exit with it.', danger: true },
   force_quit: { verb: 'Force quit', note: 'Sends SIGKILL to every process. It cannot be caught, so unsaved work is lost.', danger: true },
   pause: { verb: 'Pause', note: 'Sends SIGSTOP. The processes freeze until you resume them.', danger: false },
   resume: { verb: 'Resume', note: 'Sends SIGCONT to paused processes.', danger: false },
@@ -87,8 +87,10 @@ function showResults(results, verb) {
 // actions started from something the user looked at earlier (a finding).
 export async function planAndRun(requests, { title, verb, note, danger = true, expect } = {}) {
   toast('Checking…');
+  // One call plans them all, and the engine keeps them as one plan, so a
+  // selection of any size is one review and one approval.
   let plans;
-  try { plans = await Promise.all(requests.map(request => invoke('process_plan', { request }))); }
+  try { plans = (await invoke('process_plans', { requests })).plans; }
   catch (e) { return toast(String(e), true); }
   hideToast();
   if (expect) {
@@ -120,15 +122,39 @@ export function signalPids(pids, signal, what) {
   return planAndRun(pids.map(pid => ({ pid, signal })), { title: `${a.verb} ${what || `${pids.length} process(es)`}?`, verb: a.verb, note: a.note, danger: a.danger });
 }
 
-// Lower one process's priority: plans have no per-process renice, so this
-// confirms, then the gate checks the start time the user saw.
-export async function reniceProc(p, nice) {
-  nice = Math.max(10, nice || st.S.config?.build_nice || 10);
-  const ok = await modal({ title: `Lower the priority of ${p.name} (${p.pid})?`, html: `<div>Sets its nice value to ${nice}, so other work gets the CPU first. It keeps running. Only the process started at ${esc(new Date(p.start_time * 1000).toLocaleString())} is changed.</div>`, yes: 'Lower priority', danger: false });
+// The nice value "Lower priority" sets: a finding's own suggestion, else
+// the configured build_nice, else 10.
+export const reniceTarget = nice => Math.min(20, Math.max(1, Math.round(nice ?? st.S?.config?.build_nice ?? 10)));
+// Whether lowering would change anything: not when it already runs at or
+// above that nice value.
+export const canLower = (p, nice) => !(p?.nice >= reniceTarget(nice));
+
+// Lower the priority of one or more processes: plans have no per-process
+// renice, so one confirmation lists them all, then the gate checks each
+// start time the user saw. Cancel sends nothing.
+export async function reniceProcs(procs, nice) {
+  const target = reniceTarget(nice);
+  const todo = procs.filter(p => canLower(p, target));
+  const already = procs.length - todo.length;
+  if (!todo.length) return toast(`Already at nice ${target} or lower priority; nothing to change.`);
+  const list = todo.slice(0, 40).map(p => `<div class="pi"><span></span><div><div class="nm">${esc(p.name)} <span class="dim mono">${p.pid}</span></div></div><div class="sz dim">${p.nice != null ? `nice ${esc(p.nice)} → ${target}` : `→ ${target}`}</div></div>`).join('');
+  const ok = await modal({
+    title: todo.length === 1 ? `Lower the priority of ${todo[0].name} (${todo[0].pid})?` : `Lower the priority of ${todo.length} processes?`,
+    html: `<div>Sets the nice value to ${target}, so other work gets the CPU first. They keep running. Only the processes started at the times Mulchie saw are changed.</div>
+      <div class="plan">${list}${todo.length > 40 ? `<div class="dim">and ${todo.length - 40} more</div>` : ''}</div>${already ? `<p class="dim">${already} already at nice ${target} or above, left alone.</p>` : ''}`,
+    yes: 'Lower priority', danger: false, wide: todo.length > 1,
+  });
   if (!ok) return;
-  try {
-    const r = await invoke('renice', { pid: p.pid, startTime: p.start_time, nice });
-    await hooks.refresh(true);
-    return r.status === 'done' ? toast(`${p.name} now runs at nice ${nice}`) : toast(`Not changed: ${reasonText(r.reason)}${r.detail ? ` (${r.detail})` : ''}`, true);
-  } catch (e) { return toast(String(e), true); }
+  const done = [], not = [];
+  for (const p of todo) {
+    try {
+      const r = await invoke('renice', { pid: p.pid, startTime: p.start_time, nice: target });
+      (r.status === 'done' ? done : not).push(r.status === 'done' ? p : `${p.name} (${p.pid}): ${reasonText(r.reason)}`);
+    } catch (e) { not.push(`${p.name} (${p.pid}): ${e}`); }
+  }
+  await hooks.refresh(true);
+  if (!not.length) return toast(done.length === 1 ? `${done[0].name} now runs at nice ${target}` : `${done.length} processes now run at nice ${target}`);
+  return toast(`Lowered ${done.length} of ${todo.length}. Not changed: ${not.join('; ')}`, true);
 }
+
+export const reniceProc = (p, nice) => reniceProcs([p], nice);

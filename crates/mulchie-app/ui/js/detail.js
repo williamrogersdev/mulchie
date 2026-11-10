@@ -6,7 +6,7 @@ import { st, hooks } from './store.js';
 import { invoke } from './ipc.js';
 import { $, esc, B, BS, P, ago, dur, tilde, toast, kindChip } from './util.js';
 import { planThenExecute, confirmBox, reasonText } from './dialogs.js';
-import { GROUP_ACTIONS, groupAction, signalPids, reniceProc, planAndRun } from './signals.js';
+import { GROUP_ACTIONS, groupAction, signalPids, reniceProc, planAndRun, canLower } from './signals.js';
 import { allProcs, findConsumer, ranked, cores, cpuSummary, memSummary, KIND_TEXT } from './consumers.js';
 import { SEV_LVL, SEV_TEXT, suggestionLabel, watchFindings } from './findings.js';
 import { act } from './act.js';
@@ -120,8 +120,13 @@ export function loadProc(pid, force) {
   if (pd.busy || (!force && Date.now() - pd.at < 2500)) return;
   pd.busy = true;
   invoke('process_detail', { pid })
-    .then(d => { pd.data = d; pd.err = null; }, e => { pd.err = String(e); })
-    .finally(() => { pd.busy = false; pd.at = Date.now(); if (st.ui.detail?.type === 'proc' && +st.ui.detail.key === pid) renderDetail(); });
+    // A reply for a process the drawer no longer shows is dropped.
+    .then(d => { if (pd.pid === pid) { pd.data = d; pd.err = null; } }, e => { if (pd.pid === pid) pd.err = String(e); })
+    .finally(() => {
+      pd.busy = false;
+      if (pd.pid === pid) pd.at = Date.now();
+      if (st.ui.detail?.type === 'proc') renderDetail();
+    });
 }
 
 const SIG = { apple: 'Apple', app_store: 'App Store', developer_id: 'Developer ID', development: 'a developer’s own build', other_signed: 'signed by another certificate', ad_hoc: 'ad-hoc (no identity)', unsigned: 'not signed', unknown: 'could not be checked' };
@@ -153,7 +158,7 @@ function rProc(pid) {
       ['workspace', x.workspace ? link('ws', x.workspace, d?.workspace_label || tilde(x.workspace)) : '<span class="dim">none (its working directory is outside your projects)</span>'],
       d?.group && findConsumer(S(), d.group) && ['group', link('group', d.group, findConsumer(S(), d.group).label)]])}
     <h3 class="ds-h">Command line</h3><pre class="code">${esc(cmd) || '<span class="dim">not readable</span>'}</pre>
-    ${own && !d?.protected ? actions([btn('Quit…', da('p-term', pid), 'danger'), btn('Force quit…', da('p-kill', pid), 'danger'), x.stopped ? btn('Resume…', da('p-cont', pid)) : btn('Pause…', da('p-stop', pid)), btn('Lower priority…', da('p-renice', pid)), d?.children?.length ? btn('Quit with children…', da('p-tree', pid), 'danger') : ''])
+    ${own && !d?.protected ? actions([btn('Quit…', da('p-term', pid), 'danger'), btn('Force quit…', da('p-kill', pid), 'danger'), x.stopped ? btn('Resume…', da('p-cont', pid)) : btn('Pause…', da('p-stop', pid)), canLower(p) ? btn('Lower priority…', da('p-renice', pid)) : '', d?.children?.length ? btn('Quit with children…', da('p-tree', pid), 'danger') : ''])
       : own ? '' : '<div class="muted" style="margin-top:10px">Owned by another user; Mulchie will not signal it.</div>'}`;
   return { title: `${x.name}`, sub: `<span class="dim mono">pid ${pid}</span>`, html,
     copy: { kind: 'process', ...pick(x, ['pid', 'ppid', 'name', 'kind', 'cpu_pct', 'mem_bytes', 'start_time', 'workspace', 'cwd', 'exe', 'signature', 'listening', 'protected']), cmd, parents: d?.parents, children: d?.children, findings: fs.map(f => f.id) } };
@@ -411,7 +416,10 @@ export async function runSuggestion(i, id) {
   if (r.action === 'signal') {
     return planAndRun([{ pid: r.pid, signal: r.signal }], { title: `${sg.label}?`, verb: suggestionLabel(sg).replace('…', ''), danger: !sg.reversible, expect: { pid: r.pid, start_time: r.expected_start_time } });
   }
-  if (r.action === 'renice') return reniceProc({ pid: r.pid, name: f.evidence?.name || `pid ${r.pid}`, start_time: r.expected_start_time }, r.nice);
+  if (r.action === 'renice') {
+    const row = procBy(r.pid);
+    return reniceProc({ pid: r.pid, name: f.evidence?.name || `pid ${r.pid}`, start_time: r.expected_start_time, nice: row?.start_time === r.expected_start_time ? row.nice : undefined }, r.nice);
+  }
   return toast('This suggestion has no action the app can run.', true);
 }
 
