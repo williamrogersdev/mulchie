@@ -552,9 +552,13 @@ fn main() {
         .expect("failed to build Mulchie");
     // `--dashboard` opens the dashboard at launch instead of staying in the
     // menu bar.
+    // `--panel` opens the tray panel instead (under the menu bar's left
+    // edge, as no icon position is known yet).
     let open_at_launch = std::env::args().any(|a| a == "--dashboard");
+    let panel_at_launch = std::env::args().any(|a| a == "--panel");
     app.run(move |app, event| match event {
         RunEvent::Ready if open_at_launch => show_dashboard(app, None),
+        RunEvent::Ready if panel_at_launch => toggle_panel(app, None),
         RunEvent::Exit => exit_backend.shutdown(),
         // Opening Mulchie again (Finder, Spotlight, Dock) while it runs.
         #[cfg(target_os = "macos")]
