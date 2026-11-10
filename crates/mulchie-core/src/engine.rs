@@ -685,6 +685,18 @@ fn read_config_bytes(paths: &Paths) -> Option<Vec<u8>> {
     std::fs::read(paths.config_file()).ok()
 }
 
+/// A6: the revision of the config file's content: 64-bit FNV-1a of its
+/// bytes in hex (no file hashes as no bytes). Stable across engines and
+/// versions; it only tells contents apart.
+pub fn config_revision_of(bytes: Option<&[u8]>) -> String {
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    for b in bytes.unwrap_or_default() {
+        h ^= u64::from(*b);
+        h = h.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    format!("{h:016x}")
+}
+
 #[derive(Clone)]
 pub struct Engine {
     state: Arc<Mutex<State>>,
@@ -898,6 +910,40 @@ impl Engine {
         lock(&self.state).config.clone()
     }
 
+    /// The config and the revision of the file content it came from, read
+    /// together (A6).
+    pub fn config_and_revision(&self) -> (Config, String) {
+        self.refresh_config_if_changed();
+        let disk = lock(&self.config_disk);
+        let rev = config_revision_of(disk.as_deref());
+        let cfg = lock(&self.state).config.clone();
+        (cfg, rev)
+    }
+
+    /// With `expected`, refuse ([`ConfigError::Changed`]) unless the file's
+    /// content now is that revision. Called with the config lock held.
+    fn check_revision(
+        &self,
+        disk: &mut Option<Vec<u8>>,
+        now_bytes: &Option<Vec<u8>>,
+        expected: Option<&str>,
+    ) -> Result<(), ConfigError> {
+        let Some(exp) = expected else {
+            return Ok(());
+        };
+        let now = config_revision_of(now_bytes.as_deref());
+        if now == exp.trim() {
+            return Ok(());
+        }
+        if now_bytes != disk {
+            self.adopt_disk_config(disk, now_bytes.clone());
+        }
+        Err(ConfigError::Changed(format!(
+            "the config is at revision {now}, not {}; read it again (GET /v1/config) and reapply the change",
+            exp.trim()
+        )))
+    }
+
     /// Only the engine that holds the engine lock writes the config file.
     fn may_write_config(&self) -> Result<(), ConfigError> {
         if self.automation_enabled.load(Ordering::SeqCst) {
@@ -944,6 +990,16 @@ impl Engine {
     /// file's current content, validate, save and use it. Keys the patch
     /// does not name keep their value, so clients never send the whole file.
     pub fn patch_config(&self, patch: &Value) -> Result<Config, ConfigError> {
+        self.patch_config_if(patch, None).map(|(c, _)| c)
+    }
+
+    /// [`Engine::patch_config`], only while the file is at revision
+    /// `expected` (when given). Returns the config and its new revision.
+    pub fn patch_config_if(
+        &self,
+        patch: &Value,
+        expected: Option<&str>,
+    ) -> Result<(Config, String), ConfigError> {
         if !patch.is_object() {
             return Err(ConfigError::Parse(
                 "a config patch is a JSON object of the keys to change".into(),
@@ -952,6 +1008,7 @@ impl Engine {
         self.may_write_config()?;
         let mut disk = lock(&self.config_disk);
         let now_bytes = read_config_bytes(&self.paths);
+        self.check_revision(&mut disk, &now_bytes, expected)?;
         if now_bytes != *disk {
             // A patch names only what it changes: apply it to the file's
             // current content rather than refusing.
@@ -971,7 +1028,7 @@ impl Engine {
             return Err(ConfigError::UnknownKey(k));
         }
         self.save_config_locked(&mut disk, cfg.clone())?;
-        Ok(cfg)
+        Ok((cfg, config_revision_of(disk.as_deref())))
     }
 
     pub fn config_error(&self) -> Option<String> {
@@ -986,9 +1043,20 @@ impl Engine {
     /// engine then takes the file's content, so a caller reads the config
     /// again and reapplies its change.
     pub fn set_config(&self, cfg: Config) -> Result<(), ConfigError> {
+        self.set_config_if(cfg, None).map(|_| ())
+    }
+
+    /// [`Engine::set_config`], only while the file is at revision `expected`
+    /// (when given). Returns the new revision.
+    pub fn set_config_if(
+        &self,
+        cfg: Config,
+        expected: Option<&str>,
+    ) -> Result<String, ConfigError> {
         self.may_write_config()?;
         let mut disk = lock(&self.config_disk);
         let now_bytes = read_config_bytes(&self.paths);
+        self.check_revision(&mut disk, &now_bytes, expected)?;
         if now_bytes != *disk {
             self.adopt_disk_config(&mut disk, now_bytes);
             return Err(ConfigError::Changed(format!(
@@ -996,7 +1064,8 @@ impl Engine {
                 self.paths.config_file().display()
             )));
         }
-        self.save_config_locked(&mut disk, cfg)
+        self.save_config_locked(&mut disk, cfg)?;
+        Ok(config_revision_of(disk.as_deref()))
     }
 
     /// Take the file's current content as the engine's config, as a start

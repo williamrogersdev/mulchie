@@ -480,6 +480,8 @@ pub struct Req {
     pub auth: Option<String>,
     pub origin: Option<String>,
     pub fetch_site: Option<String>,
+    /// `If-Match`: a config revision for PUT and PATCH /v1/config.
+    pub if_match: Option<String>,
     pub body: Vec<u8>,
 }
 
@@ -613,6 +615,7 @@ pub fn read_req<R: BufRead>(
         auth: None,
         origin: None,
         fetch_site: None,
+        if_match: None,
         body: Vec::new(),
     };
     let mut content_length: Option<usize> = None;
@@ -660,6 +663,7 @@ pub fn read_req<R: BufRead>(
             "authorization" => req.auth = Some(value.into()),
             "origin" => req.origin = Some(value.into()),
             "sec-fetch-site" => req.fetch_site = Some(value.into()),
+            "if-match" => req.if_match = Some(value.into()),
             _ => {}
         }
     }
@@ -915,6 +919,19 @@ struct ConfigBody {
 
 /// The raw value of `key` in the query string. Not percent-decoded: the
 /// values read this way are snake_case codes.
+/// A6: the config revision a write expects, from `If-Match` (quotes and a
+/// `W/` prefix are dropped) or the `if_revision` query parameter.
+fn if_revision(req: &Req) -> Option<String> {
+    let h = req.if_match.as_deref().map(|v| {
+        v.trim()
+            .trim_start_matches("W/")
+            .trim_matches('"')
+            .to_string()
+    });
+    h.or_else(|| query_str(req, "if_revision").map(String::from))
+        .filter(|v| !v.is_empty())
+}
+
 fn query_str<'a>(req: &'a Req, key: &str) -> Option<&'a str> {
     req.query
         .split('&')
@@ -1273,11 +1290,15 @@ fn route(req: &Req, engine: &Engine, read_only: bool) -> Resp {
                 Ok(()) => ok(&serde_json::json!({ "ok": true, "queued": true })),
                 Err((code, m)) => fail(409, code, m),
             },
-            ("GET", "/v1/config") => ok(&serde_json::json!({
-                "config": engine.config(),
-                "config_error": engine.config_error(),
-                "path": engine.paths().config_file(),
-            })),
+            ("GET", "/v1/config") => {
+                let (config, revision) = engine.config_and_revision();
+                ok(&serde_json::json!({
+                    "config": config,
+                    "revision": revision,
+                    "config_error": engine.config_error(),
+                    "path": engine.paths().config_file(),
+                }))
+            }
             ("PUT", "/v1/config") => {
                 let b: ConfigBody = body(req)?;
                 let Some(cfg) = b.config else {
@@ -1293,8 +1314,12 @@ fn route(req: &Req, engine: &Engine, read_only: bool) -> Resp {
                     let e = crate::config::ConfigError::UnknownKey(k);
                     return Ok(fail(400, "unknown_key", e.to_string()));
                 }
-                match engine.set_config(cfg) {
-                    Ok(()) => ok(&serde_json::json!({ "ok": true, "config": engine.config() })),
+                match engine.set_config_if(cfg, if_revision(req).as_deref()) {
+                    Ok(revision) => ok(&serde_json::json!({
+                        "ok": true,
+                        "config": engine.config(),
+                        "revision": revision,
+                    })),
                     Err(e @ crate::config::ConfigError::Changed(_)) => {
                         fail(409, "config_changed", e.to_string())
                     }
@@ -1306,10 +1331,17 @@ fn route(req: &Req, engine: &Engine, read_only: bool) -> Resp {
             }
             ("PATCH", "/v1/config") => {
                 let patch: serde_json::Value = body(req)?;
-                match engine.patch_config(&patch) {
-                    Ok(cfg) => ok(&serde_json::json!({ "ok": true, "config": cfg })),
+                match engine.patch_config_if(&patch, if_revision(req).as_deref()) {
+                    Ok((cfg, revision)) => ok(&serde_json::json!({
+                        "ok": true,
+                        "config": cfg,
+                        "revision": revision,
+                    })),
                     Err(e @ crate::config::ConfigError::UnknownKey(_)) => {
                         fail(400, "unknown_key", e.to_string())
+                    }
+                    Err(e @ crate::config::ConfigError::Changed(_)) => {
+                        fail(409, "config_changed", e.to_string())
                     }
                     Err(e @ crate::config::ConfigError::NotLockHolder(_)) => {
                         fail(409, "not_lock_holder", e.to_string())

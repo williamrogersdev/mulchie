@@ -1367,6 +1367,93 @@ fn sessions_hooks_and_updates_over_the_api() {
 
 /// N8: a key the config does not have is refused with 400 `unknown_key`
 /// naming its path, for PATCH and PUT; nothing is saved.
+/// A6: GET /v1/config gives a revision of the file's content; PUT and PATCH
+/// with a revision (If-Match or `if_revision`) that is not the file's now
+/// answer 409 config_changed and save nothing; a match saves and gives the
+/// new revision.
+#[test]
+fn config_writes_check_the_revision() {
+    let r = running(Limits::default());
+    let full = format!("Bearer {}", r.token);
+    let (code, v) = send(r.port, "GET", "/v1/config", Some(&full), "");
+    assert_eq!(code, 200, "{v}");
+    let rev = v["revision"].as_str().unwrap().to_string();
+    assert_eq!(rev.len(), 16, "{rev}");
+    let with_if = |method: &str, path: &str, if_match: &str, body: &str| {
+        raw(
+            r.port,
+            &format!(
+                "{method} {path} HTTP/1.1\r\nHost: 127.0.0.1:{}\r\nAuthorization: {full}\r\nIf-Match: {if_match}\r\nContent-Length: {}\r\n\r\n{body}",
+                r.port,
+                body.len()
+            ),
+        )
+    };
+    let patch = r#"{"watch":{"interval_secs":130}}"#;
+    // A stale revision: refused, nothing saved.
+    let (code, v) = with_if("PATCH", "/v1/config", "\"0000000000000000\"", patch);
+    assert_eq!(
+        (code, v["code"].as_str()),
+        (409, Some("config_changed")),
+        "{v}"
+    );
+    let (code, v) = send(
+        r.port,
+        "PATCH",
+        "/v1/config?if_revision=0000000000000000",
+        Some(&full),
+        patch,
+    );
+    assert_eq!(
+        (code, v["code"].as_str()),
+        (409, Some("config_changed")),
+        "{v}"
+    );
+    assert_ne!(r.engine.config().watch.interval_secs, 130);
+    // The current revision (quoted, as an ETag): saved, a new revision back.
+    let (code, v) = with_if("PATCH", "/v1/config", &format!("\"{rev}\""), patch);
+    assert_eq!(code, 200, "{v}");
+    assert_eq!(r.engine.config().watch.interval_secs, 130);
+    let rev2 = v["revision"].as_str().unwrap().to_string();
+    assert_ne!(rev2, rev);
+    let (_, v) = send(r.port, "GET", "/v1/config", Some(&full), "");
+    assert_eq!(v["revision"], rev2.as_str());
+    // PUT: the old revision is refused, the new one saves.
+    let whole = json!({ "config": r.engine.config() }).to_string();
+    let (code, v) = with_if("PUT", "/v1/config", &rev, &whole);
+    assert_eq!(
+        (code, v["code"].as_str()),
+        (409, Some("config_changed")),
+        "{v}"
+    );
+    let (code, v) = send(
+        r.port,
+        "PUT",
+        &format!("/v1/config?if_revision={rev2}"),
+        Some(&full),
+        &whole,
+    );
+    assert_eq!(code, 200, "{v}");
+    assert!(v["revision"].is_string());
+    // Without a revision, writes work as before.
+    let (code, _) = send(r.port, "PATCH", "/v1/config", Some(&full), patch);
+    assert_eq!(code, 200);
+    // The file changed behind the engine's back: the revision it gave no
+    // longer matches.
+    let (_, v) = send(r.port, "GET", "/v1/config", Some(&full), "");
+    let rev3 = v["revision"].as_str().unwrap().to_string();
+    let file = r.engine.paths().config_file();
+    let mut text = std::fs::read_to_string(&file).unwrap();
+    text.push('\n');
+    std::fs::write(&file, text).unwrap();
+    let (code, v) = with_if("PATCH", "/v1/config", &rev3, patch);
+    assert_eq!(
+        (code, v["code"].as_str()),
+        (409, Some("config_changed")),
+        "{v}"
+    );
+}
+
 #[test]
 fn unknown_config_keys_are_refused() {
     let r = running(Limits::default());

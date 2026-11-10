@@ -484,6 +484,12 @@ paths:
                 type: object
                 properties:
                   config: { type: object }
+                  revision:
+                    type: string
+                    description: >-
+                      The revision of the config file's content (16 hex digits). Send it back as
+                      `If-Match` or `if_revision` on PUT or PATCH to write only if nothing changed
+                      the file since.
                   config_error: { type: [string, "null"] }
                   path: { type: string }
         default: { $ref: "#/components/responses/Error" }
@@ -500,7 +506,12 @@ paths:
         holds the engine lock writes the config: any other answers 409 `not_lock_holder`.
         A key the config does not have is 400 `unknown_key`, naming its path (for example
         `guard.rulez`); nothing is saved.
+        With a revision (`If-Match` header, quoted or not, or the `if_revision` query parameter)
+        that is not the file's content now, nothing is saved: 409 `config_changed`.
         Prefer `PATCH`, which sends only the keys that change.
+      parameters:
+        - { $ref: "#/components/parameters/IfMatch" }
+        - { $ref: "#/components/parameters/IfRevision" }
       requestBody:
         required: true
         content:
@@ -520,6 +531,7 @@ paths:
                 properties:
                   ok: { type: boolean }
                   config: { type: object }
+                  revision: { type: string, description: The revision of the file as saved }
         "409": { $ref: "#/components/responses/Error" }
         default: { $ref: "#/components/responses/Error" }
     patch:
@@ -534,6 +546,12 @@ paths:
         A key the config does not have, at any depth, is 400 `unknown_key` naming its path
         (`watch.intervl_secs`, `limits.workspaces[0].budget.bogus`); keys set to null are not
         checked. Nothing is saved.
+        With a revision (`If-Match` header or `if_revision`) that is not the file's content now,
+        nothing is saved: 409 `config_changed`. Without one the patch applies to whatever the
+        file holds.
+      parameters:
+        - { $ref: "#/components/parameters/IfMatch" }
+        - { $ref: "#/components/parameters/IfRevision" }
       requestBody:
         required: true
         content:
@@ -550,6 +568,7 @@ paths:
                 properties:
                   ok: { type: boolean }
                   config: { type: object }
+                  revision: { type: string, description: The revision of the file as saved }
         "409": { $ref: "#/components/responses/Error" }
         default: { $ref: "#/components/responses/Error" }
   /v1/lease:
@@ -916,6 +935,19 @@ components:
       type: http
       scheme: bearer
       description: The token from `<config dir>/token`, or the read-only one from `<config dir>/token.read`.
+  parameters:
+    IfMatch:
+      name: If-Match
+      in: header
+      required: false
+      description: The `revision` from `GET /v1/config`; the write happens only while the file is at it
+      schema: { type: string }
+    IfRevision:
+      name: if_revision
+      in: query
+      required: false
+      description: The same as `If-Match`, for clients that cannot set headers
+      schema: { type: string }
   responses:
     Json:
       description: A JSON object
