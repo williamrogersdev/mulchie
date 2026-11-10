@@ -14,16 +14,20 @@
     <div class="mode" id="pMode"></div>
     <div class="dim mono" id="pTime"></div>
   </div>
-  <div class="pb">
+  <div class="pb" id="pBody">
     <div class="notices" id="pNotices"></div>
-    <div class="mini">
-      <div class="card"><div class="l"><span>CPU · load</span><span id="pCores"></span></div><div class="v" id="pCpu">—</div><canvas id="pCpuC"></canvas></div>
-      <div class="card"><div class="l"><span>Memory</span><span id="pSwap"></span></div><div class="v" id="pMem">—</div><canvas id="pMemC"></canvas></div>
-      <div class="card"><div class="l"><span>Disk free</span><span id="pFc"></span></div><div class="v" id="pDisk">—</div><canvas id="pDiskC"></canvas></div>
-      <div class="card"><div class="l"><span>Agents · builds</span><span id="pSlots" style="margin-left:6px"></span></div><div class="v" id="pAg">—</div><canvas id="pIoC"></canvas></div>
+    <p class="headline" id="pHead"></p>
+    <div class="tiles">
+      <div class="tile" role="button" tabindex="0" data-open="d:cpu:" id="pCpuT"><div class="l">CPU</div><div class="v" id="pCpu">—</div><div class="s" id="pCpuS"></div></div>
+      <div class="tile" role="button" tabindex="0" data-open="d:mem:" id="pMemT"><div class="l">Memory</div><div class="v" id="pMem">—</div><div class="s" id="pMemS"></div></div>
+      <div class="tile" role="button" tabindex="0" data-open="disk"><div class="l">Disk free</div><div class="v" id="pDisk">—</div><div class="s" id="pDiskS"></div></div>
+      <div class="tile" role="button" tabindex="0" data-open="d:agents:"><div class="l">Agents · builds</div><div class="v" id="pAg">—</div><div class="s" id="pAgS"></div></div>
     </div>
-    <div><h3>Needs attention</h3><div id="pFind"></div></div>
-    <div><h3>Top consumers</h3><div class="rows" id="pTop"></div></div>
+    <div class="pcols">
+      <div><h3>Using CPU</h3><div class="cbars" id="pCpuTop"></div></div>
+      <div><h3>Using memory</h3><div class="cbars" id="pMemTop"></div></div>
+    </div>
+    <div id="pFindW"><h3>Needs attention</h3><div id="pFind"></div></div>
   </div>
   <div class="pf">
     <button class="btn pri" data-open="overview">Open dashboard</button>
@@ -63,7 +67,12 @@
     <div class="notices" id="dNotices"></div>
 
     <section class="view" id="v-overview">
+      <div class="ovhead"><p class="headline" id="oHead"></p><button class="btn sm" id="copyOverview" title="Copy a summary of what is shown, for pasting to an agent">Copy for agent</button></div>
       <div class="grid g4" id="kpis"></div>
+      <div class="grid g2" style="margin-top:10px">
+        <div class="card"><div class="chead"><h3>Using CPU</h3><a class="lnk" role="button" tabindex="0" data-d="cpu" data-dk="">All →</a></div><div class="cbars" id="oCpuTop"></div></div>
+        <div class="card"><div class="chead"><h3>Using memory</h3><a class="lnk" role="button" tabindex="0" data-d="mem" data-dk="">All →</a></div><div class="cbars" id="oMemTop"></div></div>
+      </div>
       <div class="grid g2" style="margin-top:10px">
         <div class="card"><div class="chead"><h3>CPU and load</h3><div class="legend" id="lgCpu"></div></div><div class="chart" id="chCpu"></div></div>
         <div class="card"><div class="chead"><h3>Memory and swap</h3><div class="legend" id="lgMem"></div></div><div class="chart" id="chMem"></div></div>
@@ -75,36 +84,30 @@
         <div class="card"><h3>Findings</h3><div id="findings"></div></div>
       </div>
       <div class="card" style="margin-top:10px">
-        <div class="chead"><h3>Usage by group</h3><span class="dim">workspaces and apps, summed over every process</span></div>
+        <div class="chead"><h3>Usage by group</h3><span class="dim c-md">workspaces and apps, summed over every process</span></div>
         <table id="groups"></table>
       </div>
     </section>
 
     <section class="view fill" id="v-processes">
       <div class="toolbar">
-        <input type="text" id="pFilter" placeholder="Filter by name, pid, workspace or command  (⌘F)" style="width:340px">
+        <input type="text" id="pFilter" placeholder="Filter by name, pid, workspace or command  (⌘F)" class="grow-in">
         <div class="seg" id="kindSeg"><button data-k="">All</button><button data-k="agent">Agents</button><button data-k="build">Builds</button><button data-k="runtime">Runtimes</button><button data-k="other">Other</button></div>
         <label class="muted"><input type="checkbox" id="pMine"> mine only</label>
         <div class="sp"></div>
-        <span class="dim" id="pCount"></span>
+        <span class="dim c-md" id="pCount"></span>
       </div>
       <div class="bulk" id="pBulk"><span id="pBulkN"></span><button class="btn sm" data-bulk="stop">Pause</button><button class="btn sm" data-bulk="cont">Resume</button><button class="btn sm" data-bulk="renice">Lower priority</button><button class="btn sm danger" data-bulk="term">Terminate</button><button class="btn sm danger" data-bulk="kill">Kill</button><div style="flex:1"></div><button class="btn sm" id="pClear">Clear</button></div>
-      <div class="split closed" id="pSplit">
-        <div class="tbl-wrap"><table id="procs"></table></div>
-        <div class="side card" id="pSide"></div>
-      </div>
+      <div class="tbl-wrap"><table id="procs"></table></div>
     </section>
 
     <section class="view fill" id="v-workspaces">
       <div class="toolbar">
-        <input type="text" id="wFilter" placeholder="Filter workspaces or branches" style="width:280px">
+        <input type="text" id="wFilter" placeholder="Filter workspaces or branches" class="grow-in">
         <div class="sp"></div>
-        <span class="dim">every repo or worktree with a running process</span>
+        <span class="dim c-md">every repo or worktree with a running process</span>
       </div>
-      <div class="split closed" id="wSplit">
-        <div class="tbl-wrap"><table id="wss"></table></div>
-        <div class="side card" id="wSide"></div>
-      </div>
+      <div class="tbl-wrap"><table id="wss"></table></div>
     </section>
 
     <section class="view" id="v-disk">
@@ -121,10 +124,10 @@
             <button class="btn" id="wtSweep">Sweep idle…</button>
           </div>
         </div>
-        <div class="bulk" id="wtBulk"><span id="wtBulkN"></span><label class="muted"><input type="checkbox" id="wtBackup" checked> save a patch of uncommitted changes and remove anyway</label><div style="flex:1"></div><button class="btn sm danger" id="wtRemove">Remove selected…</button><button class="btn sm" id="wtClear">Clear</button></div>
+        <div class="bulk" id="wtBulk"><span id="wtBulkN"></span><label class="muted"><input type="checkbox" id="wtBackup" checked> save uncommitted changes and remove anyway</label><div style="flex:1"></div><button class="btn sm danger" id="wtRemove">Remove selected…</button><button class="btn sm" id="wtClear">Clear</button></div>
         <div style="max-height:420px;overflow:auto"><table id="wts"></table></div>
       </div>
-      <div class="grid g2" style="margin-top:10px">
+      <div class="grid g2 g2-wide" style="margin-top:10px">
         <div class="card">
           <div class="chead"><h3>Build caches</h3><div class="toolbar" style="margin:0"><div class="seg" id="bcSeg"><button data-f="stale">Stale</button><button data-f="recent">Recent</button><button data-f="inuse">In use</button><button data-f="all">All</button></div><button class="btn sm" id="bcStale">Clear stale…</button></div></div>
           <div class="bulk" id="bcBulk"><span id="bcBulkN"></span><div style="flex:1"></div><button class="btn sm danger" id="bcClean">Clear selected…</button><button class="btn sm" id="bcClear">Clear</button></div>
@@ -141,13 +144,22 @@
       <div class="toolbar">
         <div class="seg" id="aSeg"><button data-s="">All</button><button data-s="manual">You</button><button data-s="api">API / agents</button><button data-s="optimizer">Optimizer</button><button data-s="monitor">Alerts</button></div>
         <div class="sp"></div>
-        <span class="dim">last 500 actions, newest first</span>
+        <span class="dim c-md">last 500 actions, newest first; click one for details and backups</span>
       </div>
       <div class="tbl-wrap"><table id="acts"></table></div>
     </section>
 
     <section class="view" id="v-agents">
-      <div class="grid g2">
+      <div class="card connect">
+        <h3>Connect an agent</h3>
+        <div class="muted">One command registers Mulchie’s MCP server with the agent apps it finds (Claude Code, Claude Desktop, Cursor and others):</div>
+        <div class="cmdrow"><pre class="code" id="connectCmd">mulchie mcp install</pre><button class="btn sm" data-copy-el="connectCmd">Copy</button></div>
+        <div class="muted" style="margin-top:8px"><b>Read-only</b> for agents that should look but not act (no deleting, signalling or pruning):</div>
+        <div class="cmdrow"><pre class="code" id="connectRo">mulchie mcp install --read-only</pre><button class="btn sm" data-copy-el="connectRo">Copy</button></div>
+        <div class="muted" style="margin-top:8px">To add it by hand, <span class="mono">mulchie mcp config</span> prints the JSON below. Scripts can use the read-only API token from <span class="mono">mulchie token --read-only</span>: it allows the GET and plan routes only.</div>
+        <div id="connectNote" class="warn" style="margin-top:6px"></div>
+      </div>
+      <div class="grid g2 g2-wide" style="margin-top:10px">
         <div class="card">
           <h3>Local API</h3>
           <dl class="kv" id="apiKv"></dl>
@@ -179,13 +191,17 @@ mulchie run --label "web build" -- cargo build --release</pre>
       </div>
       <div class="card" style="margin-top:10px">
         <h3>Endpoints</h3>
-        <table id="endpoints"></table>
+        <table id="endpoints" class="wrap-tbl"></table>
       </div>
     </section>
 
     <section class="view" id="v-settings">
       <div class="card"><div class="notices" id="cfgNote" style="margin-bottom:10px"></div><div class="form" id="form"></div><div class="actions"><button class="btn pri" id="saveCfg">Save</button></div></div>
     </section>
+    <aside id="drawer" class="drawer" role="dialog" aria-labelledby="dTitle" aria-hidden="true">
+      <div class="dh"><div class="dt"><h2 id="dTitle"></h2><span id="dSub"></span></div><button class="btn sm" id="dCopy" title="Copy what this panel shows, for pasting to an agent">Copy for agent</button><button class="btn sm" id="dClose" aria-label="Close details">×</button></div>
+      <div class="db" id="dBody"></div>
+    </aside>
   </main>
 </div>
 

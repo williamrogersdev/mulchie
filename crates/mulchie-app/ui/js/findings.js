@@ -1,36 +1,44 @@
 // Findings ("needs attention") and status notices about Mulchie itself.
 import { st } from './store.js';
-import { esc, B, P, ago } from './util.js';
+import { esc, B, P, ago, clock } from './util.js';
+import { cpuSummary, memSummary, ranked } from './consumers.js';
 
+// What needs attention, each with where it leads (`open`: a detail, or `go`:
+// a view) and one primary action (`act`: a runner name main.js knows).
 export function findings() {
   const S = st.S, out = [], s = S.snapshot, c = S.config;
   if (!s.disk_total || !c) return out;
+  const stale = S.scan?.stale_bytes || 0, n = S.diskmap?.worktrees?.filter(w => w.sweepable).length || 0;
+  const diskAct = stale ? { label: 'Clear stale…', run: 'stale' } : n ? { label: 'Sweep…', run: 'sweep' } : { label: 'Show disk', run: 'go:disk' };
   const free = s.disk_free / 1e9;
-  if (free < c.low_disk_gb) out.push(['bad', `Disk nearly full: ${B(s.disk_free)} free`, 'Clear stale caches or sweep idle worktrees.', 'disk']);
-  else if (S.low_disk) out.push(['warn', `Free space under ${c.alert_below_gb} GB`, `${B(s.disk_free)} free.`, 'disk']);
-  if (S.forecast?.hours_to_low != null && S.forecast.hours_to_low < 24) out.push(['warn', `Disk filling at ${B(S.forecast.bytes_per_hour)}/h`, `Reaches the ${c.low_disk_gb} GB floor in about ${S.forecast.hours_to_low.toFixed(1)} h at this rate.`, 'disk']);
+  if (free < c.low_disk_gb) out.push({ lvl: 'bad', t: `Disk nearly full: ${B(s.disk_free)} free`, d: 'Clear stale caches or sweep idle worktrees.', go: 'disk', act: diskAct });
+  else if (S.low_disk) out.push({ lvl: 'warn', t: `Free space under ${c.alert_below_gb} GB`, d: `${B(s.disk_free)} free.`, go: 'disk', act: diskAct });
+  if (S.forecast?.hours_to_low != null && S.forecast.hours_to_low < 24) out.push({ lvl: 'warn', t: `Disk filling at ${B(S.forecast.bytes_per_hour)}/h`, d: `Reaches the ${c.low_disk_gb} GB floor in about ${S.forecast.hours_to_low.toFixed(1)} h at this rate.`, go: 'disk', act: diskAct });
   if (s.cpu_count && s.load[0] > s.cpu_count * 2) {
-    const top = [...s.workspaces].sort((a, b) => b.cpu_pct - a.cpu_pct).slice(0, 3).map(w => `${w.label} ${P(w.cpu_pct)}`).join(', ');
-    out.push([s.load[0] > s.cpu_count * 6 ? 'bad' : 'warn', `Load ${s.load[0].toFixed(0)} on ${s.cpu_count} cores (${(s.load[0] / s.cpu_count).toFixed(1)}× oversubscribed)`, `Top: ${top}`, 'workspaces']);
+    const sum = cpuSummary(S), top = ranked(S, 'cpu_pct')[0];
+    out.push({ lvl: s.load[0] > s.cpu_count * 6 ? 'bad' : 'warn', t: `CPU ${sum.word}: ${(s.load[0] / s.cpu_count).toFixed(1)}× more work than cores`, d: sum.headline, open: ['cpu', ''], act: top ? { label: `Show ${top.short}`, run: `d:group:${top.key}` } : { label: 'Show CPU', run: 'd:cpu:' } });
   }
   const mp = s.mem_total ? s.mem_available / s.mem_total * 100 : 100;
-  if (mp < c.throttle_mem_free_pct) out.push(['bad', `Memory pressure: ${mp.toFixed(0)}% available`, 'Builds are being deprioritised.', 'processes']);
-  if (s.swap_used > 8e9) out.push(['warn', `${B(s.swap_used)} in swap`, 'Heavy swapping slows every agent. Sort processes by memory.', 'processes']);
-  for (const w of s.workspaces.filter(w => w.orphan)) out.push(['warn', `Orphaned: ${w.label}`, `${w.orphan} · ${P(w.cpu_pct)} CPU, ${B(w.mem_bytes)}`, 'ws:' + w.path]);
-  for (const w of s.workspaces.filter(w => w.paused)) out.push(['warn', `Paused: ${w.label}`, 'Its processes are stopped (SIGSTOP). Resume or close it out.', 'ws:' + w.path]);
-  const n = S.diskmap?.worktrees?.filter(w => w.sweepable).length || 0;
-  if (n) out.push(['warn', `${n} idle agent worktree(s), ${B(S.diskmap.sweepable_bytes)}`, `Idle ${c.worktree_idle_days}+ days. A sweep keeps branches and saves patches.`, 'disk']);
-  const stale = S.scan?.stale_bytes || 0;
-  if (stale > 1e9) out.push(['warn', `${B(stale)} of stale build caches`, 'Unused within the stale window, with no agent running in the project.', 'disk']);
-  if (S.throttled) out.push(['ok', `${S.throttled} build process(es) at lower priority`, 'The optimizer reniced them under pressure.', 'activity']);
-  if (S.slots?.waiting?.length) out.push(['ok', `${S.slots.waiting.length} job(s) queued for a build slot`, S.slots.waiting.map(w => w.label).join(', '), 'agents']);
+  if (mp < c.throttle_mem_free_pct || s.swap_used > 8e9) {
+    const sum = memSummary(S), top = ranked(S, 'mem_bytes')[0];
+    out.push({ lvl: mp < c.throttle_mem_free_pct ? 'bad' : 'warn', t: mp < c.throttle_mem_free_pct ? `Memory pressure: ${mp.toFixed(0)}% available` : `${B(s.swap_used)} in swap`, d: sum.headline, open: ['mem', ''], act: top ? { label: `Show ${top.short}`, run: `d:group:${top.key}` } : { label: 'Show memory', run: 'd:mem:' } });
+  }
+  for (const w of s.workspaces.filter(w => w.orphan)) out.push({ lvl: 'warn', t: `Orphaned: ${w.label}`, d: `${w.orphan} · ${P(w.cpu_pct)} CPU, ${B(w.mem_bytes)}`, open: ['ws', w.path], act: { label: 'Stop…', run: `stop:${w.path}` } });
+  for (const w of s.workspaces.filter(w => w.paused)) out.push({ lvl: 'warn', t: `Paused: ${w.label}`, d: 'Its processes are stopped (SIGSTOP). Resume or close it out.', open: ['ws', w.path], act: { label: 'Show', run: `d:ws:${w.path}` } });
+  if (n) out.push({ lvl: 'warn', t: `${n} idle agent worktree(s), ${B(S.diskmap.sweepable_bytes)}`, d: `Idle ${c.worktree_idle_days}+ days. A sweep keeps branches and saves patches.`, go: 'disk', act: { label: 'Sweep…', run: 'sweep' } });
+  if (stale > 1e9) out.push({ lvl: 'warn', t: `${B(stale)} of stale build caches`, d: 'Unused within the stale window, with no agent running in the project.', go: 'disk', act: { label: 'Clean…', run: 'stale' } });
+  if (S.throttled) out.push({ lvl: 'ok', t: `${S.throttled} build process(es) at lower priority`, d: 'The optimizer reniced them under pressure.', open: ['agents', ''], act: { label: 'Show', run: 'd:agents:' } });
+  if (S.slots?.waiting?.length) out.push({ lvl: 'ok', t: `${S.slots.waiting.length} job(s) queued for a build slot`, d: S.slots.waiting.map(w => w.label).join(', '), open: ['agents', ''], act: { label: 'Show', run: 'd:agents:' } });
   return out;
 }
 
+// Where a finding leads when its text is clicked: a detail or a view.
+const target = f => f.open ? `data-d="${esc(f.open[0])}" data-dk="${esc(f.open[1])}"` : `data-go="${esc(f.go || 'overview')}"`;
+
 export function findingsHtml(list, compact) {
   if (!list.length) return '<div class="empty" style="padding:12px">Nothing needs attention.</div>';
-  return list.slice(0, compact ? 5 : 99).map(([lvl, t, d, go]) =>
-    `<div class="finding" role="button" tabindex="0" data-go="${esc(go || '')}"><span class="ic" style="background:var(--${lvl})"></span><div class="t"><div>${esc(t)}</div>${compact ? '' : `<div class="muted">${esc(d)}</div>`}</div></div>`).join('');
+  return list.slice(0, compact ? 5 : 99).map(f =>
+    `<div class="finding"><span class="ic" style="background:var(--${f.lvl})"></span><div class="t" role="button" tabindex="0" ${target(f)}><div>${esc(f.t)}</div>${compact ? '' : `<div class="muted">${esc(f.d)}</div>`}</div>${f.act ? `<button class="btn sm" data-run="${esc(f.act.run)}">${esc(f.act.label)}</button>` : ''}</div>`).join('');
 }
 
 // An error string as a sentence: capitalised and ending in a full stop.
@@ -48,6 +56,10 @@ export function notices() {
   if (conn?.mode === 'disconnected') {
     out.push(['bad', 'Not connected to Mulchie’s engine',
       `${sentence(conn.detail) || 'No engine answers.'} Retrying every few seconds${S ? '; the figures shown are from before the connection was lost' : ''}. If it stays gone, this app starts its own engine.`]);
+  }
+  if (st.error && conn?.mode !== 'disconnected') {
+    out.push(['bad', 'Could not read the engine’s state',
+      `${sentence(st.error)} ${S ? `The figures shown are from ${S.snapshot.at_unix ? clock(S.snapshot.at_unix) : 'earlier'}.` : ''} Retrying every few seconds.`]);
   }
   if (!S) return out;
   if (S.config_error) {

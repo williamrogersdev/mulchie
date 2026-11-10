@@ -58,11 +58,16 @@ export function sortRows(rows, [k, dir]) {
   });
 }
 
+// A table head with a <colgroup>: tables use a fixed layout, so columns with
+// a width `w` keep it, the others share what is left (with an ellipsis and
+// the full text in a tooltip), and a class `c` such as c-md or c-lg hides the
+// column on narrow windows.
 export function th(cols, sort, id) {
-  return '<tr>' + cols.map(c => {
-    if (c.check) return `<th style="width:24px"><input type="checkbox" data-all="${id}"></th>`;
+  const cg = '<colgroup>' + cols.map(c => `<col class="${c.c || ''}"${c.check ? ' style="width:30px"' : c.w ? ` style="width:${c.w}"` : ''}>`).join('') + '</colgroup>';
+  return cg + '<tr>' + cols.map(c => {
+    if (c.check) return `<th><input type="checkbox" data-all="${id}" aria-label="Select all"></th>`;
     const on = sort && sort[0] === c.k;
-    return `<th class="${c.n ? 'n ' : ''}${c.k ? 's ' : ''}${c.c || ''}" ${c.k ? `data-sort="${id}:${c.k}"` : ''} ${c.w ? `style="width:${c.w}"` : ''}>${c.l}${on ? ` <span class="arr">${sort[1] < 0 ? '↓' : '↑'}</span>` : ''}</th>`;
+    return `<th class="${c.n ? 'n ' : ''}${c.k ? 's ' : ''}${c.c || ''}" ${c.k ? `data-sort="${id}:${c.k}"` : ''}>${c.l}${on ? ` <span class="arr">${sort[1] < 0 ? '↓' : '↑'}</span>` : ''}</th>`;
   }).join('') + '</tr>';
 }
 

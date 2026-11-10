@@ -1,8 +1,29 @@
-// The tray panel.
+// The tray panel: what the machine is doing in one sentence, who is using the
+// CPU and memory, and what needs attention. Everything opens the dashboard at
+// the matching detail; actions run there, through the plan dialogs.
 import { st } from '../store.js';
-import { $, esc, B, P, clock } from '../util.js';
-import { drawMini } from '../chart.js';
+import { invoke } from '../ipc.js';
+import { $, esc, B, clock } from '../util.js';
 import { findings, findingsHtml, notices, noticesHtml, modeHtml, modeTitle } from '../findings.js';
+import { barsHtml, cpuSummary, memSummary, cpuTile, memTile } from '../consumers.js';
+
+let lastH = 0;
+
+// Size the panel window to its content, within the screen-friendly maximum.
+function fit() {
+  const want = Math.ceil($('#panel .ph').offsetHeight + $('#pBody').scrollHeight + $('#panel .pf').offsetHeight + 2);
+  if (Math.abs(want - lastH) > 3) {
+    lastH = want;
+    invoke('fit_panel', { height: want }).catch(() => {});
+  }
+}
+
+const tile = (id, t) => {
+  $(`#${id}`).textContent = t.v;
+  $(`#${id}S`).textContent = t.s;
+  $(`#${id}S`).className = 's ' + (t.level === 'ok' ? '' : t.level);
+  $(`#${id}T`).title = t.title;
+};
 
 export function renderPanel() {
   const S = st.S;
@@ -10,23 +31,23 @@ export function renderPanel() {
   mode.innerHTML = modeHtml();
   mode.title = modeTitle();
   $('#pNotices').innerHTML = noticesHtml(notices(), true);
-  if (!S) return;
-  const s = S.snapshot, hc = st.conn?.mode === 'disconnected' ? 'stale' : S.health;
-  const el = $('#pHealth'); el.querySelector('.dot').className = 'dot ' + hc; el.querySelector('span:last-child').textContent = hc;
-  $('#pTime').textContent = s.at_unix ? clock(s.at_unix) : '';
-  $('#pCpu').textContent = `${P(s.cpu_pct)} · ${s.load[0].toFixed(0)}`;
-  $('#pCores').textContent = `${s.cpu_count} cores`;
-  $('#pMem').textContent = B(s.mem_total - s.mem_available);
-  $('#pSwap').textContent = `swap ${B(s.swap_used, 0)}`;
-  $('#pDisk').textContent = B(s.disk_free);
-  $('#pFc').textContent = S.forecast?.hours_to_full != null ? `full ~${S.forecast.hours_to_full.toFixed(0)}h` : `of ${B(s.disk_total, 0)}`;
-  $('#pAg').textContent = `${s.agent_count} · ${s.build_count}`;
-  $('#pSlots').textContent = `${S.slots.active.length}/${S.slots.capacity} slots`;
-  const tail = st.H.slice(-100), dv = tail.map(x => x.disk_free);
-  drawMini($('#pCpuC'), tail.map(x => x.cpu), '#6fb0f0', { max: 100 });
-  drawMini($('#pMemC'), tail.map(x => x.mem_used), '#b691e8', { max: s.mem_total });
-  drawMini($('#pDiskC'), dv, '#79c37d', { min: Math.min(...dv) - 2e9, max: Math.max(...dv) + 2e9 });
-  drawMini($('#pIoC'), tail.map(x => x.read_bps + x.write_bps), '#5fc9c0');
-  $('#pFind').innerHTML = findingsHtml(findings(), true);
-  $('#pTop').innerHTML = s.groups.slice(0, 6).map(g => `<div class="r" data-gproc="${esc(g.group)}"><span class="nm">${esc(g.group)}</span><span class="mono">${P(g.cpu_pct)} · ${B(g.mem_bytes, 0)}</span></div>`).join('');
+  if (S) {
+    const s = S.snapshot, stale = st.conn?.mode === 'disconnected' || st.error ? 'stale' : S.health;
+    const el = $('#pHealth'); el.querySelector('.dot').className = 'dot ' + stale; el.querySelector('span:last-child').textContent = stale;
+    $('#pTime').textContent = s.at_unix ? clock(s.at_unix) : '';
+    const cs = cpuSummary(S), ms = memSummary(S);
+    $('#pHead').innerHTML = `${esc(cs.headline)}${ms.level !== 'ok' ? ` <span class="${ms.level}">${esc(ms.headline)}</span>` : ''}`;
+    tile('pCpu', cpuTile(S));
+    tile('pMem', memTile(S));
+    $('#pDisk').textContent = B(s.disk_free);
+    $('#pDiskS').textContent = S.forecast?.hours_to_full != null ? `full in ~${S.forecast.hours_to_full.toFixed(0)} h` : `of ${B(s.disk_total, 0)}`;
+    $('#pAg').textContent = `${s.agent_count} · ${s.build_count}`;
+    $('#pAgS').textContent = `slots ${S.slots.active.length}/${S.slots.capacity}${S.slots.waiting.length ? ` · ${S.slots.waiting.length} queued` : ''}`;
+    $('#pCpuTop').innerHTML = barsHtml(S, 'cpu_pct', 4);
+    $('#pMemTop').innerHTML = barsHtml(S, 'mem_bytes', 4);
+    const f = findings();
+    $('#pFindW').style.display = f.length ? '' : 'none';
+    $('#pFind').innerHTML = findingsHtml(f, true);
+  }
+  fit();
 }

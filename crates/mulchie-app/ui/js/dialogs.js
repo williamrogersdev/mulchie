@@ -25,6 +25,7 @@ export function modal({ title, html, yes = 'Confirm', danger = true, wide = fals
     const done = v => {
       $('#modal').classList.remove('on');
       yesB.onclick = noB.onclick = null;
+      $('#mBody').onchange = null;
       closeModal = null;
       res(v);
     };
@@ -122,7 +123,7 @@ export async function reviewPlan(plan, { title, verb, intro }) {
         yesB.disabled = !p.length;
         yesB.textContent = p.length ? `${verb} ${p.length} · ${B(p.reduce((a, i) => a + i.bytes, 0))}` : verb;
       };
-      body.addEventListener('change', upd);
+      body.onchange = upd;
       upd();
     },
   });

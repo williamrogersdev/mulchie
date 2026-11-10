@@ -11,23 +11,23 @@ export async function loadIntegration(force) {
 }
 
 const ENDPOINTS = [
-  ['GET', '/v1/health', 'open', 'health (or stale), sample age, disk, load, free build slots'],
-  ['GET', '/v1/state', 'token', 'full snapshot: processes, workspaces, scan, disk map, slots, actions'],
-  ['GET', '/v1/history', 'token', '30 minutes of 3 s samples'],
-  ['GET', '/v1/advice', 'token', 'ok_to_start_heavy_work, suggested_jobs, reasons'],
-  ['POST', '/v1/scan', 'token', 'rescan caches and the disk map'],
-  ['GET', '/v1/clean/plan', 'token', 'plan of stale caches (?want_bytes=N)'],
-  ['POST', '/v1/clean/plan', 'token', '{paths:[…]} or {stale:true} → plan'],
-  ['POST', '/v1/clean', 'token', '{items:[…]} from a plan → per-item results'],
-  ['GET', '/v1/sweep', 'token', 'plan of idle agent worktrees'],
-  ['POST', '/v1/sweep', 'token', '{items:[…]} from the sweep plan'],
-  ['POST', '/v1/worktree/plan', 'token', '{paths:[…], allow_dirty} → plan'],
-  ['POST', '/v1/worktree/remove', 'token', '{items:[…]} from the worktree plan'],
-  ['POST', '/v1/process', 'token', '{pid, action: term|kill|stop|cont|renice, nice?}'],
-  ['POST', '/v1/workspace', 'token', '{path, action: pause|resume|deprioritize|stop_builds|kill_all}'],
-  ['POST', '/v1/prune', 'token', '{key: npm|bun|pnpm|yarn|uv|pip|homebrew|go|simulators}'],
-  ['POST', '/v1/lease', 'token', '{label, pid?, ttl_secs?, ticket?} → granted, jobs, position'],
-  ['POST', '/v1/release', 'token', '{ticket}'],
+  ['GET', '/v1/health', 'none', 'health (or stale), sample age, disk, load, free build slots'],
+  ['GET', '/v1/state', 'any token', 'full snapshot: processes, workspaces, scan, disk map, slots, actions'],
+  ['GET', '/v1/history', 'any token', '30 minutes of 3 s samples'],
+  ['GET', '/v1/advice', 'any token', 'ok_to_start_heavy_work, suggested_jobs, reasons'],
+  ['POST', '/v1/scan', 'full token', 'rescan caches and the disk map'],
+  ['GET', '/v1/clean/plan', 'any token', 'plan of stale caches (?want_bytes=N)'],
+  ['POST', '/v1/clean/plan', 'any token', '{paths:[…]} or {stale:true} → plan'],
+  ['POST', '/v1/clean', 'full token', '{items:[…]} from a plan → per-item results'],
+  ['GET', '/v1/sweep', 'any token', 'plan of idle agent worktrees'],
+  ['POST', '/v1/sweep', 'full token', '{items:[…]} from the sweep plan'],
+  ['POST', '/v1/worktree/plan', 'any token', '{paths:[…], allow_dirty} → plan'],
+  ['POST', '/v1/worktree/remove', 'full token', '{items:[…]} from the worktree plan'],
+  ['POST', '/v1/process', 'full token', '{pid, action: term|kill|stop|cont|renice, nice?}'],
+  ['POST', '/v1/workspace', 'full token', '{path, action: pause|resume|deprioritize|stop_builds|kill_all}'],
+  ['POST', '/v1/prune', 'full token', '{key: npm|bun|pnpm|yarn|uv|pip|homebrew|go|simulators}'],
+  ['POST', '/v1/lease', 'full token', '{label, pid?, ttl_secs?, ticket?} → granted, jobs, position'],
+  ['POST', '/v1/release', 'full token', '{ticket}'],
 ];
 
 export async function renderAgents() {
@@ -40,11 +40,13 @@ export async function renderAgents() {
   const who = I.mode === 'client' ? '<dt>served by</dt><dd>another Mulchie engine (this app is its client)</dd>' : I.mode === 'engine' ? '<dt>served by</dt><dd>this app</dd>' : '';
   $('#apiKv').innerHTML = `<dt>base url</dt><dd>${esc(base)}</dd>${who}<dt>token file</dt><dd>${esc(tilde(I.token_path))}</dd><dt>token</dt><dd>${tok}</dd>`;
   $('#curlEx').textContent = `TOKEN=$(cat ${tilde(I.token_path)})\ncurl -s -H "Authorization: Bearer $TOKEN" ${base}/v1/advice\ncurl -s -H "Authorization: Bearer $TOKEN" ${base}/v1/sweep    # a plan; POST the approved items back`;
+  $('#connectNote').textContent = I.cli_linked ? '' : I.cli_other ? `${tilde(I.cli_other)}; the commands above use whichever mulchie is first on your PATH.` : I.cli_path ? 'Link the CLI below first so `mulchie` runs from any shell.' : '';
   $('#cliInfo').innerHTML = I.cli_linked
     ? `Linked at <span class="mono">${esc(tilde(I.cli_linked))}</span>.`
+    : I.cli_other ? `<span class="warn">${esc(tilde(I.cli_other))}</span>. Mulchie will not replace it; remove it yourself to link this app's CLI.`
     : I.cli_path ? 'Bundled with the app. Link it to run <span class="mono">mulchie</span> from any shell.'
       : 'Not bundled in this build. Install with <span class="mono">cargo install mulchie</span> or <span class="mono">brew install williamrogersdev/tap/mulchie-cli</span>.';
-  $('#installCli').disabled = !I.cli_path;
+  $('#installCli').disabled = !I.cli_path || !!I.cli_other && !I.cli_other.includes(' links to ');
   $('#installCli').textContent = I.cli_linked ? 'Relink ~/.local/bin/mulchie' : 'Link mulchie into ~/.local/bin';
   $('#mcpJson').textContent = JSON.stringify({ mcpServers: { mulchie: { command: cli, args: ['mcp'] } } }, null, 2);
   $('#mcpCmd').textContent = `claude mcp add --scope user mulchie -- ${cli} mcp`;
@@ -55,5 +57,5 @@ Many agents run on this machine at once. Mulchie (MCP server "mulchie", or the \
   \`mulchie run --label "<repo>: <task>" -- <command>\`
 - Do not delete worktrees or caches by hand. Use \`sweep_worktrees\` or \`clean_caches\`, which keep branches and back up uncommitted work.
 - When the machine is slow, check \`top_processes\` and \`list_workspaces\` before stopping anything.`;
-  $('#endpoints').innerHTML = th([{ l: 'Method' }, { l: 'Path' }, { l: 'Auth' }, { l: 'Body / returns' }]) + ENDPOINTS.map(e => `<tr><td class="mono">${e[0]}</td><td class="mono">${e[1]}</td><td class="dim">${e[2]}</td><td class="muted">${esc(e[3])}</td></tr>`).join('');
+  $('#endpoints').innerHTML = th([{ l: 'Method', w: '62px' }, { l: 'Path', w: '170px' }, { l: 'Auth', w: '86px', c: 'c-md' }, { l: 'Body / returns' }]) + ENDPOINTS.map(e => `<tr><td class="mono">${e[0]}</td><td class="mono">${e[1]}</td><td class="dim c-md">${e[2]}</td><td class="muted wrap">${esc(e[3])}</td></tr>`).join('');
 }
