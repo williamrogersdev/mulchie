@@ -90,6 +90,15 @@ pub const ROUTES: &[(&str, &str)] = &[
     ("GET", "/v1/config"),
     ("PUT", "/v1/config"),
     ("PATCH", "/v1/config"),
+    ("GET", "/v1/sessions"),
+    // `{id}` is a session id (`s-<start>-<pid>`); see `route`.
+    ("GET", "/v1/sessions/{id}"),
+    ("GET", "/v1/sessions/{id}/events"),
+    ("GET", "/v1/limits/status"),
+    ("POST", "/v1/hook"),
+    ("POST", "/v1/guard/check"),
+    ("GET", "/v1/updates"),
+    ("POST", "/v1/updates/check"),
 ];
 
 // ------------------------------------------------------------------ token
@@ -113,11 +122,17 @@ pub const READ_ONLY_POSTS: &[&str] = &["/v1/clean/plan", "/v1/worktree/plan", "/
 /// would make the machine worse, not safer.
 pub const READ_ONLY_LEASE_POSTS: &[&str] = &["/v1/lease", "/v1/release"];
 
+/// An agent's hook reports and asks with the read-only token: these record
+/// activity and answer, and change nothing on the machine.
+pub const READ_ONLY_HOOK_POSTS: &[&str] = &["/v1/hook", "/v1/guard/check"];
+
 /// Whether the read-only token may call `method path`.
 pub fn read_only_allowed(method: &str, path: &str) -> bool {
     method == "GET"
         || (method == "POST"
-            && (READ_ONLY_POSTS.contains(&path) || READ_ONLY_LEASE_POSTS.contains(&path)))
+            && (READ_ONLY_POSTS.contains(&path)
+                || READ_ONLY_LEASE_POSTS.contains(&path)
+                || READ_ONLY_HOOK_POSTS.contains(&path)))
 }
 
 /// The token file for this user's environment.
@@ -918,6 +933,56 @@ fn query_enum<T: serde::de::DeserializeOwned>(req: &Req, key: &str) -> Result<Op
 }
 
 /// `GET /v1/process/<pid>`.
+/// `GET /v1/sessions/{id}` and `GET /v1/sessions/{id}/events`.
+fn session_route(req: &Req, engine: &Engine, rest: &str) -> Resp {
+    let (id, events) = match rest.strip_suffix("/events") {
+        Some(id) => (id, true),
+        None => (rest, false),
+    };
+    if crate::session::Session::parse_id(id).is_none() {
+        return fail(
+            400,
+            "invalid_session_id",
+            "expected a session id like s-1730000000-4242 (from GET /v1/sessions)",
+        );
+    }
+    if !events {
+        return match engine.session(id) {
+            Some(d) => ok(&d),
+            None => fail(404, "unknown_session", format!("no session {id}")),
+        };
+    }
+    let r = (|| -> Result<Resp, Resp> {
+        let since = query_u64(req, "since")?.unwrap_or(0);
+        let limit = query_u64(req, "limit")?.unwrap_or(200);
+        if !(1..=1000).contains(&limit) {
+            return Ok(fail(400, "invalid_query", "limit must be 1 to 1000"));
+        }
+        let known = engine.session(id).is_some();
+        match engine.session_events(id, since, limit as usize) {
+            Ok(ev) if ev.is_empty() && !known => Ok(fail(
+                404,
+                "unknown_session",
+                format!("no session or record {id}"),
+            )),
+            Ok(ev) => {
+                let next = ev
+                    .last()
+                    .and_then(|e| e.get("seq"))
+                    .and_then(serde_json::Value::as_u64)
+                    .unwrap_or(since);
+                Ok(ok(&serde_json::json!({
+                    "session_id": id,
+                    "events": ev,
+                    "next_since": next,
+                })))
+            }
+            Err(e) => Ok(fail(500, "record_unreadable", e.to_string())),
+        }
+    })();
+    r.unwrap_or_else(|e| e)
+}
+
 fn process_detail(engine: &Engine, rest: &str) -> Resp {
     let Ok(pid) = rest.parse::<u32>() else {
         return fail(
@@ -986,6 +1051,9 @@ fn route(req: &Req, engine: &Engine, read_only: bool) -> Resp {
             if !rest.contains('/') && rest != "plan" && rest != "execute" {
                 return process_detail(engine, rest);
             }
+        }
+        if let Some(rest) = req.path.strip_prefix("/v1/sessions/") {
+            return session_route(req, engine, rest);
         }
     }
     let r = (|| -> Result<Resp, Resp> {
@@ -1148,6 +1216,31 @@ fn route(req: &Req, engine: &Engine, read_only: bool) -> Resp {
                     Err((code, m)) => fail(400, code, m),
                 }
             }
+            ("GET", "/v1/sessions") => {
+                let st = engine.snapshot_state();
+                ok(&serde_json::json!({
+                    "enabled": st.sessions.enabled,
+                    "write_bytes_available": st.sessions.write_bytes_available,
+                    "sessions": engine.sessions(),
+                }))
+            }
+            ("GET", "/v1/limits/status") => ok(&engine.limits_status()),
+            ("POST", "/v1/hook") => {
+                let b: crate::engine::HookRequest = body(req)?;
+                match engine.hook(&b) {
+                    Ok(r) => ok(&r),
+                    Err((code, m)) => fail(400, code, m),
+                }
+            }
+            ("POST", "/v1/guard/check") => {
+                let b: crate::engine::GuardCheckRequest = body(req)?;
+                ok(&engine.guard_check(&b))
+            }
+            ("GET", "/v1/updates") => ok(&engine.updates_status(true)),
+            ("POST", "/v1/updates/check") => match engine.request_update_check() {
+                Ok(()) => ok(&serde_json::json!({ "ok": true, "queued": true })),
+                Err((code, m)) => fail(409, code, m),
+            },
             ("GET", "/v1/config") => ok(&serde_json::json!({
                 "config": engine.config(),
                 "config_error": engine.config_error(),
