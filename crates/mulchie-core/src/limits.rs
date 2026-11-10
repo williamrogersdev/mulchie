@@ -375,18 +375,32 @@ impl Limits {
         self.hog_since.retain(|k, _| hog_seen.contains(k));
         self.hogs = hogs_now;
 
-        // Resume paused processes once a breach has been clear long enough.
-        for b in self.breaches.values() {
+        // Resume paused processes `resume_after_secs` after the pause,
+        // whether or not the session is back under: pausing does not lower
+        // memory or the process count, so waiting for a clear could leave
+        // them stopped for good. A breach still over the cap at that point
+        // ends here, so a new one (and a new pause) can follow after
+        // `sustain_secs`.
+        let mut rearm: Vec<(String, CapKind)> = Vec::new();
+        for b in self.breaches.values_mut() {
             let paused = b.action == LimitAction::Pause
                 && matches!(b.action_state, ActionState::Done | ActionState::Partial);
-            let due = b
-                .cleared_unix
-                .is_some_and(|c| now >= c.saturating_add(b.resume_after_secs));
+            let due = now >= b.breached_unix.saturating_add(b.resume_after_secs);
             if paused && due && !b.restored && !self.resume_requested.contains(&b.id) {
                 self.resume_requested.push(b.id.clone());
+                if b.cleared_unix.is_none() {
+                    b.cleared_unix = Some(now);
+                    rearm.push((b.session_id.clone(), b.cap));
+                }
                 events.push(LimitEvent::ResumeDue {
                     breach_id: b.id.clone(),
                 });
+            }
+        }
+        for key in rearm {
+            if let Some(st) = self.caps.get_mut(&key) {
+                st.active = None;
+                st.over_since = None;
             }
         }
         self.prune();

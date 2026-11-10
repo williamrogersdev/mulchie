@@ -223,9 +223,9 @@ fn ended_sessions_clear_their_breaches() {
 }
 
 /// A pause breach that was carried out is due for resume resume_after_secs
-/// after it clears, once.
+/// after the pause, once.
 #[test]
-fn resume_is_due_after_clearing_once() {
+fn resume_is_due_after_the_pause_once() {
     let cfg = cfg_cpu(2.0, 0, LimitAction::Pause);
     let mut l = Limits::default();
     let mut s = session("s-1-10", "/code/a", 3.0);
@@ -233,8 +233,8 @@ fn resume_is_due_after_clearing_once() {
     l.get_mut(&id).unwrap().action_state = ActionState::Done;
     s.usage.cpu_cores = 0.0;
     l.evaluate(1010, [&s].into_iter(), &cfg, M);
-    assert!(l.evaluate(1039, [&s].into_iter(), &cfg, M).is_empty());
-    let ev = l.evaluate(1040, [&s].into_iter(), &cfg, M);
+    assert!(l.evaluate(1029, [&s].into_iter(), &cfg, M).is_empty());
+    let ev = l.evaluate(1030, [&s].into_iter(), &cfg, M);
     assert_eq!(
         ev,
         vec![LimitEvent::ResumeDue {
@@ -253,6 +253,40 @@ fn resume_is_due_after_clearing_once() {
     s.usage.cpu_cores = 0.0;
     l.evaluate(2001, [&s].into_iter(), &cfg, M);
     assert!(l.evaluate(3000, [&s].into_iter(), &cfg, M).is_empty());
+}
+
+/// Pausing does not lower memory: the pause still ends after
+/// resume_after_secs, the breach ends with it, and a session still over the
+/// cap is breached (and paused) again after sustain_secs.
+#[test]
+fn a_pause_on_a_cap_that_stays_over_resumes_and_rearms() {
+    let cfg = LimitsConfig {
+        default: Some(Budget {
+            memory_mb: cap(50.0, 10, LimitAction::Pause),
+            resume_after_secs: 30,
+            ..Budget::default()
+        }),
+        ..LimitsConfig::default()
+    };
+    let mut l = Limits::default();
+    let s = session("s-1-10", "/code/a", 0.0); // 100 MB, over 50
+    l.evaluate(1000, [&s].into_iter(), &cfg, M);
+    let id = breached(&l.evaluate(1010, [&s].into_iter(), &cfg, M))[0].clone();
+    l.get_mut(&id).unwrap().action_state = ActionState::Done;
+    assert!(l.evaluate(1039, [&s].into_iter(), &cfg, M).is_empty());
+    let ev = l.evaluate(1040, [&s].into_iter(), &cfg, M);
+    assert_eq!(
+        ev,
+        vec![LimitEvent::ResumeDue {
+            breach_id: id.clone()
+        }]
+    );
+    assert_eq!(l.get(&id).unwrap().cleared_unix, Some(1040));
+    assert!(breached(&l.evaluate(1041, [&s].into_iter(), &cfg, M)).is_empty());
+    assert!(breached(&l.evaluate(1050, [&s].into_iter(), &cfg, M)).is_empty());
+    let again = breached(&l.evaluate(1051, [&s].into_iter(), &cfg, M));
+    assert_eq!(again.len(), 1);
+    assert_ne!(again[0], id);
 }
 
 /// Exactly-once delivery per session.
