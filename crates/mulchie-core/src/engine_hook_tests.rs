@@ -442,3 +442,19 @@ fn hook_registrations_are_capped() {
     e.hook(&req).unwrap();
     assert_eq!(e.session("s-900-200").unwrap().session.cwd, None);
 }
+
+/// `client` (1–64) and `client_session_id` (≤512) count characters, not
+/// bytes, as openapi says.
+#[test]
+fn hook_field_limits_count_characters() {
+    let (_t, e) = engine(Config::default(), Vec::new());
+    let mut req = hook_req(4_000_999, HookEvent::Prompt, None);
+    req.client = "é".repeat(64);
+    req.client_session_id = Some("é".repeat(512));
+    assert!(e.hook(&req).is_ok(), "64 and 512 characters, more bytes");
+    req.client = "é".repeat(65);
+    assert_eq!(e.hook(&req).unwrap_err().0, "invalid_body");
+    req.client = "claude".into();
+    req.client_session_id = Some("é".repeat(513));
+    assert_eq!(e.hook(&req).unwrap_err().0, "invalid_body");
+}

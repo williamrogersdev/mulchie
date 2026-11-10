@@ -288,7 +288,7 @@ impl Engine {
             now,
             root.pid,
             root.start_time,
-            &capped(&req.client, 64),
+            &capped(&req.client, 256),
             command.clone(),
             Some(req.client.clone()),
             req.client_session_id.clone(),
@@ -302,7 +302,7 @@ impl Engine {
                 now,
                 "session_start",
                 json!({
-                    "agent": capped(&req.client, 64), "source": "hook",
+                    "agent": capped(&req.client, 256), "source": "hook",
                     "root_pid": root.pid, "root_start_time": root.start_time,
                     "command": command, "workspace": ws, "cwd": cwd,
                 }),
@@ -313,13 +313,13 @@ impl Engine {
 
     /// `POST /v1/hook`.
     pub fn hook(&self, req: &HookRequest) -> Result<HookReply, (&'static str, String)> {
-        if req.client.is_empty() || req.client.len() > 64 {
+        if req.client.is_empty() || req.client.chars().count() > 64 {
             return Err(("invalid_body", "client must be 1 to 64 characters".into()));
         }
         if req
             .client_session_id
             .as_ref()
-            .is_some_and(|s| s.len() > 512)
+            .is_some_and(|s| s.chars().count() > 512)
         {
             return Err((
                 "invalid_body",
@@ -384,7 +384,7 @@ impl Engine {
                         .map(|c| capped(&redact_command_line(c), RECORD_TEXT))
                 };
                 let mut ev = json!({
-                    "client": capped(&req.client, 64),
+                    "client": capped(&req.client, 256),
                     "tool": req.tool.as_deref().map(|t| capped(&redact_command_line(t), 128)),
                     "command": text(&req.command),
                     "detail": text(&req.detail),
@@ -395,7 +395,7 @@ impl Engine {
                     // Another caller: its own client fields, flagged.
                     ev["unbound"] = json!(true);
                     ev["client_session_id"] =
-                        json!(req.client_session_id.as_deref().map(|c| capped(c, 512)));
+                        json!(req.client_session_id.as_deref().map(|c| capped(c, 2048)));
                 }
                 self.record_writer()
                     .event(id, now, &format!("hook_{}", req.event.code()), ev);
