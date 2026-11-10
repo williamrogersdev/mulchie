@@ -88,6 +88,107 @@ fn severity_rank(s: &Value) -> u8 {
     }
 }
 
+/// The MCP tool (and CLI command) for a suggestion's `api_request`: only
+/// calls that look or plan, never one that acts. `None` for a route with
+/// no such tool.
+pub fn tool_for_api_request(r: &Value) -> Option<(&'static str, Value, Option<String>)> {
+    let route = r["route"].as_str()?;
+    let (path, _) = route.split_once('?').unwrap_or((route, ""));
+    let body = &r["body"];
+    match (r["method"].as_str()?, path) {
+        ("GET", "/v1/state") => Some(("get_status", json!({}), Some("mulchie status".into()))),
+        ("GET", "/v1/findings") => {
+            Some(("list_findings", json!({}), Some("mulchie findings".into())))
+        }
+        ("GET", "/v1/sessions") => {
+            Some(("list_sessions", json!({}), Some("mulchie sessions".into())))
+        }
+        ("GET", "/v1/limits/status") => {
+            Some(("limits_status", json!({}), Some("mulchie limits".into())))
+        }
+        ("GET", "/v1/updates") => Some(("list_updates", json!({}), Some("mulchie updates".into()))),
+        ("POST", "/v1/findings/dismiss") => {
+            let id = body["id"].as_str()?;
+            Some((
+                "dismiss_finding",
+                json!({ "id": id }),
+                Some(format!("mulchie findings dismiss {}", q(id))),
+            ))
+        }
+        ("POST", "/v1/process/plan") => {
+            let mut args = serde_json::Map::new();
+            for k in [
+                "pid",
+                "signal",
+                "tree",
+                "group",
+                "action",
+                "session",
+                "include_agent",
+            ] {
+                if !body[k].is_null() {
+                    args.insert(k.into(), body[k].clone());
+                }
+            }
+            let line = match (
+                body["session"].as_str(),
+                body["group"].as_str(),
+                body["pid"].as_u64(),
+            ) {
+                (Some(sid), _, _) => body["action"].as_str().map(|a| {
+                    format!(
+                        "mulchie group {} {}{}",
+                        q(&format!("session:{sid}")),
+                        q(a),
+                        if body["include_agent"] == true {
+                            " --include-agent"
+                        } else {
+                            ""
+                        }
+                    )
+                }),
+                (_, Some(g), _) => body["action"]
+                    .as_str()
+                    .map(|a| format!("mulchie group {} {}", q(g), q(a))),
+                (_, _, Some(p)) => body["signal"]
+                    .as_str()
+                    .map(|sig| format!("mulchie signal {p} {}", q(sig))),
+                _ => None,
+            };
+            Some(("plan_process_action", Value::Object(args), line))
+        }
+        ("GET", p) => {
+            if let Some(rest) = p.strip_prefix("/v1/sessions/") {
+                let (id, events) = match rest.strip_suffix("/events") {
+                    Some(id) => (id, true),
+                    None => (rest, false),
+                };
+                crate::sessions::check_session_id(id).ok()?;
+                return Some(if events {
+                    (
+                        "get_session",
+                        json!({ "id": id, "events": true }),
+                        Some(format!("mulchie sessions {} --events", q(id))),
+                    )
+                } else {
+                    (
+                        "get_session",
+                        json!({ "id": id }),
+                        Some(format!("mulchie sessions {}", q(id))),
+                    )
+                });
+            }
+            let pid: u32 = p.strip_prefix("/v1/process/")?.parse().ok()?;
+            Some((
+                "inspect_process",
+                json!({ "pid": pid }),
+                Some(format!("mulchie inspect {pid}")),
+            ))
+        }
+        _ => None,
+    }
+}
+
 /// A finding, short, with the tool calls (all of them look or plan) and CLI
 /// commands that follow from its suggestions.
 pub fn finding_brief(f: &Value) -> Value {
@@ -96,6 +197,14 @@ pub fn finding_brief(f: &Value) -> Value {
     let mut next = Vec::new();
     let mut cli = Vec::new();
     for sug in f["suggested"].as_array().into_iter().flatten() {
+        // The engine's own call, as data, when it gives one.
+        if let Some((name, args, line)) = tool_for_api_request(&sug["api_request"]) {
+            if name != "dismiss_finding" {
+                next.push(json!({ "label": sug["label"], "name": name, "arguments": args }));
+                cli.extend(line);
+            }
+            continue;
+        }
         let r = &sug["request"];
         if r["action"] == "signal" {
             if let (Some(p), Some(sig)) = (r["pid"].as_u64(), r["signal"].as_str()) {
@@ -1284,5 +1393,51 @@ mod tests {
         let j = d.to_string();
         assert!(j.find("\"cpu\"").unwrap() < j.find("\"recommendations\"").unwrap());
         assert!(j.len() < 12_000, "{}", j.len());
+    }
+
+    #[test]
+    fn a_suggestions_api_request_becomes_the_next_call() {
+        let f = json!({ "id": "limit_exceeded:b1", "kind": "limit_exceeded", "severity": "high", "title": "t", "why": "", "evidence": {},
+            "suggested": [
+                { "label": "Plan", "api": "POST /v1/process/plan", "api_request": { "method": "POST", "route": "/v1/process/plan", "body": { "session": "s-1-2", "action": "pause" } } },
+                { "label": "Show", "api_request": { "method": "GET", "route": "/v1/sessions/s-1-2" } },
+                { "label": "Stopped", "api_request": { "method": "GET", "route": "/v1/state" } },
+                { "label": "Odd", "api_request": { "method": "GET", "route": "/v1/sessions/../config" } },
+                { "label": "Hide", "api_request": { "method": "POST", "route": "/v1/findings/dismiss", "body": { "id": "limit_exceeded:b1" } } } ] });
+        let b = finding_brief(&f);
+        let next = b["next_calls"].as_array().unwrap();
+        assert_eq!(next[0]["name"], "plan_process_action");
+        assert_eq!(
+            next[0]["arguments"],
+            json!({ "session": "s-1-2", "action": "pause" })
+        );
+        assert_eq!(next[1]["name"], "get_session");
+        assert_eq!(next[1]["arguments"]["id"], "s-1-2");
+        assert_eq!(next[2]["name"], "get_status");
+        // A route that is not a session id maps to nothing; the dismissal
+        // is listed once.
+        assert_eq!(next.len(), 4, "{b}");
+        assert_eq!(next[3]["name"], "dismiss_finding");
+        let cli: Vec<&str> = b["cli"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(Value::as_str)
+            .collect();
+        assert!(
+            cli.contains(&"mulchie group session:s-1-2 pause"),
+            "{cli:?}"
+        );
+        assert!(cli.contains(&"mulchie sessions s-1-2"), "{cli:?}");
+        assert_eq!(
+            cli.iter()
+                .filter(|c| c.starts_with("mulchie findings dismiss"))
+                .count(),
+            1
+        );
+        // Never a call that acts.
+        for n in next {
+            assert_ne!(n["name"], "execute_plan");
+        }
     }
 }
