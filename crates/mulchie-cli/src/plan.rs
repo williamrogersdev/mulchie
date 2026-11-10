@@ -37,10 +37,33 @@ impl Job {
     }
 }
 
-/// Where plans come from and go to.
 /// Said when the engine took a plan but gave no usable answer.
 pub const MAY_HAVE_ACTED: &str = "The engine may have acted on some of the plan: check `mulchie status` or the action journal before trying again";
 
+/// Whether the engine may have carried out some of a request that failed
+/// this way: no answer (or a lost one), or a server error. A refusal (4xx)
+/// came before anything ran.
+pub fn may_have_acted(e: &mulchie_core::api::ApiError) -> bool {
+    match e.status {
+        0 => !matches!(
+            e.code.as_str(),
+            "engine_not_running" | "engine_unreachable" | "unreachable"
+        ),
+        s => s >= 500,
+    }
+}
+
+/// An execute request's error in words, with [`MAY_HAVE_ACTED`] only when
+/// that can be so.
+pub fn execute_error(e: &mulchie_core::api::ApiError) -> String {
+    if may_have_acted(e) {
+        format!("{}. {MAY_HAVE_ACTED}", conn::describe(e))
+    } else {
+        conn::describe(e)
+    }
+}
+
+/// Where plans come from and go to.
 pub enum Backend {
     Engine(Client),
     Local(Engine),
@@ -84,7 +107,7 @@ impl Backend {
                     _ => "/v1/clean",
                 };
                 let v = conn::call(c, "POST", route, Some(&json!({ "items": items })))
-                    .map_err(|e| format!("{}. {MAY_HAVE_ACTED}", conn::describe(&e)))?;
+                    .map_err(|e| execute_error(&e))?;
                 serde_json::from_value(v).map_err(|e| {
                     format!("unexpected reply from the engine; versions may differ ({e}). {MAY_HAVE_ACTED}")
                 })

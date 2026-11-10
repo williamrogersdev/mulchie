@@ -46,7 +46,8 @@ pub fn render(slots: &Value, now: u64) -> String {
         active.len(),
         slots["capacity"].as_u64().unwrap_or(0)
     );
-    if active.is_empty() {
+    let waiters = slots["waiting"].as_array().cloned().unwrap_or_default();
+    if active.is_empty() && waiters.is_empty() {
         return s;
     }
     s.push_str(&format!(
@@ -68,7 +69,16 @@ pub fn render(slots: &Value, now: u64) -> String {
             mins(age),
         ));
     }
-    s.push_str("Release one whose holder is gone with `mulchie slots release <ticket>`.\n");
+    for w in &waiters {
+        s.push_str(&format!(
+            "  {:>7}  {:<28}  {:>7}  {:>8}  waiting\n",
+            w["id"],
+            w["label"].as_str().unwrap_or(""),
+            w["pid"].as_u64().map_or("-".into(), |p| p.to_string()),
+            mins(now.saturating_sub(w["since_unix"].as_u64().unwrap_or(now))),
+        ));
+    }
+    s.push_str("End one whose holder is gone with `mulchie slots release <ticket>`.\n");
     s
 }
 
@@ -130,13 +140,17 @@ pub fn run_release(
             return 1;
         }
     };
-    let Some(lease) = state["slots"]["active"]
-        .as_array()
-        .into_iter()
-        .flatten()
-        .find(|l| l["id"].as_u64() == Some(ticket))
-        .cloned()
-    else {
+    // A granted slot, or a place in the queue: both end the same way.
+    let find = |k: &str| {
+        state["slots"][k]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .find(|l| l["id"].as_u64() == Some(ticket))
+            .cloned()
+    };
+    let waiting = find("active").is_none();
+    let Some(lease) = find("active").or_else(|| find("waiting")) else {
         let _ = writeln!(
             err,
             "mulchie: no build slot has ticket {ticket} (it may have ended already; `mulchie slots` lists them)"
@@ -144,7 +158,8 @@ pub fn run_release(
         return 1;
     };
     let who = format!(
-        "slot {ticket} ({}{})",
+        "{} {ticket} ({}{})",
+        if waiting { "waiting ticket" } else { "slot" },
         lease["label"].as_str().unwrap_or("no label"),
         lease["pid"]
             .as_u64()
@@ -273,6 +288,31 @@ mod tests {
         let (code, _, err, sent) = go(ok(), 8, true, false, true);
         assert_eq!(code, 1);
         assert!(err.contains("no build slot has ticket 8") && sent.is_empty());
+    }
+
+    #[test]
+    fn a_waiting_ticket_can_be_ended_too() {
+        let posted = RefCell::new(Vec::new());
+        let call = |_m: &str, p: &str, b: Option<&Value>| -> Result<Value, ApiError> {
+            if p == "/v1/release" {
+                posted.borrow_mut().push(b.cloned().unwrap_or(Value::Null));
+                return Ok(json!({ "released": true, "admin": true }));
+            }
+            Ok(json!({ "slots": { "capacity": 1, "active": [], "waiting": [
+                { "id": 9, "label": "queued build", "pid": null, "since_unix": 1 } ] } }))
+        };
+        let mut ask = |_: &str| true;
+        let (mut out, mut err) = (Vec::new(), Vec::new());
+        let code = run_release(&call, 9, true, false, &mut ask, false, &mut out, &mut err);
+        assert_eq!(code, 0, "{}", String::from_utf8_lossy(&err));
+        assert!(String::from_utf8_lossy(&out).contains("waiting ticket 9"));
+        assert_eq!(posted.borrow().clone(), vec![json!({ "ticket": 9 })]);
+        let t = render(
+            &json!({ "capacity": 1, "active": [], "waiting": [
+            { "id": 9, "label": "queued build", "since_unix": 1 } ] }),
+            100,
+        );
+        assert!(t.contains("queued build") && t.contains("waiting"), "{t}");
     }
 
     #[test]

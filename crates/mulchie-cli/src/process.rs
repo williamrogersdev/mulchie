@@ -95,7 +95,13 @@ pub fn command(paths: &Paths, target: Target, confirm: Confirm, json_out: bool) 
         }
     };
     let call = |m: &str, p: &str, b: Option<&Value>| {
-        conn::call(&client, m, p, b).map_err(|e| conn::describe(&e))
+        conn::call(&client, m, p, b).map_err(|e| {
+            if p == "/v1/process/execute" {
+                crate::plan::execute_error(&e)
+            } else {
+                conn::describe(&e)
+            }
+        })
     };
     let mut ask = |q: &str| -> bool {
         eprint!("{q} [y/N] ");
@@ -207,8 +213,9 @@ pub fn run(call: &Call, target: &Target, ui: &mut Ui) -> i32 {
             );
             return 1;
         }
+        // The caller's error says whether the engine may have acted.
         Err(e) => {
-            let _ = writeln!(ui.err, "mulchie: {e}. {}", crate::plan::MAY_HAVE_ACTED);
+            let _ = writeln!(ui.err, "mulchie: {e}");
             return 1;
         }
     };
@@ -542,8 +549,10 @@ mod tests {
 
     #[test]
     fn a_failed_or_odd_execute_says_the_engine_may_have_acted() {
+        use mulchie_core::api::ApiError;
+        let timeout = ApiError::new(0, "timeout", "the engine did not answer in time");
         for reply in [
-            Err("the engine did not answer in time [timeout]".to_string()),
+            Err(crate::plan::execute_error(&timeout)),
             Ok(json!({ "ok": true })),
         ] {
             let odd = reply.is_ok();
@@ -564,6 +573,31 @@ mod tests {
                     "{err}"
                 );
             }
+        }
+    }
+
+    #[test]
+    fn only_errors_after_which_the_engine_may_have_run_say_so() {
+        use crate::plan::{execute_error, may_have_acted};
+        use mulchie_core::api::ApiError;
+        for (status, code, acted) in [
+            (0, "timeout", true),
+            (0, "io_error", true),
+            (500, "internal", true),
+            (0, "unreachable", false),
+            (0, "engine_not_running", false),
+            (400, "items_required", false),
+            (401, "unauthorized", false),
+            (403, "read_only_token", false),
+            (409, "config_changed", false),
+        ] {
+            let e = ApiError::new(status, code, "x");
+            assert_eq!(may_have_acted(&e), acted, "{status} {code}");
+            assert_eq!(
+                execute_error(&e).contains("may have acted"),
+                acted,
+                "{status} {code}"
+            );
         }
     }
 }

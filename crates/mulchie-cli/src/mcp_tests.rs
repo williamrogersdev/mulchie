@@ -1609,3 +1609,39 @@ fn a_plan_marked_not_ready_gets_no_plan_id_even_with_a_ready_item() {
         "{v}"
     );
 }
+
+/// An engine that checks, while a lease is being granted, that a release on
+/// exit could not run yet (it would miss the new ticket).
+struct Watching {
+    secrets: std::sync::OnceLock<crate::mcp::Secrets>,
+    held_during_lease: std::cell::Cell<Option<bool>>,
+}
+
+impl Api for Watching {
+    fn call(&self, _m: &str, path: &str, _b: Option<&Value>) -> Result<Value, ApiError> {
+        if path == "/v1/lease" {
+            let held = self.secrets.get().unwrap().try_lock().is_err();
+            self.held_during_lease.set(Some(held));
+            return Ok(json!({ "granted": true, "ticket": 4, "release_secret": "s4" }));
+        }
+        Ok(json!({ "released": true }))
+    }
+}
+
+#[test]
+fn a_release_on_exit_waits_for_a_lease_in_flight() {
+    let api = Watching {
+        secrets: std::sync::OnceLock::new(),
+        held_during_lease: std::cell::Cell::new(None),
+    };
+    let mut s = Session::new(&api);
+    api.secrets.set(s.secrets.clone()).ok().unwrap();
+    result(&s.handle(call(1, "acquire_build_slot", json!({}))).unwrap());
+    assert_eq!(api.held_during_lease.get(), Some(true));
+    assert_eq!(
+        crate::mcp_tools::lock_secrets(&s.secrets)
+            .get(&4)
+            .map(String::as_str),
+        Some("s4")
+    );
+}

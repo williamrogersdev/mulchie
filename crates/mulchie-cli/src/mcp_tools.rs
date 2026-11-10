@@ -1220,11 +1220,13 @@ pub fn call_tool(cx: &mut Ctx, name: &str, a: &Map<String, Value>) -> ToolResult
             // Renewing or polling a ticket sends its secret, which the
             // engine may require on any call that names a ticket.
             let sent = a.get("ticket").and_then(Value::as_u64);
-            if let Some(sec) = sent.and_then(|t| lock_secrets(cx.secrets).get(&t).cloned()) {
+            // Held across the request: a release on exit (a signal) waits
+            // for it, and so sees a ticket the engine has just granted.
+            let mut secrets = lock_secrets(cx.secrets);
+            if let Some(sec) = sent.and_then(|t| secrets.get(&t).cloned()) {
                 body["secret"] = json!(sec);
             }
             let mut r = post("/v1/lease", body)?;
-            let mut secrets = lock_secrets(cx.secrets);
             if let Some(o) = r.as_object_mut() {
                 let got = o.get("ticket").and_then(Value::as_u64);
                 if let (Some(Value::String(secret)), Some(t)) = (o.remove("release_secret"), got) {
