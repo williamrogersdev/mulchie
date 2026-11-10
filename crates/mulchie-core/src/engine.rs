@@ -311,6 +311,8 @@ pub struct HealthSummary {
     /// Why the action journal could not be written, while that is so.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub journal_error: Option<String>,
+    /// Journal entries that could not be written since the engine started.
+    pub journal_lost: u64,
     /// Seconds since the last completed cache scan; `None` before the first.
     pub scan_age_secs: Option<u64>,
     /// The last scan is older than twice the scan interval (plus 10 minutes):
@@ -347,6 +349,8 @@ pub struct State {
     /// Why the action journal could not be written, while that is so. Actions
     /// still run; their results carry `journal_error` too.
     pub journal_error: Option<String>,
+    /// Journal entries that could not be written since the engine started.
+    pub journal_lost: u64,
     /// Build processes whose original priority could not be restored.
     pub restore_failed: usize,
     /// Seconds since the last completed cache scan; `None` before the first.
@@ -658,6 +662,7 @@ impl Engine {
             low_disk: false,
             loops: Loops::default(),
             journal_error: None,
+            journal_lost: 0,
             restore_failed: 0,
             scan_age_secs: None,
             scan_stale: false,
@@ -717,6 +722,7 @@ impl Engine {
         st.health = st.health_at(now);
         st.automation = st.automation && self.automation_allowed();
         st.journal_error = self.journal.last_error();
+        st.journal_lost = self.journal.lost();
         (st.scan_age_secs, st.scan_stale) = st.scan_age(now);
         st.restore_failed = lock(&self.reniced)
             .values()
@@ -750,6 +756,7 @@ impl Engine {
             reclaimable_stale: st.scan.as_ref().map(|s| s.stale_bytes).unwrap_or(0),
             restarts: st.loops.sample.restarts + st.loops.scan.restarts,
             journal_error: self.journal.last_error(),
+            journal_lost: self.journal.lost(),
             scan_age_secs: st.scan_age(now).0,
             scan_stale: st.scan_age(now).1,
             findings: st.finding_counts,

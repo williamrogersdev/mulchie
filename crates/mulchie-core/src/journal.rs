@@ -5,6 +5,7 @@
 use serde::{Deserialize, Serialize};
 use std::io::{BufRead, Write};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
 
 use crate::config::create_private_dir;
@@ -66,6 +67,10 @@ pub struct Journal {
     lock: Mutex<()>,
     /// The last append failure, cleared by the next successful append.
     last_error: Mutex<Option<String>>,
+    /// Entries that could not be written since this journal was opened.
+    lost: AtomicU64,
+    /// The gap not yet noted in the file: (entries, first and last time).
+    gap: Mutex<Option<(u64, u64, u64)>>,
 }
 
 impl Journal {
@@ -79,6 +84,8 @@ impl Journal {
             max_bytes,
             lock: Mutex::new(()),
             last_error: Mutex::new(None),
+            lost: AtomicU64::new(0),
+            gap: Mutex::new(None),
         }
     }
 
@@ -102,9 +109,44 @@ impl Journal {
             .clone()
     }
 
+    /// How many entries could not be written since the journal was opened.
+    pub fn lost(&self) -> u64 {
+        self.lost.load(Ordering::Relaxed)
+    }
+
     /// Append one line, rotating first when the file would pass the limit.
+    /// After failures, the first append that succeeds is preceded by a
+    /// `journal_gap` entry: "journal gap: N entries lost between T1 and T2".
     pub fn append(&self, a: &Action) -> std::io::Result<()> {
-        let res = self.append_inner(a);
+        let pending = *self.gap.lock().unwrap_or_else(|e| e.into_inner());
+        let mut res = Ok(());
+        if let Some((n, first, last)) = pending {
+            let note = Action::note(
+                a.at_unix,
+                "journal_gap",
+                format!("journal gap: {n} entries lost between {first} and {last} (unix seconds)"),
+                0,
+                None,
+                "mulchie",
+            );
+            res = self.append_inner(&note);
+            if res.is_ok() {
+                let mut g = self.gap.lock().unwrap_or_else(|e| e.into_inner());
+                // Entries lost meanwhile by another thread stay pending.
+                *g = g.and_then(|(m, _, l)| (m > n).then_some((m - n, l, l)));
+            }
+        }
+        if res.is_ok() {
+            res = self.append_inner(a);
+        }
+        if res.is_err() {
+            self.lost.fetch_add(1, Ordering::Relaxed);
+            let mut g = self.gap.lock().unwrap_or_else(|e| e.into_inner());
+            *g = Some(match *g {
+                Some((n, first, last)) => (n + 1, first, last.max(a.at_unix)),
+                None => (1, a.at_unix, a.at_unix),
+            });
+        }
         *self.last_error.lock().unwrap_or_else(|e| e.into_inner()) = res.as_ref().err().map(|e| {
             format!(
                 "could not write the action journal {}: {e}",
@@ -210,5 +252,36 @@ mod tests {
         f.write_all(b"not json\n").unwrap();
         j.append(&act(2)).unwrap();
         assert_eq!(j.tail(10).len(), 2);
+    }
+
+    /// R7: failed appends are counted, and the first append that succeeds
+    /// afterwards is preceded by a gap line naming how many and when.
+    #[test]
+    fn lost_entries_are_counted_and_noted_as_a_gap() {
+        let t = tempfile::tempdir().unwrap();
+        let dir = t.path().join("cfg");
+        // A file where the directory should be: every append fails.
+        std::fs::write(&dir, "").unwrap();
+        let j = Journal::at(dir.join("actions.jsonl"), ROTATE_BYTES);
+        for i in [100, 105, 107] {
+            assert!(j.append(&act(i)).is_err());
+        }
+        assert_eq!(j.lost(), 3);
+        assert!(j.last_error().is_some());
+        std::fs::remove_file(&dir).unwrap();
+        j.append(&act(110)).unwrap();
+        assert_eq!(j.lost(), 3, "a count since start, not cleared");
+        assert!(j.last_error().is_none());
+        let tail = j.tail(10);
+        assert_eq!(tail.len(), 2, "{tail:?}");
+        assert_eq!(tail[0].kind, "journal_gap");
+        assert_eq!(
+            tail[0].detail,
+            "journal gap: 3 entries lost between 100 and 107 (unix seconds)"
+        );
+        assert_eq!(tail[1].at_unix, 110);
+        // No second gap line once noted.
+        j.append(&act(111)).unwrap();
+        assert_eq!(j.tail(10).len(), 3);
     }
 }

@@ -616,6 +616,11 @@ fn journal_failures_show_in_state_and_health() {
     e.log("note", "again".into(), 0, None, "t");
     assert!(e.snapshot_state().journal_error.is_none());
     assert!(e.health_summary().journal_error.is_none());
+    // R7: the loss is counted since start and noted in the file.
+    assert_eq!(e.snapshot_state().journal_lost, 1);
+    assert_eq!(e.health_summary().journal_lost, 1);
+    let text = std::fs::read_to_string(&jf).unwrap();
+    assert!(text.contains("journal gap: 1 entries lost"), "{text}");
 }
 
 /// C8: a head waiter with a long TTL that stops polling no longer blocks the

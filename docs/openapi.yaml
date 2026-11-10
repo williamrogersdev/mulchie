@@ -65,6 +65,7 @@ paths:
                   reclaimable_stale: { type: integer }
                   restarts: { type: integer }
                   journal_error: { type: string, description: Why the action journal could not be written; absent when it can }
+                  journal_lost: { type: integer, description: "Journal entries that could not be written since the engine started. The first entry written after a failure is preceded by a `journal_gap` entry: \"journal gap: N entries lost between T1 and T2 (unix seconds)\"" }
                   scan_age_secs: { type: [integer, "null"] }
                   scan_stale: { type: boolean, description: The last scan is older than twice the scan interval plus 10 minutes }
                   findings: { $ref: "#/components/schemas/FindingCounts" }
@@ -74,7 +75,7 @@ paths:
       description: |
         The latest snapshot (machine figures, top processes, workspaces, `consumers` groups,
         `cpu_summary` and `mem_summary` in words), health, config error, build slots, forecast,
-        last scan, disk map and recent actions. Also `journal_error`, `restore_failed`,
+        last scan, disk map and recent actions. Also `journal_error`, `journal_lost`, `restore_failed`,
         `scan_age_secs`, `scan_stale`, `findings` (as in `GET /v1/findings?dismissed=1`),
         `finding_counts` and `findings_unix`. Command lines and lease labels are redacted.
       responses:
