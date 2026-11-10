@@ -11,7 +11,7 @@
 //! Every method here blocks (remote calls, git, deletes); Tauri commands call
 //! them on a blocking thread.
 
-use mulchie_core::api::{self, Client, Server};
+use mulchie_core::api::{self, ApiError, Client, Server};
 use mulchie_core::engine::{ProcAction, Sample};
 use mulchie_core::lock::{self, EngineLock, LockError};
 use mulchie_core::process::ProcessSource;
@@ -226,6 +226,8 @@ struct Inner {
     lock: Option<EngineLock>,
     server: Option<Server>,
     down_since: Option<Instant>,
+    /// Consecutive soft failures (timeouts) of a remote engine.
+    fails: u32,
 }
 
 pub struct Backend {
@@ -240,6 +242,47 @@ fn now_unix() -> u64 {
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0)
+}
+
+/// How a failed remote call bears on the connection: `None` when the engine
+/// answered (the call itself failed), `Some(true)` when the connection is
+/// gone for sure (nothing listens, or the token is rejected), `Some(false)`
+/// for a timeout or I/O error, which counts only when it happens twice in a
+/// row so a slow but healthy engine is not dropped.
+pub fn failure_kind(e: &ApiError) -> Option<bool> {
+    match (e.status, e.code.as_str()) {
+        (0, "unreachable") => Some(true),
+        (0, _) => Some(false),
+        (401, _) => Some(true),
+        _ => None,
+    }
+}
+
+/// Check that `pid` is still the process the user saw (same start time) in
+/// an engine state, before sending it a signal.
+pub fn check_process(state: &Value, pid: u32, start_time: u64) -> Result<(), String> {
+    let snap = &state["snapshot"];
+    let listed = snap["top"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .chain(
+            snap["workspaces"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .flat_map(|w| w["procs"].as_array().into_iter().flatten()),
+        )
+        .find(|p| p["pid"].as_u64() == Some(u64::from(pid)));
+    match listed {
+        None => Err(format!(
+            "process {pid} is no longer running or no longer listed; nothing was sent"
+        )),
+        Some(p) if p["start_time"].as_u64() != Some(start_time) => Err(format!(
+            "pid {pid} now belongs to a different process than the one you confirmed; nothing was sent"
+        )),
+        Some(_) => Ok(()),
+    }
 }
 
 fn guard<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
@@ -273,6 +316,7 @@ impl Backend {
                 lock: None,
                 server: None,
                 down_since: Some(Instant::now()),
+                fails: 0,
             }),
             plans: Mutex::new(PlanBook::default()),
         };
@@ -347,30 +391,51 @@ impl Backend {
         inner.down_since = None;
     }
 
-    /// Connect to the engine holding the lock, which announced `port`.
-    fn connect(&self, inner: &mut Inner, port: Option<u16>) {
+    /// Reach the engine holding the lock, which announced `port`. Network
+    /// I/O: never call it with `inner` locked.
+    fn dial(&self, port: Option<u16>) -> Result<(Client, Option<u32>), String> {
         let holder = lock::running_engine(&self.paths);
         let port = port.or(holder.as_ref().and_then(|h| h.port));
         let Some(port) = port else {
-            let msg = match &holder {
+            return Err(match &holder {
                 Some(h) => format!("the engine (pid {}) has not opened its API yet", h.pid),
                 None => "no Mulchie engine is running".into(),
-            };
-            return self.set_down(inner, msg);
+            });
         };
-        match Client::connect_in(&self.paths, port) {
-            Ok(c) => {
+        Client::connect_in(&self.paths, port).map(|c| (c, holder.map(|h| h.pid)))
+    }
+
+    fn apply_dial(&self, inner: &mut Inner, r: Result<(Client, Option<u32>), String>) {
+        match r {
+            Ok((c, pid)) => {
                 inner.info = ConnInfo {
                     mode: Mode::Client,
                     port: Some(c.port()),
-                    engine_pid: holder.map(|h| h.pid),
+                    engine_pid: pid,
                     detail: None,
                     since_unix: now_unix(),
                 };
                 inner.conn = Conn::Remote(c);
                 inner.down_since = None;
+                inner.fails = 0;
             }
             Err(e) => self.set_down(inner, e),
+        }
+    }
+
+    /// Connect to the engine holding the lock, which announced `port`.
+    fn connect(&self, inner: &mut Inner, port: Option<u16>) {
+        let r = self.dial(port);
+        self.apply_dial(inner, r);
+    }
+
+    /// Connect without holding `inner` across the network I/O; applies the
+    /// result only if nothing else changed the connection meanwhile.
+    fn connect_unlocked(&self, port: Option<u16>) {
+        let r = self.dial(port);
+        let mut inner = guard(&self.inner);
+        if matches!(inner.conn, Conn::Down) {
+            self.apply_dial(&mut inner, r);
         }
     }
 
@@ -384,44 +449,69 @@ impl Backend {
         inner.info.port = None;
         inner.info.engine_pid = None;
         inner.conn = Conn::Down;
+        inner.fails = 0;
     }
 
-    /// A remote call could not reach the engine.
-    fn mark_down(&self, why: &str) {
+    /// A remote call failed: drop the connection when [`failure_kind`] says
+    /// it is gone (twice in a row for timeouts). The supervisor then
+    /// reconnects, re-reading the token, or takes over.
+    fn note_failure(&self, e: &ApiError) {
+        let Some(hard) = failure_kind(e) else {
+            return;
+        };
         let mut inner = guard(&self.inner);
-        if matches!(inner.conn, Conn::Remote(_)) {
+        if !matches!(inner.conn, Conn::Remote(_)) {
+            return;
+        }
+        inner.fails += 1;
+        if hard || inner.fails >= 2 {
+            let why = if e.status == 401 {
+                "the engine rejected this app's token; reconnecting with the current one"
+                    .to_string()
+            } else {
+                e.message.clone()
+            };
             self.set_down(&mut inner, format!("lost the engine: {why}"));
         }
     }
 
-    /// One supervision step (every few seconds): check a remote engine, and
-    /// when disconnected, reconnect or take over.
+    fn note_ok(&self) {
+        let mut inner = guard(&self.inner);
+        if matches!(inner.conn, Conn::Remote(_)) {
+            inner.fails = 0;
+        }
+    }
+
+    /// One supervision step (every few seconds): check a remote engine with
+    /// an authenticated call, and when disconnected, reconnect or take over.
     pub fn tick(&self) {
         match self.conn() {
             Conn::Local(_) => {}
-            Conn::Remote(c) => {
-                if let Err(e) = c.request("GET", "/v1/health", None, api::HEALTH_TIMEOUT) {
-                    self.mark_down(&e.message);
-                }
-            }
+            Conn::Remote(c) => match c.request("GET", "/v1/advice", None, api::HEALTH_TIMEOUT) {
+                Ok(_) => self.note_ok(),
+                Err(e) => self.note_failure(&e),
+            },
             Conn::Down => {
-                let mut inner = guard(&self.inner);
-                if !matches!(inner.conn, Conn::Down) {
-                    return;
-                }
                 if let Some(h) = lock::running_engine(&self.paths) {
-                    return self.connect(&mut inner, h.port);
+                    return self.connect_unlocked(h.port);
                 }
-                let waited = inner
+                let waited = guard(&self.inner)
                     .down_since
                     .map(|t| t.elapsed())
                     .unwrap_or(Duration::MAX);
                 if waited < self.opts.takeover_after {
                     return;
                 }
+                let mut inner = guard(&self.inner);
+                if !matches!(inner.conn, Conn::Down) {
+                    return;
+                }
                 match EngineLock::acquire(&self.paths, now_unix()) {
                     Ok(lk) => self.become_engine(&mut inner, lk),
-                    Err(LockError::Held(h)) => self.connect(&mut inner, h.and_then(|h| h.port)),
+                    Err(LockError::Held(h)) => {
+                        drop(inner);
+                        self.connect_unlocked(h.and_then(|h| h.port));
+                    }
                     Err(e) => self.set_down(&mut inner, e.to_string()),
                 }
             }
@@ -452,13 +542,16 @@ impl Backend {
         path: &str,
         body: Option<Value>,
     ) -> Result<Value, String> {
-        c.request(method, path, body.as_ref(), api::timeout_for(method, path))
-            .map_err(|e| {
-                if e.code == "unreachable" {
-                    self.mark_down(&e.message);
-                }
-                e.message
-            })
+        match c.request(method, path, body.as_ref(), api::timeout_for(method, path)) {
+            Ok(v) => {
+                self.note_ok();
+                Ok(v)
+            }
+            Err(e) => {
+                self.note_failure(&e);
+                Err(e.message)
+            }
+        }
     }
 
     fn down_error(&self) -> String {
@@ -608,7 +701,15 @@ impl Backend {
         }
     }
 
-    pub fn process_action(&self, pid: u32, action: ProcAction) -> Result<(), String> {
+    /// Signal `pid`, but only if it is still the process with `start_time`
+    /// that the user confirmed.
+    pub fn process_action(
+        &self,
+        pid: u32,
+        start_time: u64,
+        action: ProcAction,
+    ) -> Result<(), String> {
+        check_process(&self.state()?, pid, start_time)?;
         match self.conn() {
             Conn::Local(e) => e.process_action(pid, action, "manual"),
             Conn::Remote(c) => {

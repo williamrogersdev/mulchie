@@ -359,3 +359,111 @@ fn tray_title_marks_bad_health() {
     assert_eq!(tray_title(&t), "‼︎ 12G · 40%");
     assert_eq!(tray_title(&TrayInfo::default()), "");
 }
+
+#[test]
+fn failures_drop_the_connection_only_when_it_is_really_gone() {
+    use mulchie_core::api::ApiError;
+    let e = |status, code| ApiError::new(status, code, "x");
+    assert_eq!(backend::failure_kind(&e(0, "unreachable")), Some(true));
+    assert_eq!(backend::failure_kind(&e(401, "unauthorized")), Some(true));
+    assert_eq!(backend::failure_kind(&e(0, "timeout")), Some(false));
+    assert_eq!(backend::failure_kind(&e(0, "io_error")), Some(false));
+    assert_eq!(backend::failure_kind(&e(500, "internal")), None);
+    assert_eq!(backend::failure_kind(&e(400, "bad_request")), None);
+}
+
+#[test]
+fn signals_need_the_start_time_the_user_saw() {
+    let st = json!({"snapshot": {
+        "top": [{"pid": 10, "start_time": 100}],
+        "workspaces": [{"procs": [{"pid": 20, "start_time": 200}]}]
+    }});
+    assert!(backend::check_process(&st, 10, 100).is_ok());
+    assert!(backend::check_process(&st, 20, 200).is_ok());
+    let reused = backend::check_process(&st, 10, 999).unwrap_err();
+    assert!(reused.contains("different process"), "{reused}");
+    assert!(backend::check_process(&st, 30, 1)
+        .unwrap_err()
+        .contains("no longer"));
+
+    // Through the backend: a process the engine does not list is refused
+    // before anything is sent.
+    let f = fixture();
+    let a = Backend::start(f.paths.clone(), f.opts());
+    let err = a
+        .process_action(std::process::id(), 1, ProcAction::Cont)
+        .unwrap_err();
+    assert!(err.contains("nothing was sent"), "{err}");
+    a.shutdown();
+}
+
+#[test]
+fn a_rejected_token_disconnects_and_the_next_tick_reconnects() {
+    let f = fixture();
+    let a = Backend::start(f.paths.clone(), f.opts());
+    let b = Backend::start(
+        f.paths.clone(),
+        Options {
+            takeover_after: Duration::from_secs(3600),
+            ..f.opts()
+        },
+    );
+    assert_eq!(b.mode(), Mode::Client);
+    // Rotate the token: the client's calls now get 401.
+    let tok = mulchie_core::api::token_path_in(&f.paths);
+    std::fs::remove_file(&tok).unwrap();
+    a.shutdown();
+    let a = Backend::start(f.paths.clone(), f.opts());
+    assert_eq!(a.mode(), Mode::Engine);
+    let old = b.info().port;
+    let err = b.state();
+    if old == a.info().port {
+        // Same port, new token: refused, then reconnected with the new one.
+        assert!(err.is_err());
+        assert_eq!(b.mode(), Mode::Disconnected);
+    }
+    b.tick();
+    b.tick();
+    assert_eq!(b.mode(), Mode::Client, "{:?}", b.info());
+    assert!(b.state().is_ok());
+    drop(b);
+    a.shutdown();
+}
+
+#[test]
+fn cli_link_state_tells_our_link_from_other_files() {
+    let f = fixture();
+    let bin = f.root.join("mulchie-bundled");
+    std::fs::write(&bin, "x").unwrap();
+    let link = f.root.join("link");
+    assert_eq!(link_state(&link, Some(&bin)), LinkState::Missing);
+    std::os::unix::fs::symlink(&bin, &link).unwrap();
+    assert_eq!(link_state(&link, Some(&bin)), LinkState::Ours);
+    assert!(matches!(link_state(&link, None), LinkState::OtherLink(_)));
+    std::fs::remove_file(&link).unwrap();
+    std::fs::write(&link, "a regular file").unwrap();
+    assert_eq!(link_state(&link, Some(&bin)), LinkState::OtherFile);
+}
+
+#[test]
+fn capabilities_grant_only_event_listening() {
+    let caps: Value = serde_json::from_str(include_str!("../capabilities/default.json")).unwrap();
+    let perms: Vec<&str> = caps["permissions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|p| p.as_str().unwrap())
+        .collect();
+    assert_eq!(
+        perms,
+        ["core:event:allow-listen", "core:event:allow-unlisten"]
+    );
+}
+
+#[test]
+fn panel_height_stays_within_limits() {
+    assert_eq!(panel_height(500.0), 500.0);
+    assert_eq!(panel_height(10.0), 320.0);
+    assert_eq!(panel_height(5000.0), 760.0);
+    assert_eq!(panel_height(f64::NAN), 620.0);
+}

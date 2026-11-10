@@ -102,8 +102,13 @@ async fn workspace_action(
 }
 
 #[tauri::command]
-async fn process_action(b: B<'_>, pid: u32, action: ProcAction) -> Result<(), String> {
-    blocking(&b, move |b| b.process_action(pid, action)).await
+async fn process_action(
+    b: B<'_>,
+    pid: u32,
+    start_time: u64,
+    action: ProcAction,
+) -> Result<(), String> {
+    blocking(&b, move |b| b.process_action(pid, start_time, action)).await
 }
 
 #[tauri::command]
@@ -119,7 +124,11 @@ struct Integration {
     token: Option<String>,
     token_error: Option<String>,
     cli_path: Option<String>,
+    /// `~/.local/bin/mulchie` when it is a link to the bundled CLI.
     cli_linked: Option<String>,
+    /// Something else is at `~/.local/bin/mulchie` (a file, or a link
+    /// elsewhere): its path and what it is.
+    cli_other: Option<String>,
     home: String,
     backups_dir: String,
     version: String,
@@ -133,6 +142,29 @@ fn bundled_cli() -> Option<PathBuf> {
     let p = exe.parent()?.join("mulchie");
     let m = std::fs::metadata(&p).ok()?;
     (m.is_file() && m.len() > 0).then_some(p)
+}
+
+#[derive(Debug, PartialEq)]
+enum LinkState {
+    Missing,
+    /// A link to the bundled CLI.
+    Ours,
+    OtherLink(PathBuf),
+    OtherFile,
+}
+
+fn link_state(link: &Path, bundled: Option<&Path>) -> LinkState {
+    let Ok(m) = std::fs::symlink_metadata(link) else {
+        return LinkState::Missing;
+    };
+    if !m.file_type().is_symlink() {
+        return LinkState::OtherFile;
+    }
+    let target = std::fs::read_link(link).unwrap_or_default();
+    match bundled {
+        Some(b) if target == b => LinkState::Ours,
+        _ => LinkState::OtherLink(target),
+    }
 }
 
 fn link_target(paths: &Paths) -> PathBuf {
@@ -153,9 +185,21 @@ fn integration(b: B<'_>, app: AppHandle) -> Integration {
         token_error: token.as_ref().err().map(|e| e.to_string()),
         token: token.ok(),
         cli_path: bundled_cli().map(|p| p.display().to_string()),
-        cli_linked: std::fs::symlink_metadata(&linked)
-            .is_ok()
-            .then(|| linked.display().to_string()),
+        cli_linked: matches!(
+            link_state(&linked, bundled_cli().as_deref()),
+            LinkState::Ours
+        )
+        .then(|| linked.display().to_string()),
+        cli_other: match link_state(&linked, bundled_cli().as_deref()) {
+            LinkState::OtherFile => Some(format!(
+                "{} is a different file, not a link to this app's CLI",
+                linked.display()
+            )),
+            LinkState::OtherLink(t) => {
+                Some(format!("{} links to {}", linked.display(), t.display()))
+            }
+            _ => None,
+        },
         home: paths.home.display().to_string(),
         backups_dir: paths.backups_dir.display().to_string(),
         version: app.package_info().version.to_string(),
@@ -236,6 +280,24 @@ fn open_dashboard(app: AppHandle, view: Option<String>) {
 #[tauri::command]
 fn window_visible(window: WebviewWindow) -> bool {
     window.is_visible().unwrap_or(false) && !window.is_minimized().unwrap_or(false)
+}
+
+/// The panel's height for its content, in logical pixels, within limits that
+/// keep it on a small screen.
+fn panel_height(want: f64) -> f64 {
+    if want.is_finite() {
+        want.clamp(320.0, 760.0)
+    } else {
+        620.0
+    }
+}
+
+/// Size the tray panel to its content (the panel window only).
+#[tauri::command]
+fn fit_panel(window: WebviewWindow, height: f64) {
+    if window.label() == "panel" {
+        let _ = window.set_size(tauri::LogicalSize::new(400.0, panel_height(height)));
+    }
 }
 
 #[tauri::command]
@@ -402,6 +464,7 @@ fn main() {
             reveal,
             open_dashboard,
             window_visible,
+            fit_panel,
             quit
         ])
         .setup(move |app| {
