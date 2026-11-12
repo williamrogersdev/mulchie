@@ -55,6 +55,7 @@ pub fn safe_test_config(paths: &Paths) -> mulchie_core::LoadedConfig {
     cfg.limits.default = None;
     cfg.limits.workspaces.clear();
     cfg.memory_guard.action = mulchie_core::config::MemoryAction::Off;
+    cfg.runaway.action = mulchie_core::config::MemoryAction::Off;
     cfg.updates.check = mulchie_core::config::UpdateCheck::Off;
     cfg.save_to(paths, 0).expect("write the test config");
     let loaded = Config::load_from(paths);

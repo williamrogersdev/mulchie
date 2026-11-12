@@ -84,7 +84,7 @@ Limits look at one session. The memory guard looks at the whole machine: when me
 mulchie config set memory_guard.action stop
 ```
 
-- **When it fires.** Less than `memory_guard.free_pct` (default 5) percent of memory is available, or the kernel reports critical memory pressure, for `sustain_secs` (default 15).
+- **When it fires.** Less than `memory_guard.free_pct` (default 5) percent of memory is available, or the kernel reports critical memory pressure, or swap in use reaches `memory_guard.swap_pct` (default 50) percent of physical memory, for `sustain_secs` (default 15). The swap check matters because a machine can fill its swap while a third of its memory still counts as available; macOS then stalls and restarts rather than end ordinary programs.
 - **What it closes.** The biggest unit using at least `min_mb` (default 300). With `scope: sessions` (the default) a unit is everything one agent session started; the agent itself is spared unless `include_agent` is set, so the agent sees its build or test run end and can carry on. With `scope: all` a unit can also be any other app, workspace or program of yours. That can be an app you are using, and unsaved work in it is lost.
 - **How.** SIGTERM to every process of the unit, then SIGKILL after `stop_grace_secs` (default 5) to what is left. Then it waits `cooldown_secs` (default 30) and, if memory is still low, closes the next biggest.
 - **A cap per unit.** `unit_max_mb` closes (or reports) any unit that stays over that much memory, even when the machine is not low. 0, the default, turns it off.
@@ -92,6 +92,24 @@ mulchie config set memory_guard.action stop
 - **Only the engine that holds the lock acts.** Any other engine reports.
 
 `mulchie limits` shows whether the guard acts, whether memory is low and what it closed. Closings are also written to `actions.jsonl` and, for a session, to its activity record as `memory_guard` events. Closing a process loses whatever it had not saved; the guard is a last resort that trades one process for a machine that keeps running.
+
+## Runaway chains
+
+A build script that calls itself (an `npm run build` whose build step runs `npm run build` again) adds a level about every second. Every level keeps its memory while it waits for the next one, so a machine can lose all its memory and swap in about ten minutes. Mulchie looks for that shape in every sample: one command line, in one working directory, running nested inside copies of itself. At `runaway.depth` copies (default 6) it is a runaway chain.
+
+By default Mulchie only reports it: a `runaway_chain` finding and a notification, with the command that stops it (`mulchie signal <pid> kill --tree`). To let Mulchie stop it:
+
+```sh
+mulchie config set runaway.action stop
+```
+
+- **What it stops.** The outermost copy of the command and everything under it. The shell that ran it, the agent and unrelated work are not touched.
+- **How.** It freezes every process of the chain (SIGSTOP), reads the process list again and freezes what appeared in the meantime, until nothing new appears. Then it kills them all (SIGKILL). The freeze is what keeps a level that started a moment ago from carrying on by itself. Every signal goes through the safety gate, which checks each process again by its start time.
+- **Afterwards.** For `runaway.remember_secs` (default one hour) the [`runaway_repeat` guard rule](/docs/hooks/#guard-rules) warns before the same command is run in the same directory again, and an agent session whose chain was stopped is told so at its next hook call. This memory is lost when the engine restarts.
+- **What it does not catch.** A chain whose levels differ in command line or directory, and processes that multiply without nesting. For those, a `processes` cap in a session budget and the memory guard still apply.
+- **Only the engine that holds the lock acts.** Any other engine reports.
+
+`mulchie limits` shows the chains running now, what Mulchie stopped and what is remembered. Stoppings are also written to `actions.jsonl` and, for a session, to its activity record as `runaway` events.
 
 ### Act on a session yourself
 
@@ -114,6 +132,7 @@ It holds these events:
 | `process_start` | A process that joined the session: pid, name and command line. At most `sessions.process_events_per_minute` a minute; the rest are summed in a `process_starts_summarised` event. |
 | `limit_breach`, `limit_action`, `limit_cleared` | A cap that was exceeded, what Mulchie did about it, and when it ended. |
 | `memory_guard` | The memory guard closed what the session started: why, how much memory, and the outcome. |
+| `runaway` | Mulchie stopped a command that kept starting itself: the command, its directory, how deep it was nested, and the outcome. |
 | `hook_session_start`, `hook_prompt`, `hook_pre_tool`, `hook_post_tool`, `hook_stop`, `hook_session_end` | What the agent's hooks reported: the client, the tool, the command, the guard's decision and the rule. |
 | `truncated` | The record hit a size cap. |
 

@@ -52,6 +52,9 @@ pub enum Trigger {
     MemoryLow,
     /// The unit itself stayed over `unit_max_mb`.
     OverCap,
+    /// Swap in use stayed over `swap_pct` of physical memory while memory
+    /// was not otherwise low; this was the biggest unit.
+    SwapHigh,
 }
 
 /// The unit the guard would close now (or will, after the cooldown).
@@ -73,6 +76,9 @@ pub struct Closing {
     pub trigger: Trigger,
     /// Percent of memory available when it was decided.
     pub free_pct: f32,
+    /// Swap in use, as a percent of physical memory, when it was decided.
+    #[serde(default)]
+    pub swap_pct: f32,
     pub pressure: Option<String>,
     pub key: String,
     pub name: String,
@@ -93,6 +99,10 @@ impl Closing {
         let why = match self.trigger {
             Trigger::MemoryLow => format!("memory was {:.0}% free", self.free_pct),
             Trigger::OverCap => "it was over the memory guard's cap".to_string(),
+            Trigger::SwapHigh => format!(
+                "swap in use had reached {:.0}% of physical memory",
+                self.swap_pct
+            ),
         };
         format!(
             "Mulchie closed {} ({} process(es), {}) because {why}",
@@ -118,6 +128,8 @@ pub struct Memory {
     pub free_pct: f32,
     /// The kernel's level: `normal`, `warning`, `critical`.
     pub pressure: Option<String>,
+    /// Swap in use, as a percent of physical memory.
+    pub swap_pct: f32,
 }
 
 #[derive(Debug, Default)]
@@ -126,6 +138,9 @@ pub struct MemGuard {
     /// Memory has been low for `sustain_secs`.
     low_due: bool,
     free_pct: f32,
+    swap_pct: f32,
+    /// Low only because of swap (memory itself is not short).
+    by_swap: bool,
     pressure: Option<String>,
     /// Unit key → when it went over `unit_max_mb`.
     over: HashMap<String, u64>,
@@ -150,6 +165,15 @@ impl MemGuard {
 
     pub fn free_pct(&self) -> f32 {
         self.free_pct
+    }
+
+    pub fn swap_pct(&self) -> f32 {
+        self.swap_pct
+    }
+
+    /// Memory counts as low only because swap is filling up.
+    pub fn by_swap(&self) -> bool {
+        self.by_swap
     }
 
     pub fn pressure(&self) -> Option<&str> {
@@ -218,8 +242,10 @@ impl MemGuard {
         can_act: bool,
     ) -> Option<String> {
         self.free_pct = mem.free_pct;
+        self.swap_pct = mem.swap_pct;
         self.pressure = mem.pressure.clone();
         if cfg.action == MemoryAction::Off {
+            self.by_swap = false;
             self.low_since = None;
             self.low_due = false;
             self.over.clear();
@@ -227,8 +253,16 @@ impl MemGuard {
             self.announced = None;
             return None;
         }
-        let low = mem.free_pct < cfg.free_pct
+        let short = mem.free_pct < cfg.free_pct
             || (cfg.on_pressure && mem.pressure.as_deref() == Some("critical"));
+        let swapping = cfg.swap_pct > 0 && mem.swap_pct >= cfg.swap_pct as f32;
+        let low = short || swapping;
+        self.by_swap = swapping && !short;
+        let low_trigger = if self.by_swap {
+            Trigger::SwapHigh
+        } else {
+            Trigger::MemoryLow
+        };
         if low {
             self.low_since.get_or_insert(now);
         } else {
@@ -258,7 +292,7 @@ impl MemGuard {
                     .max_by(biggest)
             })
             .flatten()
-            .map(|u| (u, Trigger::MemoryLow));
+            .map(|u| (u, low_trigger));
         let pick = for_low.or_else(|| {
             units
                 .iter()
@@ -295,6 +329,7 @@ impl MemGuard {
             at_unix: now,
             trigger,
             free_pct: mem.free_pct,
+            swap_pct: mem.swap_pct,
             pressure: mem.pressure.clone(),
             key: u.key.clone(),
             name: u.name.clone(),

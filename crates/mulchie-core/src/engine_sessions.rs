@@ -71,6 +71,8 @@ pub(crate) enum LimitJob {
         targets: Vec<(u32, u64)>,
         at: u64,
     },
+    /// Freeze and kill a runaway chain (see `engine_runaway.rs`).
+    RunawayStop { id: String },
 }
 
 /// Paused processes whose pause no longer applies and that no queued job
@@ -135,6 +137,9 @@ pub(crate) struct Supervision {
     /// The memory guard and its current finding (see `engine_memguard.rs`).
     pub(crate) guard: crate::memguard::MemGuard,
     pub(crate) guard_findings: Vec<Finding>,
+    /// Runaway chains and their findings (see `engine_runaway.rs`).
+    pub(crate) runaway: crate::runaway::Runaway,
+    pub(crate) runaway_findings: Vec<Finding>,
     pub(crate) paused: Vec<PausedProc>,
     /// Found in `paused.json` at start and not resumed by this engine
     /// (automation is off here); reported in state.
@@ -268,6 +273,10 @@ pub struct LimitsStatus {
     /// The memory guard: whether it acts, whether memory is low, and what it
     /// closed.
     pub memory_guard: super::memguard_glue::MemoryGuardStatus,
+    /// Runaway chains: commands nested inside copies of themselves, what
+    /// Mulchie stopped, and the commands the `runaway_repeat` guard rule
+    /// matches.
+    pub runaway: super::runaway_glue::RunawayStatus,
     /// A7: why not, when `enforcing` is false: `not_lock_holder` (another
     /// engine holds the lock) or `config_error` (the config file did not
     /// load).
@@ -579,6 +588,7 @@ impl Engine {
             findings.push(paused_file_finding(paths, e, now));
         }
         findings.extend(sup.guard_findings.iter().cloned());
+        findings.extend(sup.runaway_findings.iter().cloned());
         findings
     }
 
@@ -681,6 +691,7 @@ impl Engine {
                 LimitJob::Persist => self.persist_paused(),
                 LimitJob::GuardClose { id } => self.guard_close(&id, now),
                 LimitJob::GuardKill { id, targets, .. } => self.guard_kill(&id, &targets, now),
+                LimitJob::RunawayStop { id } => self.runaway_stop(&id, now),
             }
         }
     }
@@ -1419,6 +1430,7 @@ impl Engine {
             None
         };
         let memory_guard = self.memory_guard_status();
+        let runaway = self.runaway_status();
         let sup = lock(&self.sup);
         let mut breaches: Vec<Breach> = sup.limits.breaches().cloned().collect();
         breaches.sort_by_key(|b| std::cmp::Reverse(b.breached_unix));
@@ -1431,6 +1443,7 @@ impl Engine {
             paused_left: sup.paused_left.clone(),
             enforcing: reason.is_none(),
             memory_guard,
+            runaway,
             not_enforcing_reason: reason.map(String::from),
         }
     }

@@ -150,9 +150,13 @@ pub fn tool_for_api_request(r: &Value) -> Option<(&'static str, Value, Option<St
                 (_, Some(g), _) => body["action"]
                     .as_str()
                     .map(|a| format!("mulchie group {} {}", q(g), q(a))),
-                (_, _, Some(p)) => body["signal"]
-                    .as_str()
-                    .map(|sig| format!("mulchie signal {p} {}", q(sig))),
+                (_, _, Some(p)) => body["signal"].as_str().map(|sig| {
+                    format!(
+                        "mulchie signal {p} {}{}",
+                        q(sig),
+                        if body["tree"] == true { " --tree" } else { "" }
+                    )
+                }),
                 _ => None,
             };
             Some(("plan_process_action", Value::Object(args), line))
@@ -1393,6 +1397,19 @@ mod tests {
         let j = d.to_string();
         assert!(j.find("\"cpu\"").unwrap() < j.find("\"recommendations\"").unwrap());
         assert!(j.len() < 12_000, "{}", j.len());
+    }
+
+    #[test]
+    fn a_tree_plan_keeps_tree_in_the_call_and_the_command() {
+        let f = json!({ "id": "runaway_chain:42:7", "kind": "runaway_chain", "severity": "high", "title": "t", "why": "", "evidence": {},
+            "suggested": [
+                { "label": "Plan killing the chain", "api_request": { "method": "POST", "route": "/v1/process/plan", "body": { "pid": 42, "signal": "kill", "tree": true } } } ] });
+        let b = finding_brief(&f);
+        assert_eq!(
+            b["next_calls"][0]["arguments"],
+            json!({ "pid": 42, "signal": "kill", "tree": true })
+        );
+        assert_eq!(b["cli"][0], "mulchie signal 42 kill --tree");
     }
 
     #[test]

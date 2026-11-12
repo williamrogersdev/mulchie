@@ -16,6 +16,7 @@ fn verdict_in(cmd: &str, cwd: &str, branch: Option<&str>) -> Verdict {
         config_dir: Path::new("/Users/u/.config/mulchie"),
         current_branch: branch,
         mulchie_pids: &[4242],
+        runaways: &[],
     };
     check(&input, &GuardConfig::default())
 }
@@ -328,6 +329,7 @@ fn modes_and_aggregation() {
         config_dir: Path::new("/Users/u/.config/mulchie"),
         current_branch: None,
         mulchie_pids: &[],
+        runaways: &[],
     };
     let v = check(&input, &cfg);
     assert_eq!(v.decision, Decision::Warn);
@@ -370,6 +372,7 @@ fn without_a_workspace_the_working_directory_is_the_boundary() {
         config_dir: Path::new("/Users/u/.config/mulchie"),
         current_branch: None,
         mulchie_pids: &[],
+        runaways: &[],
     };
     let cfg = GuardConfig::default();
     // N9: outside the working directory counts, inside does not.

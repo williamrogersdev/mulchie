@@ -45,6 +45,8 @@ pub struct Config {
     pub limits: LimitsConfig,
     /// What happens when the whole machine runs low on memory.
     pub memory_guard: MemoryGuardConfig,
+    /// What happens when a command keeps starting itself.
+    pub runaway: RunawayConfig,
     /// Guard rules applied to shell commands sent through `POST /v1/hook`.
     pub guard: GuardConfig,
     /// Update and advisory checks.
@@ -183,6 +185,7 @@ impl Default for Config {
             sessions: SessionsConfig::default(),
             limits: LimitsConfig::default(),
             memory_guard: MemoryGuardConfig::default(),
+            runaway: RunawayConfig::default(),
             guard: GuardConfig::default(),
             updates: UpdatesConfig::default(),
         }
@@ -489,6 +492,10 @@ pub struct MemoryGuardConfig {
     pub free_pct: f32,
     /// ... or when the kernel reports critical memory pressure.
     pub on_pressure: bool,
+    /// ... or when swap in use reaches this percent of physical memory
+    /// (0: swap is not looked at). A machine can fill its swap while a good
+    /// share of memory still counts as available.
+    pub swap_pct: u64,
     /// How long memory must stay low (or a unit over `unit_max_mb`) first.
     pub sustain_secs: u64,
     /// Nothing using less than this is closed for low memory.
@@ -513,6 +520,7 @@ impl Default for MemoryGuardConfig {
             scope: MemoryScope::Sessions,
             free_pct: 5.0,
             on_pressure: true,
+            swap_pct: 50,
             sustain_secs: 15,
             min_mb: 300,
             unit_max_mb: 0,
@@ -528,6 +536,9 @@ impl MemoryGuardConfig {
     pub fn validate(&self, e: &mut Vec<String>) {
         if !(1.0..=50.0).contains(&self.free_pct) {
             e.push("memory_guard.free_pct must be between 1 and 50".into());
+        }
+        if self.swap_pct > 1000 {
+            e.push("memory_guard.swap_pct must be between 0 (off) and 1000".into());
         }
         if self.sustain_secs > 3600 {
             e.push("memory_guard.sustain_secs must be between 0 and 3600".into());
@@ -553,6 +564,45 @@ impl MemoryGuardConfig {
             .any(|n| n.is_empty() || n.len() > 255 || n.contains('/'))
         {
             e.push("memory_guard.never names must be 1 to 255 characters without '/'".into());
+        }
+    }
+}
+
+// ----------------------------------------------------------- runaway
+
+/// `runaway`: what happens when a command is found nested inside copies of
+/// itself (see [`crate::runaway`]): a build script that calls itself.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(default)]
+pub struct RunawayConfig {
+    /// `off`, `notify` (a finding and a notification) or `stop` (freeze the
+    /// chain, then SIGKILL it).
+    pub action: MemoryAction,
+    /// A command nested inside this many copies of itself (itself included),
+    /// same command line and working directory, is a runaway chain.
+    pub depth: usize,
+    /// How long the `runaway_repeat` guard rule matches the same command in
+    /// the same directory afterwards (0: it is not remembered).
+    pub remember_secs: u64,
+}
+
+impl Default for RunawayConfig {
+    fn default() -> Self {
+        Self {
+            action: MemoryAction::Notify,
+            depth: 6,
+            remember_secs: 3600,
+        }
+    }
+}
+
+impl RunawayConfig {
+    pub fn validate(&self, e: &mut Vec<String>) {
+        if !(3..=64).contains(&self.depth) {
+            e.push("runaway.depth must be between 3 and 64".into());
+        }
+        if self.remember_secs > 604_800 {
+            e.push("runaway.remember_secs must be between 0 and 604800".into());
         }
     }
 }
@@ -592,6 +642,9 @@ pub struct GuardRules {
     pub credential_read: RuleMode,
     /// Write shell startup files, launch agents, systemd user units or crontab.
     pub startup_write: RuleMode,
+    /// Run again, in the same directory, a command Mulchie saw starting
+    /// itself over and over (`runaway`).
+    pub runaway_repeat: RuleMode,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -839,6 +892,7 @@ impl Config {
         self.sessions.validate(&mut e);
         self.limits.validate(&mut e);
         self.memory_guard.validate(&mut e);
+        self.runaway.validate(&mut e);
         self.guard.validate(&mut e);
         self.updates.validate(&mut e);
         if e.is_empty() {
