@@ -91,6 +91,7 @@ These come from [sessions and limits](/docs/sessions/) and [update checks](/docs
 | `limit_exceeded` | An agent session stayed over a cap of its budget for the sustain time. The title says which cap, the value and what Mulchie did. | medium; high when the action is `pause` or `stop` |
 | `session_hog` | An agent session uses at least `limits.hog_share_pct` of the machine's CPU or memory while health is strained or critical. Only a report; no budget is needed. | medium |
 | `paused_list_unreadable` | The file of processes Mulchie paused for a limit could not be read at start, so processes paused by an earlier engine may still be stopped. | high |
+| `memory_low` | The machine stayed low on memory, or a consumer stayed over `memory_guard.unit_max_mb`. The title says what the [memory guard](/docs/sessions/#the-memory-guard) closed or would close. | high |
 | `mulchie_update` | A newer Mulchie release is out. | low |
 | `agent_update` | A newer version of an installed agent tool is out. | low |
 | `homebrew_outdated` | Homebrew packages are outdated, from Homebrew's local data. | info |

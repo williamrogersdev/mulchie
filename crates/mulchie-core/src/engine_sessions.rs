@@ -63,6 +63,14 @@ pub(crate) enum LimitJob {
     },
     /// Write `paused.json`.
     Persist,
+    /// Carry out a memory guard closing (SIGTERM).
+    GuardClose { id: String },
+    /// SIGKILL what is left of a memory guard closing after its grace period.
+    GuardKill {
+        id: String,
+        targets: Vec<(u32, u64)>,
+        at: u64,
+    },
 }
 
 /// Paused processes whose pause no longer applies and that no queued job
@@ -113,7 +121,7 @@ fn paused_without_a_pause(sup: &Supervision, cfg: &Config) -> (Vec<PausedProc>, 
 impl LimitJob {
     fn due(&self, now: u64) -> bool {
         match self {
-            LimitJob::Kill { at, .. } => *at <= now,
+            LimitJob::Kill { at, .. } | LimitJob::GuardKill { at, .. } => *at <= now,
             _ => true,
         }
     }
@@ -124,6 +132,9 @@ impl LimitJob {
 pub(crate) struct Supervision {
     pub(crate) tracker: Tracker,
     pub(crate) limits: Limits,
+    /// The memory guard and its current finding (see `engine_memguard.rs`).
+    pub(crate) guard: crate::memguard::MemGuard,
+    pub(crate) guard_findings: Vec<Finding>,
     pub(crate) paused: Vec<PausedProc>,
     /// Found in `paused.json` at start and not resumed by this engine
     /// (automation is off here); reported in state.
@@ -254,6 +265,9 @@ pub struct LimitsStatus {
     pub paused_left: Vec<PausedProc>,
     /// Limit actions run only on the engine that automates.
     pub enforcing: bool,
+    /// The memory guard: whether it acts, whether memory is low, and what it
+    /// closed.
+    pub memory_guard: super::memguard_glue::MemoryGuardStatus,
     /// A7: why not, when `enforcing` is false: `not_lock_holder` (another
     /// engine holds the lock) or `config_error` (the config file did not
     /// load).
@@ -287,7 +301,7 @@ fn save_paused(paths: &Paths, paused: &[PausedProc]) -> std::io::Result<()> {
 }
 
 /// `pid 12: start_time_mismatch, pid 13: process_gone` (at most four).
-fn skipped_words(results: &[ActionResult]) -> String {
+pub(super) fn skipped_words(results: &[ActionResult]) -> String {
     let skipped: Vec<String> = results
         .iter()
         .filter_map(|r| match &r.outcome {
@@ -307,7 +321,7 @@ fn skipped_words(results: &[ActionResult]) -> String {
     s
 }
 
-fn state_of(done: usize, total: usize) -> ActionState {
+pub(super) fn state_of(done: usize, total: usize) -> ActionState {
     if total > 0 && done == total {
         ActionState::Done
     } else if done > 0 {
@@ -509,10 +523,7 @@ impl Engine {
                     SessionEvent::ProcessStarted { .. } => {}
                 }
             }
-            let mut findings = limit_findings(&sup.limits, &sup.tracker, now);
-            if let Some(e) = &sup.paused_file_error {
-                findings.push(paused_file_finding(&self.paths, e, now));
-            }
+            let findings = Self::limit_category_findings(sup, &self.paths, now);
             let rl = RecordLimits::from_config(&cfg.sessions);
             let limits_changed = sup.record_limits.replace(rl) != Some(rl);
             let sweep = records && now >= sup.last_sweep.saturating_add(SWEEP_SECS);
@@ -557,6 +568,23 @@ impl Engine {
             }
             self.log("limit", text, 0, ws, "limits");
         }
+        self.replace_findings(FindingCategory::Limit, findings, now);
+    }
+
+    /// Every finding of the `limit` category: breaches, hogs, an unreadable
+    /// paused list and the memory guard's.
+    fn limit_category_findings(sup: &Supervision, paths: &Paths, now: u64) -> Vec<Finding> {
+        let mut findings = limit_findings(&sup.limits, &sup.tracker, now);
+        if let Some(e) = &sup.paused_file_error {
+            findings.push(paused_file_finding(paths, e, now));
+        }
+        findings.extend(sup.guard_findings.iter().cloned());
+        findings
+    }
+
+    /// Store the `limit` findings again (after the memory guard changed its own).
+    pub(crate) fn publish_limit_findings(&self, now: u64) {
+        let findings = Self::limit_category_findings(&lock(&self.sup), &self.paths, now);
         self.replace_findings(FindingCategory::Limit, findings, now);
     }
 
@@ -651,6 +679,8 @@ impl Engine {
                     self.resume_entries(&entries, "limits");
                 }
                 LimitJob::Persist => self.persist_paused(),
+                LimitJob::GuardClose { id } => self.guard_close(&id, now),
+                LimitJob::GuardKill { id, targets, .. } => self.guard_kill(&id, &targets, now),
             }
         }
     }
@@ -1388,6 +1418,7 @@ impl Engine {
         } else {
             None
         };
+        let memory_guard = self.memory_guard_status();
         let sup = lock(&self.sup);
         let mut breaches: Vec<Breach> = sup.limits.breaches().cloned().collect();
         breaches.sort_by_key(|b| std::cmp::Reverse(b.breached_unix));
@@ -1399,6 +1430,7 @@ impl Engine {
             paused_by_mulchie: sup.paused.clone(),
             paused_left: sup.paused_left.clone(),
             enforcing: reason.is_none(),
+            memory_guard,
             not_enforcing_reason: reason.map(String::from),
         }
     }

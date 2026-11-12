@@ -5,7 +5,7 @@ members = ["crates/mulchie-core", "crates/mulchie-cli", "crates/mulchie-app"]
 default-members = ["crates/mulchie-core", "crates/mulchie-cli"]
 
 [workspace.package]
-version = "0.3.0"
+version = "0.3.0-rc.1"
 edition = "2021"
 rust-version = "1.97"
 license = "MIT"
@@ -20,7 +20,7 @@ categories = ["command-line-utilities", "development-tools"]
 # Members turn on mulchie-core's `network` feature themselves (the CLI behind its
 # own default `network` feature), so `--no-default-features` can build without
 # the HTTPS client, e.g. to cross-check Linux without a C cross-compiler.
-mulchie-core = { version = "0.3.0", path = "crates/mulchie-core", default-features = false }
+mulchie-core = { version = "0.3.0-rc.1", path = "crates/mulchie-core", default-features = false }
 serde = { version = "1.0.229", features = ["derive", "rc"] }
 serde_json = "1.0.154"
 libc = "0.2.191"

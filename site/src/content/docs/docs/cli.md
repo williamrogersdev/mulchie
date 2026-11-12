@@ -244,7 +244,7 @@ With no id, every agent session, running first, with CPU, memory, processes and 
 mulchie limits [--json]
 ```
 
-Whether session budgets only report or act, the budgets themselves, sessions over a cap and what was done about it, sessions hogging the machine, and processes Mulchie paused.
+Whether session budgets only report or act, the budgets themselves, sessions over a cap and what was done about it, sessions hogging the machine, and processes Mulchie paused. It also shows the [memory guard](/docs/sessions/#the-memory-guard): whether it closes things when memory runs low or only reports, what it would close next, and what it closed.
 
 ### updates
 

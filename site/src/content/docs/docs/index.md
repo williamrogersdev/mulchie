@@ -7,7 +7,7 @@ Use these pages to install Mulchie, see what is using your machine, queue heavy 
 
 Mulchie keeps one machine healthy while several AI coding agents work on it. It shows what uses CPU, memory, disk I/O and disk space by repo and worktree, and what each agent session and everything it started is using. It queues heavy builds, notices processes that look left over or out of place, and reclaims space from build caches and idle worktrees without losing work. It can hold agents to budgets you set, tell them when a command looks risky, and report newer versions. It is a supervisor, not a sandbox and not an antivirus.
 
-It ships as the `mulchie` command, a macOS menu bar app with a dashboard, and an MCP server (`mulchie mcp`). The engine also serves a local HTTP API. The engine, CLI and MCP server run on macOS and Linux. The app is macOS only.
+It ships as the `mulchie` command, a macOS menu bar app with a dashboard, and an MCP server (`mulchie mcp`). The first release ships only the command; the app is built from source for now (see [Install](/install/#app)). The engine also serves a local HTTP API. The engine, CLI and MCP server run on macOS and Linux. The app is macOS only.
 
 ## Start here
 

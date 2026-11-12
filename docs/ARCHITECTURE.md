@@ -23,7 +23,7 @@ The third job deletes directories and the second and fourth signal processes. Ev
                  │                                                                    │
  sysinfo, git ──▶│ monitor ──▶ engine (state, optimizer, build queue)                 │
  filesystem   ──▶│ reclaim, diskmap (scanners: read-only)                             │
-                 │ watch (findings), consumers, session tracker, limits (pure)        │
+                 │ watch (findings), consumers, session tracker, limits, memguard     │
                  │ guard (pure), updates (HTTPS and `brew outdated`)                  │
                  │                 │                                                  │
                  │                 ▼                                                  │
@@ -146,9 +146,19 @@ A session is a root process recognised as an agent plus every descendant. A root
 - With or without budgets, a session using `limits.hog_share_pct` of CPU or memory while health is strained or critical for `limits.hog_sustain_secs` becomes a `session_hog` finding. That only reports.
 - A breach is delivered to the agent once, through its next hook call (only to the client the session is bound to), and shows in `diagnose` and `GET /v1/limits/status`.
 
+### Memory guard (`memguard.rs`, `engine_memguard.rs`)
+
+Limits hold one session to its budget. The memory guard looks at the whole machine. `memory_guard.action` is `off`, `notify` (default) or `stop`.
+
+- Memory is low when less than `free_pct` of it is available or, with `on_pressure`, the kernel reports critical pressure, for `sustain_secs`.
+- The sample loop builds the closable units from the sample: one per running session Mulchie detected (what the agent started; the agent too with `include_agent`), and with `scope: all` every other consumer group whose members are all the user's own, none protected, none named in `never`, and none an ancestor of an agent session or of the engine. A session's processes are only ever in the session's unit.
+- `MemGuard::evaluate` is pure. It picks the biggest unit using at least `min_mb` (or, with `unit_max_mb`, a unit that stayed over that cap), at most one per `cooldown_secs`. A unit of which the gate closed nothing is left alone for ten minutes.
+- With `notify`, or on an engine that does not automate, the result is a `memory_low` finding and one notification per episode. With `stop`, the closing is queued for the limits worker: `Signal` SIGTERM for every process with the start time the sample saw, then SIGKILL after `stop_grace_secs` to what is left, all through the gate, journaled, and written to the session's record as `memory_guard` events.
+- `state.memory_guard` and `memory_guard` in `GET /v1/limits/status` report the action, whether this engine enforces it, whether memory is low, what would be closed and the last 50 closings.
+
 ### Activity record (`record.rs`)
 
-Each session has an append-only record in `<config dir>/sessions/<id>.jsonl`: files `0600` in a `0700` directory. Events carry `seq`, `t` and `type`: `session_start`, `session_end`, `process_start`, `process_starts_summarised`, `limit_breach`, `limit_action`, `limit_cleared`, `hook_<event>` and `truncated`. Command lines are redacted by `redact.rs` before they are stored, which is pattern-based and best effort, and prompt text is never sent to the engine. Every string is cut at 4096 bytes.
+Each session has an append-only record in `<config dir>/sessions/<id>.jsonl`: files `0600` in a `0700` directory. Events carry `seq`, `t` and `type`: `session_start`, `session_end`, `process_start`, `process_starts_summarised`, `limit_breach`, `limit_action`, `limit_cleared`, `memory_guard`, `hook_<event>` and `truncated`. Command lines are redacted by `redact.rs` before they are stored, which is pattern-based and best effort, and prompt text is never sent to the engine. Every string is cut at 4096 bytes.
 
 Writes go through a bounded queue to one writer thread, so the sample loop never waits on the disk. A record stops at `sessions.max_record_mb` or `sessions.max_events` (one `truncated` event), process starts are limited to `sessions.process_events_per_minute` per session, and the directory is held to `sessions.max_total_mb`. Records of ended sessions are deleted after `sessions.retain_days`.
 
@@ -254,4 +264,4 @@ Docs describe only behaviour the code has.
 
 ## Quality gates
 
-CI on every pull request, on macOS and Ubuntu: `cargo fmt --check`, `cargo clippy -D warnings`, `cargo test`, the MCP smoke test over real stdio, and the discovery test (`openapi.yaml` routes, `server.json` version). Ubuntu also runs clippy for `--no-default-features`. Scripts and workflows are checked with ShellCheck and actionlint, and the site workflow builds the site. Tests never touch the real home directory: paths, clock and process table are injected, and a test that starts an engine first writes a config with build throttling off, no budgets and update checks off, so it cannot renice real processes or reach the network. The safety gate is tested against real temporary git repositories, one test per rule above.
+CI on every pull request, on macOS and Ubuntu: `cargo fmt --check`, `cargo clippy -D warnings`, `cargo test`, the MCP smoke test over real stdio, and the discovery test (`openapi.yaml` routes, `server.json` version). Ubuntu also runs clippy for `--no-default-features`. Scripts and workflows are checked with ShellCheck and actionlint, and the site workflow builds the site. Tests never touch the real home directory: paths, clock and process table are injected, and a test that starts an engine first writes a config with build throttling off, no budgets, the memory guard off and update checks off, so it cannot renice or close real processes or reach the network. The safety gate is tested against real temporary git repositories, one test per rule above.

@@ -1,7 +1,8 @@
 name: Publish
 
 # Runs when a person publishes the draft release created by release.yml:
-#   - updates the Homebrew tap (cask and formula)
+#   - updates the Homebrew tap (cask and formula; only the formula when the release has no
+#     DMG, which is a CLI-only release)
 #   - publishes mulchie-core and mulchie to crates.io
 # Both are skipped for a pre-release (a tag such as v0.3.0-rc.1, or a release marked as a
 # pre-release): a crates.io publish cannot be undone and the tap has no pre-release channel.
@@ -54,6 +55,20 @@ jobs:
         id: version
         run: echo "version=$(scripts/workspace-version.sh "$TAG")" >> "$GITHUB_OUTPUT"
 
+      # The release's own asset list decides: a DMG means a full release (cask and
+      # formula), no DMG means a CLI-only one (formula only).
+      - name: Look for a DMG among the release assets
+        if: steps.gate.outputs.enabled == 'true'
+        id: kind
+        run: |
+          DMGS="$(gh release view "$TAG" --repo "$GITHUB_REPOSITORY" --json assets --jq '[.assets[].name | select(endswith(".dmg"))] | length')"
+          if [[ "$DMGS" -gt 0 ]]; then
+            echo "app=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "::notice::$TAG has no DMG, so only the Homebrew formula is updated, not the cask."
+            echo "app=false" >> "$GITHUB_OUTPUT"
+          fi
+
       - name: Download release assets
         if: steps.gate.outputs.enabled == 'true'
         run: |
@@ -61,9 +76,14 @@ jobs:
           gh release download "$TAG" --repo "$GITHUB_REPOSITORY" --dir assets \
             --pattern '*.tar.gz.sha256' --pattern 'SHA256SUMS' --pattern '*.dmg'
           ls -l assets
+          # A full release lists its DMG in SHA256SUMS. If it does and the DMG is gone, stop.
+          if [[ "${{ steps.kind.outputs.app }}" != "true" ]] && grep -q '\.dmg' assets/SHA256SUMS; then
+            echo "::error::SHA256SUMS lists a DMG but the release has none. Refusing to publish a formula-only update."
+            exit 1
+          fi
 
       - name: Check the DMG against SHA256SUMS
-        if: steps.gate.outputs.enabled == 'true'
+        if: steps.gate.outputs.enabled == 'true' && steps.kind.outputs.app == 'true'
         run: |
           cd assets
           grep -F "Mulchie_${VERSION}_universal.dmg" SHA256SUMS | sha256sum -c -
@@ -80,17 +100,27 @@ jobs:
 
       - name: Render cask and formula
         if: steps.gate.outputs.enabled == 'true'
-        run: scripts/render-homebrew.sh "$VERSION" assets tap
+        run: |
+          if [[ "$APP" == "true" ]]; then
+            scripts/render-homebrew.sh "$VERSION" assets tap
+          else
+            scripts/render-homebrew.sh --formula-only "$VERSION" assets tap
+          fi
         env:
           VERSION: ${{ steps.version.outputs.version }}
+          APP: ${{ steps.kind.outputs.app }}
 
       - name: Commit and push to the tap
         if: steps.gate.outputs.enabled == 'true'
         working-directory: tap
         env:
           VERSION: ${{ steps.version.outputs.version }}
+          APP: ${{ steps.kind.outputs.app }}
         run: |
-          git add Casks/mulchie.rb Formula/mulchie-cli.rb
+          git add Formula/mulchie-cli.rb
+          if [[ "$APP" == "true" ]]; then
+            git add Casks/mulchie.rb
+          fi
           if git diff --cached --quiet; then
             echo "The tap is already at $VERSION."
             exit 0

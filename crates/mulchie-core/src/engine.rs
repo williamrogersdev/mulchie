@@ -34,6 +34,9 @@ use serde_json::{json, Value};
 mod sessions;
 use sessions::Supervision;
 
+#[path = "engine_memguard.rs"]
+mod memguard_glue;
+pub use memguard_glue::MemoryGuardStatus;
 #[path = "engine_hook.rs"]
 mod hook;
 pub use hook::{GuardCheckReply, GuardCheckRequest, HookEvent, HookReply, HookRequest};
@@ -391,6 +394,8 @@ pub struct State {
     pub findings_unix: Option<u64>,
     /// Agent sessions, limit breaches and the activity record, compact.
     pub sessions: SessionsState,
+    /// The memory guard: whether it acts, whether memory is low, what it closed.
+    pub memory_guard: MemoryGuardStatus,
     /// Update checks, compact (the full report: `GET /v1/updates`).
     pub updates: UpdatesStatus,
 }
@@ -784,6 +789,7 @@ impl Engine {
             finding_counts: FindingCounts::default(),
             findings_unix: None,
             sessions: SessionsState::default(),
+            memory_guard: MemoryGuardStatus::default(),
             updates: UpdatesStatus::default(),
         };
         Self {
@@ -852,6 +858,7 @@ impl Engine {
             .filter(|r| r.restore_failed)
             .count();
         st.sessions = self.sessions_state(&st.config);
+        st.memory_guard = self.memory_guard_status();
         st.updates = self.updates_status(false);
         st
     }
@@ -1358,6 +1365,7 @@ impl Engine {
             },
             &cfg,
         );
+        self.observe_memory(now, &snap, &cfg);
 
         let mut notes = Vec::new();
         {

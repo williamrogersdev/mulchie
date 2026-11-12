@@ -25,6 +25,7 @@ fn safe_config(paths: &Paths) -> mulchie_core::LoadedConfig {
     cfg.throttle_builds = false;
     cfg.limits.default = None;
     cfg.limits.workspaces.clear();
+    cfg.memory_guard.action = mulchie_core::config::MemoryAction::Off;
     cfg.updates.check = mulchie_core::config::UpdateCheck::Off;
     cfg.save_to(paths, 0).expect("write the test config");
     Config::load_from(paths)

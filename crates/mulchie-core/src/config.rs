@@ -43,6 +43,8 @@ pub struct Config {
     pub sessions: SessionsConfig,
     /// Per-session budgets. Empty: report only.
     pub limits: LimitsConfig,
+    /// What happens when the whole machine runs low on memory.
+    pub memory_guard: MemoryGuardConfig,
     /// Guard rules applied to shell commands sent through `POST /v1/hook`.
     pub guard: GuardConfig,
     /// Update and advisory checks.
@@ -180,6 +182,7 @@ impl Default for Config {
             agents: AgentsConfig::default(),
             sessions: SessionsConfig::default(),
             limits: LimitsConfig::default(),
+            memory_guard: MemoryGuardConfig::default(),
             guard: GuardConfig::default(),
             updates: UpdatesConfig::default(),
         }
@@ -441,6 +444,115 @@ impl LimitsConfig {
         }
         if !(10..=3600).contains(&self.hog_sustain_secs) {
             e.push("limits.hog_sustain_secs must be between 10 and 3600".into());
+        }
+    }
+}
+
+// ------------------------------------------------------ memory guard
+
+/// What the memory guard does when memory is low or a unit is over
+/// `unit_max_mb`.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum MemoryAction {
+    /// Nothing is watched or reported.
+    Off,
+    /// A finding and a notification naming what would be closed.
+    #[default]
+    Notify,
+    /// SIGTERM the biggest closable unit, SIGKILL after `stop_grace_secs`.
+    Stop,
+}
+
+/// What the memory guard may close.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum MemoryScope {
+    /// What agent sessions started (the agent itself only with
+    /// `include_agent`).
+    #[default]
+    Sessions,
+    /// Also any other app, workspace or program of the user that is not
+    /// protected and does not host an agent session.
+    All,
+}
+
+/// `memory_guard`: close the biggest closable consumer when the machine runs
+/// low on memory (see [`crate::memguard`]). Unlike `limits`, it looks at the
+/// whole machine, and with `scope: all` at more than agent sessions.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(default)]
+pub struct MemoryGuardConfig {
+    pub action: MemoryAction,
+    pub scope: MemoryScope,
+    /// Memory is low when less than this percent of it is available.
+    pub free_pct: f32,
+    /// ... or when the kernel reports critical memory pressure.
+    pub on_pressure: bool,
+    /// How long memory must stay low (or a unit over `unit_max_mb`) first.
+    pub sustain_secs: u64,
+    /// Nothing using less than this is closed for low memory.
+    pub min_mb: u64,
+    /// Close a unit using more than this even when memory is not low
+    /// (0: no such cap).
+    pub unit_max_mb: u64,
+    /// At least this long between two closings.
+    pub cooldown_secs: u64,
+    /// Between SIGTERM and SIGKILL.
+    pub stop_grace_secs: u64,
+    /// Let a session's agent process be closed with what it started.
+    pub include_agent: bool,
+    /// Process names never closed (a group holding one is left alone).
+    pub never: Vec<String>,
+}
+
+impl Default for MemoryGuardConfig {
+    fn default() -> Self {
+        Self {
+            action: MemoryAction::Notify,
+            scope: MemoryScope::Sessions,
+            free_pct: 5.0,
+            on_pressure: true,
+            sustain_secs: 15,
+            min_mb: 300,
+            unit_max_mb: 0,
+            cooldown_secs: 30,
+            stop_grace_secs: 5,
+            include_agent: false,
+            never: Vec::new(),
+        }
+    }
+}
+
+impl MemoryGuardConfig {
+    pub fn validate(&self, e: &mut Vec<String>) {
+        if !(1.0..=50.0).contains(&self.free_pct) {
+            e.push("memory_guard.free_pct must be between 1 and 50".into());
+        }
+        if self.sustain_secs > 3600 {
+            e.push("memory_guard.sustain_secs must be between 0 and 3600".into());
+        }
+        if !(16..=1_048_576).contains(&self.min_mb) {
+            e.push("memory_guard.min_mb must be between 16 and 1048576".into());
+        }
+        if self.unit_max_mb != 0 && !(64..=1_048_576).contains(&self.unit_max_mb) {
+            e.push("memory_guard.unit_max_mb must be 0 (off) or between 64 and 1048576".into());
+        }
+        if !(10..=3600).contains(&self.cooldown_secs) {
+            e.push("memory_guard.cooldown_secs must be between 10 and 3600".into());
+        }
+        if !(1..=300).contains(&self.stop_grace_secs) {
+            e.push("memory_guard.stop_grace_secs must be between 1 and 300".into());
+        }
+        if self.never.len() > 256 {
+            e.push("memory_guard.never holds at most 256 names".into());
+        }
+        if self
+            .never
+            .iter()
+            .any(|n| n.is_empty() || n.len() > 255 || n.contains('/'))
+        {
+            e.push("memory_guard.never names must be 1 to 255 characters without '/'".into());
         }
     }
 }
@@ -726,6 +838,7 @@ impl Config {
         self.agents.validate(&mut e);
         self.sessions.validate(&mut e);
         self.limits.validate(&mut e);
+        self.memory_guard.validate(&mut e);
         self.guard.validate(&mut e);
         self.updates.validate(&mut e);
         if e.is_empty() {

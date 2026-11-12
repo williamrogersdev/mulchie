@@ -3,7 +3,7 @@ title: Running headless
 description: "Run the Mulchie engine without the menu bar app: mulchie serve, or mulchie service install for a launchd agent on macOS or a systemd user unit on Linux."
 ---
 
-Use this page to run Mulchie on Linux, on a build server, or on a Mac without the menu bar app. The engine, CLI, API and MCP server all run without the app.
+Use this page to run Mulchie on Linux, on a build server, or on a Mac without the menu bar app. The engine, CLI, API and MCP server all run without the app, and the app is not available as a download yet.
 
 ## Start the engine
 

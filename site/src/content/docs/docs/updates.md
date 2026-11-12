@@ -54,8 +54,8 @@ mulchie config set updates.interval_hours 168
 
 With `updates.check` set to `off`, Mulchie makes no network request and runs no version command or `brew`. The interval is 6 to 720 hours.
 
-A Mulchie built without the `network` feature (`cargo build --no-default-features`) cannot make these requests at all: every check reports that the build has no network support and nothing leaves the machine. The release tarballs, the app and a plain `cargo install mulchie` use the default features, which include it.
+A Mulchie built without the `network` feature (`cargo build --no-default-features`) cannot make these requests at all: every check reports that the build has no network support and nothing leaves the machine. The release tarballs, the app and a plain `cargo install` use the default features, which include it.
 
 ## The menu bar app
 
-The app has its own updater, separate from this. Choosing **Check for Updates…** in its menu fetches `latest.json` from the project's GitHub Releases and, if you agree, downloads and installs the new version. It makes that request only when you choose it, and only in builds that have an update key. See [Install](/install/#update).
+The app (built from source for now; there is no app download yet) has its own updater, separate from this. Choosing **Check for Updates…** in its menu fetches `latest.json` from the project's GitHub Releases and, if you agree, downloads and installs the new version. It makes that request only when you choose it, and only in builds that have an update key. See [Install](/install/#update).

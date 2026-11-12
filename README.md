@@ -4,7 +4,7 @@ Mulchie keeps a machine healthy while several AI coding agents work on it. With 
 
 Mulchie is a supervisor. It is not a sandbox and not an antivirus: an agent that wants to get around it can.
 
-It ships three ways: the `mulchie` command, a macOS menu bar app with a dashboard, and an MCP server (`mulchie mcp`). The engine also serves a local HTTP API for scripts.
+It ships three ways: the `mulchie` command, a macOS menu bar app with a dashboard (build it from source for now; see Install), and an MCP server (`mulchie mcp`). The engine also serves a local HTTP API for scripts.
 
 Full documentation is at [mulchie.com/docs](https://mulchie.com/docs/).
 
@@ -23,6 +23,7 @@ Full documentation is at [mulchie.com/docs](https://mulchie.com/docs/).
 **Supervise agents**
 - A session is an agent and everything it started, found in the process table by name (Claude Code, Codex, Gemini CLI, Copilot CLI, Cursor's `cursor-agent`, aider, opencode and others; add more with `agents.extra`). `mulchie sessions` shows what each uses. See [sessions and limits](https://mulchie.com/docs/sessions/).
 - Limits are budgets per session for CPU, memory, processes, writes and runtime. The action is `notify` unless you choose `deprioritize`, `pause` or `stop`. `pause` and `stop` spare the agent itself unless the budget sets `include_agent`. A session that only a hook registered is reported, never enforced, and only the engine that holds the lock acts. A pause ends after `resume_after_secs`.
+- The memory guard watches the whole machine. When memory stays low it reports the biggest consumer it may close, and with `mulchie config set memory_guard.action stop` it closes it (SIGTERM, then SIGKILL), one at a time, until memory is back. By default that is what agent sessions started, never the agent itself; `memory_guard.scope all` extends it to your other apps and programs. Closing a process loses what it had not saved.
 - Each session has an activity record in `<config dir>/sessions/`. Command lines in it are redacted by pattern, as well as Mulchie can. It is not tamper-proof.
 - Hooks (`mulchie hooks install`) let Claude Code, Codex, Cursor, Gemini CLI and Copilot CLI tell Mulchie about session starts, prompts and shell commands. A hook fails open: with no engine, a slow one (300 ms) or any error, the action is allowed. Prompt text is never sent to the engine. See [hooks and guard rules](https://mulchie.com/docs/hooks/).
 - Guard rules check the text of a shell command for risky shapes (deleting outside the workspace, `curl | sh`, `sudo`, force-pushing a protected branch, disabling Mulchie, reading credentials, writing startup files). Every rule defaults to `warn`. They are a tripwire, not a sandbox, and miss obfuscated commands.
@@ -44,21 +45,23 @@ Full documentation is at [mulchie.com/docs](https://mulchie.com/docs/).
 
 ## Install
 
-macOS app (includes the CLI):
+The first release is the CLI for macOS and Linux:
 
 ```sh
-brew install --cask williamrogersdev/tap/mulchie
-```
-
-CLI only:
-
-```sh
-brew install williamrogersdev/tap/mulchie-cli
 curl -fsSL https://mulchie.com/install.sh | sh
-cargo install mulchie
 ```
 
-The install script puts the binary in `~/.local/bin` after checking its SHA-256. From a source checkout, `./scripts/bundle.sh` builds the app (Rust and Bun required) and `cargo install --path crates/mulchie-cli` installs the CLI.
+or, from GitHub:
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/williamrogersdev/mulchie/main/scripts/install.sh | sh
+```
+
+The install script puts the binary in `~/.local/bin` after checking its SHA-256 against the release's `.sha256` file. Every release asset has a SHA-256 checksum, and the release lists them in `SHA256SUMS`. From source: `cargo install --git https://github.com/williamrogersdev/mulchie mulchie`, or `cargo install --path crates/mulchie-cli` from a checkout. Mulchie is not on crates.io or Homebrew yet.
+
+The macOS CLI binaries are ad-hoc signed, not Developer ID signed or notarized. The install script works. A tarball downloaded with a browser is quarantined by Gatekeeper; after extracting it, run `xattr -d com.apple.quarantine ./mulchie`.
+
+The menu bar app is not available as a download yet. Build it from source on a Mac (Rust and Bun required) with `./scripts/bundle.sh`; a signed download is planned.
 
 Then check the setup:
 
@@ -66,7 +69,7 @@ Then check the setup:
 mulchie doctor
 ```
 
-The app starts the engine. Without the app, run it yourself with `mulchie serve`, or at login with `mulchie service install`.
+If you built the app, it starts the engine. Without the app, run it yourself with `mulchie serve`, or at login with `mulchie service install`.
 
 ## CLI
 
@@ -132,7 +135,7 @@ The engine listens on `127.0.0.1:47474` by default. Every route except `GET /v1/
 
 ## Configuration
 
-`~/.config/mulchie/config.json` (or under `$XDG_CONFIG_HOME/mulchie`). Print it with `mulchie config` and change one setting with `mulchie config set <key> <value>`. The app has the same settings under **Settings**. `MULCHIE_PORT` overrides the API port for one process. Sections: `watch`, `agents`, `sessions`, `limits`, `guard` and `updates`; see [configuration](https://mulchie.com/docs/configuration/).
+`~/.config/mulchie/config.json` (or under `$XDG_CONFIG_HOME/mulchie`). Print it with `mulchie config` and change one setting with `mulchie config set <key> <value>`. The app has the same settings under **Settings**. `MULCHIE_PORT` overrides the API port for one process. Sections: `watch`, `agents`, `sessions`, `limits`, `memory_guard`, `guard` and `updates`; see [configuration](https://mulchie.com/docs/configuration/).
 
 The engine contacts the network only for update checks: the GitHub releases API for Mulchie, and the npm registry for installed agent tools. `mulchie config set updates.check off` stops it. A build without the default `network` cargo feature (`--no-default-features`) cannot make requests at all.
 

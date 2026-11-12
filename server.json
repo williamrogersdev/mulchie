@@ -3,7 +3,7 @@
   "name": "io.github.williamrogersdev/mulchie",
   "title": "Mulchie",
   "description": "See what is slowing a machine shared by AI agents, and reclaim space safely, plan first.",
-  "version": "0.3.0",
+  "version": "0.3.0-rc.1",
   "websiteUrl": "https://mulchie.com",
   "repository": {
     "url": "https://github.com/williamrogersdev/mulchie",
@@ -14,7 +14,7 @@
       "registryType": "cargo",
       "registryBaseUrl": "https://crates.io",
       "identifier": "mulchie",
-      "version": "0.3.0",
+      "version": "0.3.0-rc.1",
       "transport": {
         "type": "stdio"
       },

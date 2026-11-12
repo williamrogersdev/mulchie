@@ -79,6 +79,9 @@ pub enum FindingKind {
     /// `paused.json` could not be read at start: processes paused by an
     /// earlier engine may still be stopped.
     PausedListUnreadable,
+    /// The machine stayed low on memory, or a consumer stayed over the
+    /// memory guard's cap (`memory_guard`).
+    MemoryLow,
 }
 
 impl FindingKind {
@@ -109,7 +112,7 @@ impl FindingKind {
             InsecurePermissions | ApiExposed | EngineLockNotHeld | ConfigNotLoaded => {
                 FindingCategory::Posture
             }
-            LimitExceeded | SessionHog | PausedListUnreadable => FindingCategory::Limit,
+            LimitExceeded | SessionHog | PausedListUnreadable | MemoryLow => FindingCategory::Limit,
             MulchieUpdate | AgentUpdate | HomebrewOutdated | Advisory => FindingCategory::Update,
         }
     }

@@ -578,6 +578,89 @@ fn render_paused_list_findings(found: &[Value]) -> String {
     s
 }
 
+/// `3.2 GB` or `640 MB`.
+fn mb_words(mb: f64) -> String {
+    if mb >= 1024.0 {
+        format!("{:.1} GB", mb / 1024.0)
+    } else {
+        format!("{mb:.0} MB")
+    }
+}
+
+/// The memory guard's lines in `mulchie limits` (nothing from an engine
+/// that has no memory guard).
+pub fn render_memory_guard(g: &Value) -> String {
+    if !g.is_object() {
+        return String::new();
+    }
+    let mut s = String::new();
+    let scope = if g["scope"] == "all" {
+        "your apps, workspaces and programs"
+    } else {
+        "what agent sessions started"
+    };
+    match g["action"].as_str().unwrap_or("") {
+        "off" => s.push_str("Memory guard: off (memory_guard.action in `mulchie config`).\n"),
+        "stop" if g["enforcing"] == true => s.push_str(&format!(
+            "Memory guard: on. When memory runs low it closes the biggest of {scope}, one at a time, until memory is back.\n"
+        )),
+        "stop" => s.push_str(
+            "Memory guard: set to stop, but this engine does not act (another engine holds the lock, or the config did not load).\n",
+        ),
+        _ => s.push_str(
+            "Memory guard: reports only. `mulchie config set memory_guard.action stop` lets it close the biggest consumer when memory runs low.\n",
+        ),
+    }
+    if g["action"] == "off" {
+        return s;
+    }
+    let would = &g["would_close"];
+    if g["low"] == true || would.is_object() {
+        let free = g["free_pct"].as_f64().unwrap_or(0.0);
+        let head = if g["low"] == true {
+            format!("  Memory is low now ({free:.0}% free)")
+        } else {
+            "  A consumer is over the cap".to_string()
+        };
+        if would.is_object() {
+            let verb = if g["enforcing"] == true {
+                "next to close"
+            } else {
+                "would close"
+            };
+            s.push_str(&format!(
+                "{head}; {verb}: {} ({})\n",
+                st(would, "name"),
+                mb_words(would["mem_mb"].as_f64().unwrap_or(0.0))
+            ));
+        } else {
+            s.push_str(&format!(
+                "{head}; nothing the guard may close is big enough (`mulchie top` shows what uses memory).\n"
+            ));
+        }
+    }
+    let closed = g["closings"].as_array().cloned().unwrap_or_default();
+    if !closed.is_empty() {
+        let now = now_unix();
+        s.push_str(&format!(
+            "  Closed by the memory guard ({}):\n",
+            closed.len()
+        ));
+        for c in closed.iter().take(10) {
+            s.push_str(&format!(
+                "    {} ago  {} ({}): {}\n",
+                duration(now.saturating_sub(c["at_unix"].as_u64().unwrap_or(now))),
+                st(c, "name"),
+                mb_words(c["mem_mb"].as_f64().unwrap_or(0.0)),
+                c["detail"]
+                    .as_str()
+                    .unwrap_or(c["state"].as_str().unwrap_or(""))
+            ));
+        }
+    }
+    s
+}
+
 pub fn render_limits(v: &Value) -> String {
     let mut s = String::new();
     let cfg = &v["config"];
@@ -614,6 +697,7 @@ pub fn render_limits(v: &Value) -> String {
             duration(t)
         ));
     }
+    s.push_str(&render_memory_guard(&v["memory_guard"]));
     let br = v["breaches"].as_array().cloned().unwrap_or_default();
     if br.is_empty() {
         s.push_str("No session is over its budget.\n");
@@ -1031,6 +1115,31 @@ mod tests {
             t.contains("session_start") && t.contains("--since 1"),
             "{t}"
         );
+    }
+
+    #[test]
+    fn the_memory_guard_says_whether_it_acts_and_what_it_closed() {
+        assert_eq!(render_memory_guard(&Value::Null), "");
+        let notify = json!({"action": "notify", "scope": "sessions", "enforcing": false,
+            "low": true, "free_pct": 3.2,
+            "would_close": {"name": "what the claude session in app started", "mem_mb": 3276.8},
+            "closings": []});
+        let t = render_memory_guard(&notify);
+        assert!(t.contains("reports only"), "{t}");
+        assert!(t.contains("memory_guard.action stop"), "{t}");
+        assert!(t.contains("Memory is low now (3% free); would close: what the claude session in app started (3.2 GB)"), "{t}");
+        let stop = json!({"action": "stop", "scope": "all", "enforcing": true, "low": false,
+            "free_pct": 40.0, "would_close": null,
+            "closings": [{"at_unix": now_unix(), "name": "Browser", "mem_mb": 512.0,
+                "state": "done", "detail": "SIGTERM to 4 of 4 process(es)"}]});
+        let t = render_memory_guard(&stop);
+        assert!(t.contains("Memory guard: on."), "{t}");
+        assert!(t.contains("your apps, workspaces and programs"), "{t}");
+        assert!(t.contains("Browser (512 MB): SIGTERM to 4 of 4"), "{t}");
+        assert!(!t.contains("Memory is low"), "{t}");
+        let idle = json!({"action": "stop", "enforcing": false, "closings": []});
+        assert!(render_memory_guard(&idle).contains("does not act"));
+        assert!(render_memory_guard(&json!({"action": "off"})).contains("off"));
     }
 
     #[test]
