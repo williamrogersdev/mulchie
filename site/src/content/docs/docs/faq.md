@@ -43,7 +43,7 @@ A worktree is idle when nothing outside `target/`, `node_modules/` and `.git/` h
 
 ## Does it work on Linux?
 
-The engine, CLI, API and MCP server do. The menu bar app is macOS only. See [Running headless](/docs/headless/).
+The engine, CLI, API and MCP server do. The menu bar app is macOS only, and you build it from source for now (see [Install](/install/#app)). See [Running headless](/docs/headless/).
 
 ## Does it work on Windows?
 

@@ -41,8 +41,8 @@ The updater is wired in the app (`crates/mulchie-app/src/update.rs`). The app re
 updater plugin only when `plugins.updater.pubkey` in `tauri.conf.json` is set, and "Check for
 Updates…" in its menu then reads `latest.json` from the latest GitHub Release. Until you have run
 the script and committed the result, a build says that updates are not configured, and
-`release.yml` refuses a tagged release (it checks `bundle.createUpdaterArtifacts` and the public
-key) so a release cannot ship an app that cannot update.
+`release.yml` makes a CLI-only release of a tag (see "CLI-only release" below). It checks
+`bundle.createUpdaterArtifacts` and the public key, so a release never ships an app that cannot update.
 
 ### 3. Create the `macos-signing` environment
 
@@ -85,7 +85,8 @@ Repository secrets (for `publish.yml` and `site.yml`):
 The workflows use an Apple ID and app-specific password for notarization. They do not read an App Store Connect API key.
 
 If `HOMEBREW_TAP_TOKEN` or `CARGO_REGISTRY_TOKEN` is missing, `publish.yml` skips that job with a notice. If a Cloudflare secret is missing, `site.yml` builds and checks the site but skips the deploy with a notice.
-If a signing secret is missing, a tagged release fails early and names it.
+If a signing secret is missing, a full release (one with the updater configured) fails early and names it.
+A CLI-only release uses none of them.
 
 The first crates.io publish of `mulchie-core` and `mulchie` claims those names. Check they are free.
 
@@ -94,6 +95,42 @@ The first crates.io publish of `mulchie-core` and `mulchie` claims those names. 
 Actions, Release, Run workflow, leave "dry_run" on. It builds all four CLI targets and the universal
 app with a throwaway updater key, skips signing, notarization and upload, and keeps the result as
 the `release-assets` artifact. Run it before the first real release and after any change to the workflows.
+
+## CLI-only release (before signing is set up)
+
+A tag can produce a real draft release of the CLI before any signing secret exists. The switch is
+the committed updater config: if `crates/mulchie-app/tauri.conf.json` does not have both
+`bundle.createUpdaterArtifacts: true` and a non-empty `plugins.updater.pubkey`, the `prepare` job sets
+`app=false` and prints a notice. You do not pass a flag. Dry runs ignore this and always build the app.
+
+What a CLI-only release builds:
+
+- the four CLI tarballs with their `.sha256` files (macOS arm64 and x86_64, Linux x86_64 and aarch64);
+- `SHA256SUMS` over the tarballs;
+- build provenance attestations for the tarballs;
+- a draft GitHub Release whose notes start with a line saying it is CLI only. Assembly fails if any of the eight
+  CLI files is missing.
+
+What it skips: the desktop app job, Developer ID signing, notarization, the DMG, the updater archive and
+`latest.json`. The CLI jobs do not use the `macos-signing` environment and read no Apple secret. The macOS
+binaries carry an ad-hoc signature, which the job applies and verifies with `codesign --verify` (arm64 macOS
+will not run an unsigned binary). They are not Developer ID signed or notarized: `install.sh` and `curl` do
+not quarantine a file, so installing that way works, but a binary downloaded in a browser is quarantined and
+Gatekeeper blocks it.
+
+After you publish the draft, `publish.yml` looks at the release's assets. With no `.dmg` it updates only
+`Formula/mulchie-cli.rb` in the tap (not the cask) and tells you in a notice. crates.io is unchanged.
+A pre-release is still skipped. `releases/latest` points at this release, so `install.sh` works at once;
+the in-app updater has nothing to read because there is no `latest.json` and no app yet.
+
+To move to a full release:
+
+1. Run `scripts/release-setup.sh` and commit the `tauri.conf.json` change.
+2. Create the `macos-signing` environment and set its secrets (steps 3 and 4 above).
+3. Tag the next version. The first app release cannot update anyone from a CLI-only install: there is no app
+   to update. People install the DMG or the cask once, and later versions update from there.
+
+With the updater configured, a missing Apple secret fails the release. The app is never shipped unsigned.
 
 ## First release (0.3.0): steps only the maintainer can take
 
