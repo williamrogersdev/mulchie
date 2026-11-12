@@ -750,7 +750,7 @@ paths:
         default: { $ref: "#/components/responses/Error" }
   /v1/limits/status:
     get:
-      summary: Session budgets, breaches, hogs and processes Mulchie paused
+      summary: Session budgets, breaches, hogs, processes Mulchie paused and the memory guard
       description: |
         `report_only` is true when no cap acts (every action is `notify`). `enforcing` is false
         on an engine that does not hold the lock: it reports and never acts. Every limit action
@@ -786,6 +786,7 @@ paths:
                         since_unix: { type: integer }
                   paused_by_mulchie: { type: array, items: { $ref: "#/components/schemas/PausedProc" } }
                   paused_left: { type: array, items: { $ref: "#/components/schemas/PausedProc" }, description: Paused processes Mulchie could not resume }
+                  memory_guard: { $ref: "#/components/schemas/MemoryGuardStatus" }
         default: { $ref: "#/components/responses/Error" }
   /v1/hook:
     post:
@@ -1084,6 +1085,7 @@ components:
         - homebrew_outdated
         - advisory
         - paused_list_unreadable
+        - memory_low
     FindingCounts:
       type: object
       properties:
@@ -1199,6 +1201,54 @@ components:
         bytes_written: { type: [integer, "null"], description: Null where per-process writes cannot be read }
         write_mb_per_hour: { type: [number, "null"] }
         runtime_secs: { type: integer }
+    MemoryGuardStatus:
+      type: object
+      description: >-
+        The memory guard (`memory_guard` in config), also `memory_guard` in `GET /v1/state`.
+        When memory stays low, or a unit stays over `memory_guard.unit_max_mb`, the biggest
+        closable unit is reported (`action: notify`) or closed (`action: stop`: SIGTERM, then
+        SIGKILL after `stop_grace_secs`, through the safety gate). A unit is what one agent
+        session started, or with `scope: all` any other unprotected app, workspace or program
+        of the user that does not host an agent session.
+      properties:
+        action: { type: string, enum: [off, notify, stop] }
+        scope: { type: string, enum: [sessions, all] }
+        enforcing: { type: boolean, description: "The action is `stop` and this engine automates" }
+        low: { type: boolean, description: "Memory has been low for `sustain_secs`" }
+        low_since_unix: { type: integer, nullable: true }
+        free_pct: { type: number, description: Percent of memory available at the last sample }
+        pressure: { type: string, nullable: true, enum: [normal, warning, critical] }
+        would_close:
+          nullable: true
+          type: object
+          description: The unit that qualifies now
+          properties:
+            key: { type: string, description: "`session:<id>` or a consumer group key" }
+            name: { type: string }
+            kind: { type: string, enum: [session, workspace, app, process] }
+            mem_mb: { type: number }
+            processes: { type: integer }
+            trigger: { type: string, enum: [memory_low, over_cap] }
+        closings:
+          type: array
+          description: What the guard closed or tried to, newest first, at most 50, since this engine started
+          items:
+            type: object
+            properties:
+              id: { type: string }
+              at_unix: { type: integer }
+              trigger: { type: string, enum: [memory_low, over_cap] }
+              free_pct: { type: number }
+              pressure: { type: string, nullable: true }
+              key: { type: string }
+              name: { type: string }
+              kind: { type: string, enum: [session, workspace, app, process] }
+              session_id: { type: string, nullable: true }
+              workspace: { type: string, nullable: true }
+              mem_mb: { type: number }
+              processes: { type: integer }
+              state: { type: string, enum: [pending, done, partial, skipped, not_enforced] }
+              detail: { type: string, nullable: true }
     Breach:
       type: object
       description: A session over one cap of its budget.

@@ -114,7 +114,7 @@ function showErrors(card, message, extra) {
   top.textContent = '';
   const parts = String(message).replace(/^config has invalid values: /, '').split('; ');
   for (const part of parts) {
-    const key = (/((?:limits|guard|updates|sessions)(?:\.[a-z_]+|\[\d+\])+)/.exec(part) || [])[1];
+    const key = (/((?:limits|memory_guard|guard|updates|sessions)(?:\.[a-z_]+|\[\d+\])+)/.exec(part) || [])[1];
     let placed = false;
     if (key) {
       const [block, rest] = blockOf(card, key);
@@ -253,8 +253,12 @@ function confirmStricter(lines, limits) {
 
 // ---------------------------------------------------------------- limits
 
+const MG_ACTIONS = [['off', 'Off'], ['notify', 'Report only'], ['stop', 'Close the biggest consumer']];
+const MG_SCOPES = [['sessions', 'What agent sessions started (never the agent itself)'], ['all', 'Also my other apps and programs']];
+const opts = (list, cur) => list.map(([v, n]) => `<option value="${v}" ${v === cur ? 'selected' : ''}>${esc(n)}</option>`).join('');
+
 function limitsForm(c) {
-  const l = c.limits || {}, s = c.sessions || {};
+  const l = c.limits || {}, s = c.sessions || {}, g = c.memory_guard || {};
   return `<label class="chk"><input type="checkbox" data-k="sessions.enabled" ${s.enabled !== false ? 'checked' : ''}> Track agent sessions (needed for the Sessions view, activity records and limits)</label>${ferr('sessions.enabled')}
     <ul class="explain">${ACTIONS.map(([, n, d]) => `<li><b>${esc(n)}</b>: ${esc(d)}</li>`).join('')}</ul>
     <label class="chk"><input type="checkbox" data-k="default-on" ${l.default ? 'checked' : ''}> A default budget for every session</label>
@@ -267,7 +271,12 @@ function limitsForm(c) {
     <div class="row2"><label>Share of CPU or memory (%) ${numIn('data-k="limits.hog_share_pct"', l.hog_share_pct ?? 50, 'Hog share percent', 'any', RANGE.hog_share_pct)}</label>
       <label>For at least (s) ${numIn('data-k="limits.hog_sustain_secs"', l.hog_sustain_secs ?? 120, 'Hog seconds', '1', RANGE.hog_sustain_secs)}</label></div>
     <div class="dim">While the machine is strained, a session using this share for this long is reported. Reporting only; nothing is signalled.</div>
-    ${ferr('limits.hog_share_pct')}${ferr('limits.hog_sustain_secs')}`;
+    ${ferr('limits.hog_share_pct')}${ferr('limits.hog_sustain_secs')}
+    <h4 class="cat-h">When the machine runs low on memory</h4>
+    <div class="row2"><label>Memory guard <select data-k="memory_guard.action" aria-label="Memory guard action">${opts(MG_ACTIONS, g.action || 'notify')}</select></label>
+      <label>It may close <select data-k="memory_guard.scope" aria-label="Memory guard scope">${opts(MG_SCOPES, g.scope || 'sessions')}</select></label></div>
+    <div class="dim">Memory is low under ${esc(g.free_pct ?? 5)}% free, or when the system reports critical memory pressure. Closing ends the biggest consumer (SIGTERM, then SIGKILL), one at a time, until memory is back; what it had not saved is lost.</div>
+    ${ferr('memory_guard.action')}${ferr('memory_guard.scope')}`;
 }
 
 function readLimits(card) {
@@ -290,6 +299,7 @@ function readLimits(card) {
     patch: {
       sessions: { enabled: card.querySelector('[data-k="sessions.enabled"]').checked },
       limits: { default: def ? def.budget : null, workspaces: ws, hog_share_pct: share, hog_sustain_secs: secs },
+      memory_guard: { action: n('memory_guard.action'), scope: n('memory_guard.scope') },
     },
   };
 }
@@ -304,6 +314,18 @@ function notEnforcingText() {
   if (S.config_error) return `the settings file has an error, so automatic actions are off until it is fixed (${S.config_error})`;
   if (S.lock_held_by_other) return `another Mulchie engine (pid ${S.lock_held_by_other}) holds the engine lock and acts on the budgets`;
   return 'automatic actions are off in this engine';
+}
+
+const mbText = mb => mb >= 1024 ? `${(mb / 1024).toFixed(1)} GB` : `${Math.round(mb)} MB`;
+
+// The memory guard: whether it acts, whether memory is low, what it closed.
+function memoryGuardHtml(g) {
+  if (!g || g.action === 'off') return '';
+  const mode = g.action !== 'stop' ? 'Reports only.' : g.enforcing ? 'On: it closes the biggest consumer when memory runs low.' : 'Set to close, but this engine does not act.';
+  const w = g.would_close, closed = g.closings || [];
+  const low = g.low ? `<div class="warn">Memory is low now (${esc(Math.round(g.free_pct))}% free)${w ? `; ${g.enforcing ? 'next to close' : 'would close'}: ${esc(w.name)} (${esc(mbText(w.mem_mb))})` : '; nothing it may close is big enough'}.</div>` : '';
+  return `<h4 class="cat-h">Memory guard</h4><div class="dim">${esc(mode)}</div>${low}
+    ${closed.slice(0, 10).map(c => `<div class="bkrow">${esc(c.name)} (${esc(mbText(c.mem_mb))}) <span class="dim">${esc(ago(c.at_unix))} ago · ${esc(c.detail || String(c.state).replace(/_/g, ' '))}</span></div>`).join('')}`;
 }
 
 function limitsStatusHtml() {
@@ -324,7 +346,8 @@ function limitsStatusHtml() {
     <h4 class="cat-h">Hogging the machine (${hogs.length})</h4>${hogs.length ? hogs.map(h => `<div class="bkrow">${sLink(h.session_id, h.agent)}: ${esc(Math.round(h.share_pct))}% of the ${esc(h.resource === 'cpu' ? 'CPU' : 'memory')} since ${esc(ago(h.since_unix))} ago</div>`).join('') : '<div class="dim">None.</div>'}
     ${pausedRow(paused, 'Paused by Mulchie', 'They resume on their own after the resume delay; resume them now through a plan.')}
     ${pausedRow(left, 'Left paused by an earlier engine', 'This engine will not resume these on its own.')}
-    ${!paused.length && !left.length ? '<h4 class="cat-h">Paused by Mulchie (0)</h4><div class="dim">Nothing is paused.</div>' : ''}`;
+    ${!paused.length && !left.length ? '<h4 class="cat-h">Paused by Mulchie (0)</h4><div class="dim">Nothing is paused.</div>' : ''}
+    ${memoryGuardHtml(l?.memory_guard || S?.memory_guard)}`;
 }
 
 function loadLimitsStatus() {
@@ -493,6 +516,13 @@ async function onClick(e) {
       }
       const lines = stricter(d?.config?.limits, r.patch.limits);
       if (lines.length && !(await confirmStricter(lines, r.patch.limits))) return;
+      // Turning on closing, or widening what may be closed while it is on.
+      const mg = r.patch.memory_guard, was = d?.config?.memory_guard || {};
+      if (patch.memory_guard && mg.action === 'stop' && (was.action !== 'stop' || (mg.scope === 'all' && was.scope !== 'all'))) {
+        const ok = await modal({ title: 'Let Mulchie close processes when memory runs low?', danger: true, yes: 'Turn it on',
+          html: `<div>When memory stays low, Mulchie will end the biggest consumer among ${esc(mg.scope === 'all' ? 'your apps, workspaces and programs (this can be an app you are using)' : 'what agent sessions started (builds, tests, dev servers; not the agent itself)')}, one at a time, until memory is back. Whatever a closed process had not saved is lost.</div>` });
+        if (!ok) return;
+      }
     }
     await save(card, patch, which);
     card.querySelector('.card-err').hidden = !card.querySelector('.card-err').textContent;

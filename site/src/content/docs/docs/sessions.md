@@ -76,6 +76,23 @@ A breach is handed to the agent once, through its next hook call, and appears in
 
 With or without budgets, a session that uses at least `limits.hog_share_pct` (default 50) of the machine's CPU or memory for `limits.hog_sustain_secs` (default 120) while the machine is strained or critical becomes a `session_hog` finding. This only reports.
 
+## The memory guard
+
+Limits look at one session. The memory guard looks at the whole machine: when memory stays low, it finds the biggest consumer it may close. By default it only reports (a `memory_low` finding and a notification that names what it would close). To let it close things:
+
+```sh
+mulchie config set memory_guard.action stop
+```
+
+- **When it fires.** Less than `memory_guard.free_pct` (default 5) percent of memory is available, or the kernel reports critical memory pressure, for `sustain_secs` (default 15).
+- **What it closes.** The biggest unit using at least `min_mb` (default 300). With `scope: sessions` (the default) a unit is everything one agent session started; the agent itself is spared unless `include_agent` is set, so the agent sees its build or test run end and can carry on. With `scope: all` a unit can also be any other app, workspace or program of yours. That can be an app you are using, and unsaved work in it is lost.
+- **How.** SIGTERM to every process of the unit, then SIGKILL after `stop_grace_secs` (default 5) to what is left. Then it waits `cooldown_secs` (default 30) and, if memory is still low, closes the next biggest.
+- **A cap per unit.** `unit_max_mb` closes (or reports) any unit that stays over that much memory, even when the machine is not low. 0, the default, turns it off.
+- **What it never closes.** System processes, other users' processes, Mulchie, whatever started Mulchie, the terminal, editor or app an agent session runs in, sessions that only a hook registered, and any process named in `memory_guard.never`. Every signal goes through the safety gate, which checks each process again by its start time.
+- **Only the engine that holds the lock acts.** Any other engine reports.
+
+`mulchie limits` shows whether the guard acts, whether memory is low and what it closed. Closings are also written to `actions.jsonl` and, for a session, to its activity record as `memory_guard` events. Closing a process loses whatever it had not saved; the guard is a last resort that trades one process for a machine that keeps running.
+
 ### Act on a session yourself
 
 ```sh
@@ -96,6 +113,7 @@ It holds these events:
 | `session_start`, `session_end` | The agent, root process, workspace and, at the end, runtime, peaks and bytes written. |
 | `process_start` | A process that joined the session: pid, name and command line. At most `sessions.process_events_per_minute` a minute; the rest are summed in a `process_starts_summarised` event. |
 | `limit_breach`, `limit_action`, `limit_cleared` | A cap that was exceeded, what Mulchie did about it, and when it ended. |
+| `memory_guard` | The memory guard closed what the session started: why, how much memory, and the outcome. |
 | `hook_session_start`, `hook_prompt`, `hook_pre_tool`, `hook_post_tool`, `hook_stop`, `hook_session_end` | What the agent's hooks reported: the client, the tool, the command, the guard's decision and the rule. |
 | `truncated` | The record hit a size cap. |
 

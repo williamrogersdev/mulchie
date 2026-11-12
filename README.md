@@ -23,6 +23,7 @@ Full documentation is at [mulchie.com/docs](https://mulchie.com/docs/).
 **Supervise agents**
 - A session is an agent and everything it started, found in the process table by name (Claude Code, Codex, Gemini CLI, Copilot CLI, Cursor's `cursor-agent`, aider, opencode and others; add more with `agents.extra`). `mulchie sessions` shows what each uses. See [sessions and limits](https://mulchie.com/docs/sessions/).
 - Limits are budgets per session for CPU, memory, processes, writes and runtime. The action is `notify` unless you choose `deprioritize`, `pause` or `stop`. `pause` and `stop` spare the agent itself unless the budget sets `include_agent`. A session that only a hook registered is reported, never enforced, and only the engine that holds the lock acts. A pause ends after `resume_after_secs`.
+- The memory guard watches the whole machine. When memory stays low it reports the biggest consumer it may close, and with `mulchie config set memory_guard.action stop` it closes it (SIGTERM, then SIGKILL), one at a time, until memory is back. By default that is what agent sessions started, never the agent itself; `memory_guard.scope all` extends it to your other apps and programs. Closing a process loses what it had not saved.
 - Each session has an activity record in `<config dir>/sessions/`. Command lines in it are redacted by pattern, as well as Mulchie can. It is not tamper-proof.
 - Hooks (`mulchie hooks install`) let Claude Code, Codex, Cursor, Gemini CLI and Copilot CLI tell Mulchie about session starts, prompts and shell commands. A hook fails open: with no engine, a slow one (300 ms) or any error, the action is allowed. Prompt text is never sent to the engine. See [hooks and guard rules](https://mulchie.com/docs/hooks/).
 - Guard rules check the text of a shell command for risky shapes (deleting outside the workspace, `curl | sh`, `sudo`, force-pushing a protected branch, disabling Mulchie, reading credentials, writing startup files). Every rule defaults to `warn`. They are a tripwire, not a sandbox, and miss obfuscated commands.
@@ -132,7 +133,7 @@ The engine listens on `127.0.0.1:47474` by default. Every route except `GET /v1/
 
 ## Configuration
 
-`~/.config/mulchie/config.json` (or under `$XDG_CONFIG_HOME/mulchie`). Print it with `mulchie config` and change one setting with `mulchie config set <key> <value>`. The app has the same settings under **Settings**. `MULCHIE_PORT` overrides the API port for one process. Sections: `watch`, `agents`, `sessions`, `limits`, `guard` and `updates`; see [configuration](https://mulchie.com/docs/configuration/).
+`~/.config/mulchie/config.json` (or under `$XDG_CONFIG_HOME/mulchie`). Print it with `mulchie config` and change one setting with `mulchie config set <key> <value>`. The app has the same settings under **Settings**. `MULCHIE_PORT` overrides the API port for one process. Sections: `watch`, `agents`, `sessions`, `limits`, `memory_guard`, `guard` and `updates`; see [configuration](https://mulchie.com/docs/configuration/).
 
 The engine contacts the network only for update checks: the GitHub releases API for Mulchie, and the npm registry for installed agent tools. `mulchie config set updates.check off` stops it. A build without the default `network` cargo feature (`--no-default-features`) cannot make requests at all.
 

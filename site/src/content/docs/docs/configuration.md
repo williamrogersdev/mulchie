@@ -115,6 +115,24 @@ A budget has any of the caps `cpu_cores`, `memory_mb`, `processes`, `write_mb_pe
 | `include_agent` | `false` | Let `deprioritize`, `pause` and `stop` reach the agent's own process too. |
 | `stop_grace_secs` | 10 | Between SIGTERM and SIGKILL for `stop`, 1 to 300. |
 
+## Memory guard
+
+`memory_guard` decides what happens when the whole machine runs low on memory. See [the memory guard](/docs/sessions/#the-memory-guard).
+
+| Setting | Default | Meaning |
+| --- | --- | --- |
+| `memory_guard.action` | `notify` | `off`, `notify` (a `memory_low` finding and a notification) or `stop` (close the biggest closable unit). |
+| `memory_guard.scope` | `sessions` | `sessions`: what agent sessions started. `all`: also any other unprotected app, workspace or program of yours. |
+| `memory_guard.free_pct` | 5 | Memory is low when less than this percent is available. 1 to 50. |
+| `memory_guard.on_pressure` | `true` | Critical memory pressure reported by the kernel also counts as low. |
+| `memory_guard.sustain_secs` | 15 | How long memory must stay low, or a unit over `unit_max_mb`. 0 to 3600. |
+| `memory_guard.min_mb` | 300 | Nothing using less is closed for low memory. 16 to 1048576. |
+| `memory_guard.unit_max_mb` | 0 | Close a unit that stays over this much memory even when the machine is not low. 0 is off; otherwise 64 to 1048576. |
+| `memory_guard.cooldown_secs` | 30 | At least this long between two closings. 10 to 3600. |
+| `memory_guard.stop_grace_secs` | 5 | Between SIGTERM and SIGKILL. 1 to 300. |
+| `memory_guard.include_agent` | `false` | Close a session's agent process together with what it started. |
+| `memory_guard.never` | empty | Process names never closed. At most 256. |
+
 ## Guard rules
 
 The `guard` settings control the [guard rules](/docs/hooks/#guard-rules) that agent hooks and `mulchie guard check` apply to shell commands.

@@ -196,7 +196,7 @@ pub fn tool_list() -> Vec<Tool> {
         read(
             "limits_status",
             "Session budgets",
-            "Whether session budgets only report or act (report_only, enforcing, and not_enforcing in words with not_enforcing_reason), the budgets, sessions over a cap and what was done, sessions hogging the machine, and processes Mulchie paused (paused_left: paused by an earlier engine and not resumed; resume them with plan_process_action). paused_list_unreadable lists findings that Mulchie could not read its list of paused processes: some may still be stopped. Changes nothing.",
+            "Whether session budgets only report or act (report_only, enforcing, and not_enforcing in words with not_enforcing_reason), the budgets, sessions over a cap and what was done, sessions hogging the machine, and processes Mulchie paused (paused_left: paused by an earlier engine and not resumed; resume them with plan_process_action). paused_list_unreadable lists findings that Mulchie could not read its list of paused processes: some may still be stopped. memory_guard is the machine-wide memory guard: its action (off, notify, stop), whether this engine enforces it, whether memory is low now, would_close (what it would close next) and closings (what it closed and why). Changes nothing.",
             json!({}),
         ),
         read(
