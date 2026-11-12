@@ -1,7 +1,7 @@
 {
   "name": "mulchie-app",
   "private": true,
-  "version": "0.3.0-rc.1",
+  "version": "0.3.0-rc.2",
   "description": "Tooling for the Mulchie desktop app. The Tauri CLI is pinned here; see scripts/bundle.sh.",
   "scripts": {
     "tauri": "tauri"
