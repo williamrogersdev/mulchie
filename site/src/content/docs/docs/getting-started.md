@@ -7,7 +7,13 @@ This page takes you from install to a first look at your machine, a first cleanu
 
 ## Install
 
-Install the CLI on macOS or Linux with Homebrew:
+On a Mac, install the menu bar app, which includes the `mulchie` command:
+
+```sh
+brew install --cask williamrogersdev/tap/mulchie
+```
+
+Or install only the CLI, on macOS or Linux:
 
 ```sh
 brew install williamrogersdev/tap/mulchie-cli
@@ -19,14 +25,14 @@ or with the install script:
 curl -fsSL https://mulchie.com/install.sh | sh
 ```
 
-Both check the SHA-256 before they install. For other ways, and for what macOS says about the binary, see [Install](/install/). The menu bar app is not available as a download yet: build it from source for now (macOS 12 or later). A signed download is planned.
+Each checks the SHA-256 before it installs. Install the app or the CLI, not both. For other ways, including the DMG download, see [Install](/install/). The app needs macOS 12 or later.
 
 ## First run
 
 1. Make sure `~/.local/bin` is on your `PATH`.
 2. Run `mulchie serve` to start the engine (see [Running headless](/docs/headless/)).
 
-If you built the menu bar app from source, open it instead: an icon appears in the menu bar and the engine starts. Open the dashboard from the panel to see CPU, memory, disk and a breakdown by repo and worktree. In the dashboard, open **Agent API** and choose **Link mulchie into ~/.local/bin** to put the CLI on that path.
+If you installed the menu bar app, open it instead: an icon appears in the menu bar and the engine starts. Open the dashboard from the panel to see CPU, memory, disk and a breakdown by repo and worktree. If you installed it from the DMG rather than Homebrew, open **Agent API** in the dashboard and choose **Link mulchie into ~/.local/bin** to put the CLI on that path.
 
 ## Check your install
 

@@ -11,7 +11,7 @@ const jsonLd = {
   '@type': 'SoftwareApplication',
   name: 'Mulchie',
   description:
-    'A CLI, local HTTP API and MCP server (with a macOS menu bar app you build from source) that keeps one machine healthy while many AI coding agents run on it.',
+    'A macOS menu bar app, CLI, local HTTP API and MCP server that keeps one machine healthy while many AI coding agents run on it.',
   url: `${SITE}/`,
   applicationCategory: 'DeveloperApplication',
   operatingSystem: 'macOS, Linux',
@@ -176,8 +176,12 @@ Not ready (1):
 
   <section class="sec wrap" aria-labelledby="install">
     <h2 id="install">Install</h2>
-    <p class="muted">The CLI, engine and API run on macOS and Linux. The menu bar app is not available as a download yet; build it from source for now.</p>
+    <p class="muted">The CLI, engine and API run on macOS and Linux. The menu bar app is for macOS and includes the CLI.</p>
     <ul class="cmds">
+      <li>
+        <div class="label">Menu bar app on macOS<span>Homebrew cask</span></div>
+        <pre tabindex="0"><code>brew install --cask williamrogersdev/tap/mulchie</code></pre>
+      </li>
       <li>
         <div class="label">CLI on macOS or Linux<span>Homebrew</span></div>
         <pre tabindex="0"><code>brew install williamrogersdev/tap/mulchie-cli</code></pre>
