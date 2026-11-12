@@ -1,24 +1,24 @@
 name: site
 
+# Deploys the site when a merge to main changes it. Pull requests build and check the
+# site in ci.yml (the Site job), which is part of the required "CI passed" check.
+# Run it by hand (gh workflow run site.yml) to deploy main again.
+
 on:
-  pull_request:
-    paths:
-      - 'site/**'
-      - 'scripts/install.sh'
-      - '.github/workflows/site.yml'
   push:
     branches: [main]
     paths:
       - 'site/**'
       - 'scripts/install.sh'
       - '.github/workflows/site.yml'
+  workflow_dispatch:
 
 permissions:
   contents: read
 
 concurrency:
   group: site-${{ github.ref }}
-  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+  cancel-in-progress: false
 
 jobs:
   build:
@@ -38,7 +38,6 @@ jobs:
       # Builds the site, copies scripts/install.sh into dist, then runs scripts/check-seo.mjs.
       - run: bun run build
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
-        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
         with:
           name: site-dist
           path: site/dist
@@ -46,7 +45,7 @@ jobs:
 
   deploy:
     needs: build
-    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    if: github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
     timeout-minutes: 10
     env:
@@ -57,7 +56,7 @@ jobs:
         id: creds
         run: |
           if [ -z "$CLOUDFLARE_API_TOKEN" ] || [ -z "$CLOUDFLARE_ACCOUNT_ID" ]; then
-            echo "::notice title=Deploy skipped::CLOUDFLARE_API_TOKEN or CLOUDFLARE_ACCOUNT_ID is not set. The site built and passed the SEO check but was not deployed."
+            echo "::warning title=Deploy skipped::CLOUDFLARE_API_TOKEN or CLOUDFLARE_ACCOUNT_ID is not set. The site built and passed the SEO check but was not deployed."
             echo "present=false" >> "$GITHUB_OUTPUT"
           else
             echo "present=true" >> "$GITHUB_OUTPUT"

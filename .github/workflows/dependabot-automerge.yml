@@ -1,0 +1,40 @@
+name: Dependabot auto-merge
+
+# Turns on auto-merge for Dependabot pull requests, so an update merges by itself once
+# "CI passed" is green. A major version update is left open for a person or an agent.
+#
+# The merge is made with this workflow's token, and GitHub does not start workflows for
+# pushes made that way. So main.yml does not run for a Dependabot merge; the checks that
+# ran on the pull request are the ones that count. Dependabot never changes the version,
+# so no release is missed.
+
+on:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  automerge:
+    name: Enable auto-merge
+    if: github.event.pull_request.user.login == 'dependabot[bot]'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: write
+      pull-requests: write
+    steps:
+      - name: Read the update
+        id: metadata
+        uses: dependabot/fetch-metadata@25dd0e34f4fe68f24cc83900b1fe3fe149efef98 # v3.1.0
+
+      - name: Enable auto-merge
+        if: steps.metadata.outputs.update-type != 'version-update:semver-major'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR_URL: ${{ github.event.pull_request.html_url }}
+        run: gh pr merge --auto --squash "$PR_URL"
+
+      - name: Leave a major update open
+        if: steps.metadata.outputs.update-type == 'version-update:semver-major'
+        run: echo "::notice::This is a major version update, so auto-merge was not turned on. Merge it with gh pr merge --auto --squash once it has been looked at."
