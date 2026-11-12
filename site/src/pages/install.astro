@@ -4,29 +4,40 @@ import { REPO } from '../lib/meta';
 
 const title = 'Install Mulchie on macOS or Linux';
 const description =
-  'Install the Mulchie CLI with the install script, Cargo or from source. The menu bar app is built from source for now. Checksums, Gatekeeper, uninstalling.';
+  'Install Mulchie with Homebrew: the signed macOS menu bar app, or the CLI for macOS and Linux. Also the install script, Cargo, checksums and uninstall.';
 ---
 <Base title={title} description={description} ogImage="default" current="install">
   <div class="wrap prose">
     <h1>Install Mulchie</h1>
-    <p class="lede">The first release is the <code>mulchie</code> command for macOS and Linux. Install it with one command.</p>
+    <p class="lede">Mulchie is a macOS menu bar app and a <code>mulchie</code> command for macOS and Linux. Install either with one command.</p>
 
     <h2 id="requirements">Requirements</h2>
     <ul>
       <li>CLI, engine, local API and MCP server: macOS or Linux (x86_64 or aarch64). Windows is not supported.</li>
-      <li>Menu bar app (built from source for now): macOS 12 or later, Apple silicon or Intel.</li>
+      <li>Menu bar app: macOS 12 or later, Apple silicon or Intel.</li>
     </ul>
 
     <h2 id="paths">Choose an install path</h2>
-    <p>The first release ships the <code>mulchie</code> command only. The menu bar app is not available as a download yet.</p>
+    <p>The menu bar app includes the <code>mulchie</code> command, so install the app or the CLI, not both.</p>
     <table>
       <thead><tr><th scope="col">You want</th><th scope="col">Use</th></tr></thead>
       <tbody>
-        <tr><td>The CLI on a Mac, on Linux or on a server</td><td><a href="#script">Install script</a></td></tr>
+        <tr><td>The menu bar app and dashboard on a Mac</td><td><a href="#app">Homebrew cask or the DMG</a></td></tr>
+        <tr><td>The CLI on a Mac or on Linux with Homebrew</td><td><a href="#homebrew">Homebrew</a></td></tr>
+        <tr><td>The CLI on a server, or without Homebrew</td><td><a href="#script">Install script</a></td></tr>
         <tr><td>The CLI built from source</td><td><a href="#cargo">Cargo</a> or <a href="#source">build from source</a></td></tr>
-        <tr><td>The menu bar app and dashboard</td><td><a href="#app">Build it from source</a></td></tr>
       </tbody>
     </table>
+
+    <h2 id="app">The menu bar app</h2>
+    <pre><code>brew install --cask williamrogersdev/tap/mulchie</code></pre>
+    <p>This installs <code>Mulchie.app</code> in <code>/Applications</code> and links the <code>mulchie</code> command that ships inside it. The app is a universal build, signed with a Developer ID and notarized by Apple. Update with <code>brew upgrade --cask mulchie</code> and remove with <code>brew uninstall --cask mulchie</code>.</p>
+    <p>Without Homebrew, download <code>Mulchie_&lt;version&gt;_universal.dmg</code> from the <a href={`${REPO}/releases`}>releases page</a>, open it and drag Mulchie to Applications. To put the command on your <code>PATH</code>, open the dashboard, choose <strong>Agent API</strong>, then <strong>Link mulchie into ~/.local/bin</strong>. This build does not update itself: download the newer DMG to update.</p>
+    <p>To build the app from source instead, see <a href={`${REPO}/blob/main/CONTRIBUTING.md`}>CONTRIBUTING</a>.</p>
+
+    <h2 id="homebrew">Homebrew (CLI)</h2>
+    <pre><code>brew install williamrogersdev/tap/mulchie-cli</code></pre>
+    <p>This installs the <code>mulchie</code> command from the release tarball for your OS and CPU, after Homebrew checks its SHA-256. It works on macOS and on Linux with Homebrew. Update with <code>brew upgrade mulchie-cli</code> and remove with <code>brew uninstall mulchie-cli</code>.</p>
 
     <h2 id="script">Install script (CLI)</h2>
     <pre><code>curl -fsSL https://mulchie.com/install.sh | sh</code></pre>
@@ -54,25 +65,17 @@ const description =
 cd mulchie
 cargo install --path crates/mulchie-cli</code></pre>
 
-    <h2 id="app">The menu bar app</h2>
-    <p>The menu bar app is not available as a download yet, and there is no Homebrew formula or cask yet. For now, build it from source on a Mac. It needs Rust and Bun, and the steps are in <a href={`${REPO}/blob/main/CONTRIBUTING.md`}>CONTRIBUTING</a>:</p>
-    <pre><code>git clone {REPO}.git
-cd mulchie
-./scripts/bundle.sh
-open target/release/bundle/macos/Mulchie.app</code></pre>
-    <p>A signed download is planned for a later release.</p>
-
     <h2 id="gatekeeper">macOS and Gatekeeper</h2>
-    <p>The macOS CLI binaries are ad-hoc signed. They are not signed with a Developer ID or notarized by Apple yet. In practice:</p>
+    <p>The menu bar app and its DMG are signed with a Developer ID and notarized, so they open without a warning. The standalone macOS CLI binaries in the tarballs are ad-hoc signed, not Developer ID signed or notarized yet. In practice:</p>
     <ul>
-      <li>Installing with the install script works. The script downloads the file itself, so macOS does not quarantine it.</li>
+      <li>Installing the CLI with Homebrew or the install script works. The script downloads the file itself, so macOS does not quarantine it.</li>
       <li>A tarball you download with a browser is quarantined, and Gatekeeper blocks the binary when you run it. Extract it, then clear the flag:</li>
     </ul>
     <pre><code>xattr -d com.apple.quarantine ./mulchie</code></pre>
 
     <h2 id="first-run">First run</h2>
     <ol>
-      <li>Start the engine with <code>mulchie serve</code>, or at login with <code>mulchie service install</code> (see <a href="/docs/headless/">running headless</a>). If you built the menu bar app, open it instead: it adds an icon to the menu bar and starts the engine.</li>
+      <li>Start the engine with <code>mulchie serve</code>, or at login with <code>mulchie service install</code> (see <a href="/docs/headless/">running headless</a>). If you installed the menu bar app, open it instead: it adds an icon to the menu bar and starts the engine.</li>
       <li>Make sure the install directory (<code>~/.local/bin</code> for the script) is on your <code>PATH</code>.</li>
       <li>Run <code>mulchie status</code> in a terminal. It uses the running engine and says so on stderr if it falls back to a local look.</li>
       <li>Check the setup with <code>mulchie doctor</code>. It prints pass, warn or fail for each check and changes nothing.</li>
@@ -87,16 +90,17 @@ open target/release/bundle/macos/Mulchie.app</code></pre>
 
     <h2 id="update">Update</h2>
     <ul>
+      <li>Homebrew CLI: <code>brew upgrade mulchie-cli</code>.</li>
       <li>Install script: run it again.</li>
       <li>Cargo: run the <code>cargo install --git</code> command again with <code>--force</code>.</li>
-      <li>Menu bar app built from source: build it again from a newer checkout.</li>
+      <li>Menu bar app: <code>brew upgrade --cask mulchie</code>, or download the newer DMG.</li>
     </ul>
     <p>The engine also checks for newer versions of Mulchie and of the agent tools it finds, and reports them in <code>mulchie updates</code>. It installs nothing. See <a href="/docs/updates/">update checks</a> for what it contacts and how to turn it off.</p>
 
     <h2 id="uninstall">Uninstall</h2>
     <ol>
-      <li>Stop the engine (quit the menu bar app if you built it). If you set up a background service, run <code>mulchie service uninstall</code> first (see <a href="/docs/headless/">running headless</a>). If you connected an agent, run <code>mulchie mcp uninstall --client &lt;app&gt;</code> and, if you installed hooks, <code>mulchie hooks uninstall --client &lt;app&gt;</code> for each one.</li>
-      <li>Remove the program: delete <code>~/.local/bin/mulchie</code> (install script), run <code>cargo uninstall mulchie</code> (Cargo), or delete the app you built.</li>
+      <li>Stop the engine (quit the menu bar app if you use it). If you set up a background service, run <code>mulchie service uninstall</code> first (see <a href="/docs/headless/">running headless</a>). If you connected an agent, run <code>mulchie mcp uninstall --client &lt;app&gt;</code> and, if you installed hooks, <code>mulchie hooks uninstall --client &lt;app&gt;</code> for each one.</li>
+      <li>Remove the program: run <code>brew uninstall --cask mulchie</code> or <code>brew uninstall mulchie-cli</code> (Homebrew), delete <code>~/.local/bin/mulchie</code> (install script), run <code>cargo uninstall mulchie</code> (Cargo), or delete the app from Applications.</li>
       <li>Optional: delete <code>~/.config/mulchie</code>. It holds your config, API tokens, action log, session activity records and <strong>worktree backups</strong>. Keep the <code>backups</code> folder until you are sure you do not need any patch in it.</li>
     </ol>
     <p>Source and issues live on <a href={REPO}>GitHub</a>.</p>

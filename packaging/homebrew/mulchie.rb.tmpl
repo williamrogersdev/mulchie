@@ -15,7 +15,7 @@ cask "mulchie" do
   end
 
   auto_updates true
-  conflicts_with formula: "mulchie-cli"
+  # Homebrew casks cannot declare a conflict with a formula; mulchie-cli declares it.
   depends_on macos: :monterey
 
   app "Mulchie.app"
