@@ -45,7 +45,13 @@ Full documentation is at [mulchie.com/docs](https://mulchie.com/docs/).
 
 ## Install
 
-The first release is the CLI for macOS and Linux:
+The first release is the CLI for macOS and Linux. With Homebrew:
+
+```sh
+brew install williamrogersdev/tap/mulchie-cli
+```
+
+`brew upgrade mulchie-cli` updates it. Without Homebrew, the install script:
 
 ```sh
 curl -fsSL https://mulchie.com/install.sh | sh
@@ -57,9 +63,9 @@ or, from GitHub:
 curl -fsSL https://raw.githubusercontent.com/williamrogersdev/mulchie/main/scripts/install.sh | sh
 ```
 
-The install script puts the binary in `~/.local/bin` after checking its SHA-256 against the release's `.sha256` file. Every release asset has a SHA-256 checksum, and the release lists them in `SHA256SUMS`. From source: `cargo install --git https://github.com/williamrogersdev/mulchie mulchie`, or `cargo install --path crates/mulchie-cli` from a checkout. Mulchie is not on crates.io or Homebrew yet.
+The install script puts the binary in `~/.local/bin` after checking its SHA-256 against the release's `.sha256` file. Every release asset has a SHA-256 checksum, and the release lists them in `SHA256SUMS`. From source: `cargo install --git https://github.com/williamrogersdev/mulchie mulchie`, or `cargo install --path crates/mulchie-cli` from a checkout. Mulchie is not on crates.io yet, and the menu bar app is not a download or a Homebrew cask yet: build it with `./scripts/bundle.sh`.
 
-The macOS CLI binaries are ad-hoc signed, not Developer ID signed or notarized. The install script works. A tarball downloaded with a browser is quarantined by Gatekeeper; after extracting it, run `xattr -d com.apple.quarantine ./mulchie`.
+The macOS CLI binaries are ad-hoc signed, not Developer ID signed or notarized. Homebrew and the install script both work. A tarball downloaded with a browser is quarantined by Gatekeeper; after extracting it, run `xattr -d com.apple.quarantine ./mulchie`.
 
 The menu bar app is not available as a download yet. Build it from source on a Mac (Rust and Bun required) with `./scripts/bundle.sh`; a signed download is planned.
 

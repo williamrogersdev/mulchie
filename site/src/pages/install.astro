@@ -4,7 +4,7 @@ import { REPO } from '../lib/meta';
 
 const title = 'Install Mulchie on macOS or Linux';
 const description =
-  'Install the Mulchie CLI with the install script, Cargo or from source. The menu bar app is built from source for now. Checksums, Gatekeeper, uninstalling.';
+  'Install the Mulchie CLI with Homebrew, the install script, Cargo or from source. The menu bar app is built from source for now. Checksums, Gatekeeper, uninstall.';
 ---
 <Base title={title} description={description} ogImage="default" current="install">
   <div class="wrap prose">
@@ -22,11 +22,16 @@ const description =
     <table>
       <thead><tr><th scope="col">You want</th><th scope="col">Use</th></tr></thead>
       <tbody>
-        <tr><td>The CLI on a Mac, on Linux or on a server</td><td><a href="#script">Install script</a></td></tr>
+        <tr><td>The CLI on a Mac or on Linux with Homebrew</td><td><a href="#homebrew">Homebrew</a></td></tr>
+        <tr><td>The CLI on a server, or without Homebrew</td><td><a href="#script">Install script</a></td></tr>
         <tr><td>The CLI built from source</td><td><a href="#cargo">Cargo</a> or <a href="#source">build from source</a></td></tr>
         <tr><td>The menu bar app and dashboard</td><td><a href="#app">Build it from source</a></td></tr>
       </tbody>
     </table>
+
+    <h2 id="homebrew">Homebrew (CLI)</h2>
+    <pre><code>brew install williamrogersdev/tap/mulchie-cli</code></pre>
+    <p>This installs the <code>mulchie</code> command from the release tarball for your OS and CPU, after Homebrew checks its SHA-256. It works on macOS and on Linux with Homebrew. Update with <code>brew upgrade mulchie-cli</code> and remove with <code>brew uninstall mulchie-cli</code>.</p>
 
     <h2 id="script">Install script (CLI)</h2>
     <pre><code>curl -fsSL https://mulchie.com/install.sh | sh</code></pre>
@@ -55,7 +60,7 @@ cd mulchie
 cargo install --path crates/mulchie-cli</code></pre>
 
     <h2 id="app">The menu bar app</h2>
-    <p>The menu bar app is not available as a download yet, and there is no Homebrew formula or cask yet. For now, build it from source on a Mac. It needs Rust and Bun, and the steps are in <a href={`${REPO}/blob/main/CONTRIBUTING.md`}>CONTRIBUTING</a>:</p>
+    <p>The menu bar app is not available as a download or a Homebrew cask yet. For now, build it from source on a Mac. It needs Rust and Bun, and the steps are in <a href={`${REPO}/blob/main/CONTRIBUTING.md`}>CONTRIBUTING</a>:</p>
     <pre><code>git clone {REPO}.git
 cd mulchie
 ./scripts/bundle.sh
@@ -87,6 +92,7 @@ open target/release/bundle/macos/Mulchie.app</code></pre>
 
     <h2 id="update">Update</h2>
     <ul>
+      <li>Homebrew: <code>brew upgrade mulchie-cli</code>.</li>
       <li>Install script: run it again.</li>
       <li>Cargo: run the <code>cargo install --git</code> command again with <code>--force</code>.</li>
       <li>Menu bar app built from source: build it again from a newer checkout.</li>
@@ -96,7 +102,7 @@ open target/release/bundle/macos/Mulchie.app</code></pre>
     <h2 id="uninstall">Uninstall</h2>
     <ol>
       <li>Stop the engine (quit the menu bar app if you built it). If you set up a background service, run <code>mulchie service uninstall</code> first (see <a href="/docs/headless/">running headless</a>). If you connected an agent, run <code>mulchie mcp uninstall --client &lt;app&gt;</code> and, if you installed hooks, <code>mulchie hooks uninstall --client &lt;app&gt;</code> for each one.</li>
-      <li>Remove the program: delete <code>~/.local/bin/mulchie</code> (install script), run <code>cargo uninstall mulchie</code> (Cargo), or delete the app you built.</li>
+      <li>Remove the program: run <code>brew uninstall mulchie-cli</code> (Homebrew), delete <code>~/.local/bin/mulchie</code> (install script), run <code>cargo uninstall mulchie</code> (Cargo), or delete the app you built.</li>
       <li>Optional: delete <code>~/.config/mulchie</code>. It holds your config, API tokens, action log, session activity records and <strong>worktree backups</strong>. Keep the <code>backups</code> folder until you are sure you do not need any patch in it.</li>
     </ol>
     <p>Source and issues live on <a href={REPO}>GitHub</a>.</p>

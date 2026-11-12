@@ -7,13 +7,19 @@ This page takes you from install to a first look at your machine, a first cleanu
 
 ## Install
 
-Install the CLI on macOS or Linux with the install script:
+Install the CLI on macOS or Linux with Homebrew:
+
+```sh
+brew install williamrogersdev/tap/mulchie-cli
+```
+
+or with the install script:
 
 ```sh
 curl -fsSL https://mulchie.com/install.sh | sh
 ```
 
-It checks the SHA-256 before it installs. For other ways, and for what macOS says about the binary, see [Install](/install/). The menu bar app is not available as a download yet: build it from source for now (macOS 12 or later). A signed download is planned.
+Both check the SHA-256 before they install. For other ways, and for what macOS says about the binary, see [Install](/install/). The menu bar app is not available as a download yet: build it from source for now (macOS 12 or later). A signed download is planned.
 
 ## First run
 

@@ -587,7 +587,13 @@ jobs:
   draft-release:
     name: Create draft GitHub Release
     needs: [prepare, assemble]
-    if: needs.prepare.outputs.release == 'true'  # assemble succeeded, or this job is skipped
+    # The skipped desktop job (a CLI-only release) is an ancestor through assemble, and a
+    # job with a skipped ancestor is skipped unless its condition says otherwise. So this
+    # runs under !cancelled() and checks assemble itself.
+    if: >-
+      ${{ !cancelled()
+      && needs.assemble.result == 'success'
+      && needs.prepare.outputs.release == 'true' }}
     runs-on: ubuntu-latest
     timeout-minutes: 10
     permissions:
