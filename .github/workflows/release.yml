@@ -1,39 +1,41 @@
 name: Release
 
-# Push a tag vX.Y.Z (the same version as the workspace Cargo.toml) to build everything
-# and create a DRAFT GitHub Release. A tag with a suffix, such as v0.3.0-rc.1, makes a
-# pre-release: same build and signing, but the release is marked as a pre-release so
-# releases/latest (install.sh, the app updater) keeps pointing at the last stable one.
-# A person reviews and publishes the draft;
-# publishing triggers publish.yml (Homebrew tap, crates.io).
+# Builds everything, creates the tag vX.Y.Z and publishes the GitHub Release, then calls
+# publish.yml (Homebrew tap, crates.io). No person pushes a tag or publishes a draft.
+#
+# It starts in one of three ways:
+#   - main.yml calls it when a push to main changed the workspace version and the tag
+#     v<version> does not exist yet. That is a real release.
+#   - Manual run on main with dry_run off (gh workflow run release.yml -f dry_run=false):
+#     a real release of the version on main. Use it to retry after a failed release.
+#   - Manual run with dry_run on (the default), from any branch: builds everything but
+#     skips signing, notarization, the tag and the release, so it works with no secret.
+#
+# A version with a suffix, such as 0.3.0-rc.1, makes a pre-release: same build and
+# signing, but the release is marked as a pre-release so releases/latest (install.sh, the
+# app updater) keeps pointing at the last stable one, and publish.yml skips it.
+#
+# The tag is created with the release, as the last step. A run that fails before that
+# leaves nothing behind: fix main and run it again.
 #
 # The committed updater config decides what a real release contains. With
 # bundle.createUpdaterArtifacts and plugins.updater.pubkey set in tauri.conf.json it is a
 # full release: the desktop app, signed and notarized, and the CLI. Without them it is a
 # CLI-only release: four CLI tarballs, no app, no Apple secrets, macOS binaries ad-hoc
 # signed only. See "CLI-only release" in docs/RELEASING.md.
-#
-# Manual run (Actions > Release > Run workflow) with dry_run on builds everything but
-# skips signing, notarization and upload, so it works before any secret exists.
 # Secrets and one-time setup: docs/RELEASING.md.
 
 on:
-  push:
-    tags:
-      - "v*"
+  workflow_call:
   workflow_dispatch:
     inputs:
       dry_run:
-        description: "Build only. Skip signing, notarization and the draft release."
+        description: "Build only. Skip signing, notarization, the tag and the release."
         type: boolean
         default: true
 
 permissions:
   contents: read
-
-concurrency:
-  group: release-${{ github.ref }}
-  cancel-in-progress: false
 
 env:
   CARGO_TERM_COLOR: always
@@ -53,24 +55,29 @@ jobs:
       - name: Check out source
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
-      # A real release is a tag push, or a manual run on a tag with dry_run off.
+      # A real release is a call from main.yml (the event is then the push to main), or
+      # a manual run with dry_run off. Both must be on main, and the tag must be new.
       - name: Decide mode and check the version
         id: version
         env:
-          REF_TYPE: ${{ github.ref_type }}
           EVENT: ${{ github.event_name }}
-          DRY_RUN: ${{ inputs.dry_run }}
+          DRY_RUN: ${{ github.event.inputs.dry_run }}
         run: |
           RELEASE=false
-          if [[ "$REF_TYPE" == "tag" && ( "$EVENT" == "push" || "$DRY_RUN" == "false" ) ]]; then
+          if [[ "$EVENT" == "push" || ( "$EVENT" == "workflow_dispatch" && "$DRY_RUN" == "false" ) ]]; then
             RELEASE=true
           fi
+          VERSION="$(scripts/workspace-version.sh)"
+          TAG="v$VERSION"
           if [[ "$RELEASE" == "true" ]]; then
-            VERSION="$(scripts/workspace-version.sh "$GITHUB_REF_NAME")"
-            TAG="$GITHUB_REF_NAME"
-          else
-            VERSION="$(scripts/workspace-version.sh)"
-            TAG="v$VERSION"
+            if [[ "$GITHUB_REF" != "refs/heads/main" ]]; then
+              echo "::error::A release is built from main, not from $GITHUB_REF. Run it on main, or leave dry_run on."
+              exit 1
+            fi
+            if git ls-remote --exit-code --tags origin "refs/tags/$TAG" > /dev/null; then
+              echo "::error::Tag $TAG already exists. Set a new version with scripts/bump-version.sh (docs/RELEASING.md)."
+              exit 1
+            fi
           fi
           PRERELEASE=false
           if [[ "$VERSION" == *-* ]]; then
@@ -118,7 +125,7 @@ jobs:
           if [[ "$RELEASE" == "true" ]]; then
             scripts/release-notes.sh "$VERSION" --release > release-notes.md
           elif ! scripts/release-notes.sh "$VERSION" > release-notes.md; then
-            echo "::warning file=CHANGELOG.md::No usable notes for $VERSION yet; a tagged release would fail."
+            echo "::warning file=CHANGELOG.md::No usable notes for $VERSION yet; a release would fail."
             echo "Dry run of $VERSION." > release-notes.md
           fi
           if [[ "$RELEASE" == "true" && "$APP" != "true" ]]; then
@@ -522,7 +529,7 @@ jobs:
           path: src
 
       # Every asset a release promises must be here. A missing one fails the run before
-      # anything is written, so a draft is never created from a partial set.
+      # anything is written, so a release is never created from a partial set.
       - name: Check the expected assets
         run: |
           expected=()
@@ -584,12 +591,18 @@ jobs:
           if-no-files-found: error
           retention-days: 14
 
-  draft-release:
-    name: Create draft GitHub Release
+  # Creates the tag and the release in one step, already published. gh uploads the assets
+  # to a draft first and publishes it when they are all there, so a published release is
+  # never missing a file.
+  github-release:
+    name: Publish GitHub Release
     needs: [prepare, assemble]
     if: needs.prepare.outputs.release == 'true'  # assemble succeeded, or this job is skipped
     runs-on: ubuntu-latest
     timeout-minutes: 10
+    concurrency:
+      group: github-release
+      cancel-in-progress: false
     permissions:
       contents: write
       id-token: write
@@ -612,6 +625,14 @@ jobs:
           name: release-notes
           path: notes
 
+      # Checked again here because another release may have finished while this one built.
+      - name: Check the tag is still new
+        run: |
+          if gh api "repos/$GITHUB_REPOSITORY/git/ref/tags/$TAG" > /dev/null 2>&1; then
+            echo "::error::Tag $TAG already exists, so $VERSION was released by another run."
+            exit 1
+          fi
+
       - name: Attest build provenance
         uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
         with:
@@ -619,18 +640,35 @@ jobs:
             release/*.tar.gz
             ${{ needs.prepare.outputs.app == 'true' && 'release/*.dmg' || '' }}
 
-      - name: Create or update the draft release
+      # A pre-release must never become "latest": install.sh and the updater read
+      # releases/latest. With no tag yet, a release that already exists under this name can
+      # only be a draft left by a run that failed while uploading; it is finished, not kept.
+      - name: Create the tag and publish the release
         run: |
-          # A pre-release must never become "latest": install.sh and the updater read releases/latest.
           if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" > /dev/null 2>&1; then
             gh release upload "$TAG" release/* --clobber --repo "$GITHUB_REPOSITORY"
-            gh release edit "$TAG" --notes-file notes/release-notes.md --prerelease="$PRERELEASE" --repo "$GITHUB_REPOSITORY"
+            gh release edit "$TAG" \
+              --repo "$GITHUB_REPOSITORY" \
+              --target "$GITHUB_SHA" \
+              --title "Mulchie $VERSION" \
+              --notes-file notes/release-notes.md \
+              --prerelease="$PRERELEASE" \
+              --draft=false
           else
             gh release create "$TAG" release/* \
               --repo "$GITHUB_REPOSITORY" \
-              --verify-tag \
-              --draft \
+              --target "$GITHUB_SHA" \
               --prerelease="$PRERELEASE" \
               --title "Mulchie $VERSION" \
               --notes-file notes/release-notes.md
           fi
+          gh release view "$TAG" --repo "$GITHUB_REPOSITORY" --json tagName,isDraft,isPrerelease,url
+
+  # Homebrew tap and crates.io. Skipped for a pre-release inside publish.yml.
+  publish:
+    name: Publish
+    needs: [prepare, github-release]
+    uses: ./.github/workflows/publish.yml
+    with:
+      tag: ${{ needs.prepare.outputs.tag }}
+    secrets: inherit

@@ -1,34 +1,44 @@
 name: Publish
 
-# Runs when a person publishes the draft release created by release.yml:
+# Called by release.yml as soon as it has published a GitHub Release:
 #   - updates the Homebrew tap (cask and formula; only the formula when the release has no
 #     DMG, which is a CLI-only release)
 #   - publishes mulchie-core and mulchie to crates.io
-# Both are skipped for a pre-release (a tag such as v0.3.0-rc.1, or a release marked as a
-# pre-release): a crates.io publish cannot be undone and the tap has no pre-release channel.
-# Each job skips with a notice when its secret is missing. Re-running is safe.
+# Both are skipped for a pre-release (a tag with a suffix, such as v0.3.0-rc.1): a crates.io
+# publish cannot be undone and the tap has no pre-release channel.
+# Each job skips with a warning when its secret is missing. Running it again is safe:
+#   gh workflow run publish.yml -f tag=vX.Y.Z
 # Secrets: docs/RELEASING.md.
 
 on:
-  release:
-    types: [published]
+  workflow_call:
+    inputs:
+      tag:
+        description: "The release tag, such as v0.3.0."
+        type: string
+        required: true
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "The tag of a published release, such as v0.3.0."
+        type: string
+        required: true
 
 permissions:
   contents: read
 
-concurrency:
-  group: publish-${{ github.event.release.tag_name }}
-  cancel-in-progress: false
-
 env:
-  TAG: ${{ github.event.release.tag_name }}
+  TAG: ${{ inputs.tag }}
 
 jobs:
   homebrew:
     name: Update Homebrew tap
-    if: ${{ !github.event.release.prerelease && !contains(github.event.release.tag_name, '-') }}
+    if: ${{ !contains(inputs.tag, '-') }}
     runs-on: ubuntu-latest
     timeout-minutes: 15
+    concurrency:
+      group: publish-homebrew
+      cancel-in-progress: false
     env:
       TAP_REPO: williamrogersdev/homebrew-tap
       HOMEBREW_TAP_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
@@ -38,7 +48,7 @@ jobs:
         id: gate
         run: |
           if [[ -z "$HOMEBREW_TAP_TOKEN" ]]; then
-            echo "::notice::HOMEBREW_TAP_TOKEN is not set, so the tap was not updated. See docs/RELEASING.md."
+            echo "::warning::HOMEBREW_TAP_TOKEN is not set, so the tap was not updated. See docs/RELEASING.md."
             echo "enabled=false" >> "$GITHUB_OUTPUT"
           else
             echo "enabled=true" >> "$GITHUB_OUTPUT"
@@ -134,18 +144,20 @@ jobs:
     name: Publish to crates.io
     runs-on: ubuntu-latest
     timeout-minutes: 30
+    concurrency:
+      group: publish-crates
+      cancel-in-progress: false
     env:
       CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
-      PRERELEASE: ${{ github.event.release.prerelease }}
     steps:
       - name: Check for the registry token
         id: gate
         run: |
-          if [[ "$PRERELEASE" == "true" || "$TAG" == *-* ]]; then
+          if [[ "$TAG" == *-* ]]; then
             echo "::notice::$TAG is a pre-release, so nothing was published to crates.io (a publish cannot be undone). See docs/RELEASING.md."
             echo "enabled=false" >> "$GITHUB_OUTPUT"
           elif [[ -z "$CARGO_REGISTRY_TOKEN" ]]; then
-            echo "::notice::CARGO_REGISTRY_TOKEN is not set, so nothing was published to crates.io. See docs/RELEASING.md."
+            echo "::warning::CARGO_REGISTRY_TOKEN is not set, so nothing was published to crates.io. See docs/RELEASING.md."
             echo "enabled=false" >> "$GITHUB_OUTPUT"
           else
             echo "enabled=true" >> "$GITHUB_OUTPUT"

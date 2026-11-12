@@ -1,17 +1,22 @@
 name: CI
 
+# Runs on every pull request, and on every push to main through main.yml, which calls
+# this workflow and then decides whether the commit is a release.
+# The ruleset on main requires one check from here: "CI passed".
+
 on:
   pull_request:
-  push:
-    branches: [main]
+  workflow_call:
   workflow_dispatch:
 
 permissions:
   contents: read
 
+# A pull request keeps only its newest run. Every commit on main gets its own run, so a
+# later merge never cancels the checks, or the release, of an earlier one.
 concurrency:
-  group: ci-${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: true
+  group: ci-${{ github.event_name == 'pull_request' && github.ref || github.sha }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 env:
   CARGO_TERM_COLOR: always
@@ -90,3 +95,62 @@ jobs:
 
       - name: Installer test
         run: scripts/test-install.sh
+
+      - name: Version bump script test
+        run: scripts/test-bump-version.sh
+
+      # Merging a version change releases it (main.yml), so the version in
+      # Cargo.toml must be releasable in every pull request: the same version in every
+      # file that carries it, and dated notes in CHANGELOG.md.
+      - name: The workspace version is releasable
+        run: |
+          VERSION="$(scripts/workspace-version.sh)"
+          scripts/bump-version.sh --check
+          scripts/release-notes.sh "$VERSION" --release > /dev/null
+          echo "Version $VERSION is consistent and has release notes."
+
+  # Builds the site and runs its SEO check. site.yml deploys it from main.
+  site:
+    name: Site
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    defaults:
+      run:
+        working-directory: site
+    steps:
+      - name: Check out source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install Bun
+        uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
+        with:
+          bun-version: 1.4.4
+
+      - name: Install dependencies
+        run: bun install --frozen-lockfile
+
+      - name: Build and check
+        run: bun run build
+
+  # The one check the main branch ruleset requires. It passes only when every job above
+  # passed, so a new job is covered by adding it to `needs` here, not by editing the ruleset.
+  ok:
+    name: CI passed
+    if: always()
+    needs: [rust, scripts, site]
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Check every job passed
+        env:
+          RESULTS: ${{ join(needs.*.result, ' ') }}
+        run: |
+          echo "Job results: $RESULTS"
+          for result in $RESULTS; do
+            if [[ "$result" != "success" ]]; then
+              echo "::error::A CI job did not pass ($RESULTS)"
+              exit 1
+            fi
+          done
