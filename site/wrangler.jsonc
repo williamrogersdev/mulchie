@@ -5,7 +5,8 @@
   "assets": {
     "directory": "./dist",
     "not_found_handling": "404-page"
-  }
-  // The custom domain mulchie.com is attached in the Cloudflare dashboard (or by
-  // adding a `routes` entry with `custom_domain: true`) once DNS is ready.
+  },
+  // Cloudflare creates the DNS record and certificate for a custom domain. The zone
+  // must be in the account the Worker is deployed to.
+  "routes": [{ "pattern": "mulchie.com", "custom_domain": true }]
 }
