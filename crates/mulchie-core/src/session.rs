@@ -259,6 +259,12 @@ pub struct Session {
     pub client_session_id: Option<String>,
     pub started_unix: u64,
     pub ended_unix: Option<u64>,
+    /// When the session last did something this engine saw: it used
+    /// [`ACTIVE_CPU_CORES`] or more, started a process, or its agent called
+    /// a hook. A heuristic, and no earlier than when this engine first saw
+    /// the session. Frozen once the session ends.
+    #[serde(default)]
+    pub last_active_unix: u64,
     pub usage: Usage,
     pub peak: Peak,
     /// TCP ports the session's processes listen on (from the last watch run).
@@ -351,6 +357,9 @@ pub struct Tracker {
 pub const ENDED_KEPT: usize = 200;
 /// Write-rate window.
 const RATE_WINDOW_SECS: u64 = 60;
+/// A session using this many cores or more (5% of one) counts as active.
+/// Below it an agent is waiting: its helpers still tick over.
+pub const ACTIVE_CPU_CORES: f64 = 0.05;
 
 impl Tracker {
     pub fn sessions(&self) -> impl Iterator<Item = &Session> {
@@ -435,6 +444,7 @@ impl Tracker {
             client_session_id,
             started_unix: now,
             ended_unix: None,
+            last_active_unix: now,
             usage: Usage::default(),
             peak: Peak::default(),
             listening: Vec::new(),
@@ -473,6 +483,15 @@ impl Tracker {
             s.client_session_id = client_session_id.clone();
         }
         s.client.is_some() && s.client == client && s.client_session_id == client_session_id
+    }
+
+    /// Note that a running session did something at `now` (a hook call).
+    pub fn touch(&mut self, id: &str, now: u64) {
+        if let Some(s) = self.sessions.get_mut(id) {
+            if s.status == SessionStatus::Running {
+                s.last_active_unix = s.last_active_unix.max(now);
+            }
+        }
     }
 
     /// Set the listening ports of each running session from (pid, port) pairs.
@@ -620,6 +639,7 @@ impl Tracker {
                 client_session_id: reg.as_ref().and_then(|r| r.client_session_id.clone()),
                 started_unix: now,
                 ended_unix: None,
+                last_active_unix: now,
                 usage: Usage::default(),
                 peak: Peak::default(),
                 listening: Vec::new(),
@@ -667,8 +687,10 @@ impl Tracker {
                 still
             });
             live.written_exited += exited_bytes;
+            let mut started_any = false;
             for m in &ms {
                 let known = live.members.contains_key(&m.pid);
+                started_any |= !known;
                 if !known && !is_new && m.pid != root.pid {
                     events.push(SessionEvent::ProcessStarted {
                         id: id.clone(),
@@ -730,6 +752,9 @@ impl Tracker {
             s.peak.processes = s.peak.processes.max(processes);
             if let Some(r) = rate {
                 s.peak.write_mb_per_hour = Some(s.peak.write_mb_per_hour.unwrap_or(0.0).max(r));
+            }
+            if started_any || cpu_cores >= ACTIVE_CPU_CORES {
+                s.last_active_unix = now;
             }
             s.status = SessionStatus::Running;
             s.ended_unix = None;

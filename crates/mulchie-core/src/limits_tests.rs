@@ -19,6 +19,7 @@ fn session(id: &str, ws: &str, cpu: f64) -> Session {
         client_session_id: None,
         started_unix: 0,
         ended_unix: None,
+        last_active_unix: 0,
         usage: Usage {
             cpu_cores: cpu,
             memory_mb: 100.0,

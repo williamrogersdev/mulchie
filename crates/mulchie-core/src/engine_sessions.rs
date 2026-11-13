@@ -160,6 +160,9 @@ pub struct SessionBrief {
     pub client: Option<String>,
     pub started_unix: u64,
     pub ended_unix: Option<u64>,
+    /// As on [`Session`].
+    #[serde(default)]
+    pub last_active_unix: u64,
     pub cpu_cores: f64,
     pub memory_mb: f64,
     pub processes: u32,
@@ -186,6 +189,7 @@ impl SessionBrief {
             client: s.client.clone(),
             started_unix: s.started_unix,
             ended_unix: s.ended_unix,
+            last_active_unix: s.last_active_unix,
             cpu_cores: s.usage.cpu_cores,
             memory_mb: s.usage.memory_mb,
             processes: s.usage.processes,

@@ -26,6 +26,13 @@ export function ago(t) {
   return Math.round(s / 86400) + 'd';
 }
 
+// How long ago, for a table cell: the short age, with the date as a tooltip.
+export const agoCell = t => t ? `<span title="${esc(new Date(t * 1000).toLocaleString())}">${ago(t)}</span>` : '<span class="dim">—</span>';
+// A row's own action button (`data-da` is run by detail.js). `off`: why it
+// cannot run now, shown as the tooltip of a disabled button.
+export const rowBtn = (label, name, arg, { danger = false, off = '', title = '' } = {}) =>
+  `<button class="btn sm${danger ? ' danger' : ''}" data-da="${esc(name)}" data-arg="${esc(arg)}" ${off ? `disabled title="${esc(off)}"` : title ? `title="${esc(title)}"` : ''}>${esc(label)}</button>`;
+
 export function dur(s) {
   if (s < 60) return s + 's';
   if (s < 3600) return Math.floor(s / 60) + 'm';

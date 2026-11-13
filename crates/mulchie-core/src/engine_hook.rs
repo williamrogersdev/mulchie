@@ -248,6 +248,7 @@ impl Engine {
                     .get(&id)
                     .is_some_and(|s| s.status == SessionStatus::Running);
                 if running {
+                    sup.tracker.touch(&id, now);
                     let bound = sup.tracker.set_client(
                         &id,
                         Some(req.client.clone()),
