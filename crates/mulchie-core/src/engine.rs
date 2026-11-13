@@ -59,6 +59,8 @@ pub const SAMPLE_SECS: u64 = 3;
 pub const STALE_AFTER_SECS: u64 = 15;
 /// Activity entries kept in memory and loaded from the journal on start.
 const ACTIONS_KEPT: usize = 500;
+/// Journal entries folded into the failure memory when the engine starts.
+const FAILURE_TAIL: usize = 5000;
 /// Automatic reclaim runs at most this often.
 const RECLAIM_COOLDOWN: Duration = Duration::from_secs(600);
 /// The scan loop wakes at least this often to check whether a scan is due.
@@ -405,6 +407,11 @@ pub struct State {
     pub runaway: RunawayStatus,
     /// Update checks, compact (the full report: `GET /v1/updates`).
     pub updates: UpdatesStatus,
+    /// Cache deletions, worktree removals and cache prunes skipped at least
+    /// twice in a row, most often failed first: the last reason, what to do,
+    /// and until when automatic passes leave the target alone
+    /// ([`crate::failures`]).
+    pub failures: Vec<crate::failures::Failure>,
 }
 
 impl State {
@@ -745,6 +752,8 @@ pub struct Engine {
     record: Arc<std::sync::OnceLock<crate::record::Record>>,
     /// Update checks: sources, cache and the worker's state.
     updates: Arc<Updates>,
+    /// Targets that keep being skipped, from the journal ([`crate::failures`]).
+    failures: Arc<Mutex<crate::failures::Memory>>,
 }
 
 impl Engine {
@@ -768,7 +777,11 @@ impl Engine {
         let journal = Journal::new(&paths);
         let config_disk = read_config_bytes(&paths);
         let home_for_runner = paths.home.clone();
-        let actions: VecDeque<Action> = journal.tail(ACTIONS_KEPT).into_iter().rev().collect();
+        // One read of the journal: the failure memory folds a longer tail
+        // than the activity list shows.
+        let tail = journal.tail(FAILURE_TAIL);
+        let failures = crate::failures::Memory::from_actions(&tail);
+        let actions: VecDeque<Action> = tail.into_iter().rev().take(ACTIONS_KEPT).collect();
         let config_error = loaded.error.map(|e| e.to_string());
         let state = State {
             version: env!("CARGO_PKG_VERSION").into(),
@@ -799,6 +812,7 @@ impl Engine {
             memory_guard: MemoryGuardStatus::default(),
             runaway: RunawayStatus::default(),
             updates: UpdatesStatus::default(),
+            failures: Vec::new(),
         };
         Self {
             state: Arc::new(Mutex::new(state)),
@@ -824,6 +838,7 @@ impl Engine {
             pause_lock: Arc::new(Mutex::new(())),
             record: Arc::new(std::sync::OnceLock::new()),
             updates: Arc::new(update_sources(home_for_runner)),
+            failures: Arc::new(Mutex::new(failures)),
         }
     }
 
@@ -869,6 +884,19 @@ impl Engine {
         st.memory_guard = self.memory_guard_status();
         st.runaway = self.runaway_status();
         st.updates = self.updates_status(false);
+        // A target that is gone (removed by hand since) is no longer a
+        // problem to report; cache keys of prunes are not paths and stay.
+        st.failures = lock(&self.failures)
+            .list(now)
+            .into_iter()
+            .filter(|f| {
+                let p = Path::new(&f.target);
+                !p.is_absolute()
+                    || std::fs::symlink_metadata(p).is_ok()
+                    || f.kind == "worktree"
+                        && f.reason == Some(crate::safety::SkipReason::PruneDeferred)
+            })
+            .collect();
         st
     }
 
@@ -1951,6 +1979,24 @@ impl Engine {
                 until_unix: Some(until),
             });
         })?;
+        // A dismissal hides a finding from every view, so it is itself in
+        // the journal: who looks at Activity sees what was hidden and when.
+        self.record(Action::note(
+            now_unix(),
+            "finding",
+            format!(
+                "Dismissed finding {} for {days} day(s){}",
+                crate::redact::redact_label(id),
+                if known {
+                    ""
+                } else {
+                    " (not a current finding)"
+                }
+            ),
+            0,
+            None,
+            "api",
+        ));
         Ok((until, known))
     }
 
@@ -1962,6 +2008,19 @@ impl Engine {
             d.retain(|x| x.id != id);
             found = d.len() != before;
         })?;
+        if found {
+            self.record(Action::note(
+                now_unix(),
+                "finding",
+                format!(
+                    "Showing finding {} again (dismissal removed)",
+                    crate::redact::redact_label(id)
+                ),
+                0,
+                None,
+                "api",
+            ));
+        }
         Ok(found)
     }
 
@@ -2139,7 +2198,7 @@ impl Engine {
 
     /// Check requests against the facts now, without acting.
     pub fn plan(&self, requests: &[Request]) -> Plan {
-        self.gate_run(|g| g.plan(requests))
+        self.with_past_failures(self.gate_run(|g| g.plan(requests)))
     }
 
     /// Execute exactly these requests through the safety gate; each is
@@ -2158,8 +2217,106 @@ impl Engine {
             }
             st.forget(&results);
         }
+        self.note_failures(requests, &results, now, source);
         self.note_signals(requests, &results);
         results
+    }
+
+    /// Keep the failure memory in step with what just ran, and say so in the
+    /// journal when a target reaches the point where automatic passes stop
+    /// retrying it for a while.
+    fn note_failures(
+        &self,
+        requests: &[Request],
+        results: &[ActionResult],
+        now: u64,
+        source: &str,
+    ) {
+        for (r, req) in results.iter().zip(requests) {
+            if req.failure_kind().is_none() {
+                continue;
+            }
+            self.note_failure(&r.to_action(now, source, None));
+        }
+    }
+
+    fn note_failure(&self, a: &Action) {
+        let noted = lock(&self.failures).note(a);
+        let Some(f) = noted else { return };
+        if f.count < crate::failures::BACKOFF_AFTER {
+            return;
+        }
+        let wait = crate::failures::backoff_secs(f.count);
+        self.record(Action::note(
+            a.at_unix,
+            "failure",
+            format!(
+                "{} was skipped {} times in a row ({}); automatic passes leave it alone for {} h. {}",
+                f.target,
+                f.count,
+                f.reason.map(|r| r.code()).unwrap_or_else(|| "unknown".into()),
+                wait / 3600,
+                f.advice
+            ),
+            0,
+            None,
+            "mulchie",
+        ));
+    }
+
+    /// Mark plan items whose target was skipped before.
+    fn with_past_failures(&self, mut plan: Plan) -> Plan {
+        let now = now_unix();
+        let mem = lock(&self.failures);
+        for i in plan.items.iter_mut() {
+            if let Some(kind) = i.request.failure_kind() {
+                i.past_failures = mem.past(kind, &i.request.target(), now);
+            }
+        }
+        plan
+    }
+
+    /// For automatic passes: the requests to run, and a skipped result for
+    /// each one that failed [`crate::failures::BACKOFF_AFTER`] times in a row
+    /// and is still inside its wait. Those are not run and not journaled
+    /// again (the journal has the note written when the wait began).
+    fn hold_back(&self, requests: Vec<Request>) -> (Vec<Request>, Vec<ActionResult>) {
+        let now = now_unix();
+        let mem = lock(&self.failures);
+        let mut run = Vec::new();
+        let mut held = Vec::new();
+        for r in requests {
+            let f = r
+                .failure_kind()
+                .and_then(|k| mem.backing_off(k, &r.target(), now));
+            match f {
+                Some(f) => held.push(ActionResult {
+                    action: r.action(),
+                    target: r.target(),
+                    outcome: Outcome::Skipped {
+                        reason: crate::safety::SkipReason::BackingOff,
+                        detail: format!(
+                            "skipped {} times in a row (last: {}); not retried automatically for another {} h. An explicit plan can still run it. {}",
+                            f.count,
+                            f.detail,
+                            f.retry_after_unix.unwrap_or(now).saturating_sub(now).div_ceil(3600),
+                            f.advice
+                        ),
+                    },
+                    journal_error: None,
+                }),
+                None => run.push(r),
+            }
+        }
+        (run, held)
+    }
+
+    /// Execute for an automatic pass: [`Engine::hold_back`], then the rest.
+    fn execute_auto(&self, requests: Vec<Request>, source: &str) -> Vec<ActionResult> {
+        let (run, held) = self.hold_back(requests);
+        let mut out = self.execute(&run, source);
+        out.extend(held);
+        out
     }
 
     fn cache_requests(paths: &[PathBuf]) -> Vec<Request> {
@@ -2201,7 +2358,7 @@ impl Engine {
     /// Stale caches to delete, re-checked now. `None` means every stale cache.
     pub fn reclaim_plan(&self, want_bytes: Option<u64>) -> Plan {
         let scan = self.cached_scan();
-        self.gate_run(|g| g.plan_reclaim(&scan.items, want_bytes))
+        self.with_past_failures(self.gate_run(|g| g.plan_reclaim(&scan.items, want_bytes)))
     }
 
     /// Plan and execute in one step. For the engine's automatic reclaim and an
@@ -2209,20 +2366,20 @@ impl Engine {
     /// the approved items.
     pub fn reclaim_now(&self, want_bytes: Option<u64>, source: &str) -> Vec<ActionResult> {
         let plan = self.reclaim_plan(want_bytes);
-        self.execute(&plan.approved(), source)
+        self.execute_auto(plan.approved(), source)
     }
 
     /// Idle agent worktrees a sweep would remove, re-checked now. Ready items
     /// carry the HEAD read now as their expected HEAD.
     pub fn sweep_plan(&self) -> Plan {
         let map = self.cached_diskmap();
-        self.gate_run(|g| g.plan_sweep(&map.worktrees))
+        self.with_past_failures(self.gate_run(|g| g.plan_sweep(&map.worktrees)))
     }
 
     /// Plan and execute a sweep in one step (automatic sweep, `{"auto": true}`).
     pub fn sweep_now(&self, source: &str) -> Vec<ActionResult> {
         let plan = self.sweep_plan();
-        self.execute(&plan.approved(), source)
+        self.execute_auto(plan.approved(), source)
     }
 
     /// What removing these worktrees would do, checked now. A ready removal
@@ -2275,6 +2432,7 @@ impl Engine {
         a.target = Some(key.to_string());
         a.status = Some(if r.ok { "done" } else { "skipped" }.into());
         a.reason = r.reason;
+        self.note_failure(&a);
         self.record(a);
         if r.freed > 0 {
             if let Some(m) = lock(&self.state).diskmap.as_mut() {
@@ -2469,6 +2627,27 @@ impl Engine {
                     .filter(|m| alive.get(&m.pid) == Some(&m.start_time) && m.pid != me)
                     .collect();
                 let name = format!("{} session", session.agent);
+                // The caller, its ancestors (its shell, terminal or agent)
+                // and Mulchie's own ancestors are never signalled, as in pid
+                // and group plans. A caller planning its own session keeps
+                // the rest (its builds, its other children); nothing left
+                // means the plan is refused.
+                let before = members.len();
+                let members: Vec<ProcSample> = members
+                    .into_iter()
+                    .filter(|m| !ancestors.contains(&m.pid))
+                    .collect();
+                if members.is_empty() && before > 0 {
+                    return ProcessPlan::refused(
+                        now,
+                        &sid,
+                        &act,
+                        "protected",
+                        format!(
+                            "session {sid} holds only the caller and its ancestors (its shell, terminal or agent); they are never signalled"
+                        ),
+                    );
+                }
                 if members.is_empty() {
                     return ProcessPlan::refused(
                         now,
@@ -2492,7 +2671,16 @@ impl Engine {
                     action,
                     nice,
                     cfg!(target_os = "macos"),
-                );
+                )
+                .map(|mut d| {
+                    let spared = before - members.len();
+                    if spared > 0 {
+                        d.detail.push_str(&format!(
+                            "; {spared} process(es) left out: the caller and its ancestors are never signalled"
+                        ));
+                    }
+                    d
+                });
                 (d, sid, name, act)
             }
             (Some(key), _) => {
@@ -3289,3 +3477,7 @@ unsafe fn errno() -> *mut libc::c_int {
 #[cfg(test)]
 #[path = "engine_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "engine_audit_tests.rs"]
+mod audit_tests;

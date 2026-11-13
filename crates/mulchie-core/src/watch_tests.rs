@@ -536,6 +536,56 @@ fn a_system_name_running_from_elsewhere_is_high() {
     );
 }
 
+/// The iOS Simulator runs its own syslogd, cfprefsd and trustd from the
+/// machine-wide runtime's root, as the user: not a finding. The same names
+/// from a per-user or look-alike folder still are.
+#[test]
+fn simulator_runtime_daemons_are_not_a_system_name_mismatch() {
+    const RT: &str = "/Library/Developer/CoreSimulator/Volumes/iOS_23A343/Library/Developer/CoreSimulator/Profiles/Runtimes/iOS 26.0.simruntime/Contents/Resources/RuntimeRoot";
+    let mut w = World::new();
+    let ok = [
+        (20, "syslogd", format!("{RT}/usr/sbin/syslogd")),
+        (21, "cfprefsd", format!("{RT}/usr/sbin/cfprefsd")),
+        (22, "trustd", format!("{RT}/usr/libexec/trustd")),
+    ];
+    let odd = [
+        // The user can write here.
+        (
+            30,
+            "syslogd",
+            format!("/Users/me{RT}/usr/sbin/syslogd"),
+        ),
+        // Under the runtimes, but not in a runtime root's system folder.
+        (
+            31,
+            "trustd",
+            "/Library/Developer/CoreSimulator/Volumes/x/trustd".to_string(),
+        ),
+        (32, "cfprefsd", format!("{RT}/Applications/cfprefsd")),
+        (
+            33,
+            "syslogd",
+            "/Library/Developer/CoreSimulator/../../../tmp/a.simruntime/Contents/Resources/RuntimeRoot/usr/sbin/syslogd"
+                .to_string(),
+        ),
+    ];
+    for (pid, name, exe) in ok.iter().chain(&odd) {
+        w.add(
+            facts(*pid, 5, name, &PathBuf::from(exe), None, NOW - 60),
+            ProcKind::Other,
+            None,
+        );
+    }
+    let mut pids: Vec<u32> = w
+        .run()
+        .iter()
+        .filter(|f| f.kind == FindingKind::SystemNameMismatch)
+        .filter_map(|f| f.evidence.pid)
+        .collect();
+    pids.sort_unstable();
+    assert_eq!(pids, vec![30, 31, 32, 33]);
+}
+
 #[test]
 fn unsigned_apps_are_reported_but_workspace_builds_are_not() {
     let mut w = World::new();

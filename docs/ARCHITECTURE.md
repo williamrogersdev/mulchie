@@ -67,7 +67,7 @@ The `network` cargo feature (on by default in `mulchie-core`, `mulchie` and the 
 
 `consumers.rs` groups every process into exactly one group: a workspace, an application, a program, or the system group. Keys (`workspace:…`, `app:…`, `process:…`) are what `mulchie group` takes. The CLI also takes `session:<id>` and sends it as the `session` field of the process-plan request.
 
-`procplan.rs` turns a request (one pid with a signal, a pid and its descendants, a group with an action, or a session with an action) into a list of gate requests, each carrying the start time the planner saw, plus who is affected and why anything is refused. Nothing there acts; the caller posts approved requests to `POST /v1/process/execute` and the gate re-checks every one. Protected processes (pid 1, operating-system programs, Mulchie, and the caller's own terminal and agent app) come back blocked with a reason.
+`procplan.rs` turns a request (one pid with a signal, a pid and its descendants, a group with an action, or a session with an action) into a list of gate requests, each carrying the start time the planner saw, plus who is affected and why anything is refused. Nothing there acts; the caller posts approved requests to `POST /v1/process/execute` and the gate re-checks every one. Protected processes (pid 1, operating-system programs, Mulchie, and the caller's own terminal and agent app) come back blocked with a reason. A session plan leaves out the caller and its ancestors even with `include_agent`, and is refused when nothing else is left.
 
 ### Safety gate (`safety.rs`)
 
@@ -88,6 +88,7 @@ Checks for a **worktree** removal:
   - uncommitted changes → a patch in the backups directory;
   - gitignored files that are not known caches (`.env`, local databases, notes) → a `tar.gz` beside the patch; if they exceed `backup_ignored_max_mb` the worktree is skipped instead;
   - a detached `HEAD` → a new branch `backup/<name>-<shortsha>`; an existing branch is never moved.
+- After the backup and before `git worktree remove`, `HEAD`, `git status` and the changed and ignored files are read again, and so is the process table. If anything differs the item is skipped and the backup set written for it is discarded, because the worktree is untouched (a sweep that hits the same skip on every scan does not pile up copies). A backup set that could not be completed is discarded the same way. Once `git worktree remove` has started the backups are always kept, and a failure names the directory they are in.
 - A "missing" worktree is pruned only when git itself reports it prunable, only if it is an agent worktree, and with `--expire`.
 
 Checks for a **signal or renice**:
@@ -98,7 +99,17 @@ Checks for a **signal or renice**:
 
 Sweep and clean are two-step for interactive callers: `GET` returns a plan, `POST` takes the items the user approved. Automatic sweeps and reclaims build and execute a plan in one step, through the same gate.
 
-Every executed or skipped action is appended to `<config dir>/actions.jsonl` (rotated at 5 MB).
+Planning only reads, and most of its time is spent waiting for git, so the items of one plan are checked by up to four threads (`PLAN_WORKERS`), sharing one read of the process table; the plan lists them in the order asked. Execution stays one item at a time.
+
+Every executed or skipped action is appended to `<config dir>/actions.jsonl` (rotated at 5 MB). Dismissing a finding, and showing it again, is appended too (kind `finding`).
+
+#### What Mulchie remembers about skips (`failures.rs`)
+
+The engine folds the journal's `reclaim` and `worktree` entries into one record per target: how many times in a row it was skipped, the last reason, and since when. The memory is rebuilt from the last 5000 journal entries at start, so nothing new is stored. A success clears a record, and one with no new skip for 30 days is forgotten. Process actions are left out, because a pid names a different process each time.
+
+- From the second skip in a row the target is in `failures` of `GET /v1/state` (while it still exists on disk), in `diagnose` and in `get_status`, with a sentence on what a person can do about that reason.
+- A plan item for such a target carries `past_failures`. It stays executable: a person may have fixed the cause.
+- From the third skip in a row the engine's own passes (automatic sweep and reclaim, and `{"auto": true}`) do not run the target for 6 hours, doubling with each further skip up to 7 days. They return it as skipped with `backing_off` and write nothing more to the journal; one `failure` entry is written when the wait begins. The engine only does less here: it never changes the request, widens it or tries another way.
 
 #### What may delete or signal outside the gate
 
@@ -112,6 +123,7 @@ Nothing else may delete user files or signal another program's process. These ar
 | `engine.rs` (`restore_priorities`) and `engine_sessions.rs` (`restore_breach`) | Put back, with `set_nice`, a priority Mulchie lowered, after re-reading that the pid is still the same own process by start time. |
 | `engine.rs` (`throttle`) | Lowers the priority of a build process under pressure with `lower_priority`, after the same start-time recheck. It only raises a nice value. |
 | `engine.rs` (`own_pid_alive`) and `safety.rs` (`pid_alive`) | Liveness probes: `kill(pid, 0)` sends no signal. |
+| `safety.rs` (`discard_backup_set`) | Inside the gate, but not a `Request`: removes a backup set the gate itself wrote a moment ago for a removal that did not happen. Only a real directory directly inside Mulchie's backups directory, and only before `git worktree remove` has started. |
 | `diskmap.rs` (`prune_cache`) | Runs a package manager's own prune command (npm, bun, pnpm, yarn, uv, pip, Homebrew, Go, or `xcrun simctl` for simulators) for a cache key, refused while that tool runs. The tool, not Mulchie, deletes what is in its cache. |
 
 Mulchie also manages its own files, none of them user files: `config.rs` writes the config through a temp file and rename and moves an invalid config file aside; `journal.rs` rotates the action journal; `api.rs` recreates an empty or truncated token file; `hook.rs` restarts `hook.log` past 256 KiB; `service.rs` removes the unit file `service install` wrote, and runs `launchctl` or `systemctl` for it, on `service uninstall`; the app replaces its own symbolic link to the CLI; and `mcp_install.rs` and `hooks_install.rs` write agent apps' config files atomically after backing them up.

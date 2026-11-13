@@ -982,6 +982,31 @@ const SYSTEM_DIRS: &[&str] = &[
     "/usr/local/sbin/",
 ];
 
+/// Where Xcode installs simulator runtimes for every user. Root owns it;
+/// the per-user `~/Library/Developer/CoreSimulator` is not this.
+const SIMULATOR_RUNTIMES: &str = "/Library/Developer/CoreSimulator/";
+/// The copy of the operating system inside a simulator runtime.
+const SIMULATOR_ROOT: &str = ".simruntime/Contents/Resources/RuntimeRoot";
+
+/// A simulator's own copy of a system program: under the machine-wide
+/// simulator runtimes, inside a runtime's root, in one of that root's system
+/// folders (`…/RuntimeRoot/usr/sbin/syslogd`). Each booted simulator runs
+/// `syslogd`, `cfprefsd`, `trustd` and others from there as the user.
+fn in_simulator_runtime(exe: &Path) -> bool {
+    if exe
+        .components()
+        .any(|c| c == std::path::Component::ParentDir)
+    {
+        return false;
+    }
+    let s = exe.to_string_lossy();
+    if !s.starts_with(SIMULATOR_RUNTIMES) {
+        return false;
+    }
+    s.split_once(SIMULATOR_ROOT)
+        .is_some_and(|(_, inside)| SYSTEM_DIRS.iter().any(|d| inside.starts_with(d)))
+}
+
 /// Hidden directory names that hold ordinary tools in a workspace.
 const ORDINARY_HIDDEN: &[&str] = &[
     ".venv",
@@ -1535,7 +1560,7 @@ fn detect_origin(d: &mut Det, p: &ProcFacts) {
         .copied();
     if let Some(n) = claims {
         let s = exe.to_string_lossy();
-        if !SYSTEM_DIRS.iter().any(|d| s.starts_with(d)) {
+        if !SYSTEM_DIRS.iter().any(|d| s.starts_with(d)) && !in_simulator_runtime(&exe) {
             d.push_proc(
                 p,
                 FindingKind::SystemNameMismatch,

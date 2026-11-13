@@ -67,7 +67,7 @@ Nothing is deleted or signalled in one call. Changes take two:
 
 The server keeps each plan it showed, in memory. `execute_plan` accepts only targets of ready items in a stored plan. A plan can be executed once, expires after 30 minutes, and is lost if the server restarts. The engine's safety gate then checks each item again just before it runs and skips anything that changed. The result lists what was done, what was skipped and why, every backup with its path, and how to restore.
 
-`prune_cache` is the exception. Without `execute=true` it only shows the cache, its size and what pruning does. With `execute=true` it runs the package manager's own prune command.
+`prune_cache` is the exception. Without `execute=true` it only shows the cache, its size and what pruning does. With `execute=true` it runs the package manager's own prune command, but only for a cache it previewed in the last 30 minutes, and once per preview.
 
 See the [safety model](/docs/safety/) for what the gate checks.
 

@@ -212,7 +212,7 @@ pub fn tool_list() -> Vec<Tool> {
                 "Check a command against the guard rules",
                 "Ask Mulchie's guard rules about a shell command before running it: allow, warn or block, with the reason and every rule that matched, and build advice while heavy work is not advised. Rule runaway_repeat means this command, in this directory, was just seen starting itself over and over: do not run it again until what calls it is fixed. Records nothing and runs nothing.",
                 json!({
-                    "command": { "type": "string", "description": "The shell command line" },
+                    "command": { "type": "string", "maxLength": 65536, "description": "The shell command line" },
                     "cwd": { "type": "string", "description": "The directory it would run in (default: this server's)" }
                 }),
             )
@@ -248,7 +248,7 @@ pub fn tool_list() -> Vec<Tool> {
         Tool {
             name: "prune_cache",
             title: "Prune a package manager cache",
-            description: "Run a package manager's own prune command for one cache key from disk_breakdown or diagnose (npm, bun, pnpm, yarn, uv, pip, homebrew, go, simulators). Without execute=true it only shows the cache, its size and what pruning does; show that to the user and call again with execute=true only if they agree. The package manager re-downloads anything it needs later. Refused while that tool is running.",
+            description: "Run a package manager's own prune command for one cache key from disk_breakdown or diagnose (npm, bun, pnpm, yarn, uv, pip, homebrew, go, simulators). Without execute=true it only shows the cache, its size and what pruning does; show that to the user and call again with execute=true only if they agree. execute=true is refused unless this server showed that preview in the last 30 minutes, and each preview allows one prune. The package manager re-downloads anything it needs later. Refused while that tool is running.",
             props: json!({
                 "key": { "type": "string", "description": "The cache key" },
                 "execute": { "type": "boolean", "description": "Prune, instead of only showing what would be pruned" }
@@ -322,6 +322,14 @@ pub fn allowed(tool: &Tool, read_only: bool) -> bool {
 
 // ------------------------------------------------------------ validation
 
+/// The longest string argument, unless the property's `maxLength` says
+/// otherwise (paths, ids and keys are far shorter).
+pub const MAX_STRING_ARG: usize = 4096;
+/// The most items in an array argument, unless `maxItems` says otherwise.
+/// One call that names more than this is refused, not truncated: a plan over
+/// thousands of paths would keep the engine running git for minutes.
+pub const MAX_ARRAY_ARG: usize = 500;
+
 /// Check arguments against the small schema subset the tools use.
 pub fn validate(schema: &Value, args: &Map<String, Value>) -> Result<(), String> {
     let props = schema["properties"]
@@ -355,6 +363,13 @@ fn check_value(k: &str, p: &Value, v: &Value) -> Result<(), String> {
     match p["type"].as_str().unwrap_or("") {
         "string" => {
             let s = v.as_str().ok_or(format!("`{k}` must be a string"))?;
+            let max = p["maxLength"].as_u64().unwrap_or(MAX_STRING_ARG as u64);
+            if s.len() as u64 > max {
+                return Err(format!("`{k}` must be at most {max} bytes"));
+            }
+            if s.contains('\0') {
+                return Err(format!("`{k}` must not contain a NUL byte"));
+            }
             if let Some(e) = p["enum"].as_array() {
                 if !e.iter().any(|x| x == s) {
                     let opts: Vec<&str> = e.iter().filter_map(Value::as_str).collect();
@@ -384,6 +399,12 @@ fn check_value(k: &str, p: &Value, v: &Value) -> Result<(), String> {
                 if (a.len() as u64) < m {
                     return Err(format!("`{k}` needs at least {m} item(s)"));
                 }
+            }
+            let max = p["maxItems"].as_u64().unwrap_or(MAX_ARRAY_ARG as u64);
+            if a.len() as u64 > max {
+                return Err(format!(
+                    "`{k}` takes at most {max} item(s) per call; split the request"
+                ));
             }
             for (i, x) in a.iter().enumerate() {
                 check_value(&format!("{k}[{i}]"), &p["items"], x)?;
@@ -438,6 +459,10 @@ struct StoredPlan {
 pub struct Plans {
     map: HashMap<String, StoredPlan>,
     order: Vec<String>,
+    /// Package caches whose prune preview this server showed, and when.
+    /// `prune_cache` with `execute=true` needs one, like `execute_plan`
+    /// needs a plan.
+    previews: HashMap<String, Instant>,
 }
 
 impl Plans {
@@ -474,10 +499,28 @@ impl Plans {
         self.map.remove(id)
     }
 
+    fn previewed(&mut self, key: &str) {
+        self.previews.retain(|_, at| at.elapsed() <= PLAN_TTL);
+        if self.previews.len() < MAX_PLANS {
+            self.previews.insert(key.to_string(), Instant::now());
+        }
+    }
+
+    /// Use up the preview of `key`; false when none was shown in the last
+    /// [`PLAN_TTL`].
+    fn take_preview(&mut self, key: &str) -> bool {
+        self.previews
+            .remove(key)
+            .is_some_and(|at| at.elapsed() <= PLAN_TTL)
+    }
+
     #[cfg(test)]
     pub fn age_all(&mut self, by: Duration) {
         for p in self.map.values_mut() {
             p.created -= by;
+        }
+        for at in self.previews.values_mut() {
+            *at -= by;
         }
     }
 }
@@ -506,6 +549,9 @@ fn present(plans: &mut Plans, kind: PlanKind, plan: Value, read_only: bool) -> V
                 "uncommitted_files": i["dirty_files"],
                 "verdict": i["verdict"],
                 "would_back_up": i["would_backup"],
+                // Set when this target was skipped at least twice in a row
+                // before: tell the user, it may fail the same way again.
+                "failed_before": i["past_failures"],
             })
         })
         .collect();
@@ -930,6 +976,7 @@ pub fn call_tool(cx: &mut Ctx, name: &str, a: &Map<String, Value>) -> ToolResult
                 "forecast": st["forecast"],
                 "slots": st["slots"],
                 "throttled_builds": st["throttled"],
+                "repeated_failures": st["failures"],
                 "machine": {
                     "cpu_pct": snap["cpu_pct"], "cpu_count": snap["cpu_count"], "load": snap["load"],
                     "mem_total": snap["mem_total"], "mem_available": snap["mem_available"],
@@ -1058,6 +1105,9 @@ pub fn call_tool(cx: &mut Ctx, name: &str, a: &Map<String, Value>) -> ToolResult
                 if c["prunable"] == false {
                     return Err(format!("{key} has no prune command Mulchie can run"));
                 }
+                if !cx.read_only {
+                    cx.plans.previewed(key.as_str().unwrap_or(""));
+                }
                 return Ok(json!({
                     "preview": true,
                     "key": key,
@@ -1068,7 +1118,15 @@ pub fn call_tool(cx: &mut Ctx, name: &str, a: &Map<String, Value>) -> ToolResult
                     "next": "Nothing was done. Show this to the user; if they agree, call prune_cache again with execute=true.",
                 }));
             }
-            post("/v1/prune", json!({ "key": arg("key") }))
+            // Plan, then execute: only a cache whose preview this server
+            // showed (and so the user could see) is pruned, once.
+            let key = a.get("key").and_then(Value::as_str).unwrap_or("");
+            if !cx.plans.take_preview(key) {
+                return Err(format!(
+                    "no preview of {key:?} was shown by this server in the last 30 minutes: call prune_cache without execute first, show the user what would be pruned, and call it again with execute=true only if they agree"
+                ));
+            }
+            post("/v1/prune", json!({ "key": key }))
         }
         "plan_process_action" => {
             let mut body = Map::new();
