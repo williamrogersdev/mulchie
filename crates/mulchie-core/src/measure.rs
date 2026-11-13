@@ -266,16 +266,20 @@ impl Background {
         unsafe {
             libc::setpriority(libc::PRIO_DARWIN_THREAD, 0, libc::PRIO_DARWIN_BG);
         }
-        #[cfg(target_os = "linux")]
-        {
-            let tid = unsafe { libc::syscall(libc::SYS_gettid) } as libc::id_t;
-            let was = unsafe { libc::getpriority(libc::PRIO_PROCESS, tid) };
-            unsafe { libc::setpriority(libc::PRIO_PROCESS, tid, 19) };
-            return Self { was };
+        Self {
+            #[cfg(target_os = "linux")]
+            was: lower_thread_nice(),
         }
-        #[cfg(not(target_os = "linux"))]
-        Self {}
     }
+}
+
+/// Sets this thread's nice value to 19 and returns what it was.
+#[cfg(target_os = "linux")]
+fn lower_thread_nice() -> libc::c_int {
+    let tid = unsafe { libc::syscall(libc::SYS_gettid) } as libc::id_t;
+    let was = unsafe { libc::getpriority(libc::PRIO_PROCESS, tid) };
+    unsafe { libc::setpriority(libc::PRIO_PROCESS, tid, 19) };
+    was
 }
 
 impl Drop for Background {
