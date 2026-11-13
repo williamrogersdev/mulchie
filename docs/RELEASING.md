@@ -1,9 +1,25 @@
 # Releasing Mulchie
 
-One tag, `vX.Y.Z`, builds everything and creates a draft GitHub Release. A person
-publishes the draft. Publishing updates the Homebrew tap and crates.io.
+Merging a pull request that changes the version releases that version. Nobody pushes a tag
+or publishes a draft: the pipeline builds everything, creates the tag `vX.Y.Z`, publishes the
+GitHub Release, then updates the Homebrew tap and crates.io.
 
-What the tag produces:
+```sh
+scripts/bump-version.sh X.Y.Z          # or X.Y.Z-rc.N for a release candidate
+git switch -c release-X.Y.Z && git commit -am "Version X.Y.Z" && git push -u origin HEAD
+gh pr create --fill && gh pr merge --auto --squash
+```
+
+What happens after the merge (`.github/workflows/main.yml`):
+
+1. CI runs on the merge commit.
+2. If the push changed the workspace version and the tag `vX.Y.Z` does not exist, `release.yml` runs.
+   Any other push to `main` releases nothing.
+3. `release.yml` builds and signs the assets, then creates the tag and the published GitHub Release in
+   one step, as the last thing it does.
+4. `publish.yml` updates the Homebrew tap and crates.io (not for a release candidate).
+
+What a release produces:
 
 | Asset | Used by |
 | --- | --- |
@@ -12,8 +28,10 @@ What the tag produces:
 | `Mulchie_X.Y.Z_universal.app.tar.gz` and `.sig`, `latest.json` | In-app updates |
 | `SHA256SUMS` | Manual verification |
 
-The workflows are `.github/workflows/release.yml` (build, draft release) and
-`.github/workflows/publish.yml` (tap and crates.io, on publish).
+The workflows are `.github/workflows/main.yml` (CI on `main`, then the release decision),
+`.github/workflows/release.yml` (build, tag, GitHub Release) and `.github/workflows/publish.yml`
+(tap and crates.io, called by `release.yml`). How pull requests merge is in
+[CONTRIBUTING.md](../CONTRIBUTING.md).
 
 ## One-time setup
 
@@ -41,17 +59,19 @@ The updater is wired in the app (`crates/mulchie-app/src/update.rs`). The app re
 updater plugin only when `plugins.updater.pubkey` in `tauri.conf.json` is set, and "Check for
 Updates…" in its menu then reads `latest.json` from the latest GitHub Release. Until you have run
 the script and committed the result, a build says that updates are not configured, and
-`release.yml` makes a CLI-only release of a tag (see "CLI-only release" below). It checks
+`release.yml` makes a CLI-only release (see "CLI-only release" below). It checks
 `bundle.createUpdaterArtifacts` and the public key, so a release never ships an app that cannot update.
 
 ### 3. Create the `macos-signing` environment
 
 Repository Settings, Environments, New environment, name `macos-signing`.
 
-- Deployment branches and tags: select "Selected branches and tags" and add the tag
-  pattern `v*`. Manual dry runs from a branch will be refused unless you also allow that branch.
-- Required reviewers: optional. If you add yourself, each signing job pauses for approval.
-  A release has three: the two macOS CLI builds and the desktop build.
+- Deployment branches and tags: select "Selected branches and tags" and add the branch
+  `main`. Releases are built from `main`. Manual dry runs from another branch will be refused
+  unless you also allow that branch.
+- Required reviewers: leave empty. A reviewer makes each signing job wait for a person to
+  approve it (a release has three: the two macOS CLI builds and the desktop build), and then
+  a release is no longer automatic.
 
 All signing secrets live in this environment, so only workflow runs that reference it can read them.
 
@@ -90,15 +110,20 @@ A CLI-only release uses none of them.
 
 The first crates.io publish of `mulchie-core` and `mulchie` claims those names. Check they are free.
 
-### 5. Try a dry run
+### 5. Protect `main` and turn on auto-merge
 
-Actions, Release, Run workflow, leave "dry_run" on. It builds all four CLI targets and the universal
+Already done for this repository; the commands are in [CONTRIBUTING.md](../CONTRIBUTING.md) under
+"Repository settings" in case they have to be applied again.
+
+### 6. Try a dry run
+
+`gh workflow run release.yml --ref <branch>` (or Actions, Release, Run workflow, with "dry_run" left on). It builds all four CLI targets and the universal
 app with a throwaway updater key, skips signing, notarization and upload, and keeps the result as
 the `release-assets` artifact. Run it before the first real release and after any change to the workflows.
 
 ## CLI-only release (before signing is set up)
 
-A tag can produce a real draft release of the CLI before any signing secret exists. The switch is
+A version can be released as the CLI alone before any signing secret exists. The switch is
 the committed updater config: if `crates/mulchie-app/tauri.conf.json` does not have both
 `bundle.createUpdaterArtifacts: true` and a non-empty `plugins.updater.pubkey`, the `prepare` job sets
 `app=false` and prints a notice. You do not pass a flag. Dry runs ignore this and always build the app.
@@ -108,7 +133,7 @@ What a CLI-only release builds:
 - the four CLI tarballs with their `.sha256` files (macOS arm64 and x86_64, Linux x86_64 and aarch64);
 - `SHA256SUMS` over the tarballs;
 - build provenance attestations for the tarballs;
-- a draft GitHub Release whose notes start with a line saying it is CLI only. Assembly fails if any of the eight
+- a GitHub Release whose notes start with a line saying it is CLI only. Assembly fails if any of the eight
   CLI files is missing.
 
 What it skips: the desktop app job, Developer ID signing, notarization, the DMG, the updater archive and
@@ -118,8 +143,8 @@ will not run an unsigned binary). They are not Developer ID signed or notarized:
 not quarantine a file, so installing that way works, but a binary downloaded in a browser is quarantined and
 Gatekeeper blocks it.
 
-After you publish the draft, `publish.yml` looks at the release's assets. With no `.dmg` it updates only
-`Formula/mulchie-cli.rb` in the tap (not the cask) and tells you in a notice. crates.io is unchanged.
+After the release is published, `publish.yml` looks at its assets. With no `.dmg` it updates only
+`Formula/mulchie-cli.rb` in the tap (not the cask) and says so in a notice. crates.io is unchanged.
 A pre-release is still skipped. `releases/latest` points at this release, so `install.sh` works at once;
 the in-app updater has nothing to read because there is no `latest.json` and no app yet.
 
@@ -127,7 +152,7 @@ To move to a full release:
 
 1. Run `scripts/release-setup.sh` and commit the `tauri.conf.json` change.
 2. Create the `macos-signing` environment and set its secrets (steps 3 and 4 above).
-3. Tag the next version. The first app release cannot update anyone from a CLI-only install: there is no app
+3. Release the next version. The first app release cannot update anyone from a CLI-only install: there is no app
    to update. People install the DMG or the cask once, and later versions update from there.
 
 With the updater configured, a missing Apple secret fails the release. The app is never shipped unsigned.
@@ -136,35 +161,35 @@ With the updater configured, a missing Apple secret fails the release. The app i
 
 These change things outside the repository. Do them in this order. The sections above have the commands.
 
-1. Run `scripts/release-setup.sh` and add the secrets it lists: the Apple certificate and the Apple ID, app-specific password and team ID used for notarization, the updater key, the tap token, the crates.io token and the Cloudflare token and account ID.
-2. Create `williamrogersdev/homebrew-tap`.
-3. Merge to `main`, push tag `v0.3.0`, review the draft release, publish it.
+1. Add the repository secrets: the tap token, the crates.io token and the Cloudflare token and account ID. Until they exist, the tap update, the crates.io publish and the site deploy are skipped with a warning in the run. For the desktop app, also run `scripts/release-setup.sh` and add the secrets it lists: the Apple certificate, the Apple ID, app-specific password and team ID used for notarization, and the updater key.
+2. Create `williamrogersdev/homebrew-tap` (done).
+3. Merge a pull request made with `scripts/bump-version.sh 0.3.0`.
 4. Confirm the first site deploy and the `mulchie.com` route in Cloudflare. `site/wrangler.jsonc` has no route: attach the custom domain in the Cloudflare dashboard (or add a `routes` entry with `custom_domain: true`) once DNS is ready.
 
 ## Each release
 
-1. Bump the version in `Cargo.toml` (`[workspace.package] version`) and set `[workspace.dependencies] mulchie-core`
-   to the same version, then `cargo update -w` so `Cargo.lock` follows. Two more files must carry it, and the
-   `discovery` test fails if they do not: `server.json` (`version` and the package `version`) and `docs/openapi.yaml`
-   (`info.version`). The app's `package.json` is not checked by anything, but keep it equal. The app's bundle version
+1. On a branch, make sure `CHANGELOG.md` has the notes under `## [X.Y.Z] - Unreleased`, then run
+   `scripts/bump-version.sh X.Y.Z`. It sets the version in `Cargo.toml` (`[workspace.package] version` and the
+   `mulchie-core` dependency), `Cargo.lock`, `server.json` (two places), `docs/openapi.yaml` (`info.version`) and the
+   app's `package.json`, and replaces `Unreleased` in the changelog heading with today's date. The app's bundle version
    comes from `Cargo.toml`; `tauri.conf.json` has no version.
-2. In `CHANGELOG.md`, move the unreleased entries under `## [X.Y.Z] - YYYY-MM-DD`. The release is refused while the heading says Unreleased.
-3. Open a pull request, let CI pass, merge to `main`.
-4. Tag the merge commit and push the tag:
-   ```sh
-   git switch main && git pull
-   git tag -s vX.Y.Z -m "Mulchie X.Y.Z"   # or git tag without -s
-   git push origin vX.Y.Z
-   ```
-   The workflow checks the tag equals the workspace version.
-5. Watch the run. It takes about 30 to 60 minutes, most of it notarization.
-6. Open the draft release. Check the notes and that these assets exist: four tarballs with `.sha256`, the DMG,
-   `Mulchie_X.Y.Z_universal.app.tar.gz` with `.sig`, `latest.json`, `SHA256SUMS`.
-7. Publish the draft. This runs `publish.yml`: tap update, then crates.io.
-8. Run the checks below.
+2. Open a pull request and turn on auto-merge (`gh pr merge --auto --squash`). CI checks that every file carries the
+   same version and that the changelog section is dated and not empty, so a pull request that could not be released
+   does not merge.
+3. That is all. When the pull request merges, the release runs: about 10 minutes for a CLI-only release, 30 to 60
+   with the app, most of it notarization. Follow it with `gh run watch "$(gh run list --workflow main.yml --limit 1 --json databaseId --jq '.[0].databaseId')"`.
+4. Run the checks below.
 
-If a release build fails, fix the cause, delete the tag locally and on GitHub, and tag again. A draft
-release from the failed run can be deleted. Never reuse a version that reached crates.io; bump instead.
+If the release fails, nothing was published and no tag exists: the tag is created with the release, at the end.
+
+- A failure that will pass on a second try (a runner or Apple's notary service): `gh run rerun <run id> --failed`.
+- A failure that needs a fix: merge the fix, then `gh workflow run release.yml -f dry_run=false`. That releases the
+  version on `main`. The automatic release starts only on the push that changes the version, so a fix alone does not start it.
+- If the GitHub Release exists but the tap or crates.io step failed: `gh workflow run publish.yml -f tag=vX.Y.Z`.
+  It skips what is already published.
+
+Never reuse a version that reached crates.io or has a tag; bump instead. `bump-version.sh` and `release.yml` both
+refuse a version whose tag exists.
 
 ## Release candidates
 
@@ -172,36 +197,30 @@ Cut `vX.Y.Z-rc.N` first when you want signing, notarization, the updater and the
 nobody installs. Anything with a `-` suffix after `X.Y.Z` is a pre-release. The pipeline builds, signs and
 notarizes it exactly like a release, and then differs in four ways:
 
-- The draft GitHub Release is created with the pre-release flag, so `releases/latest` does not move. `install.sh` with no
+- The GitHub Release is published with the pre-release flag, so `releases/latest` does not move. `install.sh` with no
   version, the in-app updater (`releases/latest/download/latest.json`) and Mulchie's own update check keep seeing the last
-  stable release. Keep the flag on when you publish the draft.
-- `publish.yml` skips Homebrew and crates.io (a crates.io publish cannot be undone). The crates job prints a notice. It
-  also skips on a tag with a `-` even if the pre-release flag was cleared.
+  stable release.
+- `publish.yml` skips Homebrew and crates.io (a crates.io publish cannot be undone). The crates job prints a notice.
 - The release notes are the `## [X.Y.Z]` section of `CHANGELOG.md`, with a first line saying they are for a release
   candidate. The section may still say Unreleased. A `## [X.Y.Z-rc.N]` section, if you write one, is used instead.
-- Nothing is published to the MCP registry by the workflows (that is a manual step, see below).
+- Nothing is published to the MCP registry by the workflows, for any release. Publishing `server.json` there is
+  the one step still done by hand.
 
 Steps:
 
-1. On a branch, set the version to `X.Y.Z-rc.N` in `Cargo.toml` (both places), `server.json` (both places) and
-   `docs/openapi.yaml`, then `cargo update -w`. Keep `package.json` equal. Leave `CHANGELOG.md` as it is.
-2. Run `cargo test --locked -p mulchie --test discovery` and `scripts/workspace-version.sh v$VERSION`, then run the
-   Release workflow by hand from the branch with dry_run on.
-3. Open a pull request, merge, and tag the merge commit `git tag -s vX.Y.Z-rc.N` and push it. The workflow checks the tag
-   equals the workspace version.
-4. Check the draft: it is marked Pre-release, has the same assets as a release, and `latest.json` names the rc version.
-   Publish it (this keeps it a pre-release and runs only the skipped-job notices).
+1. On a branch, run `scripts/bump-version.sh X.Y.Z-rc.N`. It leaves `CHANGELOG.md` as it is.
+2. Optional: run the Release workflow from the branch as a dry run (`gh workflow run release.yml --ref <branch>`).
+3. Open a pull request and turn on auto-merge. The merge releases the rc.
+4. Check the release: it is marked Pre-release, has the same assets as a release, and `latest.json` (when the app
+   ships) names the rc version.
 5. Install the rc: `curl -fsSL https://mulchie.com/install.sh | MULCHIE_VERSION=X.Y.Z-rc.N sh`, or download the DMG.
    Do not use `releases/latest` to find it. Run the signature, notarization and attestation checks below with `V=X.Y.Z-rc.N`.
    The in-app updater and Homebrew are not exercised by an rc.
-6. If the rc is bad, fix on `main` and tag `X.Y.Z-rc.N+1`. Delete a failed tag and draft as in "Each release".
+6. If the rc is bad, fix on `main` and release `X.Y.Z-rc.N+1`.
 
-From rc to final:
-
-1. Set the version to `X.Y.Z` in the same files as step 1 and `cargo update -w`.
-2. In `CHANGELOG.md` replace `Unreleased` in the `## [X.Y.Z]` heading with the date.
-3. Merge, tag `vX.Y.Z` and continue from "Each release", step 4. The final build is a full release: tap, crates.io and
-   `latest` all move, and an installed rc sees `X.Y.Z` as an update (a stable install never sees an rc).
+From rc to final: run `scripts/bump-version.sh X.Y.Z` (it dates the changelog heading) and merge it as in "Each release".
+The final build is a full release: tap, crates.io and `latest` all move, and an installed rc sees `X.Y.Z` as an update
+(a stable install never sees an rc).
 
 The MCP registry entry in `server.json` points at the crates.io package, which an rc does not publish. Only publish
 `server.json` to the registry for a final release.

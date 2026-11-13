@@ -3,8 +3,10 @@
 # With an argument (a tag such as v0.3.0 or v0.3.0-rc.1), exit non-zero unless it matches.
 # The version must be X.Y.Z or X.Y.Z-PRERELEASE (a release candidate is X.Y.Z-rc.N);
 # build metadata (+...) is refused because it cannot go in a tag or a download URL.
+# MULCHIE_CARGO_TOML reads another file instead, such as the Cargo.toml of an earlier commit.
 set -euo pipefail
 cd "$(dirname "$0")/.."
+manifest="${MULCHIE_CARGO_TOML:-Cargo.toml}"
 
 version="$(awk '
   /^\[/ { in_pkg = ($0 == "[workspace.package]"); next }
@@ -13,10 +15,10 @@ version="$(awk '
     print
     exit
   }
-' Cargo.toml)"
+' "$manifest")"
 
 if [ -z "$version" ]; then
-  echo "could not read [workspace.package] version from Cargo.toml" >&2
+  echo "could not read [workspace.package] version from $manifest" >&2
   exit 1
 fi
 

@@ -250,16 +250,16 @@ Windows is out of scope.
 
 ## Distribution
 
-One tag, `vX.Y.Z`, produces everything. The version lives in the workspace `Cargo.toml` only (and `server.json` follows it; a test checks).
+Merging a version change to `main` produces everything, including the tag `vX.Y.Z`. The version lives in the workspace `Cargo.toml` only (and `server.json` follows it; a test checks).
 
 | Artifact | Built by | Reaches users as |
 | --- | --- | --- |
 | `Mulchie_X.Y.Z_universal.dmg`, signed and notarized | `release.yml`, macOS runner | Download button on mulchie.com; `brew install --cask williamrogersdev/tap/mulchie` |
 | `mulchie-<target>.tar.gz` + `.sha256` for `aarch64-apple-darwin`, `x86_64-apple-darwin`, `x86_64-unknown-linux-gnu`, `aarch64-unknown-linux-gnu` | `release.yml` matrix | `curl -fsSL https://mulchie.com/install.sh \| sh`; `brew install williamrogersdev/tap/mulchie-cli` |
 | `latest.json` + updater signatures | `release.yml` | In-app updates |
-| crates `mulchie-core`, `mulchie` | `publish.yml`, after the release is published | `cargo install mulchie` |
+| crates `mulchie-core`, `mulchie` | `publish.yml`, called by `release.yml` after it publishes the release | `cargo install mulchie` |
 
-The release is created as a draft and published by a person. Publishing triggers the Homebrew tap bump and the crates.io publish. The macOS CLI binaries are signed with the Developer ID certificate, so the standalone tarball runs without a Gatekeeper prompt. `docs/RELEASING.md` has the steps.
+No person tags or publishes. `main.yml` runs CI on every push to `main` and starts `release.yml` when the push changed the workspace version; `release.yml` creates the tag and the published release together, then calls `publish.yml` for the Homebrew tap bump and the crates.io publish. In a full release the macOS CLI binaries are signed with the Developer ID certificate, so the standalone tarball runs without a Gatekeeper prompt; in a CLI-only release they are ad-hoc signed. `docs/RELEASING.md` has the steps.
 
 ## Public site
 

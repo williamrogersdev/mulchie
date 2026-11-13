@@ -4,7 +4,7 @@ Mulchie keeps a machine healthy while several AI coding agents work on it. With 
 
 Mulchie is a supervisor. It is not a sandbox and not an antivirus: an agent that wants to get around it can.
 
-It ships three ways: the `mulchie` command, a macOS menu bar app with a dashboard (build it from source for now; see Install), and an MCP server (`mulchie mcp`). The engine also serves a local HTTP API for scripts.
+It ships three ways: the `mulchie` command, a macOS menu bar app with a dashboard, and an MCP server (`mulchie mcp`). The engine also serves a local HTTP API for scripts.
 
 Full documentation is at [mulchie.com/docs](https://mulchie.com/docs/).
 
@@ -46,7 +46,19 @@ Full documentation is at [mulchie.com/docs](https://mulchie.com/docs/).
 
 ## Install
 
-The first release is the CLI for macOS and Linux:
+The menu bar app for macOS, which includes the `mulchie` command:
+
+```sh
+brew install --cask williamrogersdev/tap/mulchie
+```
+
+The CLI only, on macOS or Linux:
+
+```sh
+brew install williamrogersdev/tap/mulchie-cli
+```
+
+Install one or the other: both provide the `mulchie` command. `brew upgrade --cask mulchie` or `brew upgrade mulchie-cli` updates it. The app is also a download: `Mulchie_<version>_universal.dmg` on the [releases page](https://github.com/williamrogersdev/mulchie/releases). Without Homebrew, the install script installs the CLI:
 
 ```sh
 curl -fsSL https://mulchie.com/install.sh | sh
@@ -58,11 +70,9 @@ or, from GitHub:
 curl -fsSL https://raw.githubusercontent.com/williamrogersdev/mulchie/main/scripts/install.sh | sh
 ```
 
-The install script puts the binary in `~/.local/bin` after checking its SHA-256 against the release's `.sha256` file. Every release asset has a SHA-256 checksum, and the release lists them in `SHA256SUMS`. From source: `cargo install --git https://github.com/williamrogersdev/mulchie mulchie`, or `cargo install --path crates/mulchie-cli` from a checkout. Mulchie is not on crates.io or Homebrew yet.
+The install script puts the binary in `~/.local/bin` after checking its SHA-256 against the release's `.sha256` file. Every release asset has a SHA-256 checksum, and the release lists them in `SHA256SUMS`. From source: `cargo install --git https://github.com/williamrogersdev/mulchie mulchie`, or `cargo install --path crates/mulchie-cli` from a checkout. Mulchie is not on crates.io yet.
 
-The macOS CLI binaries are ad-hoc signed, not Developer ID signed or notarized. The install script works. A tarball downloaded with a browser is quarantined by Gatekeeper; after extracting it, run `xattr -d com.apple.quarantine ./mulchie`.
-
-The menu bar app is not available as a download yet. Build it from source on a Mac (Rust and Bun required) with `./scripts/bundle.sh`; a signed download is planned.
+The menu bar app and its DMG are signed with a Developer ID and notarized. This build of the app does not update itself: use `brew upgrade` or download the newer DMG. The standalone macOS CLI binaries are ad-hoc signed, not Developer ID signed or notarized. Homebrew and the install script both work. A tarball downloaded with a browser is quarantined by Gatekeeper; after extracting it, run `xattr -d com.apple.quarantine ./mulchie`.
 
 Then check the setup:
 

@@ -2030,7 +2030,7 @@ dependencies = [
 
 [[package]]
 name = "mulchie"
-version = "0.3.0-rc.1"
+version = "0.3.0-rc.2"
 dependencies = [
  "clap",
  "clap_complete",
@@ -2044,7 +2044,7 @@ dependencies = [
 
 [[package]]
 name = "mulchie-app"
-version = "0.3.0-rc.1"
+version = "0.3.0-rc.2"
 dependencies = [
  "mulchie-core",
  "serde",
@@ -2058,7 +2058,7 @@ dependencies = [
 
 [[package]]
 name = "mulchie-core"
-version = "0.3.0-rc.1"
+version = "0.3.0-rc.2"
 dependencies = [
  "libc",
  "semver",

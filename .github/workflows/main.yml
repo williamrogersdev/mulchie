@@ -1,0 +1,66 @@
+name: Main
+
+# Every push to main: run CI, then release if the push changed the workspace version.
+#
+#   merge a pull request  ->  CI  ->  version changed and v<version> has no tag?
+#                                       yes: release.yml builds, tags and publishes the
+#                                            GitHub Release, then publish.yml updates the
+#                                            Homebrew tap and crates.io
+#                                       no:  done
+#
+# Nobody pushes a tag or publishes a draft. To release, merge a pull request made with
+# scripts/bump-version.sh (docs/RELEASING.md). The site deploys from site.yml.
+
+on:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  ci:
+    name: CI
+    uses: ./.github/workflows/ci.yml
+
+  release-check:
+    name: Is this a release?
+    needs: ci
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      release: ${{ steps.check.outputs.release }}
+    steps:
+      - name: Check out source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Compare the version with the previous commit and the tags
+        id: check
+        env:
+          BEFORE: ${{ github.event.before }}
+        run: |
+          VERSION="$(scripts/workspace-version.sh)"
+          git fetch --quiet --depth=1 origin "$BEFORE"
+          git show FETCH_HEAD:Cargo.toml > "$RUNNER_TEMP/Cargo.before.toml"
+          PREVIOUS="$(MULCHIE_CARGO_TOML="$RUNNER_TEMP/Cargo.before.toml" scripts/workspace-version.sh)"
+          RELEASE=false
+          if [[ "$VERSION" == "$PREVIOUS" ]]; then
+            echo "::notice::Version $VERSION did not change in this push, so there is nothing to release."
+          elif git ls-remote --exit-code --tags origin "refs/tags/v$VERSION" > /dev/null; then
+            echo "::notice::Tag v$VERSION already exists, so there is nothing to release."
+          else
+            echo "::notice::Version changed from $PREVIOUS to $VERSION: releasing v$VERSION."
+            RELEASE=true
+          fi
+          echo "release=$RELEASE" >> "$GITHUB_OUTPUT"
+
+  release:
+    name: Release
+    needs: release-check
+    if: needs.release-check.outputs.release == 'true'
+    permissions:
+      contents: write
+      id-token: write
+      attestations: write
+    uses: ./.github/workflows/release.yml
+    secrets: inherit

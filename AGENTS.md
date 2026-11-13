@@ -32,6 +32,7 @@ It ships three ways:
 | `docs/openapi.yaml` | The HTTP API. A test keeps it in step with `ROUTES` in `api.rs`. |
 | `server.json` | The MCP registry entry. A test keeps its version equal to the workspace version. |
 | `packaging/`, `scripts/` | Homebrew, launchd, systemd, installer and release scripts. |
+| `.github/workflows` | `ci.yml` (the checks), `main.yml` (CI on `main`, then the release decision), `release.yml`, `publish.yml`, `site.yml`, `dependabot-automerge.yml`. `docs/RELEASING.md` describes them. |
 
 ## Build and test
 
@@ -48,6 +49,23 @@ cargo test -p mulchie --test discovery        # openapi.yaml and server.json dri
 
 The app needs Bun and, on Linux, WebKitGTK. Leave it out unless you are
 changing it.
+
+## Shipping a change
+
+Nothing is merged, tagged, released or deployed by hand. Do this and stop:
+
+```sh
+git push -u origin HEAD
+gh pr create --fill                 # the title becomes the commit subject on main
+gh pr merge --auto --squash         # merges by itself when the "CI passed" check is green
+```
+
+- Do not push to `main`, push a tag, create or publish a GitHub Release, or run `cargo publish`. The ruleset on `main` refuses direct pushes, and the workflows do the rest.
+- `CI passed` is the only required check. It needs every CI job: Rust on macOS and Ubuntu, scripts and workflows, the site build. Run the commands under "Build and test" first; `shellcheck scripts/*.sh` and `actionlint` if you touched scripts or workflows.
+- If a check fails, read it (`gh pr checks`, `gh run view <id> --log-failed`), push a fix and leave auto-merge on. If the branch conflicts with `main`, merge `main` into it and push.
+- After the merge, `main.yml` runs CI on `main`, and `site.yml` deploys the site if `site/` or `scripts/install.sh` changed.
+- To release: `scripts/bump-version.sh X.Y.Z` (or `X.Y.Z-rc.N`) on a branch, then ship that branch as above. The merge that changes the version is the release: the workflows build, create the tag, publish the GitHub Release, and update Homebrew and crates.io. Only do this when asked to release. If a release run fails, `docs/RELEASING.md` ("Each release") says how to run it again.
+- A CI job you add must be listed in `needs` of the `ok` job in `.github/workflows/ci.yml`, or it does not gate merges.
 
 ## Rules
 

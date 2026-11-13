@@ -60,8 +60,8 @@ Run these yourself, one by one, from this checkout. Replace the placeholders.
 Full explanations: docs/RELEASING.md
 
 Create the environment first (Settings > Environments > New environment: macos-signing).
-Limit its deployment branches and tags to the tag pattern v* and, if you want
-a pause before signing, add yourself as a required reviewer.
+Limit its deployment branches and tags to the branch main. Add no required reviewer:
+a reviewer makes every release wait for a person.
 
 # Updater signing key (environment: macos-signing)
 gh secret set TAURI_SIGNING_PRIVATE_KEY --env macos-signing --repo ${REPO} < "${KEY_PATH}"
@@ -79,8 +79,10 @@ gh secret set APPLE_ID --env macos-signing --repo ${REPO}          # Apple ID em
 gh secret set APPLE_PASSWORD --env macos-signing --repo ${REPO}    # app-specific password
 gh secret set APPLE_TEAM_ID --env macos-signing --repo ${REPO}     # 10 characters, e.g. UL34VFAKLJ
 
-# Publishing after the release is published (repository secrets)
+# Tap, crates.io and the site (repository secrets)
 gh secret set HOMEBREW_TAP_TOKEN --repo ${REPO}     # fine-grained token, contents:write on williamrogersdev/homebrew-tap
 gh secret set CARGO_REGISTRY_TOKEN --repo ${REPO}   # crates.io token with publish-new and publish-update scopes
+gh secret set CLOUDFLARE_API_TOKEN --repo ${REPO}   # token that can deploy Workers
+gh secret set CLOUDFLARE_ACCOUNT_ID --repo ${REPO}  # the account that owns the mulchie-site Worker
 ================================================================================
 TEXT
