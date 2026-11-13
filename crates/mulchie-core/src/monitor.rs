@@ -129,6 +129,15 @@ impl Snapshot {
         self.mem_available as f32 * 100.0 / self.mem_total as f32
     }
 
+    /// Swap in use, as a percent of physical memory (macOS grows its swap
+    /// file as needed, so a percent of the swap total says little).
+    pub fn swap_used_pct(&self) -> f32 {
+        if self.mem_total == 0 {
+            return 0.0;
+        }
+        self.swap_used as f32 * 100.0 / self.mem_total as f32
+    }
+
     pub fn mem_used(&self) -> u64 {
         self.mem_total.saturating_sub(self.mem_available)
     }

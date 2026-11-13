@@ -43,13 +43,14 @@ pub enum GuardRule {
     DisableMulchie,
     CredentialRead,
     StartupWrite,
+    RunawayRepeat,
     /// The command was longer than [`MAX_COMMAND_BYTES`] and only its start
     /// was checked. Always a warning; not configurable (not in `ALL`).
     TooLong,
 }
 
 impl GuardRule {
-    pub const ALL: [GuardRule; 7] = [
+    pub const ALL: [GuardRule; 8] = [
         GuardRule::RecursiveDelete,
         GuardRule::PipeToShell,
         GuardRule::Sudo,
@@ -57,6 +58,7 @@ impl GuardRule {
         GuardRule::DisableMulchie,
         GuardRule::CredentialRead,
         GuardRule::StartupWrite,
+        GuardRule::RunawayRepeat,
     ];
 
     pub fn code(self) -> &'static str {
@@ -68,6 +70,7 @@ impl GuardRule {
             GuardRule::DisableMulchie => "disable_mulchie",
             GuardRule::CredentialRead => "credential_read",
             GuardRule::StartupWrite => "startup_write",
+            GuardRule::RunawayRepeat => "runaway_repeat",
             GuardRule::TooLong => "too_long",
         }
     }
@@ -82,6 +85,7 @@ impl GuardRule {
             GuardRule::DisableMulchie => r.disable_mulchie,
             GuardRule::CredentialRead => r.credential_read,
             GuardRule::StartupWrite => r.startup_write,
+            GuardRule::RunawayRepeat => r.runaway_repeat,
             GuardRule::TooLong => RuleMode::Warn,
         }
     }
@@ -136,6 +140,9 @@ pub struct GuardInput<'a> {
     pub current_branch: Option<&'a str>,
     /// Pids of the running Mulchie engine (for `kill <pid>`).
     pub mulchie_pids: &'a [u32],
+    /// Commands Mulchie saw starting themselves over and over, and where
+    /// (see [`crate::runaway`]).
+    pub runaways: &'a [crate::runaway::Memo],
 }
 
 /// Check one command. Pure: reads nothing but its input.
@@ -913,6 +920,7 @@ impl Ctx<'_, '_> {
         }
         let prog = sc.prog.as_str();
         let args = &sc.args;
+        self.runaway_repeat(prog, args);
         self.runs_download(&sc);
         if DOWNLOADERS.contains(&prog) {
             self.note_download(prog, args, c);
@@ -973,6 +981,27 @@ impl Ctx<'_, '_> {
         self.reads(prog, args);
         self.writes(prog, args);
         self.mulchie_files(prog, args);
+    }
+
+    /// The command, in the directory it would run in, is one Mulchie saw
+    /// starting itself over and over.
+    fn runaway_repeat(&mut self, prog: &str, args: &[&Word]) {
+        if self.input.runaways.is_empty() || args.iter().any(|w| w.dynamic || w.glob) {
+            return;
+        }
+        let Some(cwd) = self.cwd.clone() else { return };
+        let a: Vec<&str> = args.iter().map(|w| w.text.as_str()).collect();
+        if let Some(m) = crate::runaway::repeat_of(self.input.runaways, prog, &a, &cwd) {
+            self.hit(
+                GuardRule::RunawayRepeat,
+                format!(
+                    "`{}` in {} started itself over and over a short while ago ({} copies nested inside each other) and was flagged as a runaway; find what in it runs the command again and fix that first",
+                    m.command,
+                    m.cwd.display(),
+                    m.depth
+                ),
+            );
+        }
     }
 
     // ------------------------------------------------------ delete / move

@@ -170,6 +170,7 @@ impl Engine {
         let (found, branch) = checkout_of(cwd);
         let ws = ws.map(Path::to_path_buf).or(found);
         let pids = [self.procs.self_pid()];
+        let runaways = self.runaway_memos();
         guard::check(
             &guard::GuardInput {
                 command,
@@ -179,6 +180,7 @@ impl Engine {
                 config_dir: &self.paths.config_dir,
                 current_branch: branch.as_deref(),
                 mulchie_pids: &pids,
+                runaways: &runaways,
             },
             &cfg.guard,
         )
@@ -369,7 +371,10 @@ impl Engine {
         if let Some(id) = &sid {
             // Breaches go only to the client the session is bound to.
             if bound {
-                reply.breaches = lock(&self.sup).limits.take_undelivered(id);
+                let mut sup = lock(&self.sup);
+                reply.breaches = sup.limits.take_undelivered(id);
+                // A chain Mulchie stopped in this session, said once.
+                reply.context.extend(sup.runaway.take_notes(id));
             }
             reply.context.extend(
                 reply

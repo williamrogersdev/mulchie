@@ -617,7 +617,11 @@ pub fn render_memory_guard(g: &Value) -> String {
     let would = &g["would_close"];
     if g["low"] == true || would.is_object() {
         let free = g["free_pct"].as_f64().unwrap_or(0.0);
-        let head = if g["low"] == true {
+        let swap = g["swap_pct"].as_f64().unwrap_or(0.0);
+        let by_swap = would["trigger"] == "swap_high";
+        let head = if g["low"] == true && by_swap {
+            format!("  Swap is filling up now (swap in use is {swap:.0}% of physical memory)")
+        } else if g["low"] == true {
             format!("  Memory is low now ({free:.0}% free)")
         } else {
             "  A consumer is over the cap".to_string()
@@ -661,6 +665,74 @@ pub fn render_memory_guard(g: &Value) -> String {
     s
 }
 
+/// Runaway chains in `mulchie limits` (nothing from an engine that does not
+/// look for them).
+pub fn render_runaway(r: &Value) -> String {
+    if !r.is_object() {
+        return String::new();
+    }
+    let mut s = String::new();
+    let depth = r["depth"].as_u64().unwrap_or(0);
+    match r["action"].as_str().unwrap_or("") {
+        "off" => {
+            s.push_str("Runaway chains: off (runaway.action in `mulchie config`).\n");
+            return s;
+        }
+        "stop" if r["enforcing"] == true => s.push_str(&format!(
+            "Runaway chains: on. A command running inside {depth} copies of itself is frozen and killed.\n"
+        )),
+        "stop" => s.push_str(
+            "Runaway chains: set to stop, but this engine does not act (another engine holds the lock, or the config did not load).\n",
+        ),
+        _ => s.push_str(&format!(
+            "Runaway chains: reports only. `mulchie config set runaway.action stop` lets Mulchie kill a command running inside {depth} copies of itself.\n"
+        )),
+    }
+    let place = |c: &Value| match c["cwd"].as_str() {
+        Some(d) => format!("`{}` in {d}", st(c, "command")),
+        None => format!("`{}`", st(c, "command")),
+    };
+    for c in r["chains"].as_array().into_iter().flatten() {
+        s.push_str(&format!(
+            "  Running now: {} inside {} copies of itself ({} process(es), {}); stop it with `mulchie signal {} kill --tree`\n",
+            place(c),
+            c["depth"].as_u64().unwrap_or(0),
+            c["processes"].as_u64().unwrap_or(0),
+            mb_words(c["mem_mb"].as_f64().unwrap_or(0.0)),
+            c["root_pid"].as_u64().unwrap_or(0),
+        ));
+    }
+    let now = now_unix();
+    let stopped = r["stoppings"].as_array().cloned().unwrap_or_default();
+    if !stopped.is_empty() {
+        s.push_str(&format!("  Stopped by Mulchie ({}):\n", stopped.len()));
+        for c in stopped.iter().take(10) {
+            s.push_str(&format!(
+                "    {} ago  {} ({} copies, {}): {}\n",
+                duration(now.saturating_sub(c["at_unix"].as_u64().unwrap_or(now))),
+                place(c),
+                c["depth"].as_u64().unwrap_or(0),
+                mb_words(c["mem_mb"].as_f64().unwrap_or(0.0)),
+                c["detail"]
+                    .as_str()
+                    .unwrap_or(c["state"].as_str().unwrap_or(""))
+            ));
+        }
+    }
+    let remembered = r["remembered"].as_array().cloned().unwrap_or_default();
+    if !remembered.is_empty() {
+        s.push_str("  The guard rule runaway_repeat matches for now:\n");
+        for m in remembered.iter().take(10) {
+            s.push_str(&format!(
+                "    {} (for another {})\n",
+                place(m),
+                duration(m["until_unix"].as_u64().unwrap_or(now).saturating_sub(now))
+            ));
+        }
+    }
+    s
+}
+
 pub fn render_limits(v: &Value) -> String {
     let mut s = String::new();
     let cfg = &v["config"];
@@ -698,6 +770,7 @@ pub fn render_limits(v: &Value) -> String {
         ));
     }
     s.push_str(&render_memory_guard(&v["memory_guard"]));
+    s.push_str(&render_runaway(&v["runaway"]));
     let br = v["breaches"].as_array().cloned().unwrap_or_default();
     if br.is_empty() {
         s.push_str("No session is over its budget.\n");
@@ -1140,6 +1213,49 @@ mod tests {
         let idle = json!({"action": "stop", "enforcing": false, "closings": []});
         assert!(render_memory_guard(&idle).contains("does not act"));
         assert!(render_memory_guard(&json!({"action": "off"})).contains("off"));
+        let swap = json!({"action": "notify", "enforcing": false, "low": true, "free_pct": 31.0,
+            "swap_pct": 110.0,
+            "would_close": {"name": "what the claude session in 1db started", "mem_mb": 80000.0,
+                "trigger": "swap_high"},
+            "closings": []});
+        let t = render_memory_guard(&swap);
+        assert!(
+            t.contains(
+                "Swap is filling up now (swap in use is 110% of physical memory); would close"
+            ),
+            "{t}"
+        );
+    }
+
+    #[test]
+    fn runaway_chains_say_what_runs_what_was_stopped_and_what_is_remembered() {
+        assert_eq!(render_runaway(&Value::Null), "");
+        assert!(render_runaway(&json!({"action": "off"})).contains("off"));
+        let now = now_unix();
+        let notify = json!({"action": "notify", "depth": 6, "enforcing": false,
+            "chains": [{"command": "npm run build", "cwd": "/code/site", "depth": 12,
+                "processes": 48, "mem_mb": 3686.4, "root_pid": 4242}],
+            "stoppings": [], "remembered": [{"command": "npm run build", "cwd": "/code/site",
+                "depth": 12, "at_unix": now, "until_unix": now + 3000}]});
+        let t = render_runaway(&notify);
+        assert!(t.contains("reports only"), "{t}");
+        assert!(t.contains("runaway.action stop"), "{t}");
+        assert!(t.contains("Running now: `npm run build` in /code/site inside 12 copies of itself (48 process(es), 3.6 GB); stop it with `mulchie signal 4242 kill --tree`"), "{t}");
+        assert!(t.contains("runaway_repeat"), "{t}");
+        let stop = json!({"action": "stop", "depth": 6, "enforcing": true, "chains": [],
+            "stoppings": [{"at_unix": now, "command": "npm run build", "cwd": "/code/site",
+                "depth": 7, "mem_mb": 2048.0, "state": "done",
+                "detail": "froze 21 and killed 21 of 21 process(es)"}], "remembered": []});
+        let t = render_runaway(&stop);
+        assert!(t.contains("Runaway chains: on."), "{t}");
+        assert!(
+            t.contains(
+                "`npm run build` in /code/site (7 copies, 2.0 GB): froze 21 and killed 21 of 21"
+            ),
+            "{t}"
+        );
+        let idle = json!({"action": "stop", "enforcing": false});
+        assert!(render_runaway(&idle).contains("does not act"));
     }
 
     #[test]

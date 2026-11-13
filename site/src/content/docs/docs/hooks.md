@@ -75,6 +75,7 @@ A guard rule matches the text of one shell command. It is a tripwire for agents 
 | `disable_mulchie` | Stopping, unloading or removing Mulchie, or editing its files. |
 | `credential_read` | Reading SSH private keys or cloud credentials, or dumping the keychain. |
 | `startup_write` | Writing shell startup files, launch agents, systemd user units or the crontab. |
+| `runaway_repeat` | A command that, in the directory it would run in, Mulchie saw starting itself over and over within the last `runaway.remember_secs` (default one hour). See [runaway chains](/docs/sessions/#runaway-chains). It matches the program and arguments exactly, so `npm run build` is matched and `npx react-router build` is not. |
 | `too_long` | A command over 64 KiB, of which only the first 64 KiB were checked. Always a warning, not configurable. |
 
 Each rule's mode is `off`, `warn` or `block`. **Every rule defaults to `warn`.**

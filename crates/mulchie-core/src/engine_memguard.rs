@@ -27,6 +27,9 @@ pub struct MemoryGuardStatus {
     pub low: bool,
     pub low_since_unix: Option<u64>,
     pub free_pct: f32,
+    /// Swap in use, as a percent of physical memory.
+    #[serde(default)]
+    pub swap_pct: f32,
     pub pressure: Option<String>,
     /// What would be closed now, if anything qualifies.
     pub would_close: Option<Candidate>,
@@ -43,6 +46,7 @@ fn status_of(g: &MemGuard, cfg: &MemoryGuardConfig, can_act: bool) -> MemoryGuar
         low: g.low(),
         low_since_unix: g.low_since(),
         free_pct: g.free_pct(),
+        swap_pct: g.swap_pct(),
         pressure: g.pressure().map(String::from),
         would_close: g.candidate().cloned(),
         closings: g.closings().cloned().collect(),
@@ -202,6 +206,11 @@ fn guard_findings(g: &MemGuard, cfg: &MemoryGuardConfig, can_act: bool, now: u64
     }
     let acts = cfg.action == MemoryAction::Stop && can_act;
     let seen = match (g.low(), g.pressure()) {
+        (true, _) if g.by_swap() => format!(
+            "Swap is filling up (swap in use is {:.0}% of physical memory, {:.0}% of memory free)",
+            g.swap_pct(),
+            g.free_pct()
+        ),
         (true, Some("critical")) => format!(
             "Memory is low ({:.0}% free, kernel pressure critical)",
             g.free_pct()
@@ -213,7 +222,9 @@ fn guard_findings(g: &MemGuard, cfg: &MemoryGuardConfig, can_act: bool, now: u64
         MemoryScope::Sessions => "what agent sessions started",
         MemoryScope::All => "your apps, workspaces and programs",
     };
-    let risk = if g.low() {
+    let risk = if g.by_swap() {
+        "When swap fills up the machine stalls, and macOS restarts itself rather than end ordinary programs."
+    } else if g.low() {
         "With memory this low the machine starts to swap, stall or crash."
     } else {
         "One consumer holding this much memory leaves less for everything else on the machine."
@@ -302,6 +313,7 @@ impl Engine {
         let mem = Memory {
             free_pct: snap.mem_free_pct(),
             pressure: snap.mem_summary.pressure.clone(),
+            swap_pct: snap.swap_used_pct(),
         };
         let (queued, announce, changed) = {
             let mut sup = lock(&self.sup);
@@ -337,9 +349,16 @@ impl Engine {
             self.limit_wake.notify_all();
         }
         if let Some(c) = announce {
+            let seen = if c.trigger == Trigger::SwapHigh {
+                format!(
+                    "Swap is filling up ({:.0}% of physical memory in use as swap)",
+                    mem.swap_pct
+                )
+            } else {
+                format!("Memory is low ({:.0}% free)", mem.free_pct)
+            };
             let text = format!(
-                "Memory is low ({:.0}% free). Mulchie would close {} ({}), but the memory guard only reports here.",
-                mem.free_pct,
+                "{seen}. Mulchie would close {} ({}), but the memory guard only reports here.",
                 c.name,
                 fmt_mb(c.mem_mb)
             );
@@ -502,6 +521,7 @@ impl Engine {
             "memory_guard",
             json!({
                 "closing_id": c.id, "trigger": c.trigger, "free_pct": c.free_pct,
+                "swap_pct": c.swap_pct,
                 "memory_mb": c.mem_mb, "processes": c.processes,
                 "outcome": outcome, "detail": detail,
             }),

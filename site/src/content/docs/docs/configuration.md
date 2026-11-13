@@ -125,6 +125,7 @@ A budget has any of the caps `cpu_cores`, `memory_mb`, `processes`, `write_mb_pe
 | `memory_guard.scope` | `sessions` | `sessions`: what agent sessions started. `all`: also any other unprotected app, workspace or program of yours. |
 | `memory_guard.free_pct` | 5 | Memory is low when less than this percent is available. 1 to 50. |
 | `memory_guard.on_pressure` | `true` | Critical memory pressure reported by the kernel also counts as low. |
+| `memory_guard.swap_pct` | 50 | Swap in use reaching this percent of physical memory also counts as low. 0 is off; at most 1000. |
 | `memory_guard.sustain_secs` | 15 | How long memory must stay low, or a unit over `unit_max_mb`. 0 to 3600. |
 | `memory_guard.min_mb` | 300 | Nothing using less is closed for low memory. 16 to 1048576. |
 | `memory_guard.unit_max_mb` | 0 | Close a unit that stays over this much memory even when the machine is not low. 0 is off; otherwise 64 to 1048576. |
@@ -132,6 +133,16 @@ A budget has any of the caps `cpu_cores`, `memory_mb`, `processes`, `write_mb_pe
 | `memory_guard.stop_grace_secs` | 5 | Between SIGTERM and SIGKILL. 1 to 300. |
 | `memory_guard.include_agent` | `false` | Close a session's agent process together with what it started. |
 | `memory_guard.never` | empty | Process names never closed. At most 256. |
+
+## Runaway chains
+
+`runaway` decides what happens when a command keeps starting itself. See [runaway chains](/docs/sessions/#runaway-chains).
+
+| Setting | Default | Meaning |
+| --- | --- | --- |
+| `runaway.action` | `notify` | `off`, `notify` (a `runaway_chain` finding and a notification) or `stop` (freeze the chain, then kill it). |
+| `runaway.depth` | 6 | A command running nested inside this many copies of itself, with the same command line and working directory, is a chain. 3 to 64. |
+| `runaway.remember_secs` | 3600 | How long the `runaway_repeat` guard rule matches the command in that directory afterwards. 0 remembers nothing; at most 604800. |
 
 ## Guard rules
 
@@ -147,6 +158,7 @@ The `guard` settings control the [guard rules](/docs/hooks/#guard-rules) that ag
 | `guard.rules.disable_mulchie` | `warn` | |
 | `guard.rules.credential_read` | `warn` | |
 | `guard.rules.startup_write` | `warn` | |
+| `guard.rules.runaway_repeat` | `warn` | |
 | `guard.protected_branches` | `["main", "master"]` | Branches the `force_push` rule protects. At most 64. |
 | `guard.build_advice` | `true` | While the machine is busy, advise running a recognised heavy build as `mulchie run`. |
 
