@@ -6,11 +6,11 @@ import { st, hooks } from './store.js';
 import { invoke } from './ipc.js';
 import { $, esc, B, BS, P, ago, dur, tilde, toast, kindChip } from './util.js';
 import { planThenExecute, confirmBox, reasonText } from './dialogs.js';
-import { GROUP_ACTIONS, groupAction, signalPids, reniceProc, planAndRun, canLower, sessionNote, resumePaused } from './signals.js';
+import { GROUP_ACTIONS, groupAction, signalPids, reniceProc, planAndRun, canLower, sessionNote, resumePaused, endSessions } from './signals.js';
 import { allProcs, findConsumer, ranked, cores, cpuSummary, memSummary, KIND_TEXT } from './consumers.js';
 import { SEV_LVL, SEV_TEXT, suggestionLabel, watchFindings, CATEGORY, CATEGORY_ORDER, planApi, sessionApi, runCommand, updateItems } from './findings.js';
 import { act } from './act.js';
-import { coresText, notEnforcedText, isHookOnly } from './views/sessions.js';
+import { coresText, notEnforcedText, isHookOnly, idleHtml } from './views/sessions.js';
 
 // ------------------------------------------------------------------ helpers
 
@@ -480,7 +480,7 @@ function rSession(id) {
     ${kv([['agent', esc(x.agent)], ['status', running ? '<span class="ok">running</span>' : `ended ${x.ended_unix ? esc(ago(x.ended_unix)) + ' ago' : ''}`], ['found by', x.source === 'hook' ? 'an agent hook' : 'the process table'],
       x.client && ['client', esc(x.client)], ['workspace', x.workspace ? (ws ? link('ws', ws.path, tilde(x.workspace)) : esc(tilde(x.workspace))) : '<span class="dim">none</span>'],
       x.cwd && ['working dir', `<span class="mono">${esc(tilde(x.cwd))}</span>`], ['agent process', x.root_pid ? link('proc', x.root_pid, `pid ${x.root_pid}`) : '—'],
-      x.parent && ['started by', link('session', x.parent, x.parent)], ['started', x.started_unix ? esc(new Date(x.started_unix * 1000).toLocaleString()) : '—'], ['runtime', esc(dur(u.runtime_secs || 0))],
+      x.parent && ['started by', link('session', x.parent, x.parent)], ['started', x.started_unix ? esc(new Date(x.started_unix * 1000).toLocaleString()) : '—'], ['runtime', esc(dur(u.runtime_secs || 0))], running && x.last_active_unix && ['idle', idleHtml(x)],
       x.listening?.length && ['listening', x.listening.map(p => `<span class="mono">${esc(p)}</span>`).join(', ')]])}
     ${s.command ? `<h3 class="ds-h">Command line</h3><pre class="code">${esc(s.command)}</pre>` : ''}
     ${sec('Usage', kv([['cpu', running ? `${esc(coresText(u.cpu_cores))} cores` : '—'], ['memory', running ? MBt(u.memory_mb) : '—'], ['processes', running ? String(u.processes ?? '—') : '—'], ['build slots', String(u.build_slots ?? 0)],
@@ -494,7 +494,7 @@ function rSession(id) {
     ${sec(`Processes (${procs.length})`, procs.length ? `<table class="mini-t"><colgroup><col><col style="width:70px"><col style="width:76px"></colgroup>${procs.slice(0, 60).map(p => `<tr class="click" role="button" tabindex="0" ${dl('proc', p.pid)}><td><span class="cell">${esc(p.name)} <span class="dim mono">${p.pid}</span>${p.root ? ' <span class="chip agent">agent</span>' : ''}${p.stopped ? ' <span class="chip warn">paused</span>' : ''}</span></td><td class="n">${esc(cores(p.cpu_pct))}</td><td class="n">${B(p.mem_bytes)}</td></tr>`).join('')}</table>${procs.length > 60 ? `<div class="dim">and ${procs.length - 60} more</div>` : ''}` : `<div class="dim">${running ? (d ? 'None at the last sample.' : 'Reading…') : 'The session has ended.'}</div>`)}
     ${sec('Activity', activityHtml(id))}`;
   return { title: `${x.agent || 'Session'}${x.workspace ? ` · ${tilde(x.workspace).split('/').pop()}` : ''}`, sub: `<span class="dim mono">${esc(id)}</span>${running ? '' : ' <span class="chip">ended</span>'}${breaches.some(b => b.cleared_unix == null) ? ' <span class="chip bad">over a limit</span>' : ''}`, html,
-    copy: { kind: 'session', id, ...pick(x, ['agent', 'source', 'status', 'workspace', 'cwd', 'root_pid', 'started_unix', 'ended_unix']), usage: u, peak: s.peak, breaches: breaches.map(b => pick(b, ['cap', 'max', 'value', 'action', 'action_state', 'cleared_unix'])), hint: 'Act on it with POST /v1/process/plan {"session": id, "action": …} then /v1/process/execute.' } };
+    copy: { kind: 'session', id, ...pick(x, ['agent', 'source', 'status', 'workspace', 'cwd', 'root_pid', 'started_unix', 'ended_unix', 'last_active_unix']), usage: u, peak: s.peak, breaches: breaches.map(b => pick(b, ['cap', 'max', 'value', 'action', 'action_state', 'cleared_unix'])), hint: 'Act on it with POST /v1/process/plan {"session": id, "action": …} then /v1/process/execute.' } };
 }
 
 export const actKey = a => `${a.at_unix}:${a.kind}:${a.target || a.detail.slice(0, 60)}`;
@@ -631,6 +631,10 @@ export async function detailAction(t) {
     if (name === 'p-renice') return reniceProc(p);
     if (name === 'p-tree') return planAndRun([{ pid, signal: 'term', tree: true }], { title: `Quit ${p.name} (${pid}) and its children?`, verb: 'Quit', note: 'Sends SIGTERM to the process and every descendant, children first.' });
     return signalPids([pid], name.slice(2), `${p.name} (${pid})`);
+  }
+  if (name === 's-end') {
+    const brief = (S().sessions?.list || []).find(x => x.id === arg);
+    return brief ? endSessions([brief]) : toast('That session has ended.', true);
   }
   if (name.startsWith('s-')) {
     const action = name.slice(2), a = GROUP_ACTIONS[action], include = !!st.ui.sIncAgent;

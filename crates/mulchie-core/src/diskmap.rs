@@ -2,6 +2,7 @@
 //! roots. Read-only; removal goes through the safety gate.
 
 use serde::Serialize;
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::Mutex;
@@ -9,13 +10,69 @@ use std::time::{Duration, SystemTime};
 
 use crate::config::Config;
 use crate::git::{self, git, run_with_timeout, GitError};
+use crate::measure::{measure_tree, Background};
 use crate::paths::Paths;
 use crate::process::{is_tool, ProcessSource};
-use crate::reclaim::dir_size;
+use crate::reclaim::{dir_size, SizeMemo, REMEASURE_SECS};
 use crate::safety::{any_cwd_in, is_agent_worktree, SkipReason, KNOWN_CACHE_DIRS};
 
-/// Repositories scanned at once.
+/// Repositories scanned at once: by a requested scan, and by the periodic
+/// one, which runs in the background and must not be felt.
 const REPO_WORKERS: usize = 8;
+const QUIET_WORKERS: usize = 2;
+
+/// A worktree changed (a file or a commit) within this long is measured on
+/// every scan; an older one only when something about it moved.
+pub const ACTIVE_SECS: u64 = 86_400;
+
+/// What a scan measured in one worktree: the expensive part (a walk of
+/// every file and a `git status`), kept so the next periodic scan can skip
+/// it for a worktree that shows no sign of change.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WorktreeMemo {
+    pub at_unix: u64,
+    pub head: Option<String>,
+    /// Modification time of the worktree's folder and of its git index.
+    pub mark: (u64, u64),
+    pub in_use: bool,
+    pub bytes: u64,
+    pub dirty_files: usize,
+    pub status_error: Option<String>,
+    pub last_commit_unix: u64,
+    /// Newest file change the walk saw.
+    pub newest: u64,
+    pub activity_unknown: bool,
+}
+
+impl WorktreeMemo {
+    /// Whether the periodic scan may reuse this: measured within
+    /// [`REMEASURE_SECS`], read without error, nothing running in it then or
+    /// now, the same commit, folder and index untouched, and idle for
+    /// [`ACTIVE_SECS`] when measured. The safety gate reads a worktree again
+    /// itself before removing it, so a reused figure is never acted on.
+    fn fresh(&self, now: u64, head: &Option<String>, mark: (u64, u64), in_use: bool) -> bool {
+        !in_use
+            && !self.in_use
+            && self.head == *head
+            && self.mark == mark
+            && self.status_error.is_none()
+            && !self.activity_unknown
+            && now.saturating_sub(self.at_unix) < REMEASURE_SECS
+            && self
+                .at_unix
+                .saturating_sub(self.newest.max(self.last_commit_unix))
+                >= ACTIVE_SECS
+    }
+}
+
+/// What the last scans measured. The engine keeps one between periodic
+/// scans; a scan someone asked for starts from an empty one.
+#[derive(Debug, Clone, Default)]
+pub struct ScanMemo {
+    pub worktrees: HashMap<PathBuf, WorktreeMemo>,
+    pub caches: HashMap<PathBuf, SizeMemo>,
+    pub stores: HashMap<PathBuf, SizeMemo>,
+}
 
 #[derive(Debug, Clone, Serialize)]
 pub struct Category {
@@ -339,6 +396,23 @@ fn categories_for_os(paths: &Paths, macos: bool) -> Vec<CatDef> {
 /// Scan package caches and every git worktree under the scan roots. `busy_cwds`
 /// are the working directories of the user's processes, read now.
 pub fn scan(cfg: &Config, paths: &Paths, busy_cwds: &[PathBuf], now: u64) -> DiskMap {
+    let mut memo = ScanMemo::default();
+    scan_with(cfg, paths, busy_cwds, now, &mut memo, false)
+}
+
+/// [`scan`], reusing from `memo` what shows no sign of change and leaving
+/// in it what this scan measured (`memo.caches` is the cache scan's and is
+/// not touched). `quiet` is the periodic scan: fewer threads, at background
+/// priority.
+pub fn scan_with(
+    cfg: &Config,
+    paths: &Paths,
+    busy_cwds: &[PathBuf],
+    now: u64,
+    memo: &mut ScanMemo,
+    quiet: bool,
+) -> DiskMap {
+    let prev: &ScanMemo = memo;
     let start = std::time::Instant::now();
     let cats: Vec<CatDef> = categories_for(paths)
         .into_iter()
@@ -348,42 +422,84 @@ pub fn scan(cfg: &Config, paths: &Paths, busy_cwds: &[PathBuf], now: u64) -> Dis
     // A bounded pool: at most REPO_WORKERS repositories at once.
     let queue = Mutex::new(repos.iter());
 
-    let (mut categories, mut worktrees) = std::thread::scope(|s| {
-        let ch: Vec<_> = cats
-            .iter()
-            .map(|c| {
-                s.spawn(move || Category {
-                    key: c.key.to_string(),
-                    name: c.name.to_string(),
-                    path: c.path.clone(),
-                    bytes: dir_size(&c.path),
-                    hint: c.hint.to_string(),
-                    prunable: c.prune.is_some(),
-                })
-            })
-            .collect();
-        let wh: Vec<_> = (0..REPO_WORKERS.min(repos.len()))
+    let cat_queue = Mutex::new(cats.iter());
+    let workers = if quiet { QUIET_WORKERS } else { REPO_WORKERS };
+    let (cat_out, wt_out) = std::thread::scope(|s| {
+        // A requested scan measures every store at once; the periodic one,
+        // one at a time.
+        let ch: Vec<_> = (0..if quiet { 1 } else { cats.len() })
             .map(|_| {
-                let queue = &queue;
+                let cat_queue = &cat_queue;
                 s.spawn(move || {
+                    let _bg = quiet.then(Background::enter);
                     let mut out = Vec::new();
                     loop {
-                        let next = queue.lock().unwrap_or_else(|e| e.into_inner()).next();
-                        let Some(r) = next else { break };
-                        out.extend(repo_worktrees(r, busy_cwds, cfg, paths, now));
+                        let next = cat_queue.lock().unwrap_or_else(|e| e.into_inner()).next();
+                        let Some(c) = next else { break };
+                        let mark = mtime(&c.path);
+                        let known = prev.stores.get(&c.path).filter(|m| {
+                            m.mark == mark && now.saturating_sub(m.at_unix) < REMEASURE_SECS
+                        });
+                        let size = match known {
+                            Some(m) => m.clone(),
+                            None => SizeMemo {
+                                at_unix: now,
+                                bytes: dir_size(&c.path),
+                                mark,
+                                in_use: false,
+                            },
+                        };
+                        let cat = Category {
+                            key: c.key.to_string(),
+                            name: c.name.to_string(),
+                            path: c.path.clone(),
+                            bytes: size.bytes,
+                            hint: c.hint.to_string(),
+                            prunable: c.prune.is_some(),
+                        };
+                        out.push((cat, size));
                     }
                     out
                 })
             })
             .collect();
-        let cats: Vec<Category> = ch.into_iter().filter_map(|h| h.join().ok()).collect();
-        let wts: Vec<Worktree> = wh
+        let wh: Vec<_> = (0..workers.min(repos.len()))
+            .map(|_| {
+                let queue = &queue;
+                s.spawn(move || {
+                    let _bg = quiet.then(Background::enter);
+                    let mut out = Vec::new();
+                    loop {
+                        let next = queue.lock().unwrap_or_else(|e| e.into_inner()).next();
+                        let Some(r) = next else { break };
+                        out.extend(repo_worktrees(r, busy_cwds, cfg, paths, now, prev));
+                    }
+                    out
+                })
+            })
+            .collect();
+        let cats: Vec<(Category, SizeMemo)> = ch
+            .into_iter()
+            .filter_map(|h| h.join().ok())
+            .flatten()
+            .collect();
+        let wts: Vec<(Worktree, Option<WorktreeMemo>)> = wh
             .into_iter()
             .filter_map(|h| h.join().ok())
             .flatten()
             .collect();
         (cats, wts)
     });
+    memo.stores = cat_out
+        .iter()
+        .map(|(c, m)| (c.path.clone(), m.clone()))
+        .collect();
+    memo.worktrees = wt_out
+        .iter()
+        .filter_map(|(w, m)| Some((w.path.clone(), m.clone()?)))
+        .collect();
+    let mut categories: Vec<Category> = cat_out.into_iter().map(|(c, _)| c).collect();
+    let mut worktrees: Vec<Worktree> = wt_out.into_iter().map(|(w, _)| w).collect();
 
     categories.retain(|c| c.bytes > 0);
     categories.sort_by_key(|a| std::cmp::Reverse(a.bytes));
@@ -452,7 +568,8 @@ fn repo_worktrees(
     cfg: &Config,
     paths: &Paths,
     now: u64,
-) -> Vec<Worktree> {
+    prev: &ScanMemo,
+) -> Vec<(Worktree, Option<WorktreeMemo>)> {
     let Ok(entries) = git::worktree_list(paths, repo) else {
         return Vec::new();
     };
@@ -491,9 +608,18 @@ fn repo_worktrees(
             let canon = path.canonicalize().unwrap_or_else(|_| path.clone());
             let in_use = exists && any_cwd_in(busy_cwds, &canon, false);
             let agent = is_agent_worktree(&path);
-            let bytes = if exists { dir_size(&path) } else { 0 };
-            let (dirty_files, status_error) = if exists {
-                match git(
+            let measured = exists.then(|| {
+                let mark = (mtime(&path), mtime(&git_index(repo, &path)));
+                if let Some(m) = prev
+                    .worktrees
+                    .get(&path)
+                    .filter(|m| m.fresh(now, &e.head, mark, in_use))
+                {
+                    return m.clone();
+                }
+                // One walk gives the size and the newest change.
+                let walk = measure_tree(&path, ACTIVITY_BUDGET);
+                let (dirty_files, status_error) = match git(
                     paths,
                     &path,
                     &[
@@ -505,31 +631,32 @@ fn repo_worktrees(
                 ) {
                     Ok(s) => (s.lines().filter(|l| !l.is_empty()).count(), None),
                     Err(e) => (0, Some(e.to_string())),
-                }
-            } else {
-                (0, None)
-            };
-            let last_commit_unix = if exists {
-                git(paths, &path, &["log", "-1", "--format=%ct", "HEAD"])
+                };
+                let last_commit_unix = git(paths, &path, &["log", "-1", "--format=%ct", "HEAD"])
                     .ok()
                     .and_then(|s| s.trim().parse().ok())
-                    .unwrap_or(0)
-            } else {
-                0
-            };
-            let walked = if exists {
-                last_activity_checked(&path)
-            } else {
-                Some(0)
-            };
-            let activity_unknown = walked.is_none();
-            let last_activity_unix = if exists {
-                walked
-                    .unwrap_or_else(|| last_activity(&path))
-                    .max(last_commit_unix)
-            } else {
-                0
-            };
+                    .unwrap_or(0);
+                WorktreeMemo {
+                    at_unix: now,
+                    head: e.head.clone(),
+                    // Read again: `git status` may refresh the index.
+                    mark: (mtime(&path), mtime(&git_index(repo, &path))),
+                    in_use,
+                    bytes: walk.bytes,
+                    dirty_files,
+                    status_error,
+                    last_commit_unix,
+                    newest: walk.newest,
+                    activity_unknown: !walk.complete,
+                }
+            });
+            let m = measured.as_ref();
+            let bytes = m.map_or(0, |m| m.bytes);
+            let dirty_files = m.map_or(0, |m| m.dirty_files);
+            let status_error = m.and_then(|m| m.status_error.clone());
+            let last_commit_unix = m.map_or(0, |m| m.last_commit_unix);
+            let activity_unknown = m.is_some_and(|m| m.activity_unknown);
+            let last_activity_unix = m.map_or(0, |m| m.newest.max(m.last_commit_unix));
             let idle_days = now.saturating_sub(last_activity_unix) / 86_400;
             let is_merged = e.branch.as_ref().map(|b| merged.contains(b)).unwrap_or(false);
             let locked = e.locked;
@@ -569,7 +696,7 @@ fn repo_worktrees(
             } else {
                 format!("clean; active {idle_days}d ago")
             };
-            Worktree {
+            let wt = Worktree {
                 name,
                 path,
                 repo: repo.to_path_buf(),
@@ -592,9 +719,25 @@ fn repo_worktrees(
                 verdict,
                 status_error,
                 activity_unknown,
-            }
+            };
+            (wt, measured)
         })
         .collect()
+}
+
+/// The index file of the worktree at `path` of `repo`: it changes when
+/// something is staged, committed or checked out there.
+fn git_index(repo: &Path, path: &Path) -> PathBuf {
+    let name = path.file_name().unwrap_or_default();
+    // A linked worktree's `.git` is a file naming its directory under the
+    // repository's `.git/worktrees`; that directory is named after the
+    // worktree's folder unless two share a name.
+    let linked = repo.join(".git").join("worktrees").join(name);
+    if linked.is_dir() {
+        linked.join("index")
+    } else {
+        path.join(".git").join("index")
+    }
 }
 
 fn mtime(p: &Path) -> u64 {
@@ -885,6 +1028,146 @@ mod tests {
         let v = serde_json::to_value(&h).unwrap();
         assert!(v["status_error"].is_string());
         assert!(v.get("activity_unknown").is_none());
+    }
+
+    /// `MULCHIE_BENCH_ROOT=<folder of repos> cargo test -p mulchie-core --release
+    /// --lib diskmap::tests::bench_periodic_scan -- --ignored --nocapture`:
+    /// the CPU a first periodic scan costs, then the next one. Read-only.
+    #[test]
+    #[ignore]
+    fn bench_periodic_scan() {
+        let Some(root) = std::env::var_os("MULCHIE_BENCH_ROOT").map(PathBuf::from) else {
+            return;
+        };
+        let t = tempfile::tempdir().unwrap();
+        let paths = Paths::under(t.path());
+        std::fs::create_dir_all(&paths.home).unwrap();
+        let cfg = Config {
+            scan_roots: vec![root.canonicalize().unwrap()],
+            ..Config::default()
+        };
+        let cpu = || {
+            let mut r: libc::rusage = unsafe { std::mem::zeroed() };
+            unsafe { libc::getrusage(libc::RUSAGE_SELF, &mut r) };
+            let s = |t: libc::timeval| t.tv_sec as f64 + t.tv_usec as f64 / 1e6;
+            s(r.ru_utime) + s(r.ru_stime)
+        };
+        let mut memo = ScanMemo::default();
+        for round in 0..3 {
+            let (c, at) = (cpu(), std::time::Instant::now());
+            let m = scan_with(
+                &cfg,
+                &paths,
+                &[],
+                crate::monitor::now_unix(),
+                &mut memo,
+                true,
+            );
+            println!(
+                "scan {round}: {:.2}s cpu, {:.2?} wall, {} worktrees, {} remembered",
+                cpu() - c,
+                at.elapsed(),
+                m.worktrees.len(),
+                memo.worktrees.len()
+            );
+        }
+    }
+
+    /// The periodic scan reuses a worktree's figures only while nothing
+    /// about it moved; anything that may have changed is measured again.
+    #[test]
+    fn a_memo_is_reused_only_for_a_worktree_that_shows_no_change() {
+        let t = tempfile::tempdir().unwrap();
+        let paths = Paths::under(t.path());
+        std::fs::create_dir_all(&paths.home).unwrap();
+        std::fs::create_dir_all(t.path().join("code/repo")).unwrap();
+        let root = t.path().join("code").canonicalize().unwrap();
+        let repo = root.join("repo");
+        git(&paths, &repo, &["init", "-q", "-b", "main"]).unwrap();
+        commit(&paths, &repo, "init");
+        let wt = repo.join(".claude/worktrees/agent-x");
+        git(
+            &paths,
+            &repo,
+            &["worktree", "add", "-q", "-b", "feat", wt.to_str().unwrap()],
+        )
+        .unwrap();
+        std::fs::create_dir(wt.join("sub")).unwrap();
+        std::fs::write(wt.join("sub/a.txt"), "small").unwrap();
+        let cfg = Config {
+            scan_roots: vec![root.clone()],
+            worktree_idle_days: 1,
+            ..Config::default()
+        };
+        let grow = |n: usize| std::fs::write(wt.join("sub/a.txt"), vec![b'x'; n]).unwrap();
+        let bytes = |m: &DiskMap| {
+            m.worktrees
+                .iter()
+                .find(|w| w.name == "agent-x")
+                .unwrap()
+                .bytes
+        };
+        let now = crate::monitor::now_unix();
+        let later = now + 30 * DAY;
+
+        // Changed within a day of the scan: measured every time.
+        let mut memo = ScanMemo::default();
+        let first = scan_with(&cfg, &paths, &[], now, &mut memo, true);
+        grow(200_000);
+        let second = scan_with(&cfg, &paths, &[], now + 60, &mut memo, true);
+        assert!(bytes(&second) > bytes(&first) + 150_000);
+
+        // Idle for a month: a change deep inside moves no mark, so the
+        // figures are reused, and they keep the time they were measured.
+        let mut memo = ScanMemo::default();
+        let base = scan_with(&cfg, &paths, &[], later, &mut memo, true);
+        assert_eq!(memo.worktrees[&wt].at_unix, later);
+        grow(600_000);
+        let reused = scan_with(&cfg, &paths, &[], later + 60, &mut memo, true);
+        assert_eq!(bytes(&reused), bytes(&base));
+        assert_eq!(memo.worktrees[&wt].at_unix, later);
+        let w = reused
+            .worktrees
+            .iter()
+            .find(|w| w.name == "agent-x")
+            .unwrap();
+        assert!(w.sweepable && w.dirty_files == 1 && w.idle_days >= 29);
+        // A scan someone asked for measures it.
+        assert!(bytes(&scan(&cfg, &paths, &[], later + 60)) > bytes(&base) + 300_000);
+
+        // Something running in it: measured, and not reused next time either.
+        let kept = memo.clone();
+        let busy = scan_with(
+            &cfg,
+            &paths,
+            std::slice::from_ref(&wt),
+            later + 60,
+            &mut memo,
+            true,
+        );
+        assert!(bytes(&busy) > bytes(&base) + 300_000);
+        assert!(memo.worktrees[&wt].in_use);
+        grow(900_000);
+        let after = scan_with(&cfg, &paths, &[], later + 120, &mut memo, true);
+        assert!(bytes(&after) > bytes(&busy) + 200_000);
+
+        // Too old.
+        let mut memo = kept.clone();
+        let old = scan_with(&cfg, &paths, &[], later + REMEASURE_SECS, &mut memo, true);
+        assert!(bytes(&old) > bytes(&base) + 300_000);
+
+        // A new commit, or a file added at the top: measured.
+        let mut memo = kept.clone();
+        commit(&paths, &wt, "more");
+        let moved = scan_with(&cfg, &paths, &[], later + 60, &mut memo, true);
+        assert!(bytes(&moved) > bytes(&base) + 300_000);
+        let mut memo = ScanMemo::default();
+        let base = scan_with(&cfg, &paths, &[], later, &mut memo, true);
+        grow(1_500_000);
+        std::thread::sleep(std::time::Duration::from_millis(1100));
+        std::fs::write(wt.join("top.txt"), "new").unwrap();
+        let top = scan_with(&cfg, &paths, &[], later + 60, &mut memo, true);
+        assert!(bytes(&top) > bytes(&base) + 300_000);
     }
 
     /// C12: a walk that runs out of budget is unknown, not "idle"; caches are

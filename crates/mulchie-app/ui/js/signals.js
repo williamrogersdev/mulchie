@@ -162,6 +162,17 @@ export function resumePaused(list, title = 'Resume the processes Mulchie paused?
   });
 }
 
+// End agent sessions: ask each agent and everything it started to quit.
+// One plan and one review for them all; `sessions` are rows of the list.
+export function endSessions(sessions) {
+  if (!sessions.length) return;
+  const one = sessions.length === 1 && sessions[0];
+  return planAndRun(sessions.map(s => ({ session: s.id, action: 'quit', include_agent: true })), {
+    title: one ? `End ${one.agent || 'this session'}${one.workspace ? ` in ${one.workspace.split('/').pop()}` : ''}?` : `End ${sessions.length} sessions?`,
+    verb: 'End', note: sessionNote('quit', true), danger: true,
+  });
+}
+
 // A group action ("quit Google Chrome").
 export function groupAction(key, action, name) {
   const a = GROUP_ACTIONS[action];

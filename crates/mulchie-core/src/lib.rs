@@ -8,6 +8,7 @@ pub mod guard;
 pub mod journal;
 pub mod limits;
 pub mod lock;
+pub mod measure;
 pub mod memguard;
 pub mod monitor;
 pub mod notify;

@@ -44,6 +44,8 @@ All notable changes to Mulchie are listed here. The format follows
 
 ### Changed
 
+- The periodic disk scan costs far less. It measures a directory in one pass (on macOS with `getattrlistbulk`), reuses what it measured for worktrees, caches and stores that show no change (for at most 6 hours), and runs on two threads at background priority. A scan you ask for still measures everything.
+- The app: every row has its own action (remove a worktree, clear a cache, prune a store, stop a workspace, quit a process, end a session), each through the same review dialog as before. Sessions show how long they have been idle (`last_active_unix` in the API) and can be filtered by it and ended several at once. "Needs attention" says how long each item has been so. The menu bar panel shows three figures, the biggest users with a Stop or Quit button, what needs attention, and what can be cleaned up.
 - Command-line parsing uses clap: every command has `--help` with examples, flags are strict, and unknown flags are errors.
 - `clean` and `sweep` no longer delete in one step. They show what they would do and, briefly, what they would skip and why.
 - Worktree removal backs up first and removes only if every backup step worked. Uncommitted changes become a patch that is checked to apply cleanly, gitignored files that are not caches go into a `tar.gz`, and a detached HEAD gets a `backup/<name>-<shortsha>` branch. Each backup set is a directory under the config directory's `backups/` with a `manifest.json` that says how to restore it.

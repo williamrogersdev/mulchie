@@ -434,3 +434,35 @@ tr.click:focus-visible td, .tile:focus-visible, .cb:focus-visible, .kpi:focus-vi
 
 .cfg-card .actions { flex-wrap: wrap; }
 .cfg-card .actions .btn { white-space: normal; text-align: left; }
+
+/* ---- Ages and row actions. ---- */
+.finding .ft { display: flex; gap: 8px; align-items: baseline; min-width: 0; }
+.finding .ftt { min-width: 0; overflow-wrap: anywhere; }
+.finding .age { flex: none; color: var(--tx3); font: 400 11px var(--mono); white-space: nowrap; }
+td .btn.sm { vertical-align: baseline; }
+
+/* ---- The tray panel, reworked: one line of figures, one list of who is
+   using the machine, then what to resolve, each row with its action. ---- */
+#panel .pb { overflow-x: hidden; }
+#panel .ph .mode:empty { display: none; }
+#panel .pf .sp { flex: 1; }
+.pstats { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 6px; }
+.pstat { background: var(--bg3); border: 1px solid var(--line); border-radius: 7px; padding: 6px 8px; cursor: pointer; min-width: 0; }
+.pstat:hover { border-color: var(--line2); background: var(--tile-hover); }
+.pstat .l { color: var(--tx3); font-size: 10.5px; text-transform: uppercase; letter-spacing: .04em; }
+.pstat .v { font: 600 13px var(--mono); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.pstat .s { color: var(--tx2); font-size: 11px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.prow, .prow-h { display: grid; grid-template-columns: minmax(0, 1fr) 62px 58px 50px; gap: 8px; align-items: center; }
+.prow-h { color: var(--tx3); font-size: 10.5px; text-transform: uppercase; letter-spacing: .04em; padding: 0 4px; margin: 0 -4px; }
+.prow-h span:nth-child(2), .prow-h span:nth-child(3), .prow .n { text-align: right; }
+.prow { padding: 4px; margin: 0 -4px; border-radius: 5px; cursor: pointer; }
+.prow:hover { background: var(--bg3); }
+.prow:focus-visible, .pstat:focus-visible { outline: 1px solid var(--focus); outline-offset: -1px; }
+.prow .nm { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.prow .n { font: 11.5px var(--mono); color: var(--tx2); white-space: nowrap; }
+.prow .n.hot { color: var(--tx-strong); font-weight: 600; }
+.prow .btn { justify-self: end; }
+#panel .finding .ft { display: block; }
+#panel .finding .ftt { display: block; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+#panel .finding .age { display: block; }
+#panel .more:empty, #panel .more { margin-top: 0; }

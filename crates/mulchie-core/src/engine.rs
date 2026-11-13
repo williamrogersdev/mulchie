@@ -738,6 +738,8 @@ pub struct Engine {
     record: Arc<std::sync::OnceLock<crate::record::Record>>,
     /// Update checks: sources, cache and the worker's state.
     updates: Arc<Updates>,
+    /// What the last disk scan measured, for the periodic scan to reuse.
+    scan_memo: Arc<Mutex<diskmap::ScanMemo>>,
 }
 
 impl Engine {
@@ -796,6 +798,7 @@ impl Engine {
             state: Arc::new(Mutex::new(state)),
             history: Arc::new(Mutex::new(VecDeque::with_capacity(HISTORY_LEN))),
             jobs: Arc::new(Jobs::default()),
+            scan_memo: Arc::new(Mutex::new(diskmap::ScanMemo::default())),
             next_id: Arc::new(AtomicU64::new(1)),
             paths: Arc::new(paths),
             journal: Arc::new(journal),
@@ -1535,7 +1538,7 @@ impl Engine {
             .unwrap_or(true);
         if due {
             let first = ctx.last_scan.is_none();
-            self.run_scan();
+            self.run_periodic_scan();
             ctx.last_scan = Some(Instant::now());
             if !first && cfg.auto_sweep_worktrees && self.automation_allowed() {
                 self.jobs.push(Job::Sweep {
@@ -1581,17 +1584,41 @@ impl Engine {
         }
     }
 
+    /// Scan now, measuring everything again: for a scan someone asked for
+    /// (the Rescan button, `mulchie scan`, a settings change).
     pub fn run_scan(&self) -> ScanReport {
+        self.scan_now(false)
+    }
+
+    /// The scan the loop runs every `scan_interval_mins`. It must not be
+    /// felt: it runs at background priority on two threads, and re-measures
+    /// only what may have changed since the last scan (see
+    /// [`diskmap::WorktreeMemo`]); the rest keeps its figures for up to
+    /// [`reclaim::REMEASURE_SECS`].
+    pub fn run_periodic_scan(&self) -> ScanReport {
+        self.scan_now(true)
+    }
+
+    fn scan_now(&self, quiet: bool) -> ScanReport {
         let cfg = {
             let mut st = lock(&self.state);
             st.scanning = true;
             st.config.clone()
         };
+        let _bg = quiet.then(crate::measure::Background::enter);
+        let mut memo = if quiet {
+            lock(&self.scan_memo).clone()
+        } else {
+            diskmap::ScanMemo::default()
+        };
         let cwds = own_cwds(&*self.procs);
         let now = now_unix();
-        let report = reclaim::scan(&cfg, &self.paths, &cwds, now);
+        let (report, caches) =
+            reclaim::scan_with(&cfg, &self.paths, &cwds, now, &memo.caches, quiet);
         lock(&self.state).scan = Some(Arc::new(report.clone()));
-        let map = diskmap::scan(&cfg, &self.paths, &cwds, now);
+        memo.caches = caches;
+        let map = diskmap::scan_with(&cfg, &self.paths, &cwds, now, &mut memo, quiet);
+        *lock(&self.scan_memo) = memo;
         let mut st = lock(&self.state);
         st.diskmap = Some(Arc::new(map));
         st.scanning = false;
