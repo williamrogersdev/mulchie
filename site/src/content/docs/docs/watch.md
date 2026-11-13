@@ -67,7 +67,7 @@ To never report a program, add its absolute path to `watch.allow_exes`. To never
 | `exposed_listener` | A process listening on all network interfaces or another non-loopback address, so it can be reached from the same network. A development server usually needs only `127.0.0.1`. Needs `watch.check_listeners`. | medium for a process in a workspace; info for an app; otherwise low |
 | `temp_executable` | A process whose program file is in a temporary or downloads folder: something started from a download or by another program. | low if started by a package runner such as `npx`; medium; high if it also listens beyond this machine, is quarantined, or is unsigned or ad-hoc signed |
 | `hidden_dir_executable` | A process started from a hidden folder inside your code, other than ordinary ones such as `.venv`, `.cache` or `.cargo`. | medium |
-| `system_name_mismatch` | A process that uses the name of an operating-system program but runs from somewhere other than a system folder. | high |
+| `system_name_mismatch` | A process that uses the name of an operating-system program but runs from somewhere other than a system folder. A simulator's own copies under `/Library/Developer/CoreSimulator/` (inside a runtime's `RuntimeRoot`) are not reported. | high |
 | `unsigned_executable` | A macOS app that is not code-signed, or only ad-hoc signed, and was not built in your workspaces. macOS cannot say who built it. Needs `watch.check_signatures`. | low; medium if downloaded |
 | `quarantined_executable` | A loose command-line program that still carries the macOS download quarantine flag and is running. Needs `watch.check_signatures`. | low; medium if unsigned |
 
