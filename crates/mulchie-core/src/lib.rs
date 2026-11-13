@@ -18,6 +18,7 @@ pub mod procplan;
 pub mod reclaim;
 pub mod record;
 pub mod redact;
+pub mod runaway;
 pub mod safety;
 pub mod session;
 pub mod shutdown;

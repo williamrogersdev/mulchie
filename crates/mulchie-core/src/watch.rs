@@ -82,6 +82,8 @@ pub enum FindingKind {
     /// The machine stayed low on memory, or a consumer stayed over the
     /// memory guard's cap (`memory_guard`).
     MemoryLow,
+    /// A command is running nested inside copies of itself (`runaway`).
+    RunawayChain,
 }
 
 impl FindingKind {
@@ -112,7 +114,9 @@ impl FindingKind {
             InsecurePermissions | ApiExposed | EngineLockNotHeld | ConfigNotLoaded => {
                 FindingCategory::Posture
             }
-            LimitExceeded | SessionHog | PausedListUnreadable | MemoryLow => FindingCategory::Limit,
+            LimitExceeded | SessionHog | PausedListUnreadable | MemoryLow | RunawayChain => {
+                FindingCategory::Limit
+            }
             MulchieUpdate | AgentUpdate | HomebrewOutdated | Advisory => FindingCategory::Update,
         }
     }

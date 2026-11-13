@@ -792,6 +792,7 @@ paths:
                   paused_by_mulchie: { type: array, items: { $ref: "#/components/schemas/PausedProc" } }
                   paused_left: { type: array, items: { $ref: "#/components/schemas/PausedProc" }, description: Paused processes Mulchie could not resume }
                   memory_guard: { $ref: "#/components/schemas/MemoryGuardStatus" }
+                  runaway: { $ref: "#/components/schemas/RunawayStatus" }
         default: { $ref: "#/components/responses/Error" }
   /v1/hook:
     post:
@@ -856,7 +857,9 @@ paths:
         `rsync --delete`, `git clean -f` with `-d`/`-x`, `xargs rm -r` not fed only by a `find`
         inside the boundary), pipe_to_shell (piping a download into a shell, or running a file an
         earlier command downloaded), sudo, force_push, disable_mulchie, credential_read,
-        startup_write, and too_long (always a warning: the command is longer than 64 KiB and only
+        startup_write, runaway_repeat (the command, in the directory it would run in, is one the
+        engine saw starting itself over and over within `runaway.remember_secs`), and too_long
+        (always a warning: the command is longer than 64 KiB and only
         its first 64 KiB were checked). Deletes are judged against the session's workspace, or
         with none known the given `cwd`.
       requestBody:
@@ -1107,6 +1110,7 @@ components:
         - advisory
         - paused_list_unreadable
         - memory_low
+        - runaway_chain
     FindingCounts:
       type: object
       properties:
@@ -1238,6 +1242,7 @@ components:
         low: { type: boolean, description: "Memory has been low for `sustain_secs`" }
         low_since_unix: { type: integer, nullable: true }
         free_pct: { type: number, description: Percent of memory available at the last sample }
+        swap_pct: { type: number, description: "Swap in use at the last sample, as a percent of physical memory; at `memory_guard.swap_pct` or more memory counts as low" }
         pressure: { type: string, nullable: true, enum: [normal, warning, critical] }
         would_close:
           nullable: true
@@ -1249,7 +1254,7 @@ components:
             kind: { type: string, enum: [session, workspace, app, process] }
             mem_mb: { type: number }
             processes: { type: integer }
-            trigger: { type: string, enum: [memory_low, over_cap] }
+            trigger: { type: string, enum: [memory_low, over_cap, swap_high] }
         closings:
           type: array
           description: What the guard closed or tried to, newest first, at most 50, since this engine started
@@ -1258,8 +1263,9 @@ components:
             properties:
               id: { type: string }
               at_unix: { type: integer }
-              trigger: { type: string, enum: [memory_low, over_cap] }
+              trigger: { type: string, enum: [memory_low, over_cap, swap_high] }
               free_pct: { type: number }
+              swap_pct: { type: number }
               pressure: { type: string, nullable: true }
               key: { type: string }
               name: { type: string }
@@ -1270,6 +1276,63 @@ components:
               processes: { type: integer }
               state: { type: string, enum: [pending, done, partial, skipped, not_enforced] }
               detail: { type: string, nullable: true }
+    RunawayStatus:
+      type: object
+      description: >-
+        Runaway chains (`runaway` in config), also `runaway` in `GET /v1/state`. A chain is one
+        command line, in one working directory, running nested inside at least `depth` copies of
+        itself (a build script that calls itself). It is reported (`action: notify`) or stopped
+        (`action: stop`: SIGSTOP to the outermost copy and everything under it, from a fresh
+        process list, until nothing new appears, then SIGKILL, through the safety gate).
+      properties:
+        action: { type: string, enum: [off, notify, stop] }
+        depth: { type: integer, description: "`runaway.depth`" }
+        enforcing: { type: boolean, description: "The action is `stop` and this engine automates" }
+        chains:
+          type: array
+          description: The chains running at the last sample
+          items:
+            type: object
+            properties:
+              key: { type: string, description: "`chain:<pid>:<start time>` of the outermost copy" }
+              command: { type: string, description: "The command line that repeats, redacted and shortened" }
+              cwd: { type: string, nullable: true }
+              depth: { type: integer, description: Copies nested inside each other }
+              root_pid: { type: integer, description: The outermost copy }
+              processes: { type: integer, description: The outermost copy and everything it started }
+              mem_mb: { type: number }
+              session_id: { type: string, nullable: true }
+              workspace: { type: string, nullable: true }
+              first_seen_unix: { type: integer }
+        stoppings:
+          type: array
+          description: What Mulchie stopped or tried to, newest first, at most 50, since this engine started
+          items:
+            type: object
+            properties:
+              id: { type: string }
+              at_unix: { type: integer }
+              key: { type: string }
+              command: { type: string }
+              cwd: { type: string, nullable: true }
+              depth: { type: integer }
+              processes: { type: integer }
+              mem_mb: { type: number }
+              session_id: { type: string, nullable: true }
+              workspace: { type: string, nullable: true }
+              state: { type: string, enum: [pending, done, partial, skipped, not_enforced] }
+              detail: { type: string, nullable: true }
+        remembered:
+          type: array
+          description: Commands the `runaway_repeat` guard rule matches now
+          items:
+            type: object
+            properties:
+              command: { type: string, description: "The program and its arguments, as the rule matches them" }
+              cwd: { type: string }
+              depth: { type: integer, description: The deepest nesting seen }
+              at_unix: { type: integer }
+              until_unix: { type: integer }
     Breach:
       type: object
       description: A session over one cap of its budget.

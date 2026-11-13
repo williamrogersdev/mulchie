@@ -37,6 +37,9 @@ use sessions::Supervision;
 #[path = "engine_memguard.rs"]
 mod memguard_glue;
 pub use memguard_glue::MemoryGuardStatus;
+#[path = "engine_runaway.rs"]
+mod runaway_glue;
+pub use runaway_glue::RunawayStatus;
 #[path = "engine_hook.rs"]
 mod hook;
 pub use hook::{GuardCheckReply, GuardCheckRequest, HookEvent, HookReply, HookRequest};
@@ -398,6 +401,10 @@ pub struct State {
     pub sessions: SessionsState,
     /// The memory guard: whether it acts, whether memory is low, what it closed.
     pub memory_guard: MemoryGuardStatus,
+    /// Runaway chains: commands nested inside copies of themselves and what
+    /// Mulchie stopped.
+    #[serde(default)]
+    pub runaway: RunawayStatus,
     /// Update checks, compact (the full report: `GET /v1/updates`).
     pub updates: UpdatesStatus,
     /// Cache deletions, worktree removals and cache prunes skipped at least
@@ -803,6 +810,7 @@ impl Engine {
             findings_unix: None,
             sessions: SessionsState::default(),
             memory_guard: MemoryGuardStatus::default(),
+            runaway: RunawayStatus::default(),
             updates: UpdatesStatus::default(),
             failures: Vec::new(),
         };
@@ -874,6 +882,7 @@ impl Engine {
             .count();
         st.sessions = self.sessions_state(&st.config);
         st.memory_guard = self.memory_guard_status();
+        st.runaway = self.runaway_status();
         st.updates = self.updates_status(false);
         // A target that is gone (removed by hand since) is no longer a
         // problem to report; cache keys of prunes are not paths and stay.
@@ -1393,6 +1402,7 @@ impl Engine {
             },
             &cfg,
         );
+        self.observe_runaway(now, &snap, &cfg);
         self.observe_memory(now, &snap, &cfg);
 
         let mut notes = Vec::new();

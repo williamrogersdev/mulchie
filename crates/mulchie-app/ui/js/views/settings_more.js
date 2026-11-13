@@ -37,6 +37,7 @@ const RULES = [
   ['disable_mulchie', 'Disabling Mulchie', 'Stopping, unloading or removing Mulchie, or editing its files.'],
   ['credential_read', 'Reading credentials', 'Reading SSH private keys or cloud credentials, or dumping the keychain.'],
   ['startup_write', 'Startup files', 'Writing shell startup files, launch agents, systemd user units or the crontab.'],
+  ['runaway_repeat', 'Runaway command again', 'Running again, in the same folder, a command Mulchie just saw starting itself over and over.'],
 ];
 
 const dirty = { lim: false, guard: false, upd: false };

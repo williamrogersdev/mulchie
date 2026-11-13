@@ -196,7 +196,7 @@ pub fn tool_list() -> Vec<Tool> {
         read(
             "limits_status",
             "Session budgets",
-            "Whether session budgets only report or act (report_only, enforcing, and not_enforcing in words with not_enforcing_reason), the budgets, sessions over a cap and what was done, sessions hogging the machine, and processes Mulchie paused (paused_left: paused by an earlier engine and not resumed; resume them with plan_process_action). paused_list_unreadable lists findings that Mulchie could not read its list of paused processes: some may still be stopped. memory_guard is the machine-wide memory guard: its action (off, notify, stop), whether this engine enforces it, whether memory is low now, would_close (what it would close next) and closings (what it closed and why). Changes nothing.",
+            "Whether session budgets only report or act (report_only, enforcing, and not_enforcing in words with not_enforcing_reason), the budgets, sessions over a cap and what was done, sessions hogging the machine, and processes Mulchie paused (paused_left: paused by an earlier engine and not resumed; resume them with plan_process_action). paused_list_unreadable lists findings that Mulchie could not read its list of paused processes: some may still be stopped. memory_guard is the machine-wide memory guard: its action (off, notify, stop), whether this engine enforces it, whether memory is low now, would_close (what it would close next) and closings (what it closed and why); swap filling up counts as low memory. runaway is about commands that keep starting themselves (a build script that calls itself): chains running now (command, cwd, depth, processes, root_pid), stoppings (what Mulchie froze and killed) and remembered (commands check_command warns about for now). Changes nothing.",
             json!({}),
         ),
         read(
@@ -210,7 +210,7 @@ pub fn tool_list() -> Vec<Tool> {
             ..read(
                 "check_command",
                 "Check a command against the guard rules",
-                "Ask Mulchie's guard rules about a shell command before running it: allow, warn or block, with the reason and every rule that matched, and build advice while heavy work is not advised. Records nothing and runs nothing.",
+                "Ask Mulchie's guard rules about a shell command before running it: allow, warn or block, with the reason and every rule that matched, and build advice while heavy work is not advised. Rule runaway_repeat means this command, in this directory, was just seen starting itself over and over: do not run it again until what calls it is fixed. Records nothing and runs nothing.",
                 json!({
                     "command": { "type": "string", "maxLength": 65536, "description": "The shell command line" },
                     "cwd": { "type": "string", "description": "The directory it would run in (default: this server's)" }

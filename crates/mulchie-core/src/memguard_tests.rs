@@ -19,6 +19,7 @@ fn mem(free: f32) -> Memory {
     Memory {
         free_pct: free,
         pressure: Some("normal".into()),
+        swap_pct: 0.0,
     }
 }
 
@@ -87,6 +88,7 @@ fn critical_pressure_counts_as_low_unless_turned_off() {
     let crit = Memory {
         free_pct: 30.0,
         pressure: Some("critical".into()),
+        swap_pct: 0.0,
     };
     let u = [unit("big", 3000.0)];
     let mut c = stop();
@@ -218,4 +220,48 @@ fn config_ranges_are_checked() {
     };
     bad.validate(&mut e);
     assert_eq!(e.len(), 4, "{e:?}");
+}
+
+#[test]
+fn swap_filling_up_counts_as_low_while_memory_still_looks_free() {
+    // 31% of memory "free" and swap bigger than physical memory.
+    let swapping = Memory {
+        free_pct: 31.0,
+        pressure: Some("warning".into()),
+        swap_pct: 110.0,
+    };
+    let u = [unit("big", 3000.0)];
+    let mut c = stop();
+    c.sustain_secs = 0;
+    assert_eq!(c.swap_pct, 50, "on by default");
+    let mut g = MemGuard::default();
+    let id = g.evaluate(0, &swapping, &u, &c, true).expect("closes");
+    assert!(g.low() && g.by_swap());
+    let cl = g.get(&id).unwrap();
+    assert_eq!(cl.trigger, Trigger::SwapHigh);
+    assert!(
+        cl.sentence().contains("swap in use had reached 110%"),
+        "{}",
+        cl.sentence()
+    );
+    // Under the threshold, or with the check off, it is not low.
+    let some = Memory {
+        swap_pct: 49.0,
+        ..swapping.clone()
+    };
+    assert_eq!(MemGuard::default().evaluate(0, &some, &u, &c, true), None);
+    c.swap_pct = 0;
+    let mut g = MemGuard::default();
+    assert_eq!(g.evaluate(0, &swapping, &u, &c, true), None);
+    assert!(!g.low());
+    // Memory itself short as well: the ordinary trigger.
+    c.swap_pct = 50;
+    let both = Memory {
+        free_pct: 2.0,
+        ..swapping
+    };
+    let mut g = MemGuard::default();
+    let id = g.evaluate(0, &both, &u, &c, true).unwrap();
+    assert_eq!(g.get(&id).unwrap().trigger, Trigger::MemoryLow);
+    assert!(!g.by_swap());
 }
