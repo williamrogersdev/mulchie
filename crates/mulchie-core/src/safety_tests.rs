@@ -884,6 +884,7 @@ fn backup_branch_names_are_safe() {
 #[test]
 fn skip_reasons_have_stable_codes() {
     assert_eq!(SkipReason::IgnoredTooLarge.code(), "ignored_too_large");
+    assert_eq!(SkipReason::BackingOff.code(), "backing_off");
     let r = ActionResult {
         action: ActionKind::RemoveWorktree,
         target: "/x".into(),
@@ -1729,4 +1730,357 @@ fn a_patch_that_does_not_verify_fails_the_removal() {
     let r = env.gate().execute_one(&env.remove_req(&wt, &head), "t");
     assert!(done(&r), "{r:?}");
     assert!(!wt.exists());
+}
+
+// ------------------------------------------------- audit additions (gate)
+
+fn detail(r: &ActionResult) -> String {
+    match &r.outcome {
+        Outcome::Skipped { detail, .. } => detail.clone(),
+        _ => String::new(),
+    }
+}
+
+fn backup_sets(env: &Env) -> usize {
+    std::fs::read_dir(&env.paths.backups_dir)
+        .map(|d| d.count())
+        .unwrap_or(0)
+}
+
+/// A removal that is skipped after its backup was written did not happen, so
+/// the backup set is discarded: a sweep that keeps hitting the same skip must
+/// not add a patch and an archive on every scan.
+#[test]
+fn a_skip_after_the_backup_discards_the_unused_backup_set() {
+    let env = Env::new();
+    let repo = env.repo("repo");
+    let wt = env.worktree(&repo, "agent-x", false);
+    std::fs::write(wt.join("work.txt"), "unsaved").unwrap();
+    std::fs::write(wt.join(".env"), "SECRET=1").unwrap();
+    for i in 0..3 {
+        let mut g = env.gate();
+        let late = wt.join(format!("late-{i}.txt"));
+        g.after_backup = Some(Box::new(move || std::fs::write(&late, "new").unwrap()));
+        let r = g.execute_one(&env.remove_req(&wt, &env.head(&wt)), "t");
+        assert_eq!(reason(&r), Some(SkipReason::ChangedDuringBackup), "{r:?}");
+        assert!(detail(&r).contains("discarded"), "{}", detail(&r));
+        assert_eq!(backup_sets(&env), 0, "try {i} left a backup set behind");
+    }
+    assert_eq!(
+        std::fs::read_to_string(wt.join("work.txt")).unwrap(),
+        "unsaved"
+    );
+    assert_eq!(
+        std::fs::read_to_string(wt.join(".env")).unwrap(),
+        "SECRET=1"
+    );
+    // The same worktree, left alone, is then removed with its backups kept.
+    let r = env
+        .gate()
+        .execute_one(&env.remove_req(&wt, &env.head(&wt)), "t");
+    assert!(done(&r), "{r:?}");
+    assert_eq!(backup_sets(&env), 1);
+    assert!(Path::new(&backup_of(&r, BackupKind::Patch).unwrap()).exists());
+}
+
+/// A backup set that could not be completed is not left half written.
+#[test]
+fn a_half_written_backup_set_is_discarded() {
+    let env = Env::new();
+    let repo = env.repo("repo");
+    let wt = env.worktree(&repo, "agent-x", false);
+    std::fs::write(wt.join("work.txt"), "unsaved").unwrap();
+    let mut g = env.gate();
+    g.before_verify = Some(Box::new(|p: &Path| {
+        std::fs::write(
+            p,
+            "diff --git a/missing.txt b/missing.txt\n--- a/missing.txt\n+++ b/missing.txt\n@@ -1 +1 @@\n-old\n+new\n",
+        )
+        .unwrap();
+    }));
+    let r = g.execute_one(&env.remove_req(&wt, &env.head(&wt)), "t");
+    assert_eq!(reason(&r), Some(SkipReason::BackupFailed), "{r:?}");
+    assert_eq!(backup_sets(&env), 0);
+    assert!(wt.join("work.txt").exists());
+}
+
+/// Once `git worktree remove` has started, files may be gone even when it
+/// fails: the backups stay and the result says where they are.
+#[test]
+fn a_removal_that_fails_partway_keeps_and_names_its_backups() {
+    let env = Env::new();
+    let repo = env.repo("repo");
+    let wt = env.worktree(&repo, "agent-x", false);
+    std::fs::write(wt.join("work.txt"), "unsaved").unwrap();
+    let head = env.head(&wt);
+    // The directory holding the worktree cannot be written: git cannot
+    // remove the worktree's own directory.
+    let parent = wt.parent().unwrap().to_path_buf();
+    std::fs::set_permissions(&parent, std::fs::Permissions::from_mode(0o500)).unwrap();
+    let r = env.gate().execute_one(&env.remove_req(&wt, &head), "t");
+    std::fs::set_permissions(&parent, std::fs::Permissions::from_mode(0o700)).unwrap();
+    assert_eq!(reason(&r), Some(SkipReason::RemoveFailed), "{r:?}");
+    let d = detail(&r);
+    assert!(d.contains("its backups are kept in"), "{d}");
+    assert_eq!(backup_sets(&env), 1);
+    let set = std::fs::read_dir(&env.paths.backups_dir)
+        .unwrap()
+        .next()
+        .unwrap()
+        .unwrap()
+        .path();
+    assert!(d.contains(set.to_str().unwrap()), "{d}");
+    let patch = std::fs::read_to_string(set.join("changes.patch")).unwrap();
+    assert!(
+        patch.contains("unsaved"),
+        "the uncommitted file is in the patch"
+    );
+}
+
+/// The path rules of a worktree removal, each refused before git is asked
+/// to change anything.
+#[test]
+fn worktree_paths_that_are_relative_missing_links_or_files_are_refused() {
+    let env = Env::new();
+    let repo = env.repo("repo");
+    let wt = env.worktree(&repo, "agent-x", false);
+    let head = env.head(&wt);
+    let g = env.gate();
+    let r = g.execute_one(&env.remove_req(Path::new("repo/agent-x"), &head), "t");
+    assert_eq!(reason(&r), Some(SkipReason::NotAbsolute));
+    let r = g.execute_one(&env.remove_req(&env.root.join("nowhere"), &head), "t");
+    assert_eq!(reason(&r), Some(SkipReason::NotFound));
+    // A symlink to a real, removable agent worktree is not followed.
+    let link = env.root.join("agent-link");
+    std::os::unix::fs::symlink(&wt, &link).unwrap();
+    let r = g.execute_one(&env.remove_req(&link, &head), "t");
+    assert_eq!(reason(&r), Some(SkipReason::Symlink));
+    let file = env.root.join("agent-file");
+    std::fs::write(&file, "x").unwrap();
+    let r = g.execute_one(&env.remove_req(&file, &head), "t");
+    assert_eq!(reason(&r), Some(SkipReason::NotAWorktree));
+    assert!(wt.join("lib.rs").exists() && link.exists() && file.exists());
+}
+
+#[test]
+fn a_worktree_outside_every_scan_root_is_refused() {
+    let mut env = Env::new();
+    let repo = env.repo("repo");
+    let wt = env.worktree(&repo, "agent-x", false);
+    let elsewhere = env._t.path().join("elsewhere");
+    std::fs::create_dir_all(&elsewhere).unwrap();
+    env.cfg.scan_roots = vec![elsewhere.canonicalize().unwrap()];
+    let r = env
+        .gate()
+        .execute_one(&env.remove_req(&wt, &env.head(&wt)), "t");
+    assert_eq!(reason(&r), Some(SkipReason::OutsideScanRoots));
+    assert!(wt.exists());
+}
+
+/// An agent that asks for its own worktree to be removed is refused while
+/// anything of it (its MCP server included) still works there.
+#[test]
+fn the_callers_own_mulchie_process_in_a_worktree_keeps_it() {
+    let mut env = Env::new();
+    let repo = env.repo("repo");
+    let wt = env.worktree(&repo, "agent-x", false);
+    let mut t = FakeProcesses::empty().with(40, "mulchie", Some(wt.clone()), 1);
+    t.procs[0].cmd = vec!["/opt/homebrew/bin/mulchie".into(), "mcp".into()];
+    env.procs = t;
+    let r = env
+        .gate()
+        .execute_one(&env.remove_req(&wt, &env.head(&wt)), "t");
+    assert_eq!(reason(&r), Some(SkipReason::Busy), "{r:?}");
+    assert!(wt.exists());
+}
+
+#[test]
+fn prune_refuses_relative_missing_outside_unlisted_and_locked_entries() {
+    let mut env = Env::new();
+    let repo = env.repo("repo");
+    let a = env.worktree(&repo, "agent-a", false);
+    let prune = |repo: &Path, path: &Path| Request::PruneWorktree {
+        repo: repo.to_path_buf(),
+        path: path.to_path_buf(),
+    };
+    let g = env.gate();
+    let r = g.execute_one(&prune(Path::new("repo"), &a), "t");
+    assert_eq!(reason(&r), Some(SkipReason::NotAbsolute));
+    let r = g.execute_one(&prune(&repo, Path::new("agent-a")), "t");
+    assert_eq!(reason(&r), Some(SkipReason::NotAbsolute));
+    let r = g.execute_one(&prune(&env.root.join("no-repo"), &a), "t");
+    assert_eq!(reason(&r), Some(SkipReason::NotFound));
+    let r = g.execute_one(&prune(&repo, &env.root.join("agent-unlisted")), "t");
+    assert_eq!(reason(&r), Some(SkipReason::NotAWorktree));
+
+    // A locked entry whose directory is gone stays: the lock is the user's.
+    // (git does not report a locked entry as prunable, so either check may
+    // be the one that answers.)
+    env.git(&repo, &["worktree", "lock", a.to_str().unwrap()]);
+    env.vanish(&a, 0);
+    age_admin_entry(&repo, "agent-a");
+    let r = env.gate().execute_one(&prune(&repo, &a), "t");
+    assert!(
+        matches!(
+            reason(&r),
+            Some(SkipReason::Locked | SkipReason::NotPrunable)
+        ),
+        "{r:?}"
+    );
+    assert!(git::worktree_list(&env.paths, &repo)
+        .unwrap()
+        .iter()
+        .any(|e| e.path == a && e.locked));
+    env.git(&repo, &["worktree", "unlock", a.to_str().unwrap()]);
+
+    let elsewhere = env._t.path().join("elsewhere");
+    std::fs::create_dir_all(&elsewhere).unwrap();
+    env.cfg.scan_roots = vec![elsewhere.canonicalize().unwrap()];
+    let r = env.gate().execute_one(&prune(&repo, &a), "t");
+    assert_eq!(reason(&r), Some(SkipReason::OutsideScanRoots));
+    assert!(git::worktree_list(&env.paths, &repo)
+        .unwrap()
+        .iter()
+        .any(|e| e.path == a));
+}
+
+/// Whatever started the engine (its shell, terminal or service manager) is
+/// never signalled, and neither is a pid that does not fit a positive i32
+/// (`kill` would read it as a process group or as "everything").
+#[test]
+fn signals_refuse_the_engines_ancestors_and_out_of_range_pids() {
+    let mut env = Env::new();
+    let mut t = FakeProcesses::empty()
+        .with(900, "runner", None, 10)
+        .with(800, "wrapper", None, 10)
+        .with(700, "starter", None, 10)
+        .with(600, "bystander", None, 10);
+    t.pid = 900;
+    t.procs[0].ppid = 800;
+    t.procs[1].ppid = 700;
+    env.procs = t;
+    let g = env.gate();
+    for pid in [800, 700] {
+        let r = g.execute_one(&sig(pid, 10), "t");
+        assert_eq!(reason(&r), Some(SkipReason::ProtectedProcess), "{r:?}");
+        assert!(detail(&r).contains("started Mulchie"), "{}", detail(&r));
+    }
+    for pid in [i32::MAX as u32 + 1, u32::MAX] {
+        let r = g.execute_one(&sig(pid, 10), "t");
+        assert_eq!(reason(&r), Some(SkipReason::ProtectedProcess), "{r:?}");
+    }
+    // Renice goes through the same checks.
+    let r = g.execute_one(
+        &Request::Renice {
+            pid: 800,
+            nice: 10,
+            expected_start_time: 10,
+        },
+        "t",
+    );
+    assert_eq!(reason(&r), Some(SkipReason::ProtectedProcess), "{r:?}");
+}
+
+/// A plan over many requests is checked by several threads: the items come
+/// back in the order asked, each with the verdict a single check gives, and
+/// the process table is still read once.
+#[test]
+fn a_large_plan_is_checked_in_parallel_with_the_same_verdicts_in_order() {
+    let env = Env::new();
+    let repo = env.repo("repo");
+    let mut reqs = Vec::new();
+    for i in 0..10 {
+        let wt = env.worktree(&repo, &format!("agent-{i}"), i % 4 == 3);
+        match i % 5 {
+            1 => std::fs::write(wt.join("work.txt"), "unsaved").unwrap(),
+            2 => {
+                env.git(&repo, &["worktree", "lock", wt.to_str().unwrap()]);
+            }
+            3 => std::fs::write(wt.join(".env"), "SECRET=1").unwrap(),
+            _ => {}
+        }
+        reqs.push(Request::RemoveWorktree {
+            path: wt,
+            expected_head: String::new(),
+            // Odd ones refuse uncommitted changes.
+            allow_dirty: i % 2 == 0,
+            require_idle: false,
+        });
+    }
+    reqs.push(cache(&env.cargo_project("p")));
+    reqs.push(env.remove_req(&env.root.join("nowhere"), "abc"));
+    assert!(reqs.len() > PLAN_WORKERS);
+
+    let g = env.gate();
+    let plan = g.plan(&reqs);
+    assert_eq!(g.process_table_reads(), 1);
+    assert_eq!(plan.items.len(), reqs.len());
+    let one_by_one = env.gate();
+    for (item, req) in plan.items.iter().zip(&reqs) {
+        let alone = one_by_one.plan_item(req);
+        assert_eq!(item.target, req.target());
+        assert_eq!(
+            serde_json::to_value(item).unwrap(),
+            serde_json::to_value(&alone).unwrap(),
+            "{}",
+            item.target
+        );
+    }
+    let ready = plan.items.iter().filter(|i| i.ready).count();
+    assert!(ready >= 4 && ready < reqs.len(), "{plan:?}");
+    assert_eq!(
+        plan.ready_bytes,
+        plan.items
+            .iter()
+            .filter(|i| i.ready)
+            .map(|i| i.bytes)
+            .sum::<u64>()
+    );
+    // Planning changed nothing.
+    assert_eq!(backup_sets(&env), 0);
+    assert!(reqs
+        .iter()
+        .take(10)
+        .all(|r| Path::new(&r.target()).exists()));
+}
+
+/// Not a pass or fail check: prints how long a plan over many worktrees
+/// takes, one at a time and as `Gate::plan` does it.
+/// `cargo test -p mulchie-core plan_time -- --ignored --nocapture`
+#[test]
+#[ignore = "timing only"]
+fn plan_time_over_many_worktrees() {
+    let env = Env::new();
+    let repo = env.repo("repo");
+    for i in 0..200 {
+        std::fs::write(repo.join(format!("f{i}.rs")), "fn f() {}\n").unwrap();
+    }
+    env.git(&repo, &["add", "-A"]);
+    env.git(&repo, &["commit", "-q", "-m", "files"]);
+    let reqs: Vec<Request> = (0..32)
+        .map(|i| {
+            let wt = env.worktree(&repo, &format!("agent-{i}"), false);
+            if i % 2 == 0 {
+                std::fs::write(wt.join("work.txt"), "unsaved").unwrap();
+            }
+            Request::RemoveWorktree {
+                path: wt,
+                expected_head: String::new(),
+                allow_dirty: true,
+                require_idle: false,
+            }
+        })
+        .collect();
+    let g = env.gate();
+    let t = Instant::now();
+    let serial: Vec<PlanItem> = reqs.iter().map(|r| g.plan_item(r)).collect();
+    let serial_ms = t.elapsed().as_millis();
+    let t = Instant::now();
+    let plan = g.plan(&reqs);
+    let parallel_ms = t.elapsed().as_millis();
+    assert!(serial.iter().all(|i| i.ready) && plan.items.iter().all(|i| i.ready));
+    println!(
+        "plan over {} worktrees: {serial_ms} ms one at a time, {parallel_ms} ms with {PLAN_WORKERS} workers",
+        reqs.len()
+    );
 }

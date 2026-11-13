@@ -1183,7 +1183,7 @@ fn against_a_real_engine() {
 }
 
 #[test]
-fn prune_cache_previews_by_default() {
+fn prune_cache_executes_only_what_it_previewed() {
     let f = Fake::default()
         .with(
             "GET /v1/state",
@@ -1192,17 +1192,72 @@ fn prune_cache_previews_by_default() {
             ] } }),
         )
         .with("POST /v1/prune", json!({ "ok": true, "freed": 1 }));
-    let v = result(&one(&f, call(1, "prune_cache", json!({ "key": "npm" }))));
+    let mut s = Session::new(&f);
+    // No preview yet: executing is refused, and nothing is pruned.
+    let r = s
+        .handle(call(
+            1,
+            "prune_cache",
+            json!({ "key": "npm", "execute": true }),
+        ))
+        .unwrap();
+    assert_eq!(r["result"]["isError"], true);
+    assert!(text(&r).contains("without execute first"), "{r}");
+    assert!(f.posted("/v1/prune").is_empty());
+    let v = result(
+        &s.handle(call(2, "prune_cache", json!({ "key": "npm" })))
+            .unwrap(),
+    );
     assert_eq!(v["preview"], true);
     assert_eq!(v["path"], "/h/.npm");
     assert!(f.posted("/v1/prune").is_empty(), "a preview must not prune");
-    let r = one(&f, call(2, "prune_cache", json!({ "key": "nope" })));
+    let r = s
+        .handle(call(3, "prune_cache", json!({ "key": "nope" })))
+        .unwrap();
     assert_eq!(r["result"]["isError"], true);
-    result(&one(
-        &f,
-        call(3, "prune_cache", json!({ "key": "npm", "execute": true })),
-    ));
+    // A preview of one cache does not allow pruning another.
+    let r = s
+        .handle(call(
+            4,
+            "prune_cache",
+            json!({ "key": "bun", "execute": true }),
+        ))
+        .unwrap();
+    assert_eq!(r["result"]["isError"], true);
+    result(
+        &s.handle(call(
+            5,
+            "prune_cache",
+            json!({ "key": "npm", "execute": true }),
+        ))
+        .unwrap(),
+    );
     assert_eq!(f.posted("/v1/prune"), vec![json!({ "key": "npm" })]);
+    // One preview, one prune.
+    let r = s
+        .handle(call(
+            6,
+            "prune_cache",
+            json!({ "key": "npm", "execute": true }),
+        ))
+        .unwrap();
+    assert_eq!(r["result"]["isError"], true);
+    // A preview older than the plan lifetime is not enough.
+    result(
+        &s.handle(call(7, "prune_cache", json!({ "key": "npm" })))
+            .unwrap(),
+    );
+    s.plans
+        .age_all(crate::mcp_tools::PLAN_TTL + std::time::Duration::from_secs(1));
+    let r = s
+        .handle(call(
+            8,
+            "prune_cache",
+            json!({ "key": "npm", "execute": true }),
+        ))
+        .unwrap();
+    assert_eq!(r["result"]["isError"], true);
+    assert_eq!(f.posted("/v1/prune").len(), 1);
 }
 
 #[test]
@@ -1684,4 +1739,73 @@ fn a_release_on_exit_waits_for_a_lease_in_flight() {
             .map(String::as_str),
         Some("s4")
     );
+}
+
+/// Oversized arguments are refused before anything reaches the engine: a
+/// string over the cap, a NUL byte, and more array items than one call takes.
+#[test]
+fn oversized_arguments_are_refused_before_the_engine() {
+    let f = Fake::default();
+    let long = "a".repeat(crate::mcp_tools::MAX_STRING_ARG + 1);
+    let many: Vec<String> = (0..=crate::mcp_tools::MAX_ARRAY_ARG)
+        .map(|i| format!("/w/{i}"))
+        .collect();
+    for (name, args, says) in [
+        (
+            "plan_worktree_removal",
+            json!({ "paths": [long] }),
+            "at most",
+        ),
+        (
+            "plan_worktree_removal",
+            json!({ "paths": ["/w/a\u{0}b"] }),
+            "NUL",
+        ),
+        ("plan_worktree_removal", json!({ "paths": many }), "split"),
+        ("plan_cache_cleanup", json!({ "paths": many }), "split"),
+        (
+            "execute_plan",
+            json!({ "plan_id": "p", "items": many }),
+            "split",
+        ),
+        ("dismiss_finding", json!({ "id": long }), "at most"),
+        ("prune_cache", json!({ "key": long }), "at most"),
+        (
+            "check_command",
+            json!({ "command": "x".repeat(65_537) }),
+            "at most",
+        ),
+    ] {
+        let r = one(&f, call(1, name, args));
+        assert_eq!(r["result"]["isError"], true, "{name}: {r}");
+        assert!(text(&r).contains(says), "{name}: {}", text(&r));
+    }
+    assert!(f.calls.borrow().is_empty(), "nothing reached the engine");
+}
+
+/// A plan item the engine marks as having failed before says so to the
+/// model, and get_status lists what keeps being skipped.
+#[test]
+fn past_failures_are_shown_in_plans_and_status() {
+    let mut plan = plan_with(&["/w/a", "/w/b"], &[]);
+    plan["items"][0]["past_failures"] = json!({
+        "count": 3, "reason": "backup_failed", "detail": "disk full",
+        "last_unix": 5, "advice": "check the backups directory"
+    });
+    let f = Fake::default().with("GET /v1/sweep", plan).with(
+        "GET /v1/state",
+        json!({ "health": "ok", "failures": [
+            { "kind": "worktree", "target": "/w/a", "count": 3, "reason": "backup_failed" }
+        ] }),
+    );
+    let mut s = Session::new(&f);
+    let shown = result(&s.handle(call(1, "plan_worktree_sweep", json!({}))).unwrap());
+    assert_eq!(shown["ready"][0]["failed_before"]["count"], 3);
+    assert_eq!(
+        shown["ready"][0]["failed_before"]["reason"],
+        "backup_failed"
+    );
+    assert!(shown["ready"][1]["failed_before"].is_null());
+    let st = result(&s.handle(call(2, "get_status", json!({}))).unwrap());
+    assert_eq!(st["repeated_failures"][0]["target"], "/w/a");
 }

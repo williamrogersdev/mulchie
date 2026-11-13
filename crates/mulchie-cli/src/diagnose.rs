@@ -676,8 +676,10 @@ pub fn build(state: &Value, advice: &Value, origin: Origin) -> Value {
         "agents": snap["agent_count"],
         "builds": snap["build_count"],
     });
+    let repeated_failures = failures_brief(&state["failures"], &mut recs);
     let health = json!({ "status": state["health"], "why": why });
     let rest = json!({
+        "repeated_failures": repeated_failures,
         "consumers": consumers,
         "findings": findings,
         "sessions": sessions,
@@ -689,6 +691,46 @@ pub fn build(state: &Value, advice: &Value, origin: Origin) -> Value {
         "reclaimable": reclaimable,
     });
     finish(source, state, health, problems, recs, Some(rest))
+}
+
+/// Targets that keep being skipped (`state.failures`), with one
+/// recommendation: look at why before asking for the same thing again.
+fn failures_brief(fs: &Value, recs: &mut Vec<Rec>) -> Value {
+    let list: Vec<&Value> = fs.as_array().into_iter().flatten().collect();
+    if let Some(first) = list.first() {
+        let target = first["target"].as_str().unwrap_or("");
+        recs.push(Rec {
+            priority: 2,
+            id: "repeated_failures",
+            title: format!(
+                "Look at {} cleanup(s) that keep being skipped",
+                list.len()
+            ),
+            reason: format!(
+                "{target} was skipped {} times in a row ({}). {} Mulchie's automatic passes wait before trying again; asking for the same thing again will most likely be skipped the same way.",
+                first["count"],
+                first["reason"].as_str().unwrap_or("unknown"),
+                first["advice"].as_str().unwrap_or("")
+            ),
+            gain_bytes: None,
+            gain: "knowing why the space is not coming back".into(),
+            risk: "none",
+            next_call: call("get_status", json!({})),
+            command: Some("mulchie status --json   (see failures)".into()),
+        });
+    }
+    json!({
+        "total": list.len(),
+        "top": list.iter().take(5).map(|f| json!({
+            "kind": f["kind"],
+            "target": f["target"],
+            "times_in_a_row": f["count"],
+            "reason": f["reason"],
+            "detail": f["detail"],
+            "what_to_do": f["advice"],
+            "retry_after_unix": f["retry_after_unix"],
+        })).collect::<Vec<_>>(),
+    })
 }
 
 /// Running sessions, active breaches, hogs and what Mulchie paused, from
@@ -955,6 +997,22 @@ pub fn render(d: &Value) -> String {
         s.push_str("\nEngine:\n");
         for p in problems {
             s.push_str(&format!("  ! {p}\n"));
+        }
+    }
+    let failed = d["repeated_failures"]["top"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default();
+    if !failed.is_empty() {
+        s.push_str("\nKeeps being skipped:\n");
+        for f in &failed {
+            s.push_str(&format!(
+                "  {} ({} times, {}): {}\n",
+                f["target"].as_str().unwrap_or(""),
+                f["times_in_a_row"],
+                f["reason"].as_str().unwrap_or("unknown"),
+                f["what_to_do"].as_str().unwrap_or("")
+            ));
         }
     }
     let top = d["workspaces"]["top"]

@@ -83,6 +83,11 @@ paths:
         `scan_age_secs`, `scan_stale`, `findings` (as in `GET /v1/findings?dismissed=1`),
         `finding_counts` and `findings_unix`, `sessions` (as `SessionsState`) and `updates`
         (as `GET /v1/updates` without `report`). Command lines and lease labels are redacted.
+        `failures` lists each cache, cache key or worktree that was skipped at least twice in
+        a row and is still there: `kind` (`reclaim` or `worktree`), `target`, `count`, the
+        last `reason` and `detail`, `first_unix`, `last_unix`, `advice` and, from the third skip,
+        `retry_after_unix` (the engine's automatic sweep and reclaim leave the target alone
+        until then). A success clears the record.
       responses:
         "200": { $ref: "#/components/responses/Json" }
         default: { $ref: "#/components/responses/Error" }
@@ -1040,6 +1045,17 @@ components:
               ready: { type: boolean }
               reason: { type: [string, "null"] }
               verdict: { type: string }
+              past_failures:
+                type: object
+                description: >-
+                  Present when this target was skipped at least twice in a row before. The
+                  item can still be executed.
+                properties:
+                  count: { type: integer }
+                  reason: { type: [string, "null"] }
+                  detail: { type: string }
+                  last_unix: { type: integer }
+                  advice: { type: string }
     ActionResult:
       type: object
       required: [action, target, status]
@@ -1055,7 +1071,12 @@ components:
             properties:
               kind: { type: string, enum: [patch, ignored_archive, branch] }
               location: { type: string, description: "A file path, or a branch name for kind branch" }
-        reason: { type: string }
+        reason:
+          type: string
+          description: >-
+            Why it was skipped. `backing_off` is returned only by the automatic passes
+            (`{"auto": true}`), for a target that was skipped three or more times in a row
+            and is inside its wait; it was not run.
         detail: { type: string }
         journal_error: { type: string, description: Set when the action ran but could not be written to the journal }
     FindingKind:

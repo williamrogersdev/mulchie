@@ -124,6 +124,10 @@ pub enum SkipReason {
     /// A reopen that does not follow a quit, in the same batch, of a process
     /// belonging to that app.
     ReopenNotQuit,
+    /// An automatic pass left the target alone because it was skipped
+    /// several times in a row; see [`crate::failures`]. Never the answer to
+    /// an explicit request, and never journaled.
+    BackingOff,
 }
 
 impl SkipReason {
@@ -369,7 +373,7 @@ pub enum Request {
 
 /// Tests: a hook given the patch file before it is verified.
 #[cfg(test)]
-pub(crate) type PatchHook = Box<dyn Fn(&Path)>;
+pub(crate) type PatchHook = Box<dyn Fn(&Path) + Send + Sync>;
 
 /// How long [`Request::ReopenApp`] waits for the app's main process to exit.
 pub const REOPEN_WAIT: Duration = Duration::from_secs(20);
@@ -390,6 +394,17 @@ impl Request {
             Request::Signal { .. } => ActionKind::Signal,
             Request::Renice { .. } => ActionKind::Renice,
             Request::ReopenApp { .. } => ActionKind::ReopenApp,
+        }
+    }
+
+    /// The journal kind of a request whose target is a stable name (a path):
+    /// `reclaim` or `worktree`. `None` for process requests, whose pid names
+    /// a different process each time.
+    pub fn failure_kind(&self) -> Option<&'static str> {
+        match self {
+            Request::DeleteCache { .. } => Some("reclaim"),
+            Request::RemoveWorktree { .. } | Request::PruneWorktree { .. } => Some("worktree"),
+            _ => None,
         }
     }
 
@@ -424,6 +439,10 @@ pub struct PlanItem {
     pub ready: bool,
     pub reason: Option<SkipReason>,
     pub verdict: String,
+    /// Set by the engine when this target was skipped at least twice in a
+    /// row before: how often, why, and what to do about it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub past_failures: Option<crate::failures::PastFailures>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
@@ -445,6 +464,11 @@ impl Plan {
     }
 }
 
+/// Threads that check the items of one plan. Half of the git wrapper's own
+/// limit ([`git::MAX_CONCURRENT`]), so a large plan leaves room for an
+/// execution or another plan running at the same time.
+pub const PLAN_WORKERS: usize = 4;
+
 /// The gate: configuration, locations, the live process table and the clock.
 pub struct Gate<'a> {
     pub config: &'a Config,
@@ -458,7 +482,7 @@ pub struct Gate<'a> {
     reopen_wait: Duration,
     /// Tests: runs after the backups are written, before the recheck.
     #[cfg(test)]
-    pub(crate) after_backup: Option<Box<dyn Fn()>>,
+    pub(crate) after_backup: Option<Box<dyn Fn() + Send + Sync>>,
     /// Tests: runs on `changes.patch` after it is written, before it is
     /// verified.
     #[cfg(test)]
@@ -632,13 +656,49 @@ impl<'a> Gate<'a> {
 
     /// Check every request against the facts as they are now, without acting.
     pub fn plan(&self, requests: &[Request]) -> Plan {
-        let items: Vec<PlanItem> = requests.iter().map(|r| self.plan_item(r)).collect();
+        let items = self.plan_items(requests);
         let ready_bytes = items.iter().filter(|i| i.ready).map(|i| i.bytes).sum();
         Plan {
             created_unix: self.now,
             items,
             ready_bytes,
         }
+    }
+
+    /// Check every request, in order. Planning only reads, and nearly all of
+    /// its time is spent waiting for git, so a plan over several requests is
+    /// checked by up to [`PLAN_WORKERS`] threads. Execution stays one item at
+    /// a time.
+    fn plan_items(&self, requests: &[Request]) -> Vec<PlanItem> {
+        let workers = PLAN_WORKERS.min(requests.len());
+        if workers < 2 {
+            return requests.iter().map(|r| self.plan_item(r)).collect();
+        }
+        // One read of the process table serves the whole plan; take it before
+        // the workers start so they share it.
+        let _ = self.procs_view(false);
+        let next = AtomicUsize::new(0);
+        let done: Mutex<Vec<(usize, PlanItem)>> = Mutex::new(Vec::with_capacity(requests.len()));
+        std::thread::scope(|s| {
+            for _ in 0..workers {
+                s.spawn(|| loop {
+                    let i = next.fetch_add(1, Ordering::SeqCst);
+                    let Some(r) = requests.get(i) else { break };
+                    let item = self.plan_item(r);
+                    done.lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .push((i, item));
+                });
+            }
+        });
+        let mut done = done.into_inner().unwrap_or_else(|e| e.into_inner());
+        done.sort_by_key(|(i, _)| *i);
+        if done.len() != requests.len() {
+            // A worker panicked: check again on this thread, where a panic
+            // is the caller's to see.
+            return requests.iter().map(|r| self.plan_item(r)).collect();
+        }
+        done.into_iter().map(|(_, item)| item).collect()
     }
 
     /// A sweep plan from scanned worktrees: every candidate the scanner marked
@@ -715,6 +775,7 @@ impl<'a> Gate<'a> {
             ready: false,
             reason: None,
             verdict: String::new(),
+            past_failures: None,
         };
         let res: Result<String, Skip> = match req {
             Request::DeleteCache {
@@ -1375,12 +1436,77 @@ impl<'a> Gate<'a> {
             reason: SkipReason::BackupFailed,
             detail: format!("{e}; nothing was removed"),
         })?;
-        let backups = set.backups;
         #[cfg(test)]
         if let Some(h) = &self.after_backup {
             h();
         }
+        // Until `git worktree remove` starts, a skip leaves the worktree as it
+        // was: the backup set written for it is discarded, so a removal that
+        // keeps failing does not add a copy on every try.
+        if let Err(mut s) = self.recheck_after_backup(&f, &set, &before) {
+            s.detail
+                .push_str(&self.discard_backup_set(set.dir.as_deref()));
+            return Err(s);
+        }
+        // From here git may have deleted part of the worktree even when it
+        // fails, so the backups are kept and the skip says where they are.
+        let kept = |mut s: Skip| {
+            if let Some(d) = &set.dir {
+                s.detail
+                    .push_str(&format!("; its backups are kept in {}", d.display()));
+            }
+            s
+        };
 
+        let mut g = Git::new(self.paths, &f.repo).args(["worktree", "remove"]);
+        if f.dirty_files > 0 {
+            // Uncommitted work is in the patch; git refuses otherwise.
+            g = g.arg("--force");
+        }
+        g.arg(&f.path).timeout(BACKUP_TIMEOUT).run().map_err(|e| {
+            kept(Skip {
+                reason: SkipReason::RemoveFailed,
+                detail: e.to_string(),
+            })
+        })?;
+        if f.path.exists() {
+            return Err(kept(Skip {
+                reason: SkipReason::RemoveFailed,
+                detail: "git reported success but the directory is still there".into(),
+            }));
+        }
+        Ok(Outcome::Done {
+            freed_bytes: f.bytes,
+            backups: set.backups,
+        })
+    }
+
+    /// Remove a backup set this gate has just written for a removal that did
+    /// not happen, and say so (the text is appended to the skip's detail).
+    /// Only a directory directly inside the backups directory, as
+    /// [`Gate::backup_set_dir`] creates them, is removed; anything else, or a
+    /// failure, is reported and left.
+    fn discard_backup_set(&self, dir: Option<&Path>) -> String {
+        let Some(dir) = dir else {
+            return String::new();
+        };
+        let ours = dir.parent() == Some(self.paths.backups_dir.as_path())
+            && std::fs::symlink_metadata(dir).is_ok_and(|m| m.is_dir());
+        if ours && std::fs::remove_dir_all(dir).is_ok() {
+            "; the backup written for it was discarded (the worktree is untouched)".into()
+        } else {
+            format!("; the unused backup is in {}", dir.display())
+        }
+    }
+
+    /// After the backups are written and before anything is removed: the
+    /// worktree must still be what was backed up.
+    fn recheck_after_backup(
+        &self,
+        f: &WorktreeFacts,
+        set: &BackupSet,
+        before: &std::collections::BTreeMap<PathBuf, StatPrint>,
+    ) -> Result<(), Skip> {
         // The backups describe the worktree as it was a moment ago. If anything
         // changed while they were written, stop.
         let list = git::worktree_list(self.paths, &f.path).map_err(Self::git_skip)?;
@@ -1411,7 +1537,7 @@ impl<'a> Gate<'a> {
         // Status does not see a second edit to a dirty file or any edit to an
         // ignored one. Compare stat fingerprints, the set of ignored entries, and
         // (when a patch was written) the tree a fresh `add -A` produces now.
-        if fingerprint(&f).as_ref() != Some(&before) {
+        if fingerprint(f).as_ref() != Some(before) {
             return skip(
                 SkipReason::ChangedDuringBackup,
                 "changed or ignored files were modified while backing up; nothing was removed",
@@ -1426,7 +1552,7 @@ impl<'a> Gate<'a> {
         }
         if let (Some(tree), Some(dir)) = (&set.tree, &set.dir) {
             let index = dir.join("recheck.index.tmp");
-            let now = self.staged_tree(&f, &index);
+            let now = self.staged_tree(f, &index);
             let _ = std::fs::remove_file(&index);
             match now {
                 Ok(t) if &t == tree => {}
@@ -1444,33 +1570,12 @@ impl<'a> Gate<'a> {
                 }
             }
         }
-        self.busy_check_with(&f.path, false, true)?;
-
-        let mut g = Git::new(self.paths, &f.repo).args(["worktree", "remove"]);
-        if f.dirty_files > 0 {
-            // Uncommitted work is in the patch; git refuses otherwise.
-            g = g.arg("--force");
-        }
-        g.arg(&f.path)
-            .timeout(BACKUP_TIMEOUT)
-            .run()
-            .map_err(|e| Skip {
-                reason: SkipReason::RemoveFailed,
-                detail: e.to_string(),
-            })?;
-        if f.path.exists() {
-            return skip(
-                SkipReason::RemoveFailed,
-                "git reported success but the directory is still there",
-            );
-        }
-        Ok(Outcome::Done {
-            freed_bytes: f.bytes,
-            backups,
-        })
+        self.busy_check_with(&f.path, false, true)
     }
 
-    /// Write every backup the worktree needs. Any failure fails the whole step.
+    /// Write every backup the worktree needs. Any failure fails the whole
+    /// step, and a backup set left half written is discarded (the worktree is
+    /// untouched; the error says so).
     fn back_up(&self, f: &WorktreeFacts) -> Result<BackupSet, String> {
         let mut out = Vec::new();
         let mut set_dir = None;
@@ -1478,49 +1583,72 @@ impl<'a> Gate<'a> {
         let needs_dir = f.dirty_files > 0 || !f.ignored.is_empty();
         if needs_dir {
             let dir = self.backup_set_dir(f)?;
-            if f.dirty_files > 0 {
-                let (p, t) = self.write_patch(f, &dir)?;
-                tree = Some(t);
-                out.push(Backup {
-                    kind: BackupKind::Patch,
-                    location: p.display().to_string(),
-                });
+            match self.fill_backup_set(f, &dir, &mut out) {
+                Ok(t) => tree = t,
+                Err(e) => return Err(format!("{e}{}", self.discard_backup_set(Some(&dir)))),
             }
-            if !f.ignored.is_empty() {
-                let p = write_ignored_archive(f, &dir)?;
-                out.push(Backup {
-                    kind: BackupKind::IgnoredArchive,
-                    location: p.display().to_string(),
-                });
-            }
-            let manifest = serde_json::json!({
-                "worktree": f.path,
-                "repo": f.repo,
-                "head": f.head,
-                "branch": f.branch,
-                "created_unix": self.now,
-                "backups": out,
-                "restore": "git worktree add <path> <head>; cd <path>; git apply --index changes.patch; tar -xzf ignored.tar.gz",
-            });
-            create_private_file(
-                &dir.join("manifest.json"),
-                &serde_json::to_vec_pretty(&manifest).unwrap_or_default(),
-            )
-            .map_err(|e| format!("could not write the backup manifest: {e}"))?;
             set_dir = Some(dir);
         }
         if f.detached {
-            let b = self.ensure_backup_branch(f)?;
-            out.push(Backup {
-                kind: BackupKind::Branch,
-                location: b,
-            });
+            match self.ensure_backup_branch(f) {
+                Ok(b) => out.push(Backup {
+                    kind: BackupKind::Branch,
+                    location: b,
+                }),
+                Err(e) => {
+                    return Err(format!(
+                        "{e}{}",
+                        self.discard_backup_set(set_dir.as_deref())
+                    ))
+                }
+            }
         }
         Ok(BackupSet {
             backups: out,
             dir: set_dir,
             tree,
         })
+    }
+
+    /// The patch, the archive of ignored files and the manifest, written into
+    /// `dir`. Returns the tree the patch was made from, when there is one.
+    fn fill_backup_set(
+        &self,
+        f: &WorktreeFacts,
+        dir: &Path,
+        out: &mut Vec<Backup>,
+    ) -> Result<Option<String>, String> {
+        let mut tree = None;
+        if f.dirty_files > 0 {
+            let (p, t) = self.write_patch(f, dir)?;
+            tree = Some(t);
+            out.push(Backup {
+                kind: BackupKind::Patch,
+                location: p.display().to_string(),
+            });
+        }
+        if !f.ignored.is_empty() {
+            let p = write_ignored_archive(f, dir)?;
+            out.push(Backup {
+                kind: BackupKind::IgnoredArchive,
+                location: p.display().to_string(),
+            });
+        }
+        let manifest = serde_json::json!({
+            "worktree": f.path,
+            "repo": f.repo,
+            "head": f.head,
+            "branch": f.branch,
+            "created_unix": self.now,
+            "backups": out,
+            "restore": "git worktree add <path> <head>; cd <path>; git apply --index changes.patch; tar -xzf ignored.tar.gz",
+        });
+        create_private_file(
+            &dir.join("manifest.json"),
+            &serde_json::to_vec_pretty(&manifest).unwrap_or_default(),
+        )
+        .map_err(|e| format!("could not write the backup manifest: {e}"))?;
+        Ok(tree)
     }
 
     /// A new directory `<backups>/<repo>-<name>-<now>-<random>`, mode 0700, created

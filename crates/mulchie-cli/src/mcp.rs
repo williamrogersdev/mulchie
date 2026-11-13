@@ -63,8 +63,10 @@ processes, including this agent's own app and terminal, are never acted on. Befo
 removed, uncommitted changes are saved as a patch, ignored non-cache files as a tar.gz archive, \
 and a detached HEAD on a backup/<name> branch, under Mulchie's backups directory; execute_plan's \
 result lists each backup's path and how to restore. Branches are never deleted. Build caches are \
-not backed up: the next build recreates them. prune_cache only previews unless execute=true; show \
-the preview and ask first. dismiss_finding hides a finding the user chose to ignore. \
+not backed up: the next build recreates them. prune_cache only previews unless execute=true, and execute=true \
+is refused until the same cache was previewed; show the preview and ask first. A plan item with \
+failed_before, and repeated_failures in diagnose, name a target that keeps being skipped and what \
+to do about it: say so instead of asking for the same thing again. dismiss_finding hides a finding the user chose to ignore. \
 Before heavy builds or test suites, call can_i_build, and when other agents share the machine \
 wrap the work in acquire_build_slot / release_build_slot (poll with the ticket until granted, \
 renew before ttl_secs passes, release as soon as the work ends).";
