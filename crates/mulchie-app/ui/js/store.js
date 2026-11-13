@@ -23,6 +23,7 @@ export const st = {
     bcF: 'stale', bcSel: new Set(),
     aSrc: '', cfgDirty: false,
     sSort: ['cpu_cores', -1], sIncAgent: false, limDirty: false,
+    sSel: new Set(), sF: 'all',
   },
 };
 

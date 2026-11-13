@@ -2,7 +2,7 @@
 //! (`safety.rs`) decides and deletes.
 
 use serde::Serialize;
-use std::os::unix::fs::MetadataExt;
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
@@ -61,6 +61,44 @@ const MAX_DEPTH: usize = 9;
 /// directories of the user's processes (see `process::own_cwds`); a cache is in use
 /// when one of them is at or under its project.
 pub fn scan(cfg: &Config, paths: &Paths, busy_cwds: &[PathBuf], now: u64) -> ScanReport {
+    scan_with(cfg, paths, busy_cwds, now, &HashMap::new(), false).0
+}
+
+/// How long a measurement is reused by the periodic scan for something that
+/// shows no sign of change. A requested scan measures everything again.
+pub const REMEASURE_SECS: u64 = 6 * 3600;
+
+/// A directory's size as a scan measured it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SizeMemo {
+    pub at_unix: u64,
+    pub bytes: u64,
+    /// What must still hold for the size to be reused: for a cache its
+    /// `last_used` time, for a store the modification time of its folder.
+    pub mark: u64,
+    pub in_use: bool,
+}
+
+impl SizeMemo {
+    fn fresh(&self, now: u64, mark: u64, in_use: bool) -> bool {
+        !in_use
+            && !self.in_use
+            && self.mark == mark
+            && now.saturating_sub(self.at_unix) < REMEASURE_SECS
+    }
+}
+
+/// [`scan`], reusing the sizes in `prev` for caches that are not in use and
+/// whose `last_used` time has not moved. Returns the sizes for the next
+/// scan. `quiet` runs the measuring threads at background priority.
+pub fn scan_with(
+    cfg: &Config,
+    paths: &Paths,
+    busy_cwds: &[PathBuf],
+    now: u64,
+    prev: &HashMap<PathBuf, SizeMemo>,
+    quiet: bool,
+) -> (ScanReport, HashMap<PathBuf, SizeMemo>) {
     let start = std::time::Instant::now();
     let mut found: Vec<(PathBuf, ItemKind, PathBuf)> = Vec::new();
     for root in cfg.roots(paths) {
@@ -78,23 +116,26 @@ pub fn scan(cfg: &Config, paths: &Paths, busy_cwds: &[PathBuf], now: u64) -> Sca
     found.sort();
     found.dedup();
 
+    // The periodic scan measures two caches at a time; a requested one,
+    // which someone waits for, up to eight.
     let threads = std::thread::available_parallelism()
-        .map(|n| n.get().min(8))
-        .unwrap_or(4);
+        .map(|n| n.get().min(if quiet { 2 } else { 8 }))
+        .unwrap_or(if quiet { 2 } else { 4 });
     let chunk = found.len().div_ceil(threads).max(1);
     let stale_secs = cfg.stale_hours * 3600;
     let wt_stale_secs = cfg.worktree_target_stale_hours * 3600;
 
     let mut lost = 0usize;
+    let mut memo: HashMap<PathBuf, SizeMemo> = HashMap::new();
     let mut items: Vec<Item> = std::thread::scope(|s| {
         let handles: Vec<_> = found
             .chunks(chunk)
             .map(|part| {
                 s.spawn(move || {
+                    let _bg = quiet.then(crate::measure::Background::enter);
                     part.iter()
                         .map(|(path, kind, root)| {
                             let project = path.parent().unwrap_or(path).to_path_buf();
-                            let bytes = dir_size(path);
                             let last = last_used(path);
                             let (proj_root, in_worktree) = if *kind == ItemKind::XcodeDerivedData {
                                 (path.clone(), false)
@@ -102,13 +143,24 @@ pub fn scan(cfg: &Config, paths: &Paths, busy_cwds: &[PathBuf], now: u64) -> Sca
                                 project_root(&project, root)
                             };
                             let in_use = any_cwd_in(busy_cwds, &proj_root, true);
+                            let known = prev.get(path).filter(|m| m.fresh(now, last, in_use));
+                            let size = match known {
+                                Some(m) => m.clone(),
+                                None => SizeMemo {
+                                    at_unix: now,
+                                    bytes: dir_size(path),
+                                    mark: last,
+                                    in_use,
+                                },
+                            };
+                            let bytes = size.bytes;
                             let limit = if in_worktree {
                                 wt_stale_secs
                             } else {
                                 stale_secs
                             };
                             let stale = !in_use && now.saturating_sub(last) >= limit;
-                            Item {
+                            let item = Item {
                                 path: path.clone(),
                                 project,
                                 kind: *kind,
@@ -117,7 +169,8 @@ pub fn scan(cfg: &Config, paths: &Paths, busy_cwds: &[PathBuf], now: u64) -> Sca
                                 in_worktree,
                                 in_use,
                                 stale,
-                            }
+                            };
+                            (item, size)
                         })
                         .collect::<Vec<_>>()
                 })
@@ -126,7 +179,12 @@ pub fn scan(cfg: &Config, paths: &Paths, busy_cwds: &[PathBuf], now: u64) -> Sca
         let mut out = Vec::new();
         for (h, part) in handles.into_iter().zip(found.chunks(chunk)) {
             match h.join() {
-                Ok(v) => out.extend(v),
+                Ok(v) => {
+                    for (item, size) in v {
+                        memo.insert(item.path.clone(), size);
+                        out.push(item);
+                    }
+                }
                 Err(_) => lost += part.len(),
             }
         }
@@ -140,14 +198,15 @@ pub fn scan(cfg: &Config, paths: &Paths, busy_cwds: &[PathBuf], now: u64) -> Sca
     items.sort_by_key(|a| std::cmp::Reverse(a.bytes));
     let total_bytes = items.iter().map(|i| i.bytes).sum();
     let stale_bytes = items.iter().filter(|i| i.stale).map(|i| i.bytes).sum();
-    ScanReport {
+    let report = ScanReport {
         at_unix: now,
         took_ms: start.elapsed().as_millis() as u64,
         items,
         total_bytes,
         stale_bytes,
         error,
-    }
+    };
+    (report, memo)
 }
 
 fn walk(
@@ -191,26 +250,10 @@ fn walk(
     }
 }
 
-/// Disk usage of everything under `path`, without following symbolic links.
+/// Disk usage of everything under `path`, without following symbolic links
+/// below it.
 pub fn dir_size(path: &Path) -> u64 {
-    let mut total = 0u64;
-    let mut stack = vec![path.to_path_buf()];
-    while let Some(dir) = stack.pop() {
-        let Ok(rd) = std::fs::read_dir(&dir) else {
-            continue;
-        };
-        for entry in rd.flatten() {
-            let Ok(meta) = std::fs::symlink_metadata(entry.path()) else {
-                continue;
-            };
-            if meta.is_dir() {
-                stack.push(entry.path());
-            } else {
-                total += meta.blocks() * 512;
-            }
-        }
-    }
-    total
+    crate::measure::dir_size(path)
 }
 
 /// Newest modification time of `path` and two levels below it.

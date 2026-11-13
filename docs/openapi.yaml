@@ -1179,6 +1179,13 @@ components:
         workspace: { type: [string, "null"] }
         started_unix: { type: integer }
         ended_unix: { type: [integer, "null"] }
+        last_active_unix:
+          type: integer
+          description: >-
+            When the session last did something this engine saw: it used 5% of a core or more,
+            started a process, or its agent called a hook. A heuristic, never earlier than when
+            this engine first saw the session, and frozen once the session ends. Also on each
+            entry of `state.sessions.list`.
         listening: { type: array, items: { type: integer }, description: "Ports the session's processes listen on, from the last watch run" }
         enforced:
           type: boolean

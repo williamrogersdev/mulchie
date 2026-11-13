@@ -12,29 +12,22 @@
   <div class="ph">
     <div class="health" id="pHealth"><span class="dot"></span><span>—</span></div>
     <div class="mode" id="pMode"></div>
-    <div class="dim mono" id="pTime"></div>
+    <button class="btn sm" data-open="overview" title="Open the dashboard">Dashboard</button>
   </div>
   <div class="pb" id="pBody">
     <div class="notices" id="pNotices"></div>
     <p class="headline" id="pHead"></p>
-    <div class="tiles">
-      <div class="tile" role="button" tabindex="0" data-open="d:cpu:" id="pCpuT"><div class="l">CPU</div><div class="v" id="pCpu">—</div><div class="s" id="pCpuS"></div></div>
-      <div class="tile" role="button" tabindex="0" data-open="d:mem:" id="pMemT"><div class="l">Memory</div><div class="v" id="pMem">—</div><div class="s" id="pMemS"></div></div>
-      <div class="tile" role="button" tabindex="0" data-open="disk"><div class="l">Disk free</div><div class="v" id="pDisk">—</div><div class="s" id="pDiskS"></div></div>
-      <div class="tile" role="button" tabindex="0" data-open="d:agents:"><div class="l">Agents · builds</div><div class="v" id="pAg">—</div><div class="s" id="pAgS"></div></div>
-    </div>
-    <div class="pcols">
-      <div><h3>Using CPU</h3><div class="cbars" id="pCpuTop"></div></div>
-      <div><h3>Using memory</h3><div class="cbars" id="pMemTop"></div></div>
-    </div>
-    <div id="pFindW"><h3>Needs attention</h3><div id="pFind"></div><div id="pWatch" class="more"></div></div>
+    <div class="pstats" id="pStats"></div>
+    <div id="pTopW"><h3>Using the most</h3><div class="prow-h"><span></span><span>CPU</span><span>Memory</span><span></span></div><div id="pTop"></div></div>
+    <div id="pFindW"><h3>Needs attention</h3><div id="pFind"></div></div>
+    <div id="pCleanW"><h3>Clean up</h3><div id="pClean"></div></div>
     <div id="pLim" class="more"></div>
   </div>
   <div class="pf">
-    <button class="btn pri" data-open="overview">Open dashboard</button>
-    <button class="btn" data-open="processes">Processes</button>
+    <button class="btn" data-open="sessions">Sessions</button>
     <button class="btn" data-open="disk">Disk</button>
-    <button class="btn" id="pQuit" title="Quit Mulchie">Quit</button>
+    <span class="sp"></span>
+    <button class="btn" id="pQuit" title="Quit Mulchie">Quit Mulchie</button>
   </div>
 </div>
 
@@ -71,6 +64,7 @@
     <section class="view" id="v-overview">
       <div class="ovhead"><p class="headline" id="oHead"></p><button class="btn sm" id="copyOverview" title="Copy a summary of what is shown, for pasting to an agent">Copy for agent</button></div>
       <div class="grid g4" id="kpis"></div>
+      <div class="card" style="margin-top:10px"><div class="chead"><h3>Needs attention</h3><span class="dim c-md">each with how long it has been so, and what resolves it</span></div><div id="findings"></div></div>
       <div class="grid g2" style="margin-top:10px">
         <div class="card"><div class="chead"><h3>Using CPU</h3><a class="lnk" role="button" tabindex="0" data-d="cpu" data-dk="">All →</a></div><div class="cbars" id="oCpuTop"></div></div>
         <div class="card"><div class="chead"><h3>Using memory</h3><a class="lnk" role="button" tabindex="0" data-d="mem" data-dk="">All →</a></div><div class="cbars" id="oMemTop"></div></div>
@@ -81,10 +75,7 @@
         <div class="card"><div class="chead"><h3>Disk I/O</h3><div class="legend" id="lgIo"></div></div><div class="chart" id="chIo"></div></div>
         <div class="card"><div class="chead"><h3>Disk free</h3><div class="legend" id="lgDisk"></div></div><div class="chart" id="chDisk"></div></div>
       </div>
-      <div class="grid g2" style="margin-top:10px">
-        <div class="card"><h3>CPU by workspace</h3><div class="legend" id="lgWs" style="margin-bottom:6px"></div><div class="chart" id="chWs" style="height:170px"></div></div>
-        <div class="card"><h3>Needs attention</h3><div id="findings"></div></div>
-      </div>
+      <div class="card" style="margin-top:10px"><h3>CPU by workspace</h3><div class="legend" id="lgWs" style="margin-bottom:6px"></div><div class="chart" id="chWs" style="height:170px"></div></div>
       <div class="card" style="margin-top:10px">
         <div class="chead"><h3>Usage by group</h3><span class="dim c-md">workspaces and apps, summed over every process</span></div>
         <table id="groups"></table>
@@ -115,10 +106,12 @@
     <section class="view fill" id="v-sessions">
       <div class="toolbar">
         <input type="text" id="sFilter" placeholder="Filter by agent, workspace or id" class="grow-in" aria-label="Filter sessions">
+        <div class="seg" id="sSeg"><button data-f="all">All</button><button data-f="h1">Idle 1h+</button><button data-f="d1">Idle 1d+</button><button data-f="over">Over a limit</button></div>
         <div class="sp"></div>
         <span class="dim" id="sCount"></span>
       </div>
       <div class="notices" id="sNote"></div>
+      <div class="bulk" id="sBulk"><span id="sBulkN"></span><button class="btn sm danger" data-sbulk="end">End selected…</button><button class="btn sm" id="sClear">Clear</button><span class="dim">Ending asks each agent and everything it started to quit, after you review the list.</span></div>
       <div class="tbl-wrap"><table id="sess" aria-label="Running agent sessions"></table>
         <h3 class="form-h" id="sEndedH">Ended</h3>
         <table id="sessEnded" aria-label="Ended agent sessions"></table></div>
