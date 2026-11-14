@@ -8,6 +8,8 @@ All notable changes to Mulchie are listed here. The format follows
 
 ### Fixed
 
+- Mulchie's own update check never offered a release candidate to someone running one: it asked GitHub for the latest release, which leaves pre-releases out. An install that is itself a pre-release now asks for the newest releases and is offered the highest version, pre-releases included. A stable install is still offered stable releases only.
+
 - Build throttling no longer leaves builds slow for good. Mulchie lowered the priority of every build it saw during one busy 3-second sample and then could not raise it again, because raising a priority needs root: builds and dev servers stayed at the lower priority until they exited. Now builds are throttled only after 15 seconds of sustained pressure, priorities go back after 30 calm seconds, and an engine that cannot put a priority back (one not running as root) does not lower any.
 - Health counts load: more than 2 runnable tasks per core is `busy` and more than 3 is `strained`. Before, load had to pass 4 per core, so a machine with 50 tasks queued on 16 cores read as `good`.
 - `diagnose` recommends lowering the priority of builds only for the workspace whose builds use the most CPU, and only when that is at least half a core.
@@ -15,6 +17,8 @@ All notable changes to Mulchie are listed here. The format follows
 - With no engine running, the MCP server's `diagnose` scanned the disk at full priority on every call, in every agent's server. It now scans at background priority and reuses the result for 15 minutes.
 
 ### Added
+
+- App: **Check for Updates…** in the Mulchie menu at the top left, with the standard About, Services, Hide and Quit items and Edit and Window menus. The dashboard and the panel show an update button while a newer version is known: **Update to X** installs it in a build that can update itself, **Get X** says how to get it in one that cannot. A build that can update itself looks for a new version a minute after launch and every six hours.
 
 - Feedback: agents and people can report problems with Mulchie or the machine, and the reports are kept for fixing them. Agents call the MCP tool `report_feedback` (offered by a read-only server too) and read reports with `list_feedback`; people run `mulchie feedback report <what happened>` and `mulchie feedback list`; anything else uses `POST /v1/feedback` and `GET /v1/feedback`. A report has a summary and optionally a category (`bug`, `wrong_advice`, `false_positive`, `missed`, `blocked`, `slow`, `environment`, `idea`, `other`), a severity, details and the tool it is about. It is saved as a line in `feedback.jsonl` in the config directory, readable only by the user, with the machine's state at that moment when the engine runs, and with secrets in the text hidden. A report is kept even when no engine runs. Mulchie sends the file nowhere.
 

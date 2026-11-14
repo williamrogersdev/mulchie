@@ -466,3 +466,8 @@ td .btn.sm { vertical-align: baseline; }
 #panel .finding .ftt { display: block; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 #panel .finding .age { display: block; }
 #panel .more:empty, #panel .more { margin-top: 0; }
+
+/* The update button: shown only while a newer version is known. */
+.btn.upd { flex: none; -webkit-app-region: no-drag; color: #0c0e0f; background: #79c37d; border-color: #79c37d; font-weight: 600; white-space: nowrap; }
+.btn.upd:hover { filter: brightness(1.08); }
+.btn.upd[hidden] { display: none; }

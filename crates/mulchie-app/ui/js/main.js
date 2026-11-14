@@ -300,3 +300,29 @@ loadIntegration().then(I => { if (I?.home) setHome(I.home); render(); });
 go(st.view);
 refresh(true);
 setInterval(refresh, POLL_MS);
+
+// The update button (top right of the dashboard, and the panel's header):
+// shown while a newer version of Mulchie is known. It starts the same flow
+// as "Check for Updates…" in the menu.
+const UPDATE_POLL_MS = 60000;
+async function refreshUpdate() {
+  let u = null;
+  try { u = await invoke('app_update'); } catch (e) { u = null; }
+  for (const id of ['tUpdate', 'pUpdate']) {
+    const b = $(id);
+    if (!b) continue;
+    const v = u && u.available;
+    b.hidden = !v;
+    if (!v) continue;
+    b.textContent = u.can_install ? `Update to ${v}` : `Get ${v}`;
+    b.title = u.can_install
+      ? `Mulchie ${v} is available (you have ${u.current}). Install it and relaunch.`
+      : `Mulchie ${v} is available (you have ${u.current}). Shows how to get it.`;
+  }
+}
+for (const id of ['tUpdate', 'pUpdate']) {
+  const b = $(id);
+  if (b) b.addEventListener('click', () => invoke('start_update').catch(e => toast(String(e))));
+}
+refreshUpdate();
+setInterval(refreshUpdate, UPDATE_POLL_MS);
