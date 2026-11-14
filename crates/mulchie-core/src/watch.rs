@@ -982,6 +982,14 @@ const SYSTEM_DIRS: &[&str] = &[
     "/usr/local/sbin/",
 ];
 
+/// Inside an iOS Simulator runtime, which carries its own copy of the
+/// system's daemons (syslogd, cfprefsd, securityd, trustd) and runs them as
+/// the user for every booted simulator.
+fn in_simulator_runtime(exe: &str) -> bool {
+    exe.split_once(".simruntime/Contents/Resources/RuntimeRoot/")
+        .is_some_and(|(_, rest)| SYSTEM_DIRS.iter().any(|d| rest.starts_with(&d[1..])))
+}
+
 /// Hidden directory names that hold ordinary tools in a workspace.
 const ORDINARY_HIDDEN: &[&str] = &[
     ".venv",
@@ -1535,7 +1543,7 @@ fn detect_origin(d: &mut Det, p: &ProcFacts) {
         .copied();
     if let Some(n) = claims {
         let s = exe.to_string_lossy();
-        if !SYSTEM_DIRS.iter().any(|d| s.starts_with(d)) {
+        if !SYSTEM_DIRS.iter().any(|d| s.starts_with(d)) && !in_simulator_runtime(&s) {
             d.push_proc(
                 p,
                 FindingKind::SystemNameMismatch,

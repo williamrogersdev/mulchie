@@ -6,6 +6,14 @@ All notable changes to Mulchie are listed here. The format follows
 
 ## [0.3.0] - Unreleased
 
+### Fixed
+
+- Build throttling no longer leaves builds slow for good. Mulchie lowered the priority of every build it saw during one busy 3-second sample and then could not raise it again, because raising a priority needs root: builds and dev servers stayed at the lower priority until they exited. Now builds are throttled only after 15 seconds of sustained pressure, priorities go back after 30 calm seconds, and an engine that cannot put a priority back (one not running as root) does not lower any.
+- Health counts load: more than 2 runnable tasks per core is `busy` and more than 3 is `strained`. Before, load had to pass 4 per core, so a machine with 50 tasks queued on 16 cores read as `good`.
+- `diagnose` recommends lowering the priority of builds only for the workspace whose builds use the most CPU, and only when that is at least half a core.
+- The watch no longer reports the system daemons inside an iOS Simulator runtime (`syslogd`, `cfprefsd`, `securityd`, `trustd`) as `system_name_mismatch`.
+- With no engine running, the MCP server's `diagnose` scanned the disk at full priority on every call, in every agent's server. It now scans at background priority and reuses the result for 15 minutes.
+
 ### Added
 
 - Runaway chains (`runaway` in the config): Mulchie looks in every sample for a command running nested inside copies of itself, with the same command line and working directory (a build script that calls itself, such as an `npm run build` whose build step runs `npm run build`). At `runaway.depth` copies (default 6) it is a `runaway_chain` finding and a notification. With `mulchie config set runaway.action stop` Mulchie stops the chain through the safety gate: it freezes every process of it (SIGSTOP, from a fresh process list, repeated until nothing new appears), then kills them (SIGKILL), so a level started in the meantime does not carry on. The agent and unrelated work are spared. `mulchie limits`, `GET /v1/limits/status` (`runaway`) and the MCP `limits_status` tool show chains, what was stopped and what is remembered.

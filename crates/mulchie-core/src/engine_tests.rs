@@ -571,7 +571,14 @@ fn throttling_tracks_and_restores_only_own_builds() {
         cpu_pct: 95.0,
         ..Snapshot::default()
     };
+    // As if this engine could put priorities back (it tries either way).
+    e.set_can_restore_priority(true);
     let mut ctx = SampleCtx::default();
+    // One busy sample is not pressure: nothing is lowered until it lasts.
+    for _ in 1..THROTTLE_AFTER {
+        e.apply_sample(hot.clone(), &kinds, &mut ctx);
+        assert_eq!(nice_of(pid), Some(before), "not yet sustained");
+    }
     e.apply_sample(hot.clone(), &kinds, &mut ctx);
     assert_eq!(nice_of(pid), Some(target));
     assert_eq!(nice_of(std::process::id()), Some(before));
@@ -583,6 +590,11 @@ fn throttling_tracks_and_restores_only_own_builds() {
         cpu_pct: 5.0,
         ..hot
     };
+    // A short lull changes nothing; a sustained one restores.
+    for _ in 1..RESTORE_AFTER {
+        e.apply_sample(calm.clone(), &kinds, &mut ctx);
+        assert_eq!(nice_of(pid), Some(target), "still lowered during a lull");
+    }
     e.apply_sample(calm.clone(), &kinds, &mut ctx);
     let restored = nice_of(pid) == Some(before);
     let tracked = lock(&e.reniced).get(&pid).cloned();
@@ -600,6 +612,75 @@ fn throttling_tracks_and_restores_only_own_builds() {
     // Gone from the table: forgotten.
     e.apply_sample(calm, &kinds[1..], &mut ctx);
     assert_eq!(e.snapshot_state().throttled, 0);
+}
+
+/// An engine that cannot raise a priority again never lowers one by itself:
+/// the renice would last for the life of the build.
+#[test]
+fn builds_are_not_throttled_when_the_priority_cannot_be_put_back() {
+    let mut child = std::process::Command::new("/bin/sleep")
+        .arg("30")
+        .spawn()
+        .unwrap();
+    let pid = child.id();
+    let before = nice_of(pid).unwrap();
+    let cfg = Config {
+        throttle_builds: true,
+        throttle_cpu_pct: 50.0,
+        build_nice: (before + 3).min(20),
+        ..Config::default()
+    };
+    let (_t, e) = engine_with_procs(cfg, FakeProcesses::empty().with(pid, "sleep", None, 42));
+    e.set_can_restore_priority(false);
+    let kinds = [KindInfo {
+        pid,
+        kind: ProcKind::Build,
+        own: true,
+        start_time: 42,
+    }];
+    let hot = Snapshot {
+        at_unix: now_unix(),
+        cpu_pct: 95.0,
+        ..Snapshot::default()
+    };
+    let mut ctx = SampleCtx::default();
+    for _ in 0..THROTTLE_AFTER * 2 {
+        e.apply_sample(hot.clone(), &kinds, &mut ctx);
+    }
+    let after = nice_of(pid);
+    child.kill().unwrap();
+    child.wait().unwrap();
+    assert_eq!(after, Some(before), "never reniced");
+    assert_eq!(e.snapshot_state().throttled, 0);
+    assert!(!e
+        .snapshot_state()
+        .actions
+        .iter()
+        .any(|a| a.kind == "throttle"));
+}
+
+/// Load per core sets health too: queued work is felt before CPU reads full.
+#[test]
+fn health_follows_load_per_core() {
+    let cfg = Config::default();
+    let at = |load: f64| {
+        health_of(
+            &Snapshot {
+                cpu_count: 16,
+                cpu_pct: 40.0,
+                load: [load, load, load],
+                mem_total: 100,
+                mem_available: 80,
+                disk_total: 1_000_000_000_000,
+                disk_free: 500_000_000_000,
+                ..Snapshot::default()
+            },
+            &cfg,
+        )
+    };
+    assert_eq!(at(16.0), Health::Good);
+    assert_eq!(at(33.0), Health::Busy);
+    assert_eq!(at(56.0), Health::Strained);
 }
 
 /// C6: journal failures reach state and health; recording keeps going.

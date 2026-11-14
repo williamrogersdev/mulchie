@@ -52,7 +52,7 @@ Saves are atomic: Mulchie writes a temporary file and renames it.
 | `backup_ignored_max_mb` | 200 | Gitignored files in a worktree that are not caches are archived before removal. Above this size the worktree is skipped instead. |
 | `include_node_modules` | `false` | Treat `node_modules` as a reclaimable cache. |
 | `include_xcode` | `true` on macOS, `false` elsewhere | Treat Xcode DerivedData as a reclaimable cache. |
-| `throttle_builds` | `true` | Lower the priority of builds under pressure. |
+| `throttle_builds` | `true` | Lower the priority of builds while CPU or memory stays under pressure (15 seconds), and put it back after 30 calm seconds. Used only by an engine that can put a priority back, which means one running as root; otherwise Mulchie leaves build priorities alone. |
 | `throttle_cpu_pct` | 92 | CPU use above which builds are throttled. |
 | `throttle_mem_free_pct` | 8 | Free memory below which builds are throttled. |
 | `build_nice` | 10 | Nice value applied to throttled builds, 0 to 20. |
