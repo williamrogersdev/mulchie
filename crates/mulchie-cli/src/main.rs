@@ -3,6 +3,7 @@ mod commands;
 mod conn;
 mod diagnose;
 mod doctor;
+mod feedback;
 mod hook;
 mod hook_wire;
 mod hooks_install;
@@ -133,6 +134,29 @@ fn dispatch(paths: &Paths, cmd: Command) -> i32 {
         Command::Updates(u) => sessions::updates(paths, u.check, u.out.json),
         Command::Guard(cli::GuardCommand::Check { cwd, out, command }) => {
             sessions::guard_check(paths, &command, cwd.as_deref(), out.json)
+        }
+        Command::Feedback(cli::FeedbackCommand::Report {
+            category,
+            severity,
+            details,
+            tool,
+            client,
+            out,
+            summary,
+        }) => feedback::report(
+            paths,
+            &feedback::ReportArgs {
+                summary: &summary,
+                category: category.as_deref(),
+                severity: severity.as_deref(),
+                details: details.as_deref(),
+                tool: tool.as_deref(),
+                client: client.as_deref(),
+                json: out.json,
+            },
+        ),
+        Command::Feedback(cli::FeedbackCommand::List { limit, out }) => {
+            feedback::list(paths, limit as usize, out.json)
         }
         Command::Findings(f) => match &f.action {
             Some(a) => observe::findings_action(paths, a),

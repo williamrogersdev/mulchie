@@ -169,6 +169,10 @@ A build script that calls itself adds a level about every second, and every leve
 - A chain's self-nesting commands are remembered with their directory for `runaway.remember_secs` (in memory only, so not across an engine restart). The `runaway_repeat` guard rule matches them, and a session whose chain was stopped gets one sentence about it in its next hook reply.
 - `state.runaway` and `runaway` in `GET /v1/limits/status` report the action, whether this engine enforces it, the chains running now, the last 50 stoppings and what is remembered.
 
+### Feedback (`feedback.rs`)
+
+Agents and people report problems with Mulchie or the machine: the MCP tool `report_feedback`, `mulchie feedback report`, or `POST /v1/feedback` (the read-only token is accepted, since a report only adds a line to Mulchie's own file). Each report is one JSON line in `<config dir>/feedback.jsonl`, mode 0600, opened with `O_NOFOLLOW`. The engine adds the machine's state from its last sample and a `feedback` entry in the action journal. Free text is cut to a fixed length and passed through the command-line redaction. At 4 MB the file is renamed to `feedback.jsonl.1`, replacing the earlier one, as the action journal does. With no engine, the CLI and the MCP server append to the file themselves, without the machine's state. Mulchie never sends the file anywhere.
+
 ### Activity record (`record.rs`)
 
 Each session has an append-only record in `<config dir>/sessions/<id>.jsonl`: files `0600` in a `0700` directory. Events carry `seq`, `t` and `type`: `session_start`, `session_end`, `process_start`, `process_starts_summarised`, `limit_breach`, `limit_action`, `limit_cleared`, `memory_guard`, `runaway`, `hook_<event>` and `truncated`. Command lines are redacted by `redact.rs` before they are stored, which is pattern-based and best effort, and prompt text is never sent to the engine. Every string is cut at 4096 bytes.
