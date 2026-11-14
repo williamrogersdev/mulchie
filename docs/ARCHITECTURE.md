@@ -111,7 +111,7 @@ Nothing else may delete user files or signal another program's process. These ar
 | `mulchie run` (`run.rs`) | Forwards SIGINT and SIGTERM to the command it started. |
 | `record.rs` | Deletes Mulchie's own record files under `<config dir>/sessions/`: past `sessions.retain_days`, and the oldest ended sessions' first when the directory passes `sessions.max_total_mb`. Only regular files named after a session id; live sessions' records are kept. |
 | `engine.rs` (`restore_priorities`) and `engine_sessions.rs` (`restore_breach`) | Put back, with `set_nice`, a priority Mulchie lowered, after re-reading that the pid is still the same own process by start time. |
-| `engine.rs` (`throttle`) | Lowers the priority of a build process under pressure with `lower_priority`, after the same start-time recheck. It only raises a nice value. |
+| `engine.rs` (`throttle`) | Lowers the priority of a build process with `lower_priority`, after the same start-time recheck. It only raises a nice value. It runs only after 5 samples in a row under pressure, and only in an engine that can put the priority back (one running as root): lowering a nice value needs privilege, so a renice by an ordinary user would last for the life of the process. Priorities go back after 10 calm samples in a row. |
 | `engine.rs` (`own_pid_alive`) and `safety.rs` (`pid_alive`) | Liveness probes: `kill(pid, 0)` sends no signal. |
 | `diskmap.rs` (`prune_cache`) | Runs a package manager's own prune command (npm, bun, pnpm, yarn, uv, pip, Homebrew, Go, or `xcrun simctl` for simulators) for a cache key, refused while that tool runs. The tool, not Mulchie, deletes what is in its cache. |
 

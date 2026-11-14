@@ -524,16 +524,33 @@ fn a_system_name_running_from_elsewhere_is_high() {
         ProcKind::Other,
         None,
     );
-    let f = w.run();
-    let s = one(&f, FindingKind::SystemNameMismatch);
-    assert_eq!(s.severity, Severity::High);
-    assert_eq!(s.evidence.pid, Some(10));
-    assert_eq!(
-        f.iter()
-            .filter(|f| f.kind == FindingKind::SystemNameMismatch)
-            .count(),
-        1
+    // An iOS Simulator runtime runs its own copies of the system daemons.
+    let sim = PathBuf::from("/Library/Developer/CoreSimulator/Volumes/iOS_23F77/Library/Developer/CoreSimulator/Profiles/Runtimes/iOS 26.5.simruntime/Contents/Resources/RuntimeRoot/usr/sbin/syslogd");
+    w.add(
+        facts(12, 5, "syslogd", &sim, None, NOW - 60),
+        ProcKind::Other,
+        None,
     );
+    // The same folder name outside a runtime's system folders does not pass.
+    let odd = PathBuf::from("/tmp/x.simruntime/Contents/Resources/RuntimeRoot/tmp/syslogd");
+    w.add(
+        facts(13, 5, "syslogd", &odd, None, NOW - 60),
+        ProcKind::Other,
+        None,
+    );
+    let f = w.run();
+    let mut pids: Vec<u32> = f
+        .iter()
+        .filter(|f| f.kind == FindingKind::SystemNameMismatch)
+        .filter_map(|f| f.evidence.pid)
+        .collect();
+    pids.sort();
+    assert_eq!(pids, vec![10, 13]);
+    let s = f
+        .iter()
+        .find(|f| f.kind == FindingKind::SystemNameMismatch && f.evidence.pid == Some(10))
+        .unwrap();
+    assert_eq!(s.severity, Severity::High);
 }
 
 #[test]

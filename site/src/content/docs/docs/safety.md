@@ -16,7 +16,7 @@ A few things happen outside the gate. None deletes your files or signals another
 - Mulchie ends a git command of its own that timed out.
 - `mulchie run` forwards SIGINT and SIGTERM to the command it started.
 - Mulchie deletes its own [activity records](/docs/sessions/#the-activity-record) in `sessions/` after `sessions.retain_days` or when they pass `sessions.max_total_mb`, and its own hook log when it grows past 256 KiB, and an empty or half-written token file from a crash.
-- Mulchie lowers the priority of a build under pressure, and puts back a priority it lowered (a build it throttled, or a session it deprioritized). Each time it first checks that the process is still the one it sampled, by start time, so a reused pid is skipped.
+- Mulchie lowers the priority of a build under sustained pressure only when it can put it back, which needs an engine running as root; run as you, it does not throttle builds, because the lower priority would last until the build exits. It puts back a priority it lowered (a build it throttled, or a session it deprioritized). Each time it first checks that the process is still the one it sampled, by start time, so a reused pid is skipped.
 - Mulchie checks whether a process is alive by sending it signal 0, which signals nothing.
 
 Everything else that deletes or signals goes through the gate, including every action a [session limit](/docs/sessions/#limits) takes.

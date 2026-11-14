@@ -31,7 +31,7 @@ Full documentation is at [mulchie.com/docs](https://mulchie.com/docs/).
 - Update checks report newer versions of Mulchie and of installed agent tools, and outdated Homebrew packages. They never install anything. Vulnerability lookups against OSV.dev are off unless you turn them on. See [update checks](https://mulchie.com/docs/updates/).
 
 **Optimize**
-- Lowers the priority of build processes when CPU or memory is under pressure.
+- Lowers the priority of build processes when CPU or memory stays under pressure, where it can put the priority back afterwards (an engine running as root). Run as you, it leaves build priorities alone.
 - Runs a machine-wide build queue. `mulchie run -- cargo build` waits for a free slot and runs with a fair job count. Agents use the same queue over MCP.
 - Answers "is now a good time for heavy work?" with reasons (`mulchie advice`).
 

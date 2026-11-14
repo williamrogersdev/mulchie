@@ -854,8 +854,30 @@ pub fn strip_refused(d: &mut Value) {
     }
 }
 
+/// How long a server reuses its own disk scan while no engine runs.
+const LOCAL_SCAN_TTL: Duration = Duration::from_secs(15 * 60);
+
+/// A diagnosis made in this process, for when no engine runs. The sample is
+/// fresh each time. The disk scan is not: every agent has its own server,
+/// and a full scan per call from each of them is itself a load on the
+/// machine. So it runs at background priority, and its result is kept for
+/// [`LOCAL_SCAN_TTL`].
 pub fn local_diagnosis(paths: &Paths, why: &str) -> Value {
-    let engine = crate::commands::local_engine(paths, true);
+    type Kept = (std::path::PathBuf, Instant, mulchie_core::Engine);
+    static KEPT: Mutex<Option<Kept>> = Mutex::new(None);
+    let mut kept = KEPT.lock().unwrap_or_else(|e| e.into_inner());
+    let fresh = kept
+        .as_ref()
+        .is_some_and(|(home, at, _)| *home == paths.home && at.elapsed() < LOCAL_SCAN_TTL);
+    if !fresh {
+        let engine = crate::commands::local_engine(paths, false);
+        engine.run_periodic_scan();
+        *kept = Some((paths.home.clone(), Instant::now(), engine));
+    }
+    let (_, _, engine) = kept.as_ref().expect("set above");
+    if fresh {
+        engine.set_snapshot(crate::commands::sample());
+    }
     let st = serde_json::to_value(engine.snapshot_state()).unwrap_or(Value::Null);
     let adv = serde_json::to_value(engine.advice()).unwrap_or(Value::Null);
     diagnose::build(&st, &adv, Origin::Local(why))
