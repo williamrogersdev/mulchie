@@ -61,6 +61,8 @@ All notable changes to Mulchie are listed here. The format follows
 
 ### Changed
 
+- Releases ship the desktop app again: the updater is configured (public key, update endpoint, updater artifacts), so a release builds the signed and notarized app with the files it needs to update itself, not only the CLI.
+
 - The periodic disk scan costs far less. It measures a directory in one pass (on macOS with `getattrlistbulk`), reuses what it measured for worktrees, caches and stores that show no change (for at most 6 hours), and runs on two threads at background priority. A scan you ask for still measures everything.
 - The app: every row has its own action (remove a worktree, clear a cache, prune a store, stop a workspace, quit a process, end a session), each through the same review dialog as before. Sessions show how long they have been idle (`last_active_unix` in the API) and can be filtered by it and ended several at once. "Needs attention" says how long each item has been so. The menu bar panel shows three figures, the biggest users with a Stop or Quit button, what needs attention, and what can be cleaned up.
 - Command-line parsing uses clap: every command has `--help` with examples, flags are strict, and unknown flags are errors.
