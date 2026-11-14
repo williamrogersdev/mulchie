@@ -198,8 +198,9 @@ nobody installs. Anything with a `-` suffix after `X.Y.Z` is a pre-release. The 
 notarizes it exactly like a release, and then differs in four ways:
 
 - The GitHub Release is published with the pre-release flag, so `releases/latest` does not move. `install.sh` with no
-  version, the in-app updater (`releases/latest/download/latest.json`) and Mulchie's own update check keep seeing the last
-  stable release.
+  version and the in-app updater (`releases/latest/download/latest.json`) keep seeing the last stable release. Mulchie's
+  own update check does the same for a stable install; an install that is itself a pre-release is offered the newest
+  release of any kind.
 - `publish.yml` skips Homebrew and crates.io (a crates.io publish cannot be undone). The crates job prints a notice.
 - The release notes are the `## [X.Y.Z]` section of `CHANGELOG.md`, with a first line saying they are for a release
   candidate. The section may still say Unreleased. A `## [X.Y.Z-rc.N]` section, if you write one, is used instead.

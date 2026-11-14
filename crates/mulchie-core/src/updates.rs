@@ -42,6 +42,11 @@ use crate::watch::{Evidence, Finding, FindingCategory, FindingKind, Suggestion, 
 pub const USER_AGENT: &str = concat!("mulchie/", env!("CARGO_PKG_VERSION"));
 pub const MULCHIE_RELEASE_URL: &str =
     "https://api.github.com/repos/williamrogersdev/mulchie/releases/latest";
+/// The newest releases, pre-releases included: what an install that is
+/// itself a pre-release is checked against, since `releases/latest` never
+/// names one.
+pub const MULCHIE_RELEASES_URL: &str =
+    "https://api.github.com/repos/williamrogersdev/mulchie/releases?per_page=10";
 pub const MULCHIE_RELEASES_PAGE: &str =
     "https://github.com/williamrogersdev/mulchie/releases/latest";
 pub const OSV_BATCH_URL: &str = "https://api.osv.dev/v1/querybatch";
@@ -53,6 +58,7 @@ pub const HTTP_TIMEOUT: Duration = Duration::from_secs(15);
 const BREW_TIMEOUT: Duration = Duration::from_secs(60);
 /// Response size caps.
 const SMALL_REPLY: usize = 256 * 1024;
+const RELEASE_LIST_REPLY: usize = 4 << 20;
 const OSV_BATCH_REPLY: usize = 16 << 20;
 const OSV_VULN_REPLY: usize = 2 << 20;
 const BREW_REPLY: usize = 8 << 20;
@@ -377,6 +383,44 @@ fn mulchie_update_offered(latest: &str, installed: &str, flagged_prerelease: boo
     let l_pre = !parse_version(latest)?.pre.is_empty();
     let i_pre = !parse_version(installed)?.pre.is_empty();
     Some(newer && !((l_pre || flagged_prerelease) && !i_pre))
+}
+
+/// The version a release object names (`tag_name` without its `v`).
+fn release_version(v: &Value) -> Option<String> {
+    v.get("tag_name").and_then(Value::as_str).map(|t| {
+        t.trim_start_matches('v')
+            .chars()
+            .take(64)
+            .collect::<String>()
+    })
+}
+
+/// The highest version in a list of releases, drafts left out, and whether
+/// it is flagged a pre-release.
+fn newest_release(list: &Value) -> (Option<String>, bool) {
+    let mut best: Option<(semver::Version, String, bool)> = None;
+    for r in list.as_array().map(Vec::as_slice).unwrap_or_default() {
+        if r.get("draft").and_then(Value::as_bool) == Some(true) {
+            continue;
+        }
+        let Some(tag) = release_version(r) else {
+            continue;
+        };
+        let Some(v) = parse_version(&tag) else {
+            continue;
+        };
+        let pre = r.get("prerelease").and_then(Value::as_bool) == Some(true);
+        if best
+            .as_ref()
+            .is_none_or(|(b, _, _)| precedence(&v, b) == std::cmp::Ordering::Greater)
+        {
+            best = Some((v, tag, pre));
+        }
+    }
+    match best {
+        Some((_, tag, pre)) => (Some(tag), pre),
+        None => (None, false),
+    }
 }
 
 // -------------------------------------------------------------- lockfiles
@@ -971,17 +1015,23 @@ pub fn check(http: &dyn Http, run: &dyn Runner, inp: &CheckInput, prev: Option<&
         return r;
     }
     if inp.cfg.mulchie {
-        match get_json(http, MULCHIE_RELEASE_URL, SMALL_REPLY) {
-            Ok(v) => {
-                let latest = v.get("tag_name").and_then(Value::as_str).map(|t| {
-                    t.trim_start_matches('v')
-                        .chars()
-                        .take(64)
-                        .collect::<String>()
-                });
+        // A pre-release install follows pre-releases: `releases/latest` skips
+        // them, so a release candidate would never hear of the next one.
+        let on_prerelease = parse_version(inp.version).is_some_and(|v| !v.pre.is_empty());
+        let found = if on_prerelease {
+            get_json(http, MULCHIE_RELEASES_URL, RELEASE_LIST_REPLY).map(|v| newest_release(&v))
+        } else {
+            get_json(http, MULCHIE_RELEASE_URL, SMALL_REPLY).map(|v| {
                 // GitHub's `releases/latest` already leaves out pre-releases and drafts;
-                // this keeps one from being offered to a stable install if that changes.
-                let flagged = v.get("prerelease").and_then(Value::as_bool) == Some(true);
+                // the flag keeps one from being offered to a stable install if that changes.
+                (
+                    release_version(&v),
+                    v.get("prerelease").and_then(Value::as_bool) == Some(true),
+                )
+            })
+        };
+        match found {
+            Ok((latest, flagged)) => {
                 let outdated = latest
                     .as_deref()
                     .and_then(|l| mulchie_update_offered(l, inp.version, flagged))

@@ -18,7 +18,7 @@ Checks run in the engine, on a separate thread, only in the engine that holds th
 
 | Check | What Mulchie contacts | On by default |
 | --- | --- | --- |
-| Mulchie itself (`updates.mulchie`) | The GitHub releases API: `api.github.com/repos/williamrogersdev/mulchie/releases/latest`. | Yes |
+| Mulchie itself (`updates.mulchie`) | The GitHub releases API: `api.github.com/repos/williamrogersdev/mulchie/releases/latest`. An install that is itself a pre-release (a release candidate) asks for the newest ten releases instead, `.../releases?per_page=10`, and is offered the highest version among them, pre-releases included. | Yes |
 | Agent tools (`updates.agents`) | The npm registry (`registry.npmjs.org`), for the latest version of each tool it finds installed: Claude Code, Codex and Gemini CLI. Cursor's `cursor-agent` has no documented source, so its latest version is not checked. | Yes |
 | Homebrew (`updates.homebrew`) | Nothing over the network. It runs `brew outdated` against Homebrew's local data, and only when the local `homebrew/core` tap exists. Otherwise the check is skipped. | Yes |
 | Advisories (`updates.advisories`) | `api.osv.dev`. See below. | **No** |
@@ -58,4 +58,4 @@ A Mulchie built without the `network` feature (`cargo build --no-default-feature
 
 ## The menu bar app
 
-The app (built from source for now; there is no app download yet) has its own updater, separate from this. Choosing **Check for Updates…** in its menu fetches `latest.json` from the project's GitHub Releases and, if you agree, downloads and installs the new version. It makes that request only when you choose it, and only in builds that have an update key. See [Install](/install/#update).
+The app (built from source for now; there is no app download yet) has its own updater, separate from this. **Check for Updates…** is in the Mulchie menu at the top left of the screen and in the menu bar icon's menu. It fetches `latest.json` from the project's GitHub Releases and, if you agree, downloads and installs the new version. A build that has an update key also looks by itself, a minute after launch and every six hours, and shows an **Update to X** button at the top right of the dashboard and in the panel when a newer version exists; the button starts the same flow. A build without a key makes no request of its own: it shows a **Get X** button when the engine's update check above found a newer Mulchie, and tells you how to get it (Homebrew, or the releases page). See [Install](/install/#update).

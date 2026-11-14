@@ -867,3 +867,34 @@ fn probes_come_from_safe_places_and_versions_from_metadata() {
     );
     assert!(run.runs.lock().unwrap().is_empty());
 }
+
+/// A release candidate is checked against the list of releases, so it hears
+/// of the next candidate; a stable install still asks `releases/latest`.
+#[test]
+fn a_prerelease_install_is_offered_the_next_prerelease() {
+    let list = json!([
+        {"tag_name": "v0.3.0-rc.3", "prerelease": true},
+        {"tag_name": "v0.3.0-rc.4", "prerelease": true},
+        {"tag_name": "v0.9.0", "prerelease": false, "draft": true},
+        {"tag_name": "not-a-version"},
+        {"tag_name": "v0.2.0", "prerelease": false},
+    ]);
+    assert_eq!(newest_release(&list), (Some("0.3.0-rc.4".into()), true));
+    assert_eq!(newest_release(&json!([])), (None, false));
+    assert_eq!(
+        newest_release(&json!({"message": "rate limited"})),
+        (None, false)
+    );
+    assert_eq!(
+        mulchie_update_offered("0.3.0-rc.4", "0.3.0-rc.1", true),
+        Some(true)
+    );
+    assert_eq!(
+        mulchie_update_offered("0.3.0-rc.4", "0.3.0-rc.4", true),
+        Some(false)
+    );
+    assert_eq!(
+        mulchie_update_offered("0.3.0-rc.4", "0.2.0", true),
+        Some(false)
+    );
+}

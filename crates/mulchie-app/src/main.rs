@@ -14,7 +14,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 use tauri::image::Image;
-use tauri::menu::{Menu, MenuItem, PredefinedMenuItem};
+use tauri::menu::{Menu, MenuItem, PredefinedMenuItem, Submenu};
 use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
 use tauri::{AppHandle, Emitter, Manager, PhysicalPosition, RunEvent, WebviewWindow, WindowEvent};
 
@@ -253,6 +253,83 @@ fn link_state(link: &Path, bundled: Option<&Path>) -> LinkState {
 
 fn link_target(paths: &Paths) -> PathBuf {
     paths.home.join(".local/bin/mulchie")
+}
+
+/// The engine's last update report, for a build that cannot check by itself.
+fn engine_update_report(b: &Backend) -> Option<Value> {
+    b.updates_status().ok().map(|v| v["report"].clone())
+}
+
+/// This version, a newer one if known, and whether the app can install it.
+#[tauri::command]
+async fn app_update(b: B<'_>, app: AppHandle) -> Result<Value, String> {
+    let report = blocking(&b, |b| Ok(engine_update_report(b))).await?;
+    Ok(update::status(&app, report.as_ref()))
+}
+
+/// The window's update button: the same flow as "Check for Updates…".
+#[tauri::command]
+async fn start_update(b: B<'_>, app: AppHandle) -> Result<(), String> {
+    let report = blocking(&b, |b| Ok(engine_update_report(b))).await?;
+    update::check(app, report);
+    Ok(())
+}
+
+/// "Check for Updates…" from a menu.
+fn check_from_menu(app: &AppHandle) {
+    let report = app
+        .try_state::<Arc<Backend>>()
+        .and_then(|b| engine_update_report(&b));
+    update::check(app.clone(), report);
+}
+
+/// The menu bar menus, as Mac apps have them: the app menu with About,
+/// Check for Updates…, Services, Hide and Quit, then Edit and Window.
+fn app_menu(app: &AppHandle) -> tauri::Result<Menu<tauri::Wry>> {
+    let sep = || PredefinedMenuItem::separator(app);
+    let mulchie = Submenu::with_items(
+        app,
+        "Mulchie",
+        true,
+        &[
+            &PredefinedMenuItem::about(app, Some("About Mulchie"), None)?,
+            &MenuItem::with_id(app, "app-update", "Check for Updates…", true, None::<&str>)?,
+            &sep()?,
+            &PredefinedMenuItem::services(app, None)?,
+            &sep()?,
+            &PredefinedMenuItem::hide(app, Some("Hide Mulchie"))?,
+            &PredefinedMenuItem::hide_others(app, None)?,
+            &PredefinedMenuItem::show_all(app, None)?,
+            &sep()?,
+            &MenuItem::with_id(app, "app-quit", "Quit Mulchie", true, Some("CmdOrCtrl+Q"))?,
+        ],
+    )?;
+    let edit = Submenu::with_items(
+        app,
+        "Edit",
+        true,
+        &[
+            &PredefinedMenuItem::undo(app, None)?,
+            &PredefinedMenuItem::redo(app, None)?,
+            &sep()?,
+            &PredefinedMenuItem::cut(app, None)?,
+            &PredefinedMenuItem::copy(app, None)?,
+            &PredefinedMenuItem::paste(app, None)?,
+            &PredefinedMenuItem::select_all(app, None)?,
+        ],
+    )?;
+    let window = Submenu::with_items(
+        app,
+        "Window",
+        true,
+        &[
+            &PredefinedMenuItem::minimize(app, None)?,
+            &PredefinedMenuItem::maximize(app, None)?,
+            &sep()?,
+            &PredefinedMenuItem::close_window(app, None)?,
+        ],
+    )?;
+    Menu::with_items(app, &[&mulchie, &edit, &window])
 }
 
 #[tauri::command]
@@ -616,6 +693,8 @@ fn main() {
             limits_status,
             updates_status,
             check_updates,
+            app_update,
+            start_update,
             patch_config,
             integration,
             install_cli,
@@ -629,6 +708,14 @@ fn main() {
         .setup(move |app| {
             #[cfg(target_os = "macos")]
             app.set_activation_policy(tauri::ActivationPolicy::Accessory);
+
+            app.set_menu(app_menu(app.handle())?)?;
+            app.on_menu_event(|app, e| match e.id().as_ref() {
+                "app-update" => check_from_menu(app),
+                "app-quit" => app.exit(0),
+                _ => {}
+            });
+            update::watch(app.handle().clone());
 
             let open = MenuItem::with_id(app, "open", "Open Dashboard", true, None::<&str>)?;
             let check = MenuItem::with_id(app, "update", "Check for Updates…", true, None::<&str>)?;
@@ -645,7 +732,7 @@ fn main() {
                 .show_menu_on_left_click(false)
                 .on_menu_event(|app, e| match e.id().as_ref() {
                     "open" => show_dashboard(app, None),
-                    "update" => update::check(app.clone()),
+                    "update" => check_from_menu(app),
                     "quit" => app.exit(0),
                     _ => {}
                 })
