@@ -66,6 +66,15 @@
     },
     "externalBin": [
       "binaries/mulchie"
-    ]
+    ],
+    "createUpdaterArtifacts": true
+  },
+  "plugins": {
+    "updater": {
+      "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IDZFNjY2NDIzOEQyNTJGOTMKUldTVEx5V05JMlJtYm5ybXpaMWVMWCswZmpKQ1hJQVpVS3VrRWFMd0dmaFJLUTk3MmsyMDIrc0cK",
+      "endpoints": [
+        "https://github.com/williamrogersdev/mulchie/releases/latest/download/latest.json"
+      ]
+    }
   }
 }
