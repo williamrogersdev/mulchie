@@ -97,6 +97,7 @@ Run `mulchie --help` or `mulchie <command> --help` for every flag.
 | `limits` | Session budgets: who is over, what Mulchie paused, and whether limits act. Needs the engine. |
 | `updates` | The last update check. `updates --check` asks for one now. Needs the engine. |
 | `guard check -- <command>` | Ask the guard rules about a command without running it. Needs the engine. |
+| `feedback report <what happened>` | Save a report about Mulchie or the machine. `feedback list` shows what agents and people reported. Works without the engine. |
 | `hooks install\|uninstall\|status` | Connect Mulchie to an agent's own hooks. |
 | `hook <client> <event>` | Run by an agent's hook system, not by hand. Fails open. |
 | `slots` | List build slots. `slots release <ticket>` ends one whose holder is gone. Needs the engine. |

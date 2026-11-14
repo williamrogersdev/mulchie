@@ -218,6 +218,29 @@ pub fn tool_list() -> Vec<Tool> {
             )
         },
         Tool {
+            name: "report_feedback",
+            title: "Report a problem to Mulchie",
+            description: "Tell Mulchie about a problem you hit, so the user can fix it: a Mulchie tool that failed or answered wrongly, advice or a recommendation that was wrong or useless, a finding or guard rule that fired on something ordinary, a real problem Mulchie did not notice or act on, work it blocked or slowed without reason, a slow or broken environment, or something Mulchie should do and does not. Give a summary of one or two sentences and, in details, what you did, what you expected and what happened (error text included). The report is saved in a private file on this machine with the machine's state at that moment (health, CPU, load, memory, disk); secrets in the text are hidden and nothing is sent anywhere. It works even when the engine is not running. Report once per problem, then carry on.",
+            props: json!({
+                "summary": { "type": "string", "description": "One or two sentences: what happened" },
+                "category": { "type": "string", "enum": mulchie_core::feedback::Category::ALL, "description": "bug: Mulchie failed. wrong_advice: its advice or diagnosis was wrong. false_positive: a finding or guard rule fired on something ordinary. missed: it did not notice or act on a real problem. blocked: it got in the way of wanted work. slow: the machine or a tool was slow. environment: a problem that is not Mulchie's doing. idea: something it should do. other (default)." },
+                "severity": { "type": "string", "enum": mulchie_core::feedback::Severity::ALL, "description": "low: a nuisance. medium (default): cost time. high: stopped the work or risked losing something." },
+                "details": { "type": "string", "description": "What you did, what you expected, what happened, error text" },
+                "tool": { "type": "string", "description": "The Mulchie tool or command this is about, if any" },
+                "cwd": { "type": "string", "description": "The directory you work in (default: this server's)" }
+            }),
+            required: &["summary"],
+            read_only: false,
+            destructive: false,
+            idempotent: false,
+        },
+        read(
+            "list_feedback",
+            "List feedback reports",
+            "The feedback saved on this machine, newest first: each report's id, time, category, severity, summary, details, who sent it and the machine's state then. Use it to see what agents ran into, or to check whether a problem was already reported.",
+            json!({ "limit": { "type": "integer", "minimum": 1, "maximum": 200, "description": "How many (default 20)" } }),
+        ),
+        Tool {
             required: &["pid"],
             ..read(
                 "inspect_process",
@@ -314,10 +337,13 @@ pub fn tool_list() -> Vec<Tool> {
 /// Build-slot tools: allowed in read-only mode (the read-only token may take
 /// TTL leases).
 const SLOT_TOOLS: [&str; 2] = ["acquire_build_slot", "release_build_slot"];
+/// Adds a line to Mulchie's own feedback file and changes nothing else.
+const FEEDBACK_TOOL: &str = "report_feedback";
 
-/// Tools offered in read-only mode: those that change nothing, and build slots.
+/// Tools offered in read-only mode: those that change nothing, build slots
+/// and feedback.
 pub fn allowed(tool: &Tool, read_only: bool) -> bool {
-    !read_only || tool.read_only || SLOT_TOOLS.contains(&tool.name)
+    !read_only || tool.read_only || SLOT_TOOLS.contains(&tool.name) || tool.name == FEEDBACK_TOOL
 }
 
 // ------------------------------------------------------------ validation
@@ -896,6 +922,8 @@ pub struct Ctx<'a> {
     pub read_only: bool,
     /// Release secrets by ticket, from the lease replies. Never shown.
     pub secrets: &'a Mutex<HashMap<u64, String>>,
+    /// The client's name from `initialize`, for feedback.
+    pub client: Option<&'a str>,
 }
 
 /// The core's consumer groups, short, for people and models.
@@ -1243,6 +1271,55 @@ pub fn call_tool(cx: &mut Ctx, name: &str, a: &Map<String, Value>) -> ToolResult
             Err(e) if e.code == "updates_off" => Err("Update checks are off (updates.check in Mulchie's config), so nothing was checked. Only the user should turn them on.".into()),
             Err(e) => Err(api_err(e)),
         },
+        "report_feedback" => {
+            let s = |k: &str| a.get(k).and_then(Value::as_str).map(String::from);
+            let mut body = json!({
+                "summary": s("summary").unwrap_or_default(),
+                "source": "mcp",
+                "cwd": s("cwd").or_else(|| std::env::current_dir().ok().map(|d| d.display().to_string())),
+                "client": cx.client,
+            });
+            for k in ["category", "severity", "details", "tool"] {
+                if let Some(v) = s(k) {
+                    body[k] = json!(v);
+                }
+            }
+            let saved = |entry: &Value, engine: bool| {
+                json!({
+                    "saved": true,
+                    "id": entry["id"],
+                    "with_machine_state": engine,
+                    "note": "Saved on this machine for the user (`mulchie feedback list`). Nothing was sent anywhere. Carry on with your task.",
+                })
+            };
+            match api.call("POST", "/v1/feedback", Some(&body)) {
+                Ok(v) => Ok(saved(&v["feedback"], true)),
+                // No usable engine: the report is still kept, straight to
+                // the file. That the engine is down may be the report.
+                Err(e) if matches!(e.code.as_str(), "engine_not_running" | "engine_unreachable" | "unreachable" | "io_error") => {
+                    let Some(paths) = api.paths() else {
+                        return Err(api_err(e));
+                    };
+                    let report: mulchie_core::feedback::Report =
+                        serde_json::from_value(body).map_err(|e| e.to_string())?;
+                    let entry = mulchie_core::feedback::record_local(paths, report, "mcp")?;
+                    Ok(saved(&json!({ "id": entry.id }), false))
+                }
+                Err(e) => Err(api_err(e)),
+            }
+        }
+        "list_feedback" => {
+            let limit = a.get("limit").and_then(Value::as_u64).unwrap_or(20);
+            match get(&format!("/v1/feedback?limit={limit}")) {
+                Ok(v) => Ok(v),
+                Err(_) if api.paths().is_some() => {
+                    let store = mulchie_core::feedback::Store::new(api.paths().expect("checked"));
+                    let (feedback, total) = store.recent(limit as usize);
+                    Ok(json!({ "feedback": feedback, "total": total, "path": store.path() }))
+                }
+                Err(e) => Err(e),
+            }
+        }
         "check_command" => {
             let cwd = a
                 .get("cwd")

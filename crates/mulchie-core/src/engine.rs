@@ -44,6 +44,10 @@ pub use runaway_glue::RunawayStatus;
 mod hook;
 pub use hook::{GuardCheckReply, GuardCheckRequest, HookEvent, HookReply, HookRequest};
 
+#[path = "engine_feedback.rs"]
+mod feedback_glue;
+pub use feedback_glue::FeedbackList;
+
 #[path = "engine_updates.rs"]
 mod updates_glue;
 pub use sessions::{

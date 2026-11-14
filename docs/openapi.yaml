@@ -943,6 +943,69 @@ paths:
                   queued: { type: boolean }
         "409": { description: "`updates_off`: `updates.check` is off", content: { application/json: { schema: { type: object } } } }
         default: { $ref: "#/components/responses/Error" }
+  /v1/feedback:
+    get:
+      summary: Feedback reports, newest first
+      parameters:
+        - name: limit
+          in: query
+          required: false
+          description: "How many to return (1 to 1000, default 50)"
+          schema: { type: integer, minimum: 1, maximum: 1000 }
+      responses:
+        "200":
+          description: The newest reports
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  feedback:
+                    type: array
+                    items: { $ref: "#/components/schemas/Feedback" }
+                  total: { type: integer, description: Reports stored in all }
+                  path: { type: string, description: The feedback file }
+        default: { $ref: "#/components/responses/Error" }
+    post:
+      summary: Report a problem with Mulchie or the machine
+      description: |
+        Adds one line to `<config dir>/feedback.jsonl` (private to the user; renamed to
+        `feedback.jsonl.1` at 4 MB) with the machine's state from the last sample, and a `feedback`
+        entry to the action journal. Secrets in the text are hidden word by word. Nothing is sent
+        anywhere. The read-only token is accepted.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [summary]
+              additionalProperties: false
+              properties:
+                summary: { type: string, description: "One or two sentences; kept to 500 characters" }
+                category:
+                  type: string
+                  enum: [bug, wrong_advice, false_positive, missed, blocked, slow, environment, idea, other]
+                  default: other
+                severity: { type: string, enum: [low, medium, high], default: medium }
+                details: { type: string, description: Kept to 8000 characters }
+                tool: { type: string, description: "The Mulchie tool, command or route it is about" }
+                client: { type: string, description: "Who reports, such as an agent's name" }
+                cwd: { type: string }
+                source: { type: string, description: "`mcp` or `cli` when a Mulchie front end passes the report on; otherwise stored as `api`" }
+      responses:
+        "200":
+          description: Saved
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  ok: { type: boolean }
+                  feedback: { $ref: "#/components/schemas/Feedback" }
+        "400": { description: "`invalid_body`: no summary, an unknown category or severity, or an unknown field", content: { application/json: { schema: { type: object } } } }
+        "500": { description: "`feedback_not_saved`: the file could not be written", content: { application/json: { schema: { type: object } } } }
+        default: { $ref: "#/components/responses/Error" }
 components:
   securitySchemes:
     bearer:
@@ -991,6 +1054,32 @@ components:
               error: { type: string }
               code: { type: string, description: "A stable code, e.g. unauthorized, read_only_token, items_required, invalid_body" }
   schemas:
+    Feedback:
+      type: object
+      properties:
+        id: { type: string, description: "`fb-<unix seconds>-<random>`" }
+        at_unix: { type: integer }
+        source: { type: string, enum: [api, mcp, cli] }
+        category: { type: string }
+        severity: { type: string }
+        summary: { type: string }
+        details: { type: string }
+        tool: { type: string }
+        client: { type: string }
+        cwd: { type: string }
+        mulchie_version: { type: string }
+        os: { type: string }
+        machine:
+          type: object
+          description: "The machine at the last sample; absent when no engine took the report"
+          properties:
+            health: { type: string }
+            cpu_pct: { type: number }
+            load1: { type: number }
+            cores: { type: integer }
+            mem_free_pct: { type: number }
+            disk_free_gb: { type: number }
+            sessions: { type: integer }
     Health:
       type: string
       enum: [good, busy, strained, critical, stale]

@@ -67,7 +67,13 @@ not backed up: the next build recreates them. prune_cache only previews unless e
 the preview and ask first. dismiss_finding hides a finding the user chose to ignore. \
 Before heavy builds or test suites, call can_i_build, and when other agents share the machine \
 wrap the work in acquire_build_slot / release_build_slot (poll with the ticket until granted, \
-renew before ttl_secs passes, release as soon as the work ends).";
+renew before ttl_secs passes, release as soon as the work ends). \
+When Mulchie or this machine gets in your way, call report_feedback: a Mulchie tool that failed \
+or answered wrongly, advice or a finding that was wrong or noise, a real problem Mulchie did not \
+notice, a command it blocked or slowed without reason, or a slow or broken environment. Say what \
+you did, what you expected and what happened. The report is saved on this machine for the user, \
+with the machine's state at that moment; nothing is sent anywhere. Report once per problem and \
+carry on with your task.";
 
 const READ_ONLY_NOTE: &str = " This server is read-only (it uses Mulchie's read-only token): it \
 can look, plan and use build slots, but cannot delete, signal, prune or dismiss; the user can carry \
@@ -191,6 +197,9 @@ pub struct Session<'a> {
     /// Build-slot release secrets by ticket; never shown to the client.
     /// Shared with the signal thread, which releases them on SIGTERM.
     secrets: Secrets,
+    /// The client's name from `initialize` (`claude-code`, `codex`, ...),
+    /// stored with the feedback it reports.
+    pub client: Option<String>,
 }
 
 /// Release secrets by ticket.
@@ -230,6 +239,7 @@ impl<'a> Session<'a> {
             read_only: false,
             plans: Plans::default(),
             secrets: Secrets::default(),
+            client: None,
         }
     }
 
@@ -407,6 +417,10 @@ impl<'a> Session<'a> {
                     LEGACY_VERSIONS[0]
                 };
                 self.negotiated = Some(version.to_string());
+                self.client = params["clientInfo"]["name"]
+                    .as_str()
+                    .filter(|n| !n.trim().is_empty())
+                    .map(String::from);
                 Ok(json!({
                     "protocolVersion": version,
                     "capabilities": capabilities(),
@@ -448,6 +462,7 @@ impl<'a> Session<'a> {
                     plans: &mut self.plans,
                     read_only: self.read_only,
                     secrets: &self.secrets,
+                    client: self.client.as_deref(),
                 };
                 let outcome = tools::validate(&tool.schema(), &args)
                     .and_then(|()| tools::call_tool(&mut cx, name, &args));

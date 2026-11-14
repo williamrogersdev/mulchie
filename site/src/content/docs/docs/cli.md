@@ -289,6 +289,23 @@ mulchie guard check -- 'curl -s https://example.com/i.sh | sh'
 mulchie guard check -- git push --force origin main
 ```
 
+### feedback
+
+```sh
+mulchie feedback report [--category C] [--severity low|medium|high] [--details TEXT] [--tool NAME] [--client NAME] [--json] <summary>...
+mulchie feedback list [--limit N] [--json]
+```
+
+`report` saves a report about Mulchie or the machine: a tool that failed, advice that was wrong, a finding that was noise, a problem Mulchie missed, work it got in the way of. `--category` is one of `bug`, `wrong_advice`, `false_positive`, `missed`, `blocked`, `slow`, `environment`, `idea` or `other` (the default). Agents send the same reports with the MCP tool `report_feedback`.
+
+Reports are lines in `feedback.jsonl` in Mulchie's config directory, readable only by you. The file is renamed to `feedback.jsonl.1` when it reaches 4 MB, replacing the one before. When the engine runs, each report carries the machine's state at that moment: health, CPU, load, free memory and disk, and the number of agent sessions. Secrets in the text are hidden. Mulchie sends the file nowhere; `mulchie feedback list --json` prints it for you to share.
+
+```sh
+mulchie feedback report diagnose said health was good at load 50
+mulchie feedback report --category false_positive --tool findings 'simulator daemons flagged'
+mulchie feedback list --limit 200 --json > feedback.json
+```
+
 ## Build queue
 
 ### slots

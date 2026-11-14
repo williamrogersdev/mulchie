@@ -164,6 +164,17 @@ result). Checks are off when updates.check is off in `mulchie config`.",
     #[command(subcommand)]
     Guard(GuardCommand),
 
+    /// Report a problem with Mulchie or this machine, or read the reports
+    #[command(
+        subcommand,
+        long_about = "Feedback from agents and people about Mulchie and the machine it watches: \
+a tool that failed, advice that was wrong, a finding that was noise, a problem Mulchie missed, \
+work it got in the way of. Reports are saved in a private file in Mulchie's config directory, \
+with the machine's state at that moment when the engine runs. Nothing is sent anywhere. \
+Agents report through the MCP tool report_feedback."
+    )]
+    Feedback(FeedbackCommand),
+
     /// List the build slots, or release one whose holder is gone (needs the engine)
     #[command(
         long_about = "List the build slots the engine has handed out: ticket, label, holder \
@@ -680,6 +691,47 @@ pub enum GuardCommand {
         /// The command: one quoted string, or its words after --
         #[arg(required = true, trailing_var_arg = true, allow_hyphen_values = true)]
         command: Vec<String>,
+    },
+}
+
+#[derive(Subcommand, Debug, Clone)]
+pub enum FeedbackCommand {
+    /// Save a report (works with or without the engine)
+    #[command(
+        after_help = "Examples:\n  mulchie feedback report diagnose said health was good at load 50\n  mulchie feedback report --category false_positive --tool findings 'simulator daemons flagged as system_name_mismatch'\n  mulchie feedback report --severity high --details \"$(cat error.log)\" build queue never granted a slot"
+    )]
+    Report {
+        /// What it is about
+        #[arg(long, value_parser = clap::builder::PossibleValuesParser::new(mulchie_core::feedback::Category::ALL))]
+        category: Option<String>,
+        /// low: a nuisance; medium: cost time; high: stopped the work
+        #[arg(long, value_parser = clap::builder::PossibleValuesParser::new(mulchie_core::feedback::Severity::ALL))]
+        severity: Option<String>,
+        /// What was tried, what was expected, what happened
+        #[arg(long)]
+        details: Option<String>,
+        /// The Mulchie tool or command this is about
+        #[arg(long)]
+        tool: Option<String>,
+        /// Who reports (an agent's name); default: nobody named
+        #[arg(long)]
+        client: Option<String>,
+        #[command(flatten)]
+        out: JsonArg,
+        /// One or two sentences: what happened
+        #[arg(required = true)]
+        summary: Vec<String>,
+    },
+    /// Show the saved reports, newest first
+    #[command(
+        after_help = "Examples:\n  mulchie feedback list\n  mulchie feedback list --limit 200 --json > feedback.json"
+    )]
+    List {
+        /// How many to show
+        #[arg(long, default_value_t = 20, value_parser = clap::value_parser!(u64).range(1..=1000))]
+        limit: u64,
+        #[command(flatten)]
+        out: JsonArg,
     },
 }
 
