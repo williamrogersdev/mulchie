@@ -898,3 +898,35 @@ fn a_prerelease_install_is_offered_the_next_prerelease() {
         Some(false)
     );
 }
+
+/// The app updater reads the manifest of the newest release that has one:
+/// a release candidate follows pre-releases, a stable install never sees
+/// one, and a CLI-only release (no `latest.json`) or a foreign URL is skipped.
+#[test]
+fn the_app_reads_the_newest_manifest_it_may_install() {
+    let base = "https://github.com/williamrogersdev/mulchie/releases/download";
+    let asset = |tag: &str| json!({"name": "latest.json", "browser_download_url": format!("{base}/{tag}/latest.json")});
+    let list = json!([
+        {"tag_name": "v0.3.0-rc.6", "prerelease": true, "assets": []},
+        {"tag_name": "v0.3.0-rc.5", "prerelease": true, "assets": [asset("v0.3.0-rc.5")]},
+        {"tag_name": "v0.3.0-rc.4", "prerelease": true, "assets": [asset("v0.3.0-rc.4")]},
+        {"tag_name": "v0.9.0", "draft": true, "assets": [asset("v0.9.0")]},
+        {"tag_name": "v0.8.0", "assets": [{"name": "latest.json", "browser_download_url": "https://evil.example/latest.json"}]},
+        {"tag_name": "v0.2.0", "prerelease": false, "assets": [asset("v0.2.0")]},
+    ]);
+    assert_eq!(
+        pick_app_manifest(&list, "0.3.0-rc.4"),
+        Some(format!("{base}/v0.3.0-rc.5/latest.json"))
+    );
+    assert_eq!(
+        pick_app_manifest(&list, "0.2.0"),
+        Some(format!("{base}/v0.2.0/latest.json"))
+    );
+    let only_pre =
+        json!([{"tag_name": "v0.3.0-rc.5", "prerelease": true, "assets": [asset("v0.3.0-rc.5")]}]);
+    assert_eq!(pick_app_manifest(&only_pre, "0.3.0"), None);
+    assert_eq!(
+        pick_app_manifest(&json!({"message": "rate limited"}), "0.3.0-rc.1"),
+        None
+    );
+}

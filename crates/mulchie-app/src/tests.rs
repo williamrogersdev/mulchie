@@ -325,7 +325,10 @@ fn updater_is_configured_only_with_a_public_key() {
     let mut p: HashMap<String, Value> = HashMap::new();
     assert_eq!(update::pubkey(&p), None);
     assert!(!update::Updates::from_plugins(&p).configured());
-    p.insert("updater".into(), json!({"endpoints": [update::ENDPOINT]}));
+    p.insert(
+        "updater".into(),
+        json!({"endpoints": ["https://example.invalid/latest.json"]}),
+    );
     assert_eq!(update::pubkey(&p), None);
     p.insert("updater".into(), json!({"pubkey": "  "}));
     assert_eq!(update::pubkey(&p), None);
