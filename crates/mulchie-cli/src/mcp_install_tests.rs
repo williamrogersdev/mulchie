@@ -559,3 +559,69 @@ fn a_json_config_that_would_change_on_rewrite_is_refused() {
     .unwrap_err();
     assert!(e.contains("twice"), "{e}");
 }
+
+#[test]
+fn backups_are_unique_and_pruned() {
+    let d = tempfile::tempdir().unwrap();
+    let dir = d.path().canonicalize().unwrap();
+    let target = dir.join("claude_desktop_config.json");
+    std::fs::write(&target, "{}").unwrap();
+    // Files that only look like backups, and other files' backups, stay.
+    let keep = [
+        "claude_desktop_config.json.mulchie-backup-notatime",
+        "claude_desktop_config.json.mulchie-backup-1-xyz",
+        "other.json.mulchie-backup-1",
+        "claude_desktop_config.json",
+    ];
+    for k in &keep[..3] {
+        std::fs::write(dir.join(k), "x").unwrap();
+    }
+    // An old-style backup (no random part) is the oldest and goes first.
+    std::fs::write(
+        dir.join("claude_desktop_config.json.mulchie-backup-5"),
+        "old",
+    )
+    .unwrap();
+    // A symbolic link with a backup's name is never followed or removed.
+    std::os::unix::fs::symlink(
+        &target,
+        dir.join("claude_desktop_config.json.mulchie-backup-2"),
+    )
+    .unwrap();
+    // Two in the same second do not collide.
+    let a = back_up(&target, 100).unwrap();
+    let b = back_up(&target, 100).unwrap();
+    assert_ne!(a, b);
+    assert_eq!(std::fs::read_to_string(&a).unwrap(), "{}");
+    for t in 101..110 {
+        back_up(&target, t).unwrap();
+    }
+    let names: Vec<String> = std::fs::read_dir(&dir)
+        .unwrap()
+        .flatten()
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+        .collect();
+    let backups: Vec<&String> = names
+        .iter()
+        .filter(|n| n.starts_with("claude_desktop_config.json.mulchie-backup-1"))
+        .filter(|n| backup_time(n, "claude_desktop_config.json").is_some())
+        .collect();
+    assert_eq!(backups.len(), KEEP_BACKUPS, "{names:?}");
+    for t in 105..110 {
+        assert!(
+            backups.iter().any(|n| n.contains(&format!("-{t}-"))),
+            "{names:?}"
+        );
+    }
+    assert!(
+        !names.iter().any(|n| n.ends_with("mulchie-backup-5")),
+        "{names:?}"
+    );
+    assert!(
+        names.iter().any(|n| n.ends_with("mulchie-backup-2")),
+        "{names:?}"
+    );
+    for k in keep {
+        assert!(names.iter().any(|n| n == k), "{k} {names:?}");
+    }
+}

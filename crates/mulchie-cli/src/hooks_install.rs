@@ -3,7 +3,8 @@
 //!
 //! The same care as `mcp install`: a file that does not parse is refused, a
 //! symbolic link is followed (a dangling one is refused), the old file is
-//! copied to `<file>.mulchie-backup-<unix>`, and the new one is written
+//! copied to `<file>.mulchie-backup-<unix>-<random>` (the newest five are
+//! kept), and the new one is written
 //! through a temp file and a rename with the old mode, after checking the
 //! app did not save the file meanwhile. Other keys and other hooks keep
 //! their content and order.
@@ -98,6 +99,11 @@ pub fn events_for(c: HookClient) -> &'static [EventSpec] {
     }
 }
 
+/// Copilot's hook files have no matcher, so it runs the tool hooks for every
+/// tool. `mulchie hook copilot` answers at once, without the engine, unless
+/// the tool is one of these shells (compared without case).
+pub const COPILOT_SHELL_TOOLS: [&str; 3] = ["bash", "shell", "powershell"];
+
 pub const ALL: [HookClient; 5] = [
     HookClient::ClaudeCode,
     HookClient::Codex,
@@ -130,6 +136,9 @@ pub struct HookEnv {
     pub copilot_home: Option<PathBuf>,
     /// The absolute path of the `mulchie` binary to run.
     pub exe: PathBuf,
+    /// Mulchie's config directory in this environment, where `hooks status`
+    /// expects the engine (`XDG_CONFIG_HOME` included).
+    pub config_dir: PathBuf,
 }
 
 impl HookEnv {
@@ -146,6 +155,7 @@ impl HookEnv {
             codex_home: var("CODEX_HOME"),
             copilot_home: var("COPILOT_HOME"),
             exe: crate::service::service_exe()?,
+            config_dir: mulchie_core::paths::config_dir(),
         })
     }
 
@@ -742,14 +752,7 @@ fn apply(
         if let Ok(m) = std::fs::metadata(target) {
             mode = m.permissions().mode() & 0o7777;
         }
-        let rand = mulchie_core::paths::random_hex(4).map_err(|e| e.to_string())?;
-        let backup = PathBuf::from(format!(
-            "{}.mulchie-backup-{}-{rand}",
-            target.display(),
-            now_unix()
-        ));
-        std::fs::copy(target, &backup)
-            .map_err(|e| format!("cannot back up {}: {e}", target.display()))?;
+        let backup = crate::mcp_install::back_up(target, now_unix())?;
         note = format!("\nOld file saved as {}", backup.display());
     } else if let Some(dir) = target.parent() {
         std::fs::create_dir_all(dir)
@@ -796,6 +799,10 @@ pub fn uninstall_in(env: &HookEnv, c: HookClient, dry_run: bool) -> Result<Strin
 
 /// Per client: the file, Mulchie's events in it, and the binary they run.
 pub fn status_in(env: &HookEnv) -> Value {
+    let notes: Value = std::fs::read(crate::hook::dirs_file(&env.home))
+        .ok()
+        .and_then(|b| serde_json::from_slice(&b).ok())
+        .unwrap_or(Value::Null);
     let mut out = Vec::new();
     for c in ALL {
         let path = env.file(c);
@@ -854,9 +861,34 @@ pub fn status_in(env: &HookEnv) -> Value {
                 }
             },
         }
+        if let Some(m) = config_dir_note(env, &notes, c) {
+            v["config_dir_mismatch"] = m;
+        }
         out.push(v);
     }
     json!(out)
+}
+
+/// Notes older than this are not reported.
+const NOTE_MAX_AGE: u64 = 7 * 86_400;
+
+/// The client's hook last ran with a config directory other than this
+/// environment's: one of them has a different `XDG_CONFIG_HOME`.
+fn config_dir_note(env: &HookEnv, notes: &Value, c: HookClient) -> Option<Value> {
+    let n = notes.get(c.name())?;
+    let dir = n["config_dir"].as_str()?;
+    let seen = n["seen"].as_u64()?;
+    let now = mulchie_core::monitor::now_unix();
+    if now.saturating_sub(seen) > NOTE_MAX_AGE || Path::new(dir) == env.config_dir {
+        return None;
+    }
+    Some(json!({
+        "hook_config_dir": dir,
+        "hook_xdg_config_home": n["xdg_config_home"],
+        "hook_reached_engine": n["reached"],
+        "config_dir": env.config_dir,
+        "seen": seen,
+    }))
 }
 
 fn render_status(v: &Value) -> String {
@@ -888,6 +920,19 @@ fn render_status(v: &Value) -> String {
         s.push('\n');
         if let Some(n) = c["note"].as_str() {
             s.push_str(&format!("{:<12} note: {n}\n", ""));
+        }
+        let m = &c["config_dir_mismatch"];
+        if let (Some(hook), Some(here)) = (m["hook_config_dir"].as_str(), m["config_dir"].as_str())
+        {
+            let what = if m["hook_reached_engine"] == true {
+                format!("its hook last reached an engine in {hook}, but this shell looks in {here}")
+            } else {
+                format!("its hook last looked for the engine in {hook} and found none; this shell looks in {here}, so that agent's hook allows everything")
+            };
+            s.push_str(&format!(
+                "{:<12} warning: {what}. XDG_CONFIG_HOME differs between the agent and the engine; give both the same value, or unset it in both.\n",
+                ""
+            ));
         }
     }
     s

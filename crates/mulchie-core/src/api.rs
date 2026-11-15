@@ -1142,7 +1142,10 @@ fn route(req: &Req, engine: &Engine, read_only: bool) -> Resp {
     let r = (|| -> Result<Resp, Resp> {
         Ok(match (req.method.as_str(), req.path.as_str()) {
             ("GET", "/v1/state") => ok(&engine.snapshot_state()),
-            ("GET", "/v1/history") => ok(&engine.history()),
+            ("GET", "/v1/history") => {
+                let since = query_u64(req, "since")?.unwrap_or(0);
+                ok(&engine.history_since(since))
+            }
             ("GET", "/v1/advice") => ok(&engine.advice()),
             ("POST", "/v1/scan") => {
                 ok(&serde_json::json!({ "ok": true, "queued": engine.request_scan() }))

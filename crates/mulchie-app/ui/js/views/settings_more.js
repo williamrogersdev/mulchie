@@ -55,6 +55,7 @@ const numIn = (attrs, v, label, step = 'any', [lo, hi] = []) => `<input type="nu
 const RANGE = {
   sustain_secs: [0, 86400], resume_after_secs: [10, 86400], stop_grace_secs: [1, 300],
   hog_share_pct: [10, 100], hog_sustain_secs: [10, 3600], interval_hours: [6, 720],
+  runaway_depth: [3, 64], runaway_remember_secs: [0, 604800],
 };
 
 // A whole number in a range, or an error for that field.
@@ -115,7 +116,7 @@ function showErrors(card, message, extra) {
   top.textContent = '';
   const parts = String(message).replace(/^config has invalid values: /, '').split('; ');
   for (const part of parts) {
-    const key = (/((?:limits|memory_guard|guard|updates|sessions)(?:\.[a-z_]+|\[\d+\])+)/.exec(part) || [])[1];
+    const key = (/((?:limits|memory_guard|runaway|guard|updates|sessions)(?:\.[a-z_]+|\[\d+\])+)/.exec(part) || [])[1];
     let placed = false;
     if (key) {
       const [block, rest] = blockOf(card, key);
@@ -256,10 +257,11 @@ function confirmStricter(lines, limits) {
 
 const MG_ACTIONS = [['off', 'Off'], ['notify', 'Report only'], ['stop', 'Close the biggest consumer']];
 const MG_SCOPES = [['sessions', 'What agent sessions started (never the agent itself)'], ['all', 'Also my other apps and programs']];
+const RW_ACTIONS = [['off', 'Off'], ['notify', 'Report only'], ['stop', 'Stop the chain']];
 const opts = (list, cur) => list.map(([v, n]) => `<option value="${v}" ${v === cur ? 'selected' : ''}>${esc(n)}</option>`).join('');
 
 function limitsForm(c) {
-  const l = c.limits || {}, s = c.sessions || {}, g = c.memory_guard || {};
+  const l = c.limits || {}, s = c.sessions || {}, g = c.memory_guard || {}, rw = c.runaway || {};
   return `<label class="chk"><input type="checkbox" data-k="sessions.enabled" ${s.enabled !== false ? 'checked' : ''}> Track agent sessions (needed for the Sessions view, activity records and limits)</label>${ferr('sessions.enabled')}
     <ul class="explain">${ACTIONS.map(([, n, d]) => `<li><b>${esc(n)}</b>: ${esc(d)}</li>`).join('')}</ul>
     <label class="chk"><input type="checkbox" data-k="default-on" ${l.default ? 'checked' : ''}> A default budget for every session</label>
@@ -277,7 +279,13 @@ function limitsForm(c) {
     <div class="row2"><label>Memory guard <select data-k="memory_guard.action" aria-label="Memory guard action">${opts(MG_ACTIONS, g.action || 'notify')}</select></label>
       <label>It may close <select data-k="memory_guard.scope" aria-label="Memory guard scope">${opts(MG_SCOPES, g.scope || 'sessions')}</select></label></div>
     <div class="dim">Memory is low under ${esc(g.free_pct ?? 5)}% free, or when the system reports critical memory pressure. Closing ends the biggest consumer (SIGTERM, then SIGKILL), one at a time, until memory is back; what it had not saved is lost.</div>
-    ${ferr('memory_guard.action')}${ferr('memory_guard.scope')}`;
+    ${ferr('memory_guard.action')}${ferr('memory_guard.scope')}
+    <h4 class="cat-h">Commands that keep starting themselves</h4>
+    <div class="row2"><label>Runaway chains <select data-k="runaway.action" aria-label="Runaway chains action">${opts(RW_ACTIONS, rw.action || 'notify')}</select></label>
+      <label>Copies nested (a chain) ${numIn('data-k="runaway.depth"', rw.depth ?? 6, 'Runaway depth', '1', RANGE.runaway_depth)}</label></div>
+    <div class="row2"><label>Warn agents about the command for (s) ${numIn('data-k="runaway.remember_secs"', rw.remember_secs ?? 3600, 'Runaway remember seconds', '1', RANGE.runaway_remember_secs)}</label></div>
+    <div class="dim">A command running inside this many copies of itself (same command line and folder), such as a build script that calls itself, is a runaway chain. Stopping waits until the chain has lasted three samples and grown two levels deeper, then freezes the whole chain and kills it; shells and agents are never counted as copies. Afterwards the guard rule <span class="mono">runaway_repeat</span> warns agents before they run that command there again, for this long (0: not at all).</div>
+    ${ferr('runaway.action')}${ferr('runaway.depth')}${ferr('runaway.remember_secs')}`;
 }
 
 function readLimits(card) {
@@ -295,12 +303,15 @@ function readLimits(card) {
   if (n('limits.hog_share_pct') === '' || !Number.isFinite(share)) errors.push(['limits.hog_share_pct', 'Share: enter a number']);
   else if (share < RANGE.hog_share_pct[0] || share > RANGE.hog_share_pct[1]) errors.push(['limits.hog_share_pct', `Share: between ${RANGE.hog_share_pct[0]} and ${RANGE.hog_share_pct[1]}`]);
   const secs = intIn(n('limits.hog_sustain_secs'), RANGE.hog_sustain_secs, 'Seconds', errors, 'limits.hog_sustain_secs');
+  const rwDepth = intIn(n('runaway.depth'), RANGE.runaway_depth, 'Copies nested', errors, 'runaway.depth');
+  const rwRemember = intIn(n('runaway.remember_secs'), RANGE.runaway_remember_secs, 'Seconds', errors, 'runaway.remember_secs');
   return {
     errors,
     patch: {
       sessions: { enabled: card.querySelector('[data-k="sessions.enabled"]').checked },
       limits: { default: def ? def.budget : null, workspaces: ws, hog_share_pct: share, hog_sustain_secs: secs },
       memory_guard: { action: n('memory_guard.action'), scope: n('memory_guard.scope') },
+      runaway: { action: n('runaway.action'), depth: rwDepth, remember_secs: rwRemember },
     },
   };
 }
@@ -329,6 +340,18 @@ function memoryGuardHtml(g) {
     ${closed.slice(0, 10).map(c => `<div class="bkrow">${esc(c.name)} (${esc(mbText(c.mem_mb))}) <span class="dim">${esc(ago(c.at_unix))} ago · ${esc(c.detail || String(c.state).replace(/_/g, ' '))}</span></div>`).join('')}`;
 }
 
+// Runaway chains: whether they are stopped, what runs now, what was stopped.
+function runawayHtml(r) {
+  if (!r || r.action === 'off') return '';
+  const mode = r.action !== 'stop' ? 'Reports only.' : r.enforcing ? 'On: it stops a chain once it has lasted three samples (at least 6 s) and grown two levels deeper.' : 'Set to stop, but this engine does not act.';
+  const chains = r.chains || [], stopped = r.stoppings || [], memo = r.remembered || [];
+  const where = x => x.cwd ? ` in ${x.cwd}` : '';
+  return `<h4 class="cat-h">Runaway chains</h4><div class="dim">${esc(mode)}</div>
+    ${chains.map(c => `<div class="bkrow warn">${esc(c.command)}${esc(where(c))}: ${esc(c.depth)} copies, ${esc(c.processes)} processes, ${esc(mbText(c.mem_mb))} <span class="dim">since ${esc(ago(c.first_seen_unix))} ago</span></div>`).join('')}
+    ${stopped.slice(0, 10).map(x => `<div class="bkrow">${esc(x.command)}${esc(where(x))} (${esc(x.depth)} copies, ${esc(mbText(x.mem_mb))}) <span class="dim">${esc(ago(x.at_unix))} ago · ${esc(x.detail || String(x.state).replace(/_/g, ' '))}</span></div>`).join('')}
+    ${memo.length ? `<div class="dim">Agents are warned before running: ${memo.map(m => `<span class="mono">${esc(m.command)}</span>${esc(where(m))}`).join(', ')}.</div>` : ''}`;
+}
+
 function limitsStatusHtml() {
   const S = st.S, s = S?.sessions || {}, l = lstat;
   const sessName = id => (s.list || []).find(x => x.id === id)?.agent || id;
@@ -348,7 +371,8 @@ function limitsStatusHtml() {
     ${pausedRow(paused, 'Paused by Mulchie', 'They resume on their own after the resume delay; resume them now through a plan.')}
     ${pausedRow(left, 'Left paused by an earlier engine', 'This engine will not resume these on its own.')}
     ${!paused.length && !left.length ? '<h4 class="cat-h">Paused by Mulchie (0)</h4><div class="dim">Nothing is paused.</div>' : ''}
-    ${memoryGuardHtml(l?.memory_guard || S?.memory_guard)}`;
+    ${memoryGuardHtml(l?.memory_guard || S?.memory_guard)}
+    ${runawayHtml(l?.runaway || S?.runaway)}`;
 }
 
 function loadLimitsStatus() {
@@ -513,6 +537,12 @@ async function onClick(e) {
       if (patch.memory_guard && mg.action === 'stop' && (was.action !== 'stop' || (mg.scope === 'all' && was.scope !== 'all'))) {
         const ok = await modal({ title: 'Let Mulchie close processes when memory runs low?', danger: true, yes: 'Turn it on',
           html: `<div>When memory stays low, Mulchie will end the biggest consumer among ${esc(mg.scope === 'all' ? 'your apps, workspaces and programs (this can be an app you are using)' : 'what agent sessions started (builds, tests, dev servers; not the agent itself)')}, one at a time, until memory is back. Whatever a closed process had not saved is lost.</div>` });
+        if (!ok) return;
+      }
+      const rw = r.patch.runaway, rwWas = d?.config?.runaway || {};
+      if (patch.runaway && rw.action === 'stop' && rwWas.action !== 'stop') {
+        const ok = await modal({ title: 'Let Mulchie stop runaway chains?', danger: true, yes: 'Turn it on',
+          html: `<div>When a command runs inside ${esc(rw.depth)} or more copies of itself, Mulchie will freeze the whole chain and then kill it. Whatever those processes had not saved is lost. Shells and agents are never counted as copies.</div>` });
         if (!ok) return;
       }
     }

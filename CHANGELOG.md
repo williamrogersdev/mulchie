@@ -8,6 +8,14 @@ All notable changes to Mulchie are listed here. The format follows
 
 ### Fixed
 
+- `mulchie hook` sends the command text up to the guard's 64 KiB limit (it cut it at 8 KiB), and a longer command arrives longer than that limit, so the guard warns `too_long` instead of checking a cut copy.
+- Copilot CLI runs its tool hooks for every tool. The hook now sends only shell tools (`bash`, `shell`, `powershell`) to the engine and allows the rest at once.
+- `mulchie hooks status` warns when an agent app's hook ran with a different config directory (`XDG_CONFIG_HOME`) than its own: such a hook cannot find the engine and allows everything. The hook notes this in `~/.config/mulchie/hook-dirs.json`.
+- `mcp install` and `hooks install` name each backup `<file>.mulchie-backup-<unix>-<random>`, so two in one second no longer collide, and keep only the newest five per file.
+- `~/Library/Logs/mulchie-serve.log` no longer grows without end: past 10 MiB `mulchie serve` copies it to `mulchie-serve.log.1` and empties it.
+- App connected to another engine: one `/v1/health` call per tick (an authenticated check every 30 s), and history fetched with the new `GET /v1/history?since=` instead of whole each time.
+- App: a click on the menu bar icon that closes the panel by taking its focus no longer opens it again.
+
 - Mulchie's own update check never offered a release candidate to someone running one: it asked GitHub for the latest release, which leaves pre-releases out. An install that is itself a pre-release now asks for the newest releases and is offered the highest version, pre-releases included. A stable install is still offered stable releases only.
 
 - Build throttling no longer leaves builds slow for good. Mulchie lowered the priority of every build it saw during one busy 3-second sample and then could not raise it again, because raising a priority needs root: builds and dev servers stayed at the lower priority until they exited. Now builds are throttled only after 15 seconds of sustained pressure, priorities go back after 30 calm seconds, and an engine that cannot put a priority back (one not running as root) does not lower any.
@@ -17,6 +25,9 @@ All notable changes to Mulchie are listed here. The format follows
 - With no engine running, the MCP server's `diagnose` scanned the disk at full priority on every call, in every agent's server. It now scans at background priority and reuses the result for 15 minutes.
 
 ### Added
+
+- App: Settings has a **Runaway chains** section next to the memory guard (action, nesting depth, how long agents are warned) and shows chains running now, what was stopped and which commands agents are warned about.
+- `GET /v1/history?since=<unix seconds>` returns only the samples taken after that time.
 
 - App: **Check for Updates…** in the Mulchie menu at the top left, with the standard About, Services, Hide and Quit items and Edit and Window menus. The dashboard and the panel show an update button while a newer version is known: **Update to X** installs it in a build that can update itself, **Get X** says how to get it in one that cannot. A build that can update itself looks for a new version a minute after launch and every six hours.
 

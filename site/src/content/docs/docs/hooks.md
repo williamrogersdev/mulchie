@@ -16,7 +16,7 @@ mulchie hooks status
 mulchie hooks uninstall --client claude-code
 ```
 
-`--client` is `claude-code`, `codex`, `cursor`, `gemini` or `copilot`. `--dry-run` prints the exact change and changes nothing. `mulchie hooks status` lists which apps have Mulchie's hooks and for which events. `uninstall` removes exactly the entries `install` added.
+`--client` is `claude-code`, `codex`, `cursor`, `gemini` or `copilot`. `--dry-run` prints the exact change and changes nothing. `mulchie hooks status` lists which apps have Mulchie's hooks and for which events. It also warns when an app's hook ran in the last 7 days with a different config directory than `hooks status` itself: the agent's `XDG_CONFIG_HOME` differs from the engine's, so its hook cannot find the engine and allows everything. Give both the same `XDG_CONFIG_HOME`, or unset it in both. (The hook notes this in `~/.config/mulchie/hook-dirs.json`.) `uninstall` removes exactly the entries `install` added.
 
 | Client | File that `install` edits | Events registered (Mulchie's name: the client's name) |
 | --- | --- | --- |
@@ -30,7 +30,7 @@ What `install` does to the file:
 
 - Other keys and other hooks in the file are kept, in their order. A hook of your own on the same event is never touched.
 - A file that cannot be parsed is not changed.
-- The old file is copied to `<file>.mulchie-backup-<unix time>` first. The new file is written through a temporary file and a rename, after a check that the app did not save the file in the meantime.
+- The old file is copied to `<file>.mulchie-backup-<unix time>-<random>` first. The newest five backups of each file are kept; older ones are removed. The new file is written through a temporary file and a rename, after a check that the app did not save the file in the meantime.
 - Every hook has a timeout of 5 seconds in the client's own unit (Codex's `SessionEnd`: 2 seconds).
 
 Each entry runs `mulchie hook <client> <event>` by the absolute path of the binary you ran. The command first checks that the binary still exists and allows the action if it does not, so removing Mulchie without `mulchie hooks uninstall` does not break the agent. For the shell-command event, `--guard off|warn|block` on `install` writes how far guard rules may go in that app (see [warn and block](#warn-and-block-by-client)).
@@ -56,7 +56,7 @@ The hook maps the event to a session from the process that ran it and its parent
 
 ### What is sent
 
-The hook talks only to the engine on `127.0.0.1`, with the read-only token. It sends the client's name and session id, the event, the pid of the process that ran the hook, the working directory, and for shell commands the tool name and the command text (cut at 8 KiB). **Prompt text is never sent to the engine.** The command text is redacted and cut before it is stored in the activity record.
+The hook talks only to the engine on `127.0.0.1`, with the read-only token. It sends the client's name and session id, the event, the pid of the process that ran the hook, the working directory, and for shell commands the tool name and the command text (up to 64 KiB; a longer command is cut just past that, and the guard warns `too_long`). Copilot runs its tool hooks for every tool; only its shell tools (`bash`, `shell`, `powershell`) are sent to the engine, the rest are allowed at once. **Prompt text is never sent to the engine.** The command text is redacted and cut before it is stored in the activity record.
 
 ### It fails open
 

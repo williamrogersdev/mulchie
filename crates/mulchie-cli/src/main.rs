@@ -15,6 +15,7 @@ mod observe;
 mod plan;
 mod process;
 mod run;
+mod serve_log;
 mod service;
 mod sessions;
 mod slots;

@@ -12,7 +12,7 @@ use serde_json::{json, Value};
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tauri::image::Image;
 use tauri::menu::{Menu, MenuItem, PredefinedMenuItem, Submenu};
 use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
@@ -565,6 +565,30 @@ fn tray_title(t: &TrayInfo) -> String {
     format!("{mark}{:.0}G · {:.0}%", t.disk_free as f64 / 1e9, t.cpu_pct)
 }
 
+/// When the panel last hid because it lost focus. A click on the tray icon
+/// takes the focus first, so without this the click would hide the panel
+/// and then show it again.
+static BLUR_HIDDEN_AT: std::sync::Mutex<Option<Instant>> = std::sync::Mutex::new(None);
+/// A tray click this soon after a focus-loss hide is the click that caused it.
+pub const BLUR_CLICK_WINDOW: Duration = Duration::from_millis(400);
+
+fn note_blur_hide(now: Instant) {
+    if let Ok(mut g) = BLUR_HIDDEN_AT.lock() {
+        *g = Some(now);
+    }
+}
+
+/// Whether the panel hid on focus loss within [`BLUR_CLICK_WINDOW`] before
+/// `now`; forgets that hide either way.
+fn take_recent_blur_hide(now: Instant) -> bool {
+    let at = BLUR_HIDDEN_AT.lock().ok().and_then(|mut g| g.take());
+    blur_hide_is_recent(at, now)
+}
+
+pub fn blur_hide_is_recent(at: Option<Instant>, now: Instant) -> bool {
+    at.is_some_and(|t| now.saturating_duration_since(t) <= BLUR_CLICK_WINDOW)
+}
+
 fn toggle_panel(app: &AppHandle, rect: Option<tauri::Rect>) {
     let Some(win) = app.get_webview_window("panel") else {
         return;
@@ -744,7 +768,11 @@ fn main() {
                         ..
                     } = event
                     {
-                        toggle_panel(tray.app_handle(), Some(rect));
+                        // The click that hid the panel by taking its focus
+                        // must not show it again.
+                        if !take_recent_blur_hide(Instant::now()) {
+                            toggle_panel(tray.app_handle(), Some(rect));
+                        }
                     }
                 })
                 .build(app)?;
@@ -754,6 +782,9 @@ fn main() {
                 let w = win.clone();
                 win.on_window_event(move |e| {
                     if let WindowEvent::Focused(false) = e {
+                        if w.is_visible().unwrap_or(false) {
+                            note_blur_hide(Instant::now());
+                        }
                         let _ = w.hide();
                         set_visible(&w, false);
                     }

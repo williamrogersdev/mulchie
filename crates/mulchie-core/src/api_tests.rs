@@ -413,6 +413,33 @@ fn host_and_origin_are_checked_before_anything_else() {
 }
 
 #[test]
+fn history_since_returns_only_newer_samples() {
+    let r = running(Limits::default());
+    for t in [100, 103, 106] {
+        r.engine.push_history(crate::engine::Sample {
+            t,
+            ..Default::default()
+        });
+    }
+    let auth = format!("Bearer {}", r.token);
+    let ts = |path: &str| {
+        let (code, v) = send(r.port, "GET", path, Some(&auth), "");
+        assert_eq!(code, 200, "{path}: {v}");
+        v.as_array()
+            .unwrap()
+            .iter()
+            .map(|s| s["t"].as_u64().unwrap())
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(ts("/v1/history"), [100, 103, 106]);
+    assert_eq!(ts("/v1/history?since=0"), [100, 103, 106]);
+    assert_eq!(ts("/v1/history?since=103"), [106]);
+    assert!(ts("/v1/history?since=106").is_empty());
+    let (code, v) = send(r.port, "GET", "/v1/history?since=x", Some(&auth), "");
+    assert_eq!((code, v["code"].as_str()), (400, Some("invalid_query")));
+}
+
+#[test]
 fn health_reports_staleness() {
     let r = running(Limits::default());
     let (code, v) = send(r.port, "GET", "/v1/health", None, "");

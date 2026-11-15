@@ -295,7 +295,19 @@ struct Inner {
     down_since: Option<Instant>,
     /// Consecutive soft failures (timeouts) of a remote engine.
     fails: u32,
+    /// When [`Backend::tick`] last made its authenticated check of a remote
+    /// engine; `None` after (re)connecting.
+    auth_checked: Option<Instant>,
+    /// The remote engine's `/v1/health`, as `tick` fetched it.
+    health: Option<(Instant, Value)>,
 }
+
+/// How often `tick` checks a remote engine with an authenticated call. In
+/// between it fetches only `/v1/health`, which [`Backend::tray_info`] reuses,
+/// so a client makes one call per tick (two every this often).
+pub const AUTH_CHECK_EVERY: Duration = Duration::from_secs(30);
+/// How old a health reading `tray_info` reuses at most.
+const HEALTH_REUSE: Duration = Duration::from_secs(2);
 
 pub struct Backend {
     paths: Paths,
@@ -357,6 +369,8 @@ impl Backend {
                 server: None,
                 down_since: Some(Instant::now()),
                 fails: 0,
+                auth_checked: None,
+                health: None,
             }),
             plans: Mutex::new(PlanBook::default()),
         };
@@ -460,6 +474,8 @@ impl Backend {
                 guard(&self.plans).clear();
                 inner.down_since = None;
                 inner.fails = 0;
+                inner.auth_checked = None;
+                inner.health = None;
             }
             Err(e) => self.set_down(inner, e),
         }
@@ -492,6 +508,8 @@ impl Backend {
         inner.info.engine_pid = None;
         inner.conn = Conn::Down;
         inner.fails = 0;
+        inner.auth_checked = None;
+        inner.health = None;
     }
 
     /// A remote call failed: drop the connection when [`failure_kind`] says
@@ -524,15 +542,33 @@ impl Backend {
         }
     }
 
-    /// One supervision step (every few seconds): check a remote engine with
-    /// an authenticated call, and when disconnected, reconnect or take over.
+    /// One supervision step (every few seconds): check a remote engine (with
+    /// an authenticated call every [`AUTH_CHECK_EVERY`], otherwise through
+    /// `/v1/health`, kept for [`Backend::tray_info`]), and when disconnected,
+    /// reconnect or take over.
     pub fn tick(&self) {
         match self.conn() {
             Conn::Local(_) => {}
-            Conn::Remote(c) => match c.request("GET", "/v1/advice", None, api::HEALTH_TIMEOUT) {
-                Ok(_) => self.note_ok(),
-                Err(e) => self.note_failure(&e),
-            },
+            Conn::Remote(c) => {
+                let due = guard(&self.inner)
+                    .auth_checked
+                    .is_none_or(|t| t.elapsed() >= AUTH_CHECK_EVERY);
+                let path = if due { "/v1/advice" } else { "/v1/health" };
+                match c.request("GET", path, None, api::HEALTH_TIMEOUT) {
+                    Ok(v) => {
+                        self.note_ok();
+                        let mut inner = guard(&self.inner);
+                        if matches!(inner.conn, Conn::Remote(_)) {
+                            if due {
+                                inner.auth_checked = Some(Instant::now());
+                            } else {
+                                inner.health = Some((Instant::now(), v));
+                            }
+                        }
+                    }
+                    Err(e) => self.note_failure(&e),
+                }
+            }
             Conn::Down => {
                 if let Some(h) = lock::running_engine(&self.paths) {
                     return self.connect_unlocked(h.port);
@@ -619,13 +655,23 @@ impl Backend {
                 let h: Vec<Sample> = e.history().into_iter().filter(|s| s.t > since).collect();
                 return h.iter().map(to_value).collect();
             }
-            Conn::Remote(c) => from_value(self.remote(&c, "GET", "/v1/history", None)?)?,
+            // An engine older than `since` ignores it and sends everything;
+            // the filter below still applies.
+            Conn::Remote(c) => {
+                from_value(self.remote(&c, "GET", &format!("/v1/history?since={since}"), None)?)?
+            }
             Conn::Down => return Err(self.down_error()),
         };
         Ok(all
             .into_iter()
             .filter(|s| s["t"].as_u64().unwrap_or(0) > since)
             .collect())
+    }
+
+    /// Tests: whether `tick` left a health reading for `tray_info`.
+    #[cfg(test)]
+    pub fn has_health_reading(&self) -> bool {
+        guard(&self.inner).health.is_some()
     }
 
     pub fn tray_info(&self) -> Result<TrayInfo, String> {
@@ -637,12 +683,19 @@ impl Backend {
                     Some(t.disk_total > 0 && t.disk_free < alert.saturating_mul(1_000_000_000));
                 Ok(t)
             }
-            Conn::Remote(c) => Ok(TrayInfo::from_health(&self.remote(
-                &c,
-                "GET",
-                "/v1/health",
-                None,
-            )?)),
+            Conn::Remote(c) => {
+                // The reading `tick` just took, when there is one.
+                let fresh = guard(&self.inner)
+                    .health
+                    .take()
+                    .filter(|(t, _)| t.elapsed() <= HEALTH_REUSE)
+                    .map(|(_, v)| v);
+                let h = match fresh {
+                    Some(v) => v,
+                    None => self.remote(&c, "GET", "/v1/health", None)?,
+                };
+                Ok(TrayInfo::from_health(&h))
+            }
             Conn::Down => Err(self.down_error()),
         }
     }

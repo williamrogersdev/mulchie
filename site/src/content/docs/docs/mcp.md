@@ -24,7 +24,7 @@ What each client's setup does:
 | `claude-desktop` | Edits `claude_desktop_config.json`: `~/Library/Application Support/Claude/` on macOS, `~/.config/Claude/` on Linux. |
 | `cursor` | Edits `~/.cursor/mcp.json`. |
 
-When Mulchie edits a config file, it keeps the other entries, copies the old file to `<file>.mulchie-backup-<unix time>`, writes the new one atomically, and leaves a file it cannot parse alone. An existing, different `mulchie` entry is not replaced unless you pass `--force`. `<mulchie>` is the absolute path of the `mulchie` binary you ran.
+When Mulchie edits a config file, it keeps the other entries, copies the old file to `<file>.mulchie-backup-<unix time>-<random>` (keeping the newest five such copies), writes the new one atomically, and leaves a file it cannot parse alone. An existing, different `mulchie` entry is not replaced unless you pass `--force`. `<mulchie>` is the absolute path of the `mulchie` binary you ran.
 
 To remove it:
 
