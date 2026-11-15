@@ -3,6 +3,21 @@
 export const $ = s => document.querySelector(s);
 export const $$ = s => [...document.querySelectorAll(s)];
 
+// Replace a block's content only when it changed, and give focus back to
+// the same control (by its data attributes) when it was inside. Views redraw
+// on every poll; rewriting identical HTML would drop focus, a selection or a
+// click that spans the redraw.
+export function setHtml(el, html) {
+  if (!el || el.__html === html) return;
+  const f = document.activeElement, inside = f && f !== el && el.contains(f);
+  const key = inside ? [...f.attributes].filter(a => a.name.startsWith('data-')).map(a => `[${a.name}="${CSS.escape(a.value)}"]`).join('') : '';
+  el.innerHTML = html;
+  el.__html = html;
+  if (key) el.querySelector(key)?.focus({ preventScroll: true });
+}
+// `into(el).html = …`: setHtml as an assignment.
+export const into = el => ({ set html(v) { setHtml(el, v); } });
+
 export const esc = s => String(s ?? '').replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
 
 export function B(n, d = 1) {

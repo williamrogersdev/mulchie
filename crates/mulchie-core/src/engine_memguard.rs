@@ -406,6 +406,20 @@ impl Engine {
         if self.is_shut_down() {
             return refuse(ActionState::Skipped, "the engine is shutting down");
         }
+        // A stopped process does not act on SIGTERM until it is continued,
+        // so the grace period would be wasted and it would only die at the
+        // SIGKILL. Resume what a limit paused first.
+        let paused: Vec<PausedProc> = {
+            let sup = lock(&self.sup);
+            sup.paused
+                .iter()
+                .filter(|p| c.targets.contains(&(p.pid, p.start_time)))
+                .cloned()
+                .collect()
+        };
+        if !paused.is_empty() {
+            self.resume_entries(&paused, "memory_guard");
+        }
         let reqs: Vec<Request> = c
             .targets
             .iter()

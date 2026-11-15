@@ -151,8 +151,16 @@ pub struct MemGuard {
     closings: VecDeque<Closing>,
     /// The key last announced in notify mode, so one episode notifies once.
     announced: Option<String>,
+    /// Closings for low memory since memory was last fine.
+    episode_closed: u32,
     seq: u64,
 }
+
+/// Closings for low memory or high swap in one episode (until memory is
+/// fine again). Closing the biggest unit does not always free what is short
+/// (swap is often held by programs outside any session), and without a cap
+/// the guard would close one session after another every cooldown.
+pub const MAX_CLOSINGS_PER_EPISODE: u32 = 2;
 
 impl MemGuard {
     pub fn low(&self) -> bool {
@@ -215,6 +223,10 @@ impl MemGuard {
         if matches!(state, ActionState::Skipped | ActionState::NotEnforced) {
             self.backoff
                 .insert(c.key.clone(), now.saturating_add(REFUSED_BACKOFF_SECS));
+            // Nothing was closed: it does not count against the episode.
+            if c.trigger != Trigger::OverCap {
+                self.episode_closed = self.episode_closed.saturating_sub(1);
+            }
         }
     }
 
@@ -267,6 +279,7 @@ impl MemGuard {
             self.low_since.get_or_insert(now);
         } else {
             self.low_since = None;
+            self.episode_closed = 0;
         }
         let sustained = |since: u64| now.saturating_sub(since) >= cfg.sustain_secs;
         self.low_due = self.low_since.is_some_and(sustained);
@@ -321,6 +334,13 @@ impl MemGuard {
             .is_some_and(|t| now < t.saturating_add(cfg.cooldown_secs))
         {
             return None;
+        }
+        let for_memory = trigger != Trigger::OverCap;
+        if for_memory && self.episode_closed >= MAX_CLOSINGS_PER_EPISODE {
+            return None;
+        }
+        if for_memory {
+            self.episode_closed += 1;
         }
         self.seq += 1;
         let id = format!("m-{now}-{}", self.seq);

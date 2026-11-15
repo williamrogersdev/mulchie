@@ -34,7 +34,7 @@
   <key>ThrottleInterval</key>
   <integer>10</integer>
   <key>ProcessType</key>
-  <string>Background</string>
+  <string>Standard</string>
   <key>StandardOutPath</key>
   <string>@HOME@/Library/Logs/mulchie-serve.log</string>
   <key>StandardErrorPath</key>

@@ -221,7 +221,9 @@ fn stop_kills_the_whole_chain_and_what_it_started_since_the_sample() {
     );
     // The freeze was journaled for a crash and cleared once it was over.
     assert!(lock(&e.sup).paused.is_empty());
-    assert!(crate::engine::sessions::load_paused(&e.paths).unwrap().is_empty());
+    assert!(crate::engine::sessions::load_paused(&e.paths)
+        .unwrap()
+        .is_empty());
     assert_eq!(e.snapshot_state().runaway.stoppings.len(), 1);
     assert!(e
         .snapshot_state()

@@ -1,6 +1,6 @@
 // The Workspaces view. A row opens the workspace detail.
 import { st } from '../store.js';
-import { $, $$, esc, B, BS, sortRows, th, meter, rowBtn } from '../util.js';
+import { $, into, $$, esc, B, BS, sortRows, th, meter, rowBtn } from '../util.js';
 import { sparkline } from '../chart.js';
 import { cores } from '../consumers.js';
 
@@ -12,7 +12,7 @@ export function renderWss() {
   rows = sortRows(rows, [k, ui.wSort[1]]);
   const cm = Math.max(1, ...rows.map(w => w.cpu_pct)), mm = Math.max(1, ...rows.map(w => w.mem_bytes));
   const sel = st.ui.detail?.type === 'ws' ? st.ui.detail.key : null;
-  $('#wss').innerHTML = th([{ l: 'Workspace', k: 'label' }, { l: 'Branch', k: 'branch', c: 'c-lg' }, { l: 'Agents', k: 'agents', n: 1, w: '62px' }, { l: 'Builds', k: 'builds', n: 1, w: '58px' }, { l: 'Procs', k: 'procs', n: 1, w: '56px', c: 'c-md' },
+  into($('#wss')).html = th([{ l: 'Workspace', k: 'label' }, { l: 'Branch', k: 'branch', c: 'c-lg' }, { l: 'Agents', k: 'agents', n: 1, w: '62px' }, { l: 'Builds', k: 'builds', n: 1, w: '58px' }, { l: 'Procs', k: 'procs', n: 1, w: '56px', c: 'c-md' },
     { l: 'CPU', k: 'cpu_pct', n: 1, w: '128px' }, { l: 'Last 5 min', w: '96px', c: 'c-xl' }, { l: 'Mem', k: 'mem_bytes', n: 1, w: '124px' }, { l: 'Disk I/O', k: 'io', n: 1, w: '90px', c: 'c-xl' }, { l: 'State', w: '120px', c: 'c-md' }, { l: '', w: '64px' }], ui.wSort, 'w') +
     (rows.map(w => `<tr class="click ${sel === w.path ? 'sel' : ''}" role="button" tabindex="0" data-d="ws" data-dk="${esc(w.path)}">
       <td title="${esc(w.path)}">${esc(w.label)}</td><td class="dim mono c-lg" title="${esc(w.branch || '')}">${esc(w.branch || '—')}</td>

@@ -201,6 +201,8 @@ fn closings_are_capped_and_newest_first() {
     for i in 0..(CLOSINGS_KEPT as u64 + 5) {
         let u = [unit(&format!("u{i}"), 1000.0)];
         assert!(g.evaluate(i * 10, &mem(3.0), &u, &c, true).is_some());
+        // Memory recovers in between: every closing is its own episode.
+        assert!(g.evaluate(i * 10 + 5, &mem(50.0), &u, &c, true).is_none());
     }
     assert_eq!(g.closings().count(), CLOSINGS_KEPT);
     assert_eq!(g.closings().next().unwrap().key, "u54");
@@ -264,4 +266,23 @@ fn swap_filling_up_counts_as_low_while_memory_still_looks_free() {
     let id = g.evaluate(0, &both, &u, &c, true).unwrap();
     assert_eq!(g.get(&id).unwrap().trigger, Trigger::MemoryLow);
     assert!(!g.by_swap());
+}
+
+/// One stretch of low memory closes at most MAX_CLOSINGS_PER_EPISODE units,
+/// however long it lasts; once memory is fine again the count starts over.
+#[test]
+fn one_low_memory_episode_closes_only_a_few_units() {
+    let mut c = stop();
+    c.sustain_secs = 0;
+    c.cooldown_secs = 10;
+    let mut g = MemGuard::default();
+    let u: Vec<Unit> = (0..6)
+        .map(|i| unit(&format!("u{i}"), 1000.0 + i as f64))
+        .collect();
+    let closed = (0..20u64)
+        .filter(|i| g.evaluate(i * 10, &mem(3.0), &u, &c, true).is_some())
+        .count();
+    assert_eq!(closed, MAX_CLOSINGS_PER_EPISODE as usize);
+    assert!(g.evaluate(300, &mem(50.0), &u, &c, true).is_none());
+    assert!(g.evaluate(310, &mem(3.0), &u, &c, true).is_some());
 }

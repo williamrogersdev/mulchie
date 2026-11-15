@@ -1120,7 +1120,7 @@ impl Engine {
     /// SIGCONT these paused processes through the gate and forget them
     /// (whatever the outcome: a process that exited or whose pid was reused
     /// needs nothing more). Returns how many were resumed.
-    fn resume_entries(&self, entries: &[PausedProc], source: &str) -> usize {
+    pub(crate) fn resume_entries(&self, entries: &[PausedProc], source: &str) -> usize {
         if entries.is_empty() {
             return 0;
         }

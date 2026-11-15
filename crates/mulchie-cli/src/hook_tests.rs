@@ -476,7 +476,7 @@ fn warn_asks_where_the_client_can_and_advises_where_it_cannot() {
     let (_, o) = go(Gemini, "pre_tool", r.clone(), None);
     assert_eq!(
         parsed(&o),
-        json!({ "decision": "allow", "systemMessage": format!("Mulchie warns: {why}") })
+        json!({ "systemMessage": format!("Mulchie warns: {why}") })
     );
     // A warning on a prompt is advice.
     let (_, o) = go(ClaudeCode, "prompt", r, None);

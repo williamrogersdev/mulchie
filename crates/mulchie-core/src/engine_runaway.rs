@@ -317,9 +317,7 @@ impl Engine {
                 .count();
             detail.push_str(&format!("; resumed {resumed} it could not kill"));
         }
-        lock(&self.sup)
-            .paused
-            .retain(|p| p.breach_id != journal_id);
+        lock(&self.sup).paused.retain(|p| p.breach_id != journal_id);
         self.persist_paused();
         let state = sessions::state_of(done, total);
         lock(&self.sup)

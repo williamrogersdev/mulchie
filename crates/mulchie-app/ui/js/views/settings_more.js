@@ -11,7 +11,7 @@
 // unsaved edits; the status parts are updated in place without moving focus.
 import { st, hooks } from '../store.js';
 import { invoke } from '../ipc.js';
-import { $, esc, ago, toast, tilde, B } from '../util.js';
+import { $, esc, ago, toast, tilde, B, setHtml } from '../util.js';
 import { resumePaused } from '../signals.js';
 import { modal } from '../dialogs.js';
 import { isHookOnly } from './sessions.js';
@@ -425,16 +425,7 @@ const CARDS = [
   ['upd', 'Update checks', updatesForm, readUpdates, 'updates'],
 ];
 
-// Replace a block's content only when it changed, and give focus back to
-// the same control (by its data attributes) when it was inside.
-export function setHtml(el, html) {
-  if (el.__html === html) return;
-  const f = document.activeElement, inside = f && f !== el && el.contains(f);
-  const key = inside ? [...f.attributes].filter(a => a.name.startsWith('data-')).map(a => `[${a.name}="${CSS.escape(a.value)}"]`).join('') : '';
-  el.innerHTML = html;
-  el.__html = html;
-  if (key) el.querySelector(key)?.focus({ preventScroll: true });
-}
+export { setHtml };
 
 const setDisabled = (el, v) => { if (el.disabled !== v) el.disabled = v; };
 
