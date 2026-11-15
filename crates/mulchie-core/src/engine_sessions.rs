@@ -75,6 +75,11 @@ pub(crate) enum LimitJob {
     RunawayStop { id: String },
 }
 
+/// `breach_id` prefix of the paused-list entries a runaway stopping writes
+/// before it freezes a chain, so a crash between the freeze and the kill
+/// still leaves them for the next engine to resume.
+pub(crate) const RUNAWAY_FREEZE: &str = "runaway:";
+
 /// Paused processes whose pause no longer applies and that no queued job
 /// resumes yet: every one when sessions are off; otherwise those whose breach
 /// is gone or whose budget no longer has that cap with action `pause`.
@@ -89,7 +94,11 @@ fn paused_without_a_pause(sup: &Supervision, cfg: &Config) -> (Vec<PausedProc>, 
         .flatten()
         .map(|p| (p.pid, p.start_time))
         .collect();
-    let fresh = |p: &&PausedProc| !queued.contains(&(p.pid, p.start_time));
+    // A runaway stopping's freeze is its own: it ends in a kill or a resume
+    // within the same job.
+    let fresh = |p: &&PausedProc| {
+        !queued.contains(&(p.pid, p.start_time)) && !p.breach_id.starts_with(RUNAWAY_FREEZE)
+    };
     if !cfg.sessions.enabled {
         let v = sup.paused.iter().filter(fresh).cloned().collect();
         return (v, "sessions are turned off");
@@ -700,7 +709,7 @@ impl Engine {
         }
     }
 
-    fn persist_paused(&self) {
+    pub(crate) fn persist_paused(&self) {
         let paused = lock(&self.sup).paused.clone();
         if let Err(e) = save_paused(&self.paths, &paused) {
             self.log(

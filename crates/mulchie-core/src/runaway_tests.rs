@@ -175,29 +175,127 @@ fn the_default_reports_once_and_stops_nothing() {
     assert_eq!(r.stoppings().count(), 0);
 }
 
+/// Three samples three seconds apart of a chain that grows from 8 to 10
+/// levels: what it takes before anything is stopped. The last decision.
+fn grow(r: &mut Runaway, c: &RunawayConfig, session: Option<&str>) -> Decision {
+    let mut last = Decision::default();
+    for (t, levels) in [(100, 8), (103, 9), (106, 10)] {
+        let mut chains = detect(&build_chain(levels), c.depth);
+        if let Some(s) = session {
+            chains[0].session_id = Some(s.into());
+        }
+        last = r.evaluate(t, chains, c, true);
+    }
+    last
+}
+
 #[test]
 fn stop_queues_one_stopping_and_tries_again_only_after_a_while() {
     let c = stop_cfg();
     let mut r = Runaway::default();
-    let d = r.evaluate(100, detect(&build_chain(8), c.depth), &c, true);
+    let d = grow(&mut r, &c, None);
     assert_eq!(d.stop.len(), 1);
     let s = r.get(&d.stop[0]).unwrap().clone();
     assert_eq!(s.state, ActionState::Pending);
     assert_eq!(s.root, (100, 30));
-    assert_eq!((s.depth, s.processes), (8, 24));
+    assert_eq!((s.depth, s.processes), (10, 30));
     // Still there three seconds later: not queued twice.
     assert!(r
-        .evaluate(103, detect(&build_chain(8), c.depth), &c, true)
+        .evaluate(109, detect(&build_chain(10), c.depth), &c, true)
         .stop
         .is_empty());
     // Still there after the retry time: once more.
     assert_eq!(
-        r.evaluate(100 + RETRY_SECS, detect(&build_chain(8), c.depth), &c, true)
-            .stop
-            .len(),
+        r.evaluate(
+            106 + RETRY_SECS,
+            detect(&build_chain(10), c.depth),
+            &c,
+            true
+        )
+        .stop
+        .len(),
         1
     );
     assert_eq!(r.stoppings().count(), 2);
+}
+
+/// One sample is never enough, nor is nesting that stays as deep as it was.
+#[test]
+fn a_chain_is_stopped_only_when_it_persists_and_grows() {
+    let c = stop_cfg();
+    let mut r = Runaway::default();
+    for t in [100, 103, 106, 109, 200] {
+        let d = r.evaluate(t, detect(&build_chain(8), c.depth), &c, true);
+        assert!(
+            d.stop.is_empty(),
+            "stopped a chain that did not grow at {t}"
+        );
+    }
+    let mut r = Runaway::default();
+    assert!(r
+        .evaluate(100, detect(&build_chain(8), c.depth), &c, true)
+        .stop
+        .is_empty());
+    // Deeper, but on the second sample only.
+    assert!(r
+        .evaluate(101, detect(&build_chain(12), c.depth), &c, true)
+        .stop
+        .is_empty());
+}
+
+/// Login and `-c` shells fork copies of themselves for every subshell;
+/// an agent's shells nest like that all day. Neither is a runaway.
+#[test]
+fn shells_that_fork_subshells_are_not_a_chain() {
+    for cmd in [
+        "zsh -l",
+        "/bin/zsh -l",
+        "bash --login -i",
+        "zsh -lc source ~/.zshrc && npm test",
+        "sh -c make",
+    ] {
+        let procs: Vec<SessionProc> = (0..12u32)
+            .map(|l| {
+                p(
+                    100 + l,
+                    if l == 0 { 1 } else { 99 + l },
+                    20 + l as u64,
+                    cmd,
+                    "/code",
+                )
+            })
+            .collect();
+        assert!(detect(&procs, 6).is_empty(), "{cmd}");
+    }
+    // A script that calls itself through a shell is still caught.
+    let procs: Vec<SessionProc> = (0..8u32)
+        .map(|l| {
+            p(
+                100 + l,
+                if l == 0 { 1 } else { 99 + l },
+                20 + l as u64,
+                "bash build.sh",
+                "/code",
+            )
+        })
+        .collect();
+    assert_eq!(detect(&procs, 6).len(), 1);
+    // An agent is never the command.
+    let mut procs: Vec<SessionProc> = (0..8u32)
+        .map(|l| {
+            p(
+                100 + l,
+                if l == 0 { 1 } else { 99 + l },
+                20 + l as u64,
+                "claude",
+                "/code",
+            )
+        })
+        .collect();
+    for q in &mut procs {
+        q.agent = Some("claude".into());
+    }
+    assert!(detect(&procs, 6).is_empty());
 }
 
 #[test]
@@ -257,9 +355,7 @@ fn a_chain_is_remembered_for_the_guard_rule_until_it_expires() {
 fn a_stopped_chain_is_told_to_its_session_once() {
     let c = stop_cfg();
     let mut r = Runaway::default();
-    let mut chains = detect(&build_chain(8), c.depth);
-    chains[0].session_id = Some("s-10-5".into());
-    let id = r.evaluate(100, chains, &c, true).stop.remove(0);
+    let id = grow(&mut r, &c, Some("s-10-5")).stop.remove(0);
     assert!(
         r.take_notes("s-10-5").is_empty(),
         "nothing before the gate ran"
@@ -268,15 +364,13 @@ fn a_stopped_chain_is_told_to_its_session_once() {
     let notes = r.take_notes("s-10-5");
     assert_eq!(notes.len(), 1);
     assert!(
-        notes[0].contains("npm run build") && notes[0].contains("8 copies"),
+        notes[0].contains("npm run build") && notes[0].contains("10 copies"),
         "{notes:?}"
     );
     assert!(r.take_notes("s-10-5").is_empty());
     // A stopping of which nothing was stopped says nothing.
     let mut r = Runaway::default();
-    let mut chains = detect(&build_chain(8), c.depth);
-    chains[0].session_id = Some("s-10-5".into());
-    let id = r.evaluate(100, chains, &c, true).stop.remove(0);
+    let id = grow(&mut r, &c, Some("s-10-5")).stop.remove(0);
     r.set_result(
         &id,
         ActionState::Skipped,

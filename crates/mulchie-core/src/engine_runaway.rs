@@ -216,9 +216,41 @@ impl Engine {
         if !self.automation_allowed() {
             return refuse(ActionState::NotEnforced, "automation is off on this engine");
         }
+        // Shutdown takes this lock before it resumes everything paused, so a
+        // freeze either finishes first or never starts.
+        let _pausing = lock(&self.pause_lock);
         if self.is_shut_down() {
             return refuse(ActionState::Skipped, "the engine is shutting down");
         }
+        // Decided on a sample; act only if the chain is still as big. Nesting
+        // that already unwound (subshells that exited) is left alone.
+        let still = tree(&self.procs.list(), s.root).len();
+        if still == 0 {
+            return refuse(ActionState::Skipped, "the chain had already ended");
+        }
+        if still < s.depth {
+            return refuse(
+                ActionState::Skipped,
+                "the chain had shrunk below the nesting depth before it was stopped",
+            );
+        }
+        let journal_id = format!("{}{id}", sessions::RUNAWAY_FREEZE);
+        let journal = |targets: &[(u32, u64)]| {
+            {
+                let mut sup = lock(&self.sup);
+                for (pid, st) in targets {
+                    sup.paused.push(PausedProc {
+                        pid: *pid,
+                        start_time: *st,
+                        session_id: s.session_id.clone().unwrap_or_default(),
+                        breach_id: journal_id.clone(),
+                        since_unix: now,
+                        pausing: true,
+                    });
+                }
+            }
+            self.persist_paused();
+        };
         let signal = |targets: &[(u32, u64)], signal: Signal| -> Vec<ActionResult> {
             let reqs: Vec<Request> = targets
                 .iter()
@@ -239,6 +271,9 @@ impl Engine {
             if new.is_empty() {
                 break;
             }
+            // Written before SIGSTOP: a crash before the kill or resume below
+            // leaves them for the next engine to resume.
+            journal(&new);
             let results = signal(&new, Signal::Stop);
             frozen.extend(
                 results
@@ -282,6 +317,10 @@ impl Engine {
                 .count();
             detail.push_str(&format!("; resumed {resumed} it could not kill"));
         }
+        lock(&self.sup)
+            .paused
+            .retain(|p| p.breach_id != journal_id);
+        self.persist_paused();
         let state = sessions::state_of(done, total);
         lock(&self.sup)
             .runaway
