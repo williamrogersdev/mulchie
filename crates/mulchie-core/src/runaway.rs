@@ -30,6 +30,20 @@ pub const STOPPINGS_KEPT: usize = 50;
 pub const MEMOS_KEPT: usize = 32;
 /// A chain the gate could not stop is tried again after this long.
 pub const RETRY_SECS: u64 = 30;
+/// A chain is stopped only when it was in at least this many samples...
+pub const CONFIRM_SAMPLES: u32 = 3;
+/// ... over at least this long ...
+pub const CONFIRM_SECS: u64 = 6;
+/// ... and has grown at least this many levels deeper since first seen.
+pub const CONFIRM_GROWTH: usize = 2;
+
+/// Whether a chain has shown itself to be a runaway and not a moment of
+/// ordinary nesting.
+fn confirmed(samples: u32, age_secs: u64, first_depth: usize, depth: usize) -> bool {
+    samples >= CONFIRM_SAMPLES
+        && age_secs >= CONFIRM_SECS
+        && depth >= first_depth.saturating_add(CONFIRM_GROWTH)
+}
 /// Ancestors walked for one process, and levels counted, at most.
 const MAX_WALK: usize = 4096;
 /// Processes of one chain, at most.
@@ -140,9 +154,46 @@ impl Chain {
     }
 }
 
+/// Shells whose bare or `-c` command lines repeat without any runaway: a
+/// shell forks a copy of itself, command line and all, for every `$(…)`,
+/// pipeline and subshell.
+const SHELL_PROGRAMS: &[&str] = &[
+    "zsh", "bash", "sh", "dash", "fish", "ksh", "tcsh", "csh", "nu",
+];
+
+/// A shell running with flags only (`zsh -l`, `bash --login -i`) or a
+/// `-c` command string (`zsh -lc '…'`). Its forked subshells carry the same
+/// command line, so nesting of these says nothing; the command a script
+/// recurses through (`npm run build`, `bash build.sh`) is still matched.
+fn is_shell_wrapper(cmd: &str) -> bool {
+    let mut words = cmd.split_whitespace();
+    let Some(prog) = words.next() else {
+        return false;
+    };
+    let base = prog.rsplit('/').next().unwrap_or(prog);
+    if !SHELL_PROGRAMS.contains(&base) {
+        return false;
+    }
+    for w in words {
+        if !w.starts_with('-') {
+            return false;
+        }
+        if !w.starts_with("--") && w[1..].contains('c') {
+            return true;
+        }
+    }
+    true
+}
+
 fn sig_of(p: &SessionProc) -> Option<u64> {
     // A login shell (`-zsh`) inside a login shell is a person, not a script.
-    if !p.own || p.cmd.is_empty() || p.cmd.starts_with('-') {
+    // An agent is never the runaway command: its shells nest by design.
+    if !p.own
+        || p.cmd.is_empty()
+        || p.cmd.starts_with('-')
+        || p.agent.is_some()
+        || is_shell_wrapper(&p.cmd)
+    {
         return None;
     }
     let mut h = std::collections::hash_map::DefaultHasher::new();
@@ -400,6 +451,8 @@ pub struct Runaway {
     seen: HashMap<String, u64>,
     /// Chain key → not stopped again before this time.
     retry: HashMap<String, u64>,
+    /// Chain key → (samples it was in, depth when first seen).
+    sightings: HashMap<String, (u32, usize)>,
     stoppings: VecDeque<Stopping>,
     memos: Vec<Memo>,
     /// Session id → sentences for its next hook call.
@@ -492,6 +545,7 @@ impl Runaway {
             self.chains.clear();
             self.seen.clear();
             self.retry.clear();
+            self.sightings.clear();
             return Decision::default();
         }
         let mut out = Decision::default();
@@ -499,6 +553,7 @@ impl Runaway {
         let keys: HashSet<&str> = self.chains.iter().map(|c| c.key.as_str()).collect();
         self.seen.retain(|k, _| keys.contains(k.as_str()));
         self.retry.retain(|k, _| keys.contains(k.as_str()));
+        self.sightings.retain(|k, _| keys.contains(k.as_str()));
         for i in 0..self.chains.len() {
             let key = self.chains[i].key.clone();
             match self.seen.get(&key) {
@@ -513,7 +568,21 @@ impl Runaway {
             if cfg.remember_secs > 0 {
                 self.remember(&c, now, cfg.remember_secs);
             }
+            let seen = self.sightings.entry(key.clone()).or_insert((0, c.depth));
+            seen.0 = seen.0.saturating_add(1);
+            let (samples, first_depth) = *seen;
             if cfg.action != MemoryAction::Stop || !can_act {
+                continue;
+            }
+            // Never on one sample: a real runaway is still there several
+            // samples later and has gone deeper. Nesting that comes and goes
+            // (forked subshells, a build that runs a tool twice) does not.
+            if !confirmed(
+                samples,
+                now.saturating_sub(c.first_seen_unix),
+                first_depth,
+                c.depth,
+            ) {
                 continue;
             }
             if self.retry.get(&key).is_some_and(|t| now < *t) {

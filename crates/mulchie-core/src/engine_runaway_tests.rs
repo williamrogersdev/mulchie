@@ -89,7 +89,7 @@ fn facts(pid: u32, ppid: u32, start: u64) -> ProcFacts {
     }
 }
 
-/// Six real children presented as six nested `npm run build`, under an agent.
+/// Eight real children presented as eight nested `npm run build`, under an agent.
 struct Scene {
     agent: Child,
     levels: Vec<Child>,
@@ -99,7 +99,7 @@ struct Scene {
 
 fn scene() -> Scene {
     let agent = Child::sleep();
-    let levels: Vec<Child> = (0..6).map(|_| Child::sleep()).collect();
+    let levels: Vec<Child> = (0..8).map(|_| Child::sleep()).collect();
     let a = agent.pid();
     let mut procs = vec![sp(a, 1, 500, "claude", true)];
     let mut table = vec![facts(a, 1, 500)];
@@ -115,6 +115,24 @@ fn scene() -> Scene {
         levels,
         procs,
         table,
+    }
+}
+
+/// What a stop takes: the chain seen in three samples, three seconds apart,
+/// growing from six levels to eight (`procs` minus its two, then one,
+/// deepest levels; then all of it).
+fn grown(e: &Engine, s: &Scene, procs: &[SessionProc], c: &Config) {
+    for (t, drop) in [(1_994, 2), (1_997, 1), (2_000, 0)] {
+        let gone: Vec<u32> = s.levels[s.levels.len() - drop..]
+            .iter()
+            .map(Child::pid)
+            .collect();
+        let seen: Vec<SessionProc> = procs
+            .iter()
+            .filter(|p| !gone.contains(&p.pid))
+            .cloned()
+            .collect();
+        e.observe_runaway(t, &snap(&seen), c);
     }
 }
 
@@ -175,7 +193,7 @@ fn stop_kills_the_whole_chain_and_what_it_started_since_the_sample() {
     let c = cfg(MemoryAction::Stop);
     let (_t, e) = engine(&c, s.table.clone());
     e.observe_sessions(2_000, &s.procs, M, &c);
-    e.observe_runaway(2_000, &snap(&s.procs), &c);
+    grown(&e, &s, &s.procs, &c);
     assert_eq!(chain_findings(&e).len(), 1);
     e.run_limit_jobs(2_000);
     for l in &mut s.levels {
@@ -194,13 +212,18 @@ fn stop_kills_the_whole_chain_and_what_it_started_since_the_sample() {
     let stop = &st.stoppings[0];
     assert_eq!(stop.state, ActionState::Done, "{stop:?}");
     assert_eq!(stop.command, "npm run build");
-    assert_eq!(stop.depth, 6);
+    assert_eq!(stop.depth, 8);
     let sid = Session::id_for(a, 500);
     assert_eq!(stop.session_id.as_deref(), Some(sid.as_str()));
     assert!(
-        stop.detail.as_deref().unwrap().contains("killed 7 of 7"),
+        stop.detail.as_deref().unwrap().contains("killed 9 of 9"),
         "{stop:?}"
     );
+    // The freeze was journaled for a crash and cleared once it was over.
+    assert!(lock(&e.sup).paused.is_empty());
+    assert!(crate::engine::sessions::load_paused(&e.paths)
+        .unwrap()
+        .is_empty());
     assert_eq!(e.snapshot_state().runaway.stoppings.len(), 1);
     assert!(e
         .snapshot_state()
@@ -253,10 +276,10 @@ fn the_default_reports_and_signals_nothing() {
     let st = e.runaway_status();
     assert!(!st.enforcing && st.stoppings.is_empty());
     assert_eq!(st.chains.len(), 1);
-    assert_eq!((st.chains[0].depth, st.chains[0].processes), (6, 6));
+    assert_eq!((st.chains[0].depth, st.chains[0].processes), (8, 8));
     let f = chain_findings(&e);
     assert_eq!(f.len(), 1);
-    assert!(f[0].title.contains("6 copies of itself"), "{}", f[0].title);
+    assert!(f[0].title.contains("8 copies of itself"), "{}", f[0].title);
     assert!(f[0].why.contains("runaway.action stop"), "{}", f[0].why);
     let root = s.levels[0].pid();
     assert!(
@@ -344,7 +367,7 @@ fn a_reused_pid_is_not_signalled() {
     // The table says the outermost copy started at 5000; the sample saw 1000.
     s.table[1].start_time = 5_000;
     let (_t, e) = engine(&c, s.table.clone());
-    e.observe_runaway(2_000, &snap(&s.procs), &c);
+    grown(&e, &s, &s.procs, &c);
     e.run_limit_jobs(2_000);
     std::thread::sleep(Duration::from_millis(200));
     for l in &mut s.levels {

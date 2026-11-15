@@ -325,7 +325,10 @@ fn updater_is_configured_only_with_a_public_key() {
     let mut p: HashMap<String, Value> = HashMap::new();
     assert_eq!(update::pubkey(&p), None);
     assert!(!update::Updates::from_plugins(&p).configured());
-    p.insert("updater".into(), json!({"endpoints": [update::ENDPOINT]}));
+    p.insert(
+        "updater".into(),
+        json!({"endpoints": ["https://example.invalid/latest.json"]}),
+    );
     assert_eq!(update::pubkey(&p), None);
     p.insert("updater".into(), json!({"pubkey": "  "}));
     assert_eq!(update::pubkey(&p), None);
@@ -863,8 +866,10 @@ fn cli_link_state_tells_our_link_from_other_files() {
     assert_eq!(link_state(&link, Some(&bin)), LinkState::OtherFile);
 }
 
+/// The page may listen to the app's events and drag the window by its
+/// title areas (`data-tauri-drag-region`), nothing else.
 #[test]
-fn capabilities_grant_only_event_listening() {
+fn capabilities_grant_only_event_listening_and_dragging() {
     let caps: Value = serde_json::from_str(include_str!("../capabilities/default.json")).unwrap();
     let perms: Vec<&str> = caps["permissions"]
         .as_array()
@@ -874,7 +879,11 @@ fn capabilities_grant_only_event_listening() {
         .collect();
     assert_eq!(
         perms,
-        ["core:event:allow-listen", "core:event:allow-unlisten"]
+        [
+            "core:event:allow-listen",
+            "core:event:allow-unlisten",
+            "core:window:allow-start-dragging"
+        ]
     );
 }
 

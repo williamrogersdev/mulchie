@@ -423,6 +423,61 @@ fn newest_release(list: &Value) -> (Option<String>, bool) {
     }
 }
 
+/// Where the desktop app's updater manifests live. Only URLs under this
+/// prefix are handed to the updater.
+const APP_MANIFEST_PREFIX: &str = "https://github.com/williamrogersdev/mulchie/releases/download/";
+/// The asset name of the updater manifest.
+const APP_MANIFEST_ASSET: &str = "latest.json";
+
+/// The updater manifest (`latest.json`) the desktop app at `installed`
+/// should read: the newest release that has one, drafts left out, and
+/// pre-releases left out unless `installed` is itself a pre-release.
+/// `Ok(None)` when no release has a manifest yet.
+///
+/// GitHub's `releases/latest` never names a pre-release, so a release
+/// candidate reading `releases/latest/download/latest.json` gets a 404 while
+/// every release is a pre-release, and later a stable manifest it should not
+/// skip past. Listing the releases avoids both.
+pub fn app_manifest_url(http: &dyn Http, installed: &str) -> Result<Option<String>, String> {
+    let list = get_json(http, MULCHIE_RELEASES_URL, RELEASE_LIST_REPLY)?;
+    Ok(pick_app_manifest(&list, installed))
+}
+
+fn pick_app_manifest(list: &Value, installed: &str) -> Option<String> {
+    let on_pre = parse_version(installed).is_some_and(|v| !v.pre.is_empty());
+    let mut best: Option<(semver::Version, String)> = None;
+    for r in list.as_array().map(Vec::as_slice).unwrap_or_default() {
+        if r.get("draft").and_then(Value::as_bool) == Some(true) {
+            continue;
+        }
+        let Some(v) = release_version(r).and_then(|t| parse_version(&t)) else {
+            continue;
+        };
+        let flagged = r.get("prerelease").and_then(Value::as_bool) == Some(true);
+        if (flagged || !v.pre.is_empty()) && !on_pre {
+            continue;
+        }
+        let Some(url) = r
+            .get("assets")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter(|a| a.get("name").and_then(Value::as_str) == Some(APP_MANIFEST_ASSET))
+            .filter_map(|a| a.get("browser_download_url").and_then(Value::as_str))
+            .find(|u| u.starts_with(APP_MANIFEST_PREFIX) && u.ends_with("/latest.json"))
+        else {
+            continue;
+        };
+        if best
+            .as_ref()
+            .is_none_or(|(b, _)| precedence(&v, b) == std::cmp::Ordering::Greater)
+        {
+            best = Some((v, url.to_string()));
+        }
+    }
+    best.map(|(_, u)| u)
+}
+
 // -------------------------------------------------------------- lockfiles
 
 /// One package version from a lockfile.

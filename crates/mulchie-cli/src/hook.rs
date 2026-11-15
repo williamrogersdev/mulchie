@@ -321,9 +321,9 @@ pub fn translate(
                 Out::json(json!({ "decision": "deny", "reason": reason }))
             }
             // No "ask" and no agent context before a tool: tell the user.
-            // Plain advice waits for AfterTool, which can add context.
+            // Plain advice waits for AfterTool, which can add context. No
+            // `decision`: Mulchie never answers "allow" for the user.
             "pre_tool" if d == Warn => Out::json(json!({
-                "decision": "allow",
                 "systemMessage": format!("Mulchie warns: {reason}"),
             })),
             _ => Out::default(),

@@ -1,17 +1,18 @@
 // The Activity view: the engine's journal, newest first. The list is fetched
 // only while this view is open and only when it changed.
 import { st } from '../store.js';
-import { $, $$, esc, B, th } from '../util.js';
+import { $, into, $$, esc, B, th } from '../util.js';
 import { actKey } from '../detail.js';
 import { reasonText } from '../dialogs.js';
 
-const COLOR = { reclaim: 'ok', worktree: 'ok', throttle: 'warn', pause: 'warn', stop: 'bad', alert: 'bad', error: 'bad' };
+const COLOR = { reclaim: 'ok', worktree: 'ok', throttle: 'warn', pause: 'warn', limit: 'warn', finding: 'warn', stop: 'bad', runaway: 'bad', memory_guard: 'bad', alert: 'bad', error: 'bad' };
 
 export function renderActs() {
   const ui = st.ui, d = st.ui.detail;
-  const rows = st.actions.filter(a => !ui.aSrc || a.source === ui.aSrc);
+  const want = ui.aSrc ? ui.aSrc.split(',') : null;
+  const rows = st.actions.filter(a => !want || want.includes(a.source));
   $$('#aSeg button').forEach(b => b.classList.toggle('on', b.dataset.s === ui.aSrc));
-  $('#acts').innerHTML = th([{ l: 'Time', w: '136px' }, { l: 'Source', w: '86px', c: 'c-md' }, { l: 'Kind', w: '120px' }, { l: 'Workspace', c: 'c-lg', w: '22%' }, { l: 'Detail' }, { l: 'Freed', n: 1, w: '72px' }]) +
+  into($('#acts')).html = th([{ l: 'Time', w: '136px' }, { l: 'Source', w: '86px', c: 'c-md' }, { l: 'Kind', w: '120px' }, { l: 'Workspace', c: 'c-lg', w: '22%' }, { l: 'Detail' }, { l: 'Freed', n: 1, w: '72px' }]) +
     (rows.map(a => {
       const skipped = a.status === 'skipped', k = actKey(a);
       const extra = skipped && a.reason ? ` <span class="warn">(${esc(reasonText(a.reason))})</span>` : '';

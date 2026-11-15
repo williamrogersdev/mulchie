@@ -11,9 +11,6 @@ use tauri::{AppHandle, Manager};
 use tauri_plugin_dialog::{DialogExt, MessageDialogButtons, MessageDialogKind};
 use tauri_plugin_updater::UpdaterExt;
 
-/// Where released apps look for `latest.json`.
-pub const ENDPOINT: &str =
-    "https://github.com/williamrogersdev/mulchie/releases/latest/download/latest.json";
 pub const RELEASES: &str = "https://github.com/williamrogersdev/mulchie/releases";
 
 /// The updater public key from the `plugins` section of the Tauri config, if
@@ -111,7 +108,20 @@ pub fn status(app: &AppHandle, engine_report: Option<&serde_json::Value>) -> ser
 }
 
 async fn find(app: &AppHandle) -> Result<Option<tauri_plugin_updater::Update>, String> {
-    let url = tauri::Url::parse(ENDPOINT).map_err(|e| e.to_string())?;
+    // `releases/latest` skips pre-releases, so ask which release carries the
+    // manifest this build may install (see `app_manifest_url`).
+    let current = app.package_info().version.to_string();
+    let manifest = tauri::async_runtime::spawn_blocking(move || {
+        let http = mulchie_core::updates::default_http();
+        mulchie_core::updates::app_manifest_url(http.as_ref(), &current)
+    })
+    .await
+    .map_err(|e| e.to_string())?
+    .map_err(|e| format!("Could not reach GitHub to list Mulchie releases ({e})."))?;
+    let Some(manifest) = manifest else {
+        return Ok(None);
+    };
+    let url = tauri::Url::parse(&manifest).map_err(|e| e.to_string())?;
     app.updater_builder()
         .endpoints(vec![url])
         .map_err(|e| e.to_string())?
@@ -119,7 +129,7 @@ async fn find(app: &AppHandle) -> Result<Option<tauri_plugin_updater::Update>, S
         .map_err(|e| e.to_string())?
         .check()
         .await
-        .map_err(|e| e.to_string())
+        .map_err(|e| format!("The update manifest at {manifest} could not be read ({e})."))
 }
 
 /// Look for a newer version now and then, without asking anything: the

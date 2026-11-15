@@ -7,7 +7,7 @@
   --line2: #2d3338;
   --tx: #d8dde1;
   --tx2: #9aa3a9;
-  --tx3: #646d73;
+  --tx3: #7d868d;
   --ok: #79c37d;
   --warn: #e3b24f;
   --bad: #ec6a5a;
@@ -72,7 +72,7 @@
     --line2: #d2d7db;
     --tx: #1b1f22;
     --tx2: #535c63;
-    --tx3: #858e95;
+    --tx3: #656e75;
     --ok: #2e8a3a;
     --warn: #9a6400;
     --bad: #c53526;
@@ -149,6 +149,7 @@ button { font: inherit; color: inherit; }
 .chip.bad { color: var(--bad); border-color: var(--bad-line); }
 input[type=text], input[type=number], select, textarea { background: var(--bg); border: 1px solid var(--line2); color: var(--tx); border-radius: 5px; padding: 3px 7px; font: 12px var(--sans); }
 input[type=text]:focus, input[type=number]:focus, textarea:focus { outline: none; border-color: var(--focus); }
+input:focus-visible, textarea:focus-visible, select:focus-visible { outline: 2px solid var(--focus); outline-offset: 1px; }
 ::-webkit-scrollbar { width: 9px; height: 9px; }
 ::-webkit-scrollbar-thumb { background: var(--scroll); border-radius: 5px; border: 2px solid var(--bg); }
 

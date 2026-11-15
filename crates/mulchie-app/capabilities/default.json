@@ -1,12 +1,13 @@
 {
   "identifier": "default",
-  "description": "The UI only calls the app's own commands and listens to its events.",
+  "description": "The UI only calls the app's own commands, listens to its events, and drags the dashboard by its title areas.",
   "windows": [
     "panel",
     "dashboard"
   ],
   "permissions": [
     "core:event:allow-listen",
-    "core:event:allow-unlisten"
+    "core:event:allow-unlisten",
+    "core:window:allow-start-dragging"
   ]
 }

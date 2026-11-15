@@ -246,8 +246,8 @@ only with --show. Nothing is created: the engine writes both tokens when it star
     #[command(
         long_about = "Run the engine in the foreground: the monitor, the optimizer, the build \
 queue and the local HTTP API on 127.0.0.1. Only one engine runs per user; if the app or \
-another `mulchie serve` already runs, this exits with status 1. Stops cleanly on SIGINT \
-or SIGTERM. The port is `api_port` from the config, or MULCHIE_PORT for this process.",
+another `mulchie serve` already runs, this waits for it to stop and then starts. Stops \
+cleanly on SIGINT or SIGTERM. The port is `api_port` from the config, or MULCHIE_PORT for this process.",
         after_help = "Examples:\n  mulchie serve\n  MULCHIE_PORT=47575 mulchie serve\n  mulchie service install   # run it at login instead"
     )]
     Serve,

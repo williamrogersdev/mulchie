@@ -4,7 +4,7 @@
 // dialog, where the plan is shown before anything runs.
 import { st } from '../store.js';
 import { invoke } from '../ipc.js';
-import { $, esc, B } from '../util.js';
+import { $, into, esc, B } from '../util.js';
 import { findings, findingsHtml, cleanup, notices, noticesHtml, modeHtml, modeTitle } from '../findings.js';
 import { cpuSummary, memSummary, cpuTile, memTile, ranked, cores, KIND_ICON } from '../consumers.js';
 
@@ -59,35 +59,35 @@ export function renderPanel() {
   // The engine badge only when it says something: this app is a client of
   // another engine, or it is disconnected.
   const mode = $('#pMode'), odd = st.conn && st.conn.mode !== 'engine';
-  mode.innerHTML = odd ? modeHtml() : '';
+  into(mode).html = odd ? modeHtml() : '';
   mode.title = odd ? modeTitle() : '';
   // Only what stops Mulchie from working; the rest is in the dashboard.
-  $('#pNotices').innerHTML = noticesHtml(notices().filter(n => n[0] === 'bad'), true);
+  into($('#pNotices')).html = noticesHtml(notices().filter(n => n[0] === 'bad'), true);
   if (S) {
     const s = S.snapshot, stale = st.conn?.mode === 'disconnected' || st.error ? 'stale' : S.health;
     const el = $('#pHealth'); el.querySelector('.dot').className = 'dot ' + stale; el.querySelector('span:last-child').textContent = stale;
     const cs = cpuSummary(S), ms = memSummary(S), ct = cpuTile(S), mt = memTile(S);
-    $('#pHead').innerHTML = `${esc(cs.headline)}${ms.level !== 'ok' ? ` <span class="${ms.level}">${esc(ms.headline)}</span>` : ''}`;
+    into($('#pHead')).html = `${esc(cs.headline)}${ms.level !== 'ok' ? ` <span class="${ms.level}">${esc(ms.headline)}</span>` : ''}`;
     const full = S.forecast?.hours_to_full, low = s.disk_free / 1e9 < (S.config?.low_disk_gb ?? 0);
-    $('#pStats').innerHTML = [
+    into($('#pStats')).html = [
       stat('CPU', ct.v.replace(' cores', ''), short(ct.s), cs.level, 'd:cpu:', ct.title),
       stat('Memory', mt.v.replace(/^(\S+) (\S+) of (\S+) \2$/, '$1 of $3 $2'), ms.level === 'ok' ? 'fine' : ms.level === 'warn' ? 'tight' : 'very tight', ms.level, 'd:mem:', mt.title),
       stat('Disk free', B(s.disk_free), full != null ? `full in ~${full.toFixed(0)} h` : `of ${B(s.disk_total, 0)}`, low ? 'bad' : full != null && full < 24 ? 'warn' : 'ok', 'disk', 'Open the Disk view'),
     ].join('');
-    $('#pTop').innerHTML = topHtml(S);
+    into($('#pTop')).html = topHtml(S);
     // What needs attention now (not the cleanup, which has its own list,
     // and not the notes that nothing can be done about).
     const f = findings().filter(x => x.kind !== 'cleanup' && x.lvl !== 'ok'), c = cleanup(S);
     $('#pFindW').style.display = f.length ? '' : 'none';
-    $('#pFind').innerHTML = findingsHtml(f, 3);
+    into($('#pFind')).html = findingsHtml(f, 3);
     $('#pCleanW').style.display = c.length ? '' : 'none';
-    $('#pClean').innerHTML = findingsHtml(c, 3);
+    into($('#pClean')).html = findingsHtml(c, 3);
     // One line for the rest, each a link to where it is listed. Sessions,
     // not breaches: one session can be over several caps.
     const over = new Set((S.sessions?.breaches || []).filter(b => b.cleared_unix == null).map(b => b.session_id));
     const nb = over.size, nu = S.updates?.available || 0, more = Math.max(0, f.length - 3);
     const lnk = (attrs, cls, text) => `<a class="lnk" role="button" tabindex="0" ${attrs}><span class="${cls}">${text}</span></a>`;
-    $('#pLim').innerHTML = [
+    into($('#pLim')).html = [
       more && lnk('data-open="overview"', 'warn', `${more} more to look at`),
       nb && lnk('data-v="sessions"', 'bad', `${nb === 1 ? '1 session' : `${nb} sessions`} over a limit`),
       nu && lnk('data-d="findings" data-dk="update"', 'info', `${nu === 1 ? '1 update' : `${nu} updates`}`),

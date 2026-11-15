@@ -12,6 +12,9 @@ import { SEV_LVL, SEV_TEXT, suggestionLabel, watchFindings, CATEGORY, CATEGORY_O
 import { act } from './act.js';
 import { coresText, notEnforcedText, isHookOnly, idleHtml } from './views/sessions.js';
 
+// Stores being pruned now: a prune can take minutes; one at a time per store.
+const pruning = new Set();
+
 // ------------------------------------------------------------------ helpers
 
 const kv = rows => `<dl class="kv">${rows.filter(Boolean).map(([k, v]) => `<dt>${esc(k)}</dt><dd>${v}</dd>`).join('')}</dl>`;
@@ -669,10 +672,16 @@ export async function detailAction(t) {
     }
     case 'clean-one': return planThenExecute({ request: { kind: 'clean', paths: [arg] }, batch: 'clean', title: 'Clear this build cache?', verb: 'Clear', intro: 'Deletes the folder. It is rebuilt on the next build.' });
     case 'prune': {
-      const c = S().diskmap.categories.find(x => x.key === arg);
-      if (!(await confirmBox(`Prune ${c.name}?`, `Runs <span class="mono">${esc(c.hint)}</span>. Packages are downloaded again when next needed.`, 'Prune', false))) return;
-      toast('Pruning…');
-      return act(() => invoke('prune', { key: arg }), r => r.ok ? `Freed ${B(r.freed)}${r.output ? '\n' + r.output : ''}` : `Not pruned: ${r.output || r.reason || 'failed'}`);
+      const c = S().diskmap?.categories?.find(x => x.key === arg);
+      if (!c) return toast('That store is no longer listed; refresh the Disk page.');
+      if (pruning.has(arg)) return toast(`${c.name} is already being pruned.`);
+      const size = c.bytes ? ` It holds ${B(c.bytes)} now.` : '';
+      if (!(await confirmBox(`Prune ${c.name}?`, `Runs <span class="mono">${esc(c.hint)}</span>, which deletes inside that tool's cache.${esc(size)} Packages are downloaded again when next needed. Nothing is backed up.`, 'Prune', true))) return;
+      pruning.add(arg);
+      toast(`Pruning ${c.name}…`);
+      const tail = o => (o || '').trim().split('\n').slice(-3).join('\n');
+      return act(() => invoke('prune', { key: arg }), r => r.ok ? `Freed ${B(r.freed)}${r.output ? '\n' + tail(r.output) : ''}` : `Not pruned: ${tail(r.output) || r.reason || 'failed'}`)
+        .finally(() => pruning.delete(arg));
     }
     default: return hooks.run?.(name);
   }

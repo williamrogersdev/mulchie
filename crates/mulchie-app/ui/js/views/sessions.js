@@ -5,7 +5,7 @@
 // Each running row says how long the session has been idle and can be ended
 // from the row, or several at once from the selection.
 import { st } from '../store.js';
-import { $, $$, esc, B, dur, sortRows, th, tilde, ago, agoCell, rowBtn } from '../util.js';
+import { $, into, $$, esc, B, dur, sortRows, th, tilde, ago, agoCell, rowBtn } from '../util.js';
 import { noticesHtml, idleSecs } from '../findings.js';
 import { endSessions } from '../signals.js';
 
@@ -104,13 +104,13 @@ export function renderSessions() {
   const key = ui.sSort[0] === 'idle' ? (r => idleSecs(r) ?? -1) : ui.sSort[0];
   const shown = sortRows(list.filter(r => r.status === 'running' && S_F[ui.sF](r, by)), [key, ui.sSort[1]]);
   const ended = list.filter(r => r.status !== 'running').sort((a, b) => (b.ended_unix || 0) - (a.ended_unix || 0));
-  $('#sNote').innerHTML = noticesHtml(sessionNotes(S));
+  into($('#sNote')).html = noticesHtml(sessionNotes(S));
   const overN = by.size;
   $('#sCount').textContent = s.enabled === false ? 'tracking off' : `${s.running ?? live.length} running · ${s.ended ?? ended.length} ended${overN ? ` · ${overN} over a limit` : ''}`;
   const n = cols(writes).length;
   const empty = s.enabled === false ? 'Session tracking is off.' : f || ui.sF !== 'all' ? 'No session matches the filter.' : 'No agent is running now. Sessions appear when Claude Code, Codex, Cursor or another agent starts.';
-  $('#sess').innerHTML = th(cols(writes), ui.sSort, 's') + (rowsHtml(shown, S, { ended: false }) || `<tr><td colspan="${n}" class="empty">${esc(empty)}</td></tr>`);
-  $('#sessEnded').innerHTML = ended.length
+  into($('#sess')).html = th(cols(writes), ui.sSort, 's') + (rowsHtml(shown, S, { ended: false }) || `<tr><td colspan="${n}" class="empty">${esc(empty)}</td></tr>`);
+  into($('#sessEnded')).html = ended.length
     ? th(cols(writes, true).map(c => ({ ...c, k: undefined })), null, 'x') + rowsHtml(ended, S, { ended: true })
     : `<tr><td class="empty">${s.enabled === false ? 'Session tracking is off.' : 'No ended sessions are kept.'}</td></tr>`;
   $('#sEndedH').textContent = `Ended (${ended.length})${ended[0]?.ended_unix ? ` · last ${ago(ended[0].ended_unix)} ago` : ''}`;

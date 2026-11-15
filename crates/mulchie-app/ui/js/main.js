@@ -145,10 +145,13 @@ function run(name) {
     st.ui.sSort = ['idle', -1];
     return go('sessions');
   }
-  if (name.startsWith('quit:')) {
+  if (name.startsWith('quit:')) return (async () => {
+    // From the panel the dashboard may have been hidden and not polling:
+    // look again before deciding what to quit.
+    await refresh(true);
     const c = st.S && findConsumer(st.S, name.slice(5));
     return c ? groupAction(c.key, 'quit', c.label) : toast('That is no longer among the biggest users.', true);
-  }
+  })();
   if (name.startsWith('stop:')) {
     const w = st.S?.snapshot.workspaces.find(x => x.path === name.slice(5));
     return groupAction('workspace:' + name.slice(5), 'quit', w?.label || name.slice(5));
@@ -309,7 +312,7 @@ async function refreshUpdate() {
   let u = null;
   try { u = await invoke('app_update'); } catch (e) { u = null; }
   for (const id of ['tUpdate', 'pUpdate']) {
-    const b = $(id);
+    const b = $('#' + id);
     if (!b) continue;
     const v = u && u.available;
     b.hidden = !v;
@@ -321,7 +324,7 @@ async function refreshUpdate() {
   }
 }
 for (const id of ['tUpdate', 'pUpdate']) {
-  const b = $(id);
+  const b = $('#' + id);
   if (b) b.addEventListener('click', () => invoke('start_update').catch(e => toast(String(e))));
 }
 refreshUpdate();

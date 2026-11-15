@@ -33,7 +33,7 @@
 </div>
 
 <div id="dash">
-  <nav>
+  <nav data-tauri-drag-region>
     <div class="brand"><svg viewBox="0 0 24 24" fill="none"><path d="M5 19c0-8 5-13 14-14-1 9-6 14-14 14Z" fill="#79c37d"/><path d="M5 19 13 11" stroke="#0c0e0f" stroke-width="1.6" stroke-linecap="round"/></svg>Mulchie</div>
     <a role="button" tabindex="0" data-v="overview">Overview</a>
     <a role="button" tabindex="0" data-v="processes">Processes <span class="count" id="nProc"></span></a>
@@ -47,7 +47,7 @@
     <div class="foot"><div id="ver"></div><div id="scanInfo"></div></div>
   </nav>
   <main>
-    <div class="topbar">
+    <div class="topbar" data-tauri-drag-region>
       <div class="health" id="tHealth"><span class="dot"></span><span>—</span></div>
       <div class="k"><span>cpu</span><b id="tCpu">—</b></div>
       <div class="k"><span>load</span><b id="tLoad">—</b></div>
@@ -133,7 +133,7 @@
             <button class="btn" id="wtSweep">Sweep idle…</button>
           </div>
         </div>
-        <div class="bulk" id="wtBulk"><span id="wtBulkN"></span><label class="muted"><input type="checkbox" id="wtBackup" checked> save uncommitted changes and remove anyway</label><div style="flex:1"></div><button class="btn sm danger" id="wtRemove">Remove selected…</button><button class="btn sm" id="wtClear">Clear</button></div>
+        <div class="bulk" id="wtBulk"><span id="wtBulkN"></span><label class="muted"><input type="checkbox" id="wtBackup"> include worktrees with uncommitted changes (saved as a patch first)</label><div style="flex:1"></div><button class="btn sm danger" id="wtRemove">Remove selected…</button><button class="btn sm" id="wtClear">Clear</button></div>
         <div style="max-height:420px;overflow:auto"><table id="wts"></table></div>
       </div>
       <div class="grid g2 g2-wide" style="margin-top:10px">
@@ -151,7 +151,7 @@
 
     <section class="view fill" id="v-activity">
       <div class="toolbar">
-        <div class="seg" id="aSeg"><button data-s="">All</button><button data-s="manual">You</button><button data-s="api">API / agents</button><button data-s="optimizer">Optimizer</button><button data-s="monitor">Alerts</button></div>
+        <div class="seg" id="aSeg"><button data-s="">All</button><button data-s="manual">You</button><button data-s="api">API / agents</button><button data-s="optimizer">Optimizer</button><button data-s="limits,memory_guard,runaway,sessions">Limits &amp; guards</button><button data-s="monitor">Alerts</button><button data-s="watch">Findings</button></div>
         <div class="sp"></div>
         <span class="dim c-md">last 500 actions, newest first; click one for details and backups</span>
       </div>
@@ -161,10 +161,10 @@
     <section class="view" id="v-agents">
       <div class="card connect">
         <h3>Connect an agent</h3>
-        <div class="muted">One command registers Mulchie’s MCP server with the agent apps it finds (Claude Code, Claude Desktop, Cursor and others):</div>
-        <div class="cmdrow"><pre class="code" id="connectCmd">mulchie mcp install</pre><button class="btn sm" data-copy-el="connectCmd">Copy</button></div>
+        <div class="muted">Register Mulchie’s MCP server with an agent app. Use <span class="mono">claude-code</span>, <span class="mono">claude-desktop</span>, <span class="mono">cursor</span> or <span class="mono">codex</span>; <span class="mono">mulchie mcp install</span> alone lists the apps it finds and changes nothing:</div>
+        <div class="cmdrow"><pre class="code" id="connectCmd">mulchie mcp install --client claude-code</pre><button class="btn sm" data-copy-el="connectCmd">Copy</button></div>
         <div class="muted" style="margin-top:8px"><b>Read-only</b> for agents that should look but not act (no tool that deletes, signals, prunes or dismisses findings, and no check_updates):</div>
-        <div class="cmdrow"><pre class="code" id="connectRo">mulchie mcp install --read-only</pre><button class="btn sm" data-copy-el="connectRo">Copy</button></div>
+        <div class="cmdrow"><pre class="code" id="connectRo">mulchie mcp install --client claude-code --read-only</pre><button class="btn sm" data-copy-el="connectRo">Copy</button></div>
         <div class="muted" style="margin-top:8px">To add it by hand, <span class="mono">mulchie mcp config</span> prints the JSON below. Scripts can use the read-only API token from <span class="mono">mulchie token --read-only</span>: it allows the GET and plan routes only.</div>
         <div id="connectNote" class="warn" style="margin-top:6px"></div>
       </div>
