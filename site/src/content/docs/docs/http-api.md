@@ -44,7 +44,7 @@ Requests are capped at 8 KB per line, 64 KB of headers and a 1 MB body. The serv
 | --- | --- | --- |
 | GET | `/v1/health` | Open. Health, disk, load, free build slots, finding counts. |
 | GET | `/v1/state` | Everything the engine knows: snapshot, consumer groups, health, build slots, forecast, last scan, disk map, recent actions and findings. |
-| GET | `/v1/history` | Samples from the last 30 minutes, every 3 seconds. |
+| GET | `/v1/history` | Samples from the last 30 minutes, every 3 seconds. `?since=<unix seconds>` returns only samples taken after then. |
 | GET | `/v1/advice` | Whether to start heavy work now, free slots and the suggested job count. |
 | POST | `/v1/scan` | Queue a scan of build caches and worktrees. |
 | GET | `/v1/clean/plan` | Plan deleting stale build caches. |

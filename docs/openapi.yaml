@@ -89,6 +89,12 @@ paths:
   /v1/history:
     get:
       summary: Samples from the last 30 minutes, every 3 seconds
+      parameters:
+        - name: since
+          in: query
+          required: false
+          description: Only samples taken after this time (unix seconds, compared with each sample's `t`)
+          schema: { type: integer, minimum: 0 }
       responses:
         "200": { $ref: "#/components/responses/Json" }
         default: { $ref: "#/components/responses/Error" }

@@ -423,6 +423,7 @@ pub fn prune(paths: &Paths, key: &str, json_out: bool) -> i32 {
 const LOCK_RETRY_SECS: u64 = 15;
 
 pub fn serve(paths: &Paths) -> i32 {
+    crate::serve_log::start();
     let engine = Engine::new(paths.clone(), Config::load_from(paths));
     if let Some(e) = engine.config_error() {
         eprintln!("mulchie: {e}; running with safe defaults (automatic cleanup off)");

@@ -116,7 +116,7 @@ pub enum Health {
     Stale,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Default)]
 pub struct Sample {
     pub t: u64,
     pub cpu: f32,
@@ -945,6 +945,15 @@ impl Engine {
 
     pub fn history(&self) -> Vec<Sample> {
         lock(&self.history).iter().cloned().collect()
+    }
+
+    /// The samples taken after `since` (unix seconds; 0 for all).
+    pub fn history_since(&self, since: u64) -> Vec<Sample> {
+        lock(&self.history)
+            .iter()
+            .filter(|s| s.t > since)
+            .cloned()
+            .collect()
     }
 
     pub fn config(&self) -> Config {
@@ -3148,6 +3157,11 @@ impl Engine {
     pub(crate) fn set_restart_backoff(&self, d: Duration) {
         self.backoff_ms
             .store(d.as_millis() as u64, Ordering::SeqCst);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn push_history(&self, s: Sample) {
+        lock(&self.history).push_back(s);
     }
 
     #[cfg(test)]

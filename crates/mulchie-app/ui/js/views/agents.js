@@ -13,7 +13,7 @@ export async function loadIntegration(force) {
 const ENDPOINTS = [
   ['GET', '/v1/health', 'none', 'health (or stale), sample age, disk, load, free build slots'],
   ['GET', '/v1/state', 'any token', 'full snapshot: processes, workspaces, scan, disk map, slots, actions'],
-  ['GET', '/v1/history', 'any token', '30 minutes of 3 s samples'],
+  ['GET', '/v1/history', 'any token', '30 minutes of 3 s samples (?since=<unix> for newer ones only)'],
   ['GET', '/v1/advice', 'any token', 'ok_to_start_heavy_work, suggested_jobs, reasons'],
   ['POST', '/v1/scan', 'full token', 'rescan caches and the disk map'],
   ['GET', '/v1/clean/plan', 'any token', 'plan of stale caches (?want_bytes=N)'],

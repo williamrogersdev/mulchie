@@ -139,7 +139,7 @@ mulchie hooks install --client claude-code --dry-run
 mulchie hooks install --client claude-code
 ```
 
-Supported clients are `claude-code`, `codex`, `cursor`, `gemini` and `copilot`. The install edits one file (`~/.claude/settings.json`, `~/.codex/hooks.json`, `~/.cursor/hooks.json`, `~/.gemini/settings.json` or `~/.copilot/hooks/mulchie.json`), keeps your other hooks, and first copies the old file to `<file>.mulchie-backup-<unix time>`. Codex runs new hooks only after you trust them with its `/hooks` command. Windsurf, Antigravity, opencode and Aider have no hook support.
+Supported clients are `claude-code`, `codex`, `cursor`, `gemini` and `copilot`. The install edits one file (`~/.claude/settings.json`, `~/.codex/hooks.json`, `~/.cursor/hooks.json`, `~/.gemini/settings.json` or `~/.copilot/hooks/mulchie.json`), keeps your other hooks, and first copies the old file to `<file>.mulchie-backup-<unix time>-<random>`, keeping the newest five. Codex runs new hooks only after you trust them with its `/hooks` command. Windsurf, Antigravity, opencode and Aider have no hook support.
 
 ## HTTP API
 
