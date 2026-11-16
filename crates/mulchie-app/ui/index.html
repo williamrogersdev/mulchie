@@ -36,9 +36,10 @@
   <nav data-tauri-drag-region>
     <div class="brand"><svg viewBox="0 0 24 24" fill="none"><path d="M5 19c0-8 5-13 14-14-1 9-6 14-14 14Z" fill="#79c37d"/><path d="M5 19 13 11" stroke="#0c0e0f" stroke-width="1.6" stroke-linecap="round"/></svg>Mulchie</div>
     <a role="button" tabindex="0" data-v="overview">Overview</a>
-    <a role="button" tabindex="0" data-v="processes">Processes <span class="count" id="nProc"></span></a>
-    <a role="button" tabindex="0" data-v="workspaces">Workspaces <span class="count" id="nWs"></span></a>
-    <a role="button" tabindex="0" data-v="sessions">Sessions <span class="count" id="nSess"></span></a>
+    <a role="button" tabindex="0" data-v="sessions"><span class="nl"><span class="kt-g session" aria-hidden="true"></span>Sessions</span> <span class="count" id="nSess"></span></a>
+    <a role="button" tabindex="0" data-v="apps"><span class="nl"><span class="kt-g app" aria-hidden="true"></span>Apps</span> <span class="count" id="nApps"></span></a>
+    <a role="button" tabindex="0" data-v="workspaces"><span class="nl"><span class="kt-g workspace" aria-hidden="true"></span>Workspaces</span> <span class="count" id="nWs"></span></a>
+    <a role="button" tabindex="0" data-v="processes"><span class="nl"><span class="kt-g process" aria-hidden="true"></span>Processes</span> <span class="count" id="nProc"></span></a>
     <a role="button" tabindex="0" data-v="disk">Disk <span class="count" id="nDisk"></span></a>
     <a role="button" tabindex="0" data-v="activity">Activity <span class="count" id="nAct"></span></a>
     <a role="button" tabindex="0" data-v="agents">Agent API</a>
@@ -49,10 +50,10 @@
   <main>
     <div class="topbar" data-tauri-drag-region>
       <div class="health" id="tHealth"><span class="dot"></span><span>—</span></div>
-      <div class="k"><span>cpu</span><b id="tCpu">—</b></div>
+      <div class="k click" role="button" tabindex="0" data-d="cpu" data-dk="" title="What is using the CPU"><span>cpu</span><b id="tCpu">—</b></div>
       <div class="k"><span>load</span><b id="tLoad">—</b></div>
-      <div class="k"><span>mem</span><b id="tMem">—</b></div>
-      <div class="k"><span>swap</span><b id="tSwap">—</b></div>
+      <div class="k click" role="button" tabindex="0" data-d="mem" data-dk="" title="What is using memory"><span>mem</span><b id="tMem">—</b></div>
+      <div class="k click" role="button" tabindex="0" data-d="swap" data-dk="" title="What is holding swap"><span>swap</span><b id="tSwap">—</b></div>
       <div class="k"><span>disk</span><b id="tDisk">—</b></div>
       <div class="k"><span>io</span><b id="tIo">—</b></div>
       <div class="k"><span>slots</span><b id="tSlots">—</b></div>
@@ -72,6 +73,10 @@
         <div class="card"><div class="chead"><h3>Using memory</h3><a class="lnk" role="button" tabindex="0" data-d="mem" data-dk="">All →</a></div><div class="cbars" id="oMemTop"></div></div>
       </div>
       <div class="grid g2" style="margin-top:10px">
+        <div class="card"><div class="chead"><h3>Busiest sessions</h3><a class="lnk" role="button" tabindex="0" data-go="sessions">All →</a></div><div id="oSessTop"></div></div>
+        <div class="card"><div class="chead"><h3>Holding swap</h3><a class="lnk" role="button" tabindex="0" data-d="swap" data-dk="">All →</a></div><div id="oSwapTop"></div></div>
+      </div>
+      <div class="grid g2" style="margin-top:10px">
         <div class="card"><div class="chead"><h3>CPU and load</h3><div class="legend" id="lgCpu"></div></div><div class="chart" id="chCpu"></div></div>
         <div class="card"><div class="chead"><h3>Memory and swap</h3><div class="legend" id="lgMem"></div></div><div class="chart" id="chMem"></div></div>
         <div class="card"><div class="chead"><h3>Disk I/O</h3><div class="legend" id="lgIo"></div></div><div class="chart" id="chIo"></div></div>
@@ -86,6 +91,7 @@
 
     <section class="view fill" id="v-processes">
       <div class="toolbar">
+        <span class="kt process" title="A process: one running program instance, with its pid">Process</span>
         <input type="text" id="pFilter" placeholder="Filter by name, pid, workspace or command  (⌘F)" class="grow-in">
         <div class="seg" id="kindSeg"><button data-k="">All</button><button data-k="agent">Agents</button><button data-k="build">Builds</button><button data-k="runtime">Runtimes</button><button data-k="other">Other</button></div>
         <label class="muted"><input type="checkbox" id="pMine"> mine only</label>
@@ -96,8 +102,19 @@
       <div class="tbl-wrap"><table id="procs"></table></div>
     </section>
 
+    <section class="view fill" id="v-apps">
+      <div class="toolbar">
+        <span class="kt app" title="An app: a program bundle with all its helper processes">App</span>
+        <input type="text" id="aFilter" placeholder="Filter apps" class="grow-in" aria-label="Filter apps">
+        <div class="sp"></div>
+        <span class="dim c-md">each app with all its helper processes; swap is memory macOS compressed or moved out for it</span>
+      </div>
+      <div class="tbl-wrap"><table id="apps" aria-label="Apps"></table></div>
+    </section>
+
     <section class="view fill" id="v-workspaces">
       <div class="toolbar">
+        <span class="kt workspace" title="A workspace: a repo or worktree folder, with every process running in it">Workspace</span>
         <input type="text" id="wFilter" placeholder="Filter workspaces or branches" class="grow-in">
         <div class="sp"></div>
         <span class="dim c-md">every repo or worktree with a running process</span>
@@ -107,6 +124,7 @@
 
     <section class="view fill" id="v-sessions">
       <div class="toolbar">
+        <span class="kt session" title="A session: one agent and everything it started">Session</span>
         <input type="text" id="sFilter" placeholder="Filter by agent, workspace or id" class="grow-in" aria-label="Filter sessions">
         <div class="seg" id="sSeg"><button data-f="all">All</button><button data-f="h1">Idle 1h+</button><button data-f="d1">Idle 1d+</button><button data-f="over">Over a limit</button></div>
         <div class="sp"></div>
@@ -208,11 +226,11 @@ mulchie run --label "web build" -- cargo build --release</pre>
       <div class="card"><div class="notices" id="cfgNote" style="margin-bottom:10px"></div><div class="form" id="form"></div><div class="actions"><button class="btn pri" id="saveCfg">Save</button></div></div>
       <div id="cfgMore"></div>
     </section>
-    <aside id="drawer" class="drawer" role="dialog" aria-labelledby="dTitle" aria-hidden="true">
-      <div class="dh"><div class="dt"><h2 id="dTitle"></h2><span id="dSub"></span></div><button class="btn sm" id="dCopy" title="Copy what this panel shows, for pasting to an agent">Copy for agent</button><button class="btn sm" id="dClose" aria-label="Close details">×</button></div>
-      <div class="db" id="dBody"></div>
-    </aside>
   </main>
+  <aside id="drawer" class="inspector" aria-labelledby="dTitle">
+    <div class="dh" data-tauri-drag-region><div class="dt"><h2 id="dTitle"></h2><span id="dSub"></span></div><button class="btn sm" id="dCopy" title="Copy what this panel shows, for pasting to an agent">Copy for agent</button><button class="btn sm" id="dClose" aria-label="Back to what is using the machine" title="Back to what is using the machine">×</button></div>
+    <div class="db" id="dBody"></div>
+  </aside>
 </div>
 
 <div class="modal-bg" id="modal"><div class="modal" id="mBox" role="dialog" aria-modal="true" aria-labelledby="mTitle" aria-describedby="mBody"><h2 id="mTitle"></h2><div class="body" id="mBody"></div><div class="row"><button class="btn" id="mNo">Cancel</button><button class="btn danger" id="mYes">Confirm</button></div></div></div>

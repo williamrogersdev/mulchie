@@ -48,7 +48,7 @@ const WATCH = [
   ['check_listeners', 'Check listening network ports', 'bool'],
   ['check_signatures', 'Check code signatures and download flags (macOS)', 'bool'],
   ['allow_exes', 'Never report these programs', 'list', 'Full paths, one per line.'],
-  ['allow_ids', 'Never report these observations', 'list', 'Observation ids, one per line (the drawer’s Copy for agent shows the id).'],
+  ['allow_ids', 'Never report these observations', 'list', 'Observation ids, one per line (the inspector’s Copy for agent shows the id).'],
 ];
 
 const field = (id, [, l, t, h], v) => `<label for="${id}">${esc(l)}</label>${t === 'bool' ? `<div><input type="checkbox" id="${id}" ${v ? 'checked' : ''}></div>` : t === 'list' ? `<textarea id="${id}" rows="3" style="font:11.5px var(--mono)">${esc((v || []).join('\n'))}</textarea>` : `<div><input type="number" step="${t === 'int' ? '1' : 'any'}" id="${id}" value="${esc(v)}" style="width:120px" aria-describedby="${id}_err"><div class="bad" id="${id}_err" role="alert"></div></div>`}${h ? `<div class="hint">${esc(h)}</div>` : ''}`;

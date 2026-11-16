@@ -35,6 +35,7 @@ fn sample(p: &ProcFacts, kind: ProcKind, ws: Option<&Path>) -> ProcSample {
         kind,
         cpu_pct: 0.0,
         mem_bytes: 1,
+        swap_bytes: 0,
         start_time: p.start_time,
         stopped: false,
     }

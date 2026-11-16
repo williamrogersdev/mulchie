@@ -81,8 +81,15 @@ paths:
         `cpu_summary` and `mem_summary` in words), health, config error, build slots, forecast,
         last scan, disk map and recent actions. Also `journal_error`, `journal_lost`, `restore_failed`,
         `scan_age_secs`, `scan_stale`, `findings` (as in `GET /v1/findings?dismissed=1`),
-        `finding_counts` and `findings_unix`, `sessions` (as `SessionsState`) and `updates`
+        `finding_counts` and `findings_unix`, `sessions` (as `SessionsState`; its `list` holds every
+        running session, up to 500, and the 50 most recently ended) and `updates`
         (as `GET /v1/updates` without `report`). Command lines and lease labels are redacted.
+
+        Swap: each process in `snapshot.top` and each consumer group carries `swap_bytes`, its memory
+        compressed or swapped out (on macOS its physical footprint minus what is resident; 0 for
+        other users' processes and on other systems). `snapshot.consumers.by_swap` ranks the groups
+        holding the most, and `snapshot.consumers.apps` lists every app group (up to 100), biggest
+        memory first.
       responses:
         "200": { $ref: "#/components/responses/Json" }
         default: { $ref: "#/components/responses/Error" }
@@ -1221,6 +1228,22 @@ components:
             quarantined: { type: boolean }
             cpu_pct: { type: number }
             mem_bytes: { type: integer }
+            culprits:
+              type: array
+              description: |
+                Memory findings only: what is using the most memory now, or holding the most swap when
+                swap crossed its threshold. Processes in an agent session are counted under the session,
+                the rest under their app, workspace or program. At most 8, biggest first.
+              items:
+                type: object
+                required: [kind, key, name, cpu_pct, mem_bytes, swap_bytes]
+                properties:
+                  kind: { type: string, enum: [session, app, workspace, process, system] }
+                  key: { type: string, description: "A session id, or a consumer group key (`app:…`, `workspace:…`, `process:…`, `system`)" }
+                  name: { type: string }
+                  cpu_pct: { type: number }
+                  mem_bytes: { type: integer }
+                  swap_bytes: { type: integer }
             path: { type: string }
             mode: { type: string }
             detail: { type: string }

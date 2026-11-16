@@ -883,6 +883,7 @@ fn member(f: &crate::process::ProcFacts, kind: ProcKind) -> crate::consumers::Pr
         kind,
         cpu_pct: 50.0,
         mem_bytes: 1,
+        swap_bytes: 0,
         start_time: f.start_time,
         stopped: false,
     }
@@ -964,6 +965,7 @@ fn info(pid: u32, start_time: u64, kind: ProcKind) -> crate::monitor::ProcInfo {
         own: true,
         cpu_pct: 0.0,
         mem_bytes: 0,
+        swap_bytes: 0,
         read_bps: 0,
         write_bps: 0,
         nice: 0,

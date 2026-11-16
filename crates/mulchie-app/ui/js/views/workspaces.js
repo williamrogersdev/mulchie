@@ -14,7 +14,7 @@ export function renderWss() {
   const sel = st.ui.detail?.type === 'ws' ? st.ui.detail.key : null;
   into($('#wss')).html = th([{ l: 'Workspace', k: 'label' }, { l: 'Branch', k: 'branch', c: 'c-lg' }, { l: 'Agents', k: 'agents', n: 1, w: '62px' }, { l: 'Builds', k: 'builds', n: 1, w: '58px' }, { l: 'Procs', k: 'procs', n: 1, w: '56px', c: 'c-md' },
     { l: 'CPU', k: 'cpu_pct', n: 1, w: '128px' }, { l: 'Last 5 min', w: '96px', c: 'c-xl' }, { l: 'Mem', k: 'mem_bytes', n: 1, w: '124px' }, { l: 'Disk I/O', k: 'io', n: 1, w: '90px', c: 'c-xl' }, { l: 'State', w: '120px', c: 'c-md' }, { l: '', w: '64px' }], ui.wSort, 'w') +
-    (rows.map(w => `<tr class="click ${sel === w.path ? 'sel' : ''}" role="button" tabindex="0" data-d="ws" data-dk="${esc(w.path)}">
+    (rows.map(w => `<tr class="click k-workspace ${sel === w.path ? 'sel' : ''}" role="button" tabindex="0" data-d="ws" data-dk="${esc(w.path)}">
       <td title="${esc(w.path)}">${esc(w.label)}</td><td class="dim mono c-lg" title="${esc(w.branch || '')}">${esc(w.branch || '—')}</td>
       <td class="n">${w.agents || '<span class="dim">0</span>'}</td><td class="n">${w.builds || '<span class="dim">0</span>'}</td><td class="n c-md">${w.procs.length}</td>
       <td class="n">${meter(w.cpu_pct, cm)}${esc(cores(w.cpu_pct))}</td><td class="c-xl"><canvas class="spark" data-spark="${esc(w.label)}"></canvas></td>

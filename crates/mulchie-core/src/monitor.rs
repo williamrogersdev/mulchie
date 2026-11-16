@@ -39,6 +39,9 @@ pub struct ProcInfo {
     pub own: bool,
     pub cpu_pct: f32,
     pub mem_bytes: u64,
+    /// Memory compressed or swapped out (macOS: physical footprint minus
+    /// resident; 0 for other users' processes and elsewhere).
+    pub swap_bytes: u64,
     pub read_bps: u64,
     pub write_bps: u64,
     pub nice: i32,
@@ -438,6 +441,11 @@ impl Monitor {
                 Some((root, wt)) => label_for(root, *wt),
                 None => app_group(p.exe(), &name),
             };
+            let swap_bytes = if own {
+                swapped_out(pid.as_u32(), p.memory())
+            } else {
+                0
+            };
             samples.push(ProcSample {
                 pid: pid.as_u32(),
                 ppid: p.parent().map(|x| x.as_u32()).unwrap_or(0),
@@ -448,6 +456,7 @@ impl Monitor {
                 kind,
                 cpu_pct: p.cpu_usage(),
                 mem_bytes: p.memory(),
+                swap_bytes,
                 start_time: p.start_time(),
                 stopped: matches!(p.status(), ProcessStatus::Stop),
             });
@@ -486,6 +495,7 @@ impl Monitor {
                 own,
                 cpu_pct: p.cpu_usage(),
                 mem_bytes: p.memory(),
+                swap_bytes,
                 read_bps,
                 write_bps,
                 nice: if own { priority_of(pid.as_u32()) } else { 0 },
@@ -578,6 +588,13 @@ impl Monitor {
         pick.extend(all.iter().take(60).map(|p| p.pid));
         all.sort_by_key(|p| std::cmp::Reverse(p.mem_bytes));
         pick.extend(all.iter().take(60).map(|p| p.pid));
+        all.sort_by_key(|p| std::cmp::Reverse(p.swap_bytes));
+        pick.extend(
+            all.iter()
+                .take(30)
+                .filter(|p| p.swap_bytes > 0)
+                .map(|p| p.pid),
+        );
         all.sort_by_key(|p| std::cmp::Reverse(p.read_bps + p.write_bps));
         pick.extend(
             all.iter()
@@ -880,6 +897,32 @@ pub fn git_branch(root: &Path) -> Option<String> {
         Some(b) => Some(b.to_string()),
         None => Some(txt.chars().take(8).collect()),
     }
+}
+
+/// Memory of `pid` that is compressed or swapped out: its physical
+/// footprint (which counts those pages) minus what is resident. Only the
+/// user's own processes can be asked; 0 when the system does not say.
+#[cfg(target_os = "macos")]
+fn swapped_out(pid: u32, resident: u64) -> u64 {
+    let mut info: libc::rusage_info_v2 = unsafe { std::mem::zeroed() };
+    // SAFETY: `info` is a rusage_info_v2 and RUSAGE_INFO_V2 asks for exactly
+    // that layout; the kernel writes at most its size.
+    let rc = unsafe {
+        libc::proc_pid_rusage(
+            pid as libc::c_int,
+            libc::RUSAGE_INFO_V2,
+            &mut info as *mut libc::rusage_info_v2 as *mut libc::rusage_info_t,
+        )
+    };
+    if rc != 0 {
+        return 0;
+    }
+    info.ri_phys_footprint.saturating_sub(resident)
+}
+
+#[cfg(not(target_os = "macos"))]
+fn swapped_out(_pid: u32, _resident: u64) -> u64 {
+    0
 }
 
 pub fn priority_of(pid: u32) -> i32 {

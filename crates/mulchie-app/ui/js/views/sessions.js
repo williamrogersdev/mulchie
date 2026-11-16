@@ -1,6 +1,6 @@
 // The Sessions view: agent sessions (an agent process and everything it
 // started), from the polled state (`state.sessions`, the running ones and
-// the most recently ended, at most 50). A row opens the session detail,
+// every running one, up to 500, and the 50 most recently ended). A row opens the session detail,
 // with its processes, breaches, what Mulchie paused and its activity record.
 // Each running row says how long the session has been idle and can be ended
 // from the row, or several at once from the selection.
@@ -45,7 +45,7 @@ export function notEnforcedText(r) {
   return r.enforced == null && r.source === 'hook' ? NOT_ENFORCED.hook_registered : null;
 }
 
-// How idle counts, for tooltips and the drawer.
+// How idle counts, for tooltips and the inspector.
 export const IDLE_HELP = 'Idle: since the session last used 5% of a core or more, started a process, or its agent called a hook. Counted from when this engine first saw the session.';
 // "active", or how long it has been idle (amber from a day).
 export function idleHtml(r) {
@@ -70,7 +70,7 @@ function rowsHtml(rows, S, { ended }) {
       !ended && `CPU ${coresText(r.cpu_cores)} cores`, !ended && `memory ${MB(r.memory_mb)}`, !ended && `${r.processes} processes`,
       !ended && idle != null && (idle < 120 ? 'active now' : `idle ${ago(r.last_active_unix)}`),
       n ? `${n} limit(s) exceeded` : 'not over a limit', isHookOnly(r) ? 'registered by a hook, reported only' : ''].filter(Boolean).join(', ');
-    return `<tr class="click ${sel === r.id ? 'sel' : ''}" role="button" tabindex="0" data-d="session" data-dk="${esc(r.id)}" aria-label="${esc(label)}">
+    return `<tr class="click k-session ${sel === r.id ? 'sel' : ''}" role="button" tabindex="0" data-d="session" data-dk="${esc(r.id)}" aria-label="${esc(label)}">
       <td>${ended ? '' : `<input type="checkbox" data-ssel="${esc(r.id)}" aria-label="Select ${esc(r.agent)}" ${st.ui.sSel.has(r.id) ? 'checked' : ''}>`}</td>
       <td>${esc(r.agent)}${isHookOnly(r) ? ' <span class="chip" title="Registered by an agent hook: limits report on it but never act">hook</span>' : ''}</td>
       <td title="${esc(r.workspace || '')}">${r.workspace ? esc(tilde(r.workspace)) : '<span class="dim">none</span>'}</td>

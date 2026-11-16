@@ -8,6 +8,11 @@
   --tx: #d8dde1;
   --tx2: #9aa3a9;
   --tx3: #7d868d;
+  --k-session: #c4a0f5;
+  --k-app: #74b6f5;
+  --k-workspace: #7fcf83;
+  --k-process: #b3bbc1;
+  --k-system: #8a939a;
   --ok: #79c37d;
   --warn: #e3b24f;
   --bad: #ec6a5a;
@@ -73,6 +78,11 @@
     --tx: #1b1f22;
     --tx2: #535c63;
     --tx3: #656e75;
+    --k-session: #7b4fc4;
+    --k-app: #2f72b8;
+    --k-workspace: #2e7d36;
+    --k-process: #59626a;
+    --k-system: #6b737a;
     --ok: #2e8a3a;
     --warn: #9a6400;
     --bad: #c53526;
@@ -153,7 +163,7 @@ input:focus-visible, textarea:focus-visible, select:focus-visible { outline: 2px
 ::-webkit-scrollbar { width: 9px; height: 9px; }
 ::-webkit-scrollbar-thumb { background: var(--scroll); border-radius: 5px; border: 2px solid var(--bg); }
 
-#dash { display: none; height: 100%; grid-template-columns: 172px 1fr; }
+#dash { display: none; height: 100%; grid-template-rows: minmax(0, 1fr); grid-template-columns: 172px minmax(0, 1fr) var(--insp-w); --insp-w: clamp(300px, 30vw, 440px); }
 body.dashboard #dash { display: grid; }
 nav { background: var(--bg2); border-right: 1px solid var(--line); padding: 38px 8px 10px; display: flex; flex-direction: column; gap: 1px; -webkit-app-region: drag; }
 nav .brand { display: flex; align-items: center; gap: 7px; padding: 0 8px 12px; font-weight: 600; font-size: 13px; }
@@ -349,18 +359,55 @@ tr.click:focus-visible td, .tile:focus-visible, .cb:focus-visible, .kpi:focus-vi
 .cb .bar i, .cons .bar i { display: block; height: 100%; background: var(--c1); }
 .cb .bar i.mem { background: var(--c2); }
 .ki { display: inline-block; width: 14px; color: var(--tx3); font-size: 10px; }
-.ki.workspace { color: var(--c3); }
+.ki.workspace { color: var(--k-workspace); }
+.ki.app { color: var(--k-app); }
+.ki.session { color: var(--k-session); }
+.ki.process { color: var(--k-process); }
 
-/* ---- The detail drawer. ---- */
-.drawer { position: absolute; top: 38px; right: 0; bottom: 0; width: min(460px, calc(100% - 40px)); background: var(--bg2); border-left: 1px solid var(--line2); box-shadow: -14px 0 30px var(--shadow); display: flex; flex-direction: column; transform: translateX(105%); transition: transform .16s ease; z-index: 20; visibility: hidden; }
-.drawer.on { transform: none; visibility: visible; }
-.drawer .dh { display: flex; align-items: center; gap: 8px; padding: 10px 12px; border-bottom: 1px solid var(--line); }
-.drawer .dt { flex: 1; min-width: 0; display: flex; align-items: baseline; gap: 8px; }
-.drawer .dt h2 { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; min-width: 0; }
-.drawer .db { flex: 1; overflow-y: auto; overflow-x: hidden; padding: 10px 12px 18px; }
-.drawer .ds { margin-top: 14px; }
-.drawer .ds h3, .ds-h { margin: 14px 0 6px; }
-.drawer .ds > h3 { margin-top: 0; }
+/* ---- The inspector: the permanent right column. It shows what is
+   selected, with its actions; with nothing selected, what is using the
+   machine now. ---- */
+.inspector { background: var(--bg2); border-left: 1px solid var(--line); display: flex; flex-direction: column; min-width: 0; overflow: hidden; }
+.inspector .dh { display: flex; align-items: center; gap: 8px; height: 38px; flex: none; padding: 0 10px 0 12px; border-bottom: 1px solid var(--line); }
+.inspector .dh .btn { -webkit-app-region: no-drag; }
+.inspector .dt { flex: 1; min-width: 0; display: flex; align-items: center; gap: 8px; }
+.inspector .dt h2 { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; min-width: 0; font-size: 13px; }
+.inspector .db { flex: 1; overflow-y: auto; overflow-x: hidden; padding: 10px 12px 18px; }
+.inspector .ds { margin-top: 14px; }
+.inspector .ds h3, .ds-h { margin: 14px 0 6px; }
+.inspector .ds > h3 { margin-top: 0; }
+.inspector.home #dClose { visibility: hidden; }
+
+/* ---- Kinds: sessions, apps, workspaces and processes each have a colour,
+   a shape and a word, used the same way everywhere. ---- */
+.kt { display: inline-flex; align-items: center; gap: 4px; flex: none; padding: 0 6px 0 5px; border-radius: 4px; border: 1px solid currentColor; font-size: 10px; font-weight: 600; letter-spacing: .03em; text-transform: uppercase; line-height: 16px; white-space: nowrap; }
+.kt::before, .kt-g::before { content: '●'; font-size: 9px; }
+.kt-g { display: inline-block; width: 14px; text-align: center; flex: none; }
+.kt.session, .kt-g.session { color: var(--k-session); } .kt.session::before, .kt-g.session::before { content: '◉'; }
+.kt.app, .kt-g.app { color: var(--k-app); } .kt.app::before, .kt-g.app::before { content: '◆'; }
+.kt.workspace, .kt-g.workspace { color: var(--k-workspace); } .kt.workspace::before, .kt-g.workspace::before { content: '▲'; font-size: 8px; }
+.kt.process, .kt-g.process { color: var(--k-process); } .kt.process::before, .kt-g.process::before { content: '●'; }
+.kt.system, .kt-g.system { color: var(--k-system); } .kt.system::before, .kt-g.system::before { content: '⚙'; }
+nav a .nl { display: inline-flex; align-items: center; gap: 4px; }
+tr.k-session > td:first-child { box-shadow: inset 3px 0 var(--k-session); }
+tr.k-app > td:first-child { box-shadow: inset 3px 0 var(--k-app); }
+tr.k-workspace > td:first-child { box-shadow: inset 3px 0 var(--k-workspace); }
+tr.k-process > td:first-child { box-shadow: inset 3px 0 var(--k-process); }
+
+/* "Behind it": what a status message is about, each opening in the inspector. */
+.who { display: flex; flex-wrap: wrap; gap: 4px 6px; margin-top: 4px; align-items: center; }
+.who .wl { color: var(--tx3); font-size: 11px; }
+.wc { display: inline-flex; align-items: center; gap: 4px; max-width: 100%; padding: 1px 7px 1px 4px; border-radius: 10px; border: 1px solid var(--line2); background: var(--bg3); font-size: 11px; cursor: pointer; color: var(--tx); }
+.wc:hover { border-color: var(--focus); }
+.wc .n { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; max-width: 200px; }
+.wc .v { font-family: var(--mono); color: var(--tx2); font-size: 10.5px; }
+.rank { width: 100%; border-collapse: collapse; table-layout: fixed; }
+.rank td { padding: 4px 4px; border-bottom: 1px solid var(--line); vertical-align: middle; }
+.rank tr { cursor: pointer; }
+.rank tr:hover td { background: var(--bg3); }
+.rank .nm { display: flex; align-items: center; gap: 6px; min-width: 0; }
+.rank .nm span:last-child { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.rank .v { text-align: right; font-family: var(--mono); font-size: 11px; color: var(--tx2); white-space: nowrap; }
 .why-s { margin: 0 0 6px; line-height: 1.45; }
 .why-s.ok { color: var(--tx); }
 .wrap-t { white-space: pre-wrap; overflow-wrap: anywhere; margin: 0; color: var(--tx2); }
@@ -403,7 +450,7 @@ tr.click:focus-visible td, .tile:focus-visible, .cb:focus-visible, .kpi:focus-vi
 .more .bad, .more .warn, .more .info { font-weight: 500; }
 .form-h { grid-column: 1 / -1; margin: 14px 0 0; font-size: 12px; color: var(--tx); border-top: 1px solid var(--line); padding-top: 12px; }
 .form .form-hint { grid-column: 1 / -1; margin-top: 0; }
-.drawer select { padding: 2px 6px; }
+.inspector select { padding: 2px 6px; }
 
 /* Sessions, limits, guard and updates */
 .db .seg { flex-wrap: wrap; margin: 6px 0; }
@@ -472,3 +519,5 @@ td .btn.sm { vertical-align: baseline; }
 .btn.upd { flex: none; -webkit-app-region: no-drag; color: #0c0e0f; background: #79c37d; border-color: #79c37d; font-weight: 600; white-space: nowrap; }
 .btn.upd:hover { filter: brightness(1.08); }
 .btn.upd[hidden] { display: none; }
+.topbar .k.click { cursor: pointer; border-radius: 4px; padding: 1px 3px; margin: -1px -3px; }
+.topbar .k.click:hover { background: var(--bg3); }
