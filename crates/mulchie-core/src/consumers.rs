@@ -46,6 +46,9 @@ pub struct ProcSample {
     pub cpu_pct: f32,
     /// Resident memory in bytes.
     pub mem_bytes: u64,
+    /// Memory compressed or swapped out (macOS: the physical footprint minus
+    /// what is resident; 0 where the system does not say).
+    pub swap_bytes: u64,
     pub start_time: u64,
     /// Stopped (SIGSTOP / `T` state).
     pub stopped: bool,
@@ -103,6 +106,8 @@ pub struct MemberProc {
     pub kind: ProcKind,
     pub cpu_pct: f32,
     pub mem_bytes: u64,
+    /// Compressed or swapped out ([`ProcSample::swap_bytes`]).
+    pub swap_bytes: u64,
     pub start_time: u64,
 }
 
@@ -130,6 +135,9 @@ pub struct ConsumerGroup {
     /// them, so this can overstate what the group alone uses.
     pub mem_bytes: u64,
     pub mem_share_pct: f32,
+    /// Summed memory compressed or swapped out: what this group holds of
+    /// the swap and the compressor (macOS; 0 elsewhere).
+    pub swap_bytes: u64,
     pub procs: usize,
     /// The group's top-level process: the earliest-started member whose parent
     /// is not in the group (an app's main executable when there is one).
@@ -156,12 +164,20 @@ pub struct Consumers {
     pub by_cpu: Vec<ConsumerGroup>,
     /// Top groups by memory, at most [`TOP_GROUPS`].
     pub by_mem: Vec<ConsumerGroup>,
+    /// Top groups by memory compressed or swapped out, at most
+    /// [`TOP_GROUPS`]; only groups holding some.
+    pub by_swap: Vec<ConsumerGroup>,
+    /// Every app (a group of kind `app`), biggest memory first, at most
+    /// [`MAX_APPS`].
+    pub apps: Vec<ConsumerGroup>,
     /// How many groups there are in all.
     pub groups: usize,
     pub memory_note: String,
 }
 
 pub const TOP_GROUPS: usize = 10;
+/// Apps listed in [`Consumers::apps`].
+pub const MAX_APPS: usize = 100;
 
 pub const MEMORY_NOTE: &str = "Memory per group is resident memory summed over its processes; pages shared between processes are counted in each, so totals can exceed what is really used.";
 
@@ -420,13 +436,27 @@ pub fn group(procs: &[ProcSample], ctx: &GroupCtx) -> (Consumers, Members) {
     all.sort_by(|a, b| b.cpu_pct.total_cmp(&a.cpu_pct).then(a.key.cmp(&b.key)));
     let by_cpu: Vec<ConsumerGroup> = all.iter().take(TOP_GROUPS).cloned().collect();
     all.sort_by(|a, b| b.mem_bytes.cmp(&a.mem_bytes).then(a.key.cmp(&b.key)));
-    let by_mem: Vec<ConsumerGroup> = all.into_iter().take(TOP_GROUPS).collect();
+    let by_mem: Vec<ConsumerGroup> = all.iter().take(TOP_GROUPS).cloned().collect();
+    let apps: Vec<ConsumerGroup> = all
+        .iter()
+        .filter(|g| g.kind == GroupKind::App)
+        .take(MAX_APPS)
+        .cloned()
+        .collect();
+    all.sort_by(|a, b| b.swap_bytes.cmp(&a.swap_bytes).then(a.key.cmp(&b.key)));
+    let by_swap: Vec<ConsumerGroup> = all
+        .into_iter()
+        .filter(|g| g.swap_bytes > 0)
+        .take(TOP_GROUPS)
+        .collect();
     (
         Consumers {
             cores,
             mem_total: ctx.mem_total,
             by_cpu,
             by_mem,
+            by_swap,
+            apps,
             groups,
             memory_note: MEMORY_NOTE.into(),
         },
@@ -472,6 +502,7 @@ fn summarize(
 ) -> ConsumerGroup {
     let cpu_pct: f32 = ms.iter().map(|p| p.cpu_pct).sum();
     let mem_bytes: u64 = ms.iter().map(|p| p.mem_bytes).sum();
+    let swap_bytes: u64 = ms.iter().map(|p| p.swap_bytes).sum();
     let main = main_member(ms, bundle.as_deref());
     let mut top: Vec<&ProcSample> = ms.iter().collect();
     top.sort_by(|a, b| {
@@ -508,6 +539,7 @@ fn summarize(
         } else {
             mem_bytes as f32 * 100.0 / ctx.mem_total as f32
         },
+        swap_bytes,
         procs: ms.len(),
         main_pid: main.map(|p| p.pid).unwrap_or(0),
         main_start_time: main.map(|p| p.start_time).unwrap_or(0),
@@ -520,6 +552,7 @@ fn summarize(
                 kind: p.kind,
                 cpu_pct: p.cpu_pct,
                 mem_bytes: p.mem_bytes,
+                swap_bytes: p.swap_bytes,
                 start_time: p.start_time,
             })
             .collect(),

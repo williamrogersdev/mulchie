@@ -1,10 +1,13 @@
-// The detail drawer: every table row, finding, tile and chart legend opens
-// one. It slides over the right of the view (tables never reflow), closes on
-// Esc or ×, and re-renders on each poll without losing focus, scroll or the
-// expanded rows. Every value that reaches innerHTML goes through esc().
+// The inspector: the permanent right column. Every table row, finding, tile,
+// chip and chart legend shows its detail and actions here; with nothing
+// selected it shows what is using the machine (swap, the busiest sessions,
+// apps). Esc or × goes back to that summary. It re-renders on each poll
+// without losing focus, scroll or the expanded rows. Every value that reaches
+// innerHTML goes through esc().
 import { st, hooks } from './store.js';
 import { invoke } from './ipc.js';
-import { $, esc, B, BS, P, ago, dur, tilde, toast, kindChip } from './util.js';
+import { $, esc, B, BS, P, ago, dur, tilde, toast, kindChip, kindTag } from './util.js';
+import { behind, rankHtml, runningSessions, sessionCulprit, groupCulprit } from './culprits.js';
 import { planThenExecute, confirmBox, reasonText } from './dialogs.js';
 import { GROUP_ACTIONS, groupAction, signalPids, reniceProc, planAndRun, canLower, sessionNote, resumePaused, endSessions } from './signals.js';
 import { allProcs, findConsumer, ranked, cores, cpuSummary, memSummary, KIND_TEXT } from './consumers.js';
@@ -111,12 +114,12 @@ function rWorkspace(path) {
     <div class="actions">${btn('Open in Terminal', `data-term="${esc(w.path)}"` + (w.exists ? '' : ' disabled'))}${caches.length ? btn(`Clean caches (${B(caches.reduce((a, i) => a + i.bytes, 0))})…`, da('clean-caches', w.path)) : ''}${wt ? btn('Worktree →', dl('wt', wt.path)) : ''}</div>
     ${sec(`Processes (${procs.length})`, procRows(procs))}
     ${sec(`Build caches (${caches.length})`, caches.length ? `<table class="mini-t"><colgroup><col><col style="width:80px"><col style="width:80px"></colgroup>${caches.map(i => `<tr class="click" role="button" tabindex="0" ${dl('cache', i.path)}><td><span class="cell" title="${esc(i.path)}">${esc(tilde(i.path).replace(tilde(w.path), '…'))}</span></td><td class="n">${B(i.bytes)}</td><td class="n ${i.in_use ? 'ok' : i.stale ? 'warn' : 'dim'}">${i.in_use ? 'in use' : i.stale ? 'stale' : 'recent'}</td></tr>`).join('')}</table>` : '<div class="dim">None found under this folder.</div>')}`;
-  return { title: w.label, sub: w.paused ? '<span class="chip warn">paused</span>' : '', html,
+  return { title: w.label, sub: kindTag('workspace') + (w.paused ? ' <span class="chip warn">paused</span>' : ''), html,
     copy: { kind: 'workspace', ...pick(w, ['path', 'label', 'branch', 'agents', 'builds', 'paused', 'throttled', 'orphan', 'cpu_pct', 'mem_bytes']), processes: procs.map(procCopy), caches: caches.map(i => pick(i, ['path', 'kind', 'bytes', 'stale', 'in_use'])) } };
 }
 
 // The engine's full record of one process (`GET /v1/process/<pid>`), read
-// when the drawer opens and again every few seconds while it stays open.
+// when the inspector opens and again every few seconds while it stays open.
 const pd = { pid: null, data: undefined, err: null, at: 0, busy: false };
 export function loadProc(pid, force) {
   pid = +pid;
@@ -124,7 +127,7 @@ export function loadProc(pid, force) {
   if (pd.busy || (!force && Date.now() - pd.at < 2500)) return;
   pd.busy = true;
   invoke('process_detail', { pid })
-    // A reply for a process the drawer no longer shows is dropped.
+    // A reply for a process the inspector no longer shows is dropped.
     .then(d => { if (pd.pid === pid) { pd.data = d; pd.err = null; } }, e => { if (pd.pid === pid) pd.err = String(e); })
     .finally(() => {
       pd.busy = false;
@@ -151,7 +154,7 @@ function rProc(pid) {
   const html = `<div>${x.kind ? kindChip(x.kind) : ''} ${own ? '' : '<span class="chip">another user</span>'} ${x.stopped ? '<span class="chip warn">paused</span>' : ''} ${p?.nice > 0 ? `<span class="chip warn">nice ${p.nice}</span>` : ''}</div>
     ${d?.protected ? `<p class="why-s warn">Mulchie will not signal it: ${esc(d.protected)}.</p>` : ''}
     ${fs.length ? sec(`Observations (${fs.length})`, fs.map(f => `<div class="finding" role="button" tabindex="0" ${dl('finding', f.id)}><span class="ic" style="background:var(--${SEV_LVL[f.severity] || 'info'})"></span><div class="t"><div>${esc(f.title)}</div></div></div>`).join('')) : ''}
-    ${kv([['cpu', x.cpu_pct != null ? `${esc(cores(x.cpu_pct))} <span class="dim">(${P(x.cpu_pct, 1)} of one core)</span>` : '—'], ['memory', x.mem_bytes != null ? B(x.mem_bytes) : '—'], p && ['disk i/o', `${BS(p.read_bps)} r · ${BS(p.write_bps)} w`], p && ['nice', String(p.nice)],
+    ${kv([['cpu', x.cpu_pct != null ? `${esc(cores(x.cpu_pct))} <span class="dim">(${P(x.cpu_pct, 1)} of one core)</span>` : '—'], ['memory', x.mem_bytes != null ? B(x.mem_bytes) : '—'], p?.swap_bytes > 0 && ['swap', `${B(p.swap_bytes)} <span class="dim">compressed or swapped out</span>`], p && ['disk i/o', `${BS(p.read_bps)} r · ${BS(p.write_bps)} w`], p && ['nice', String(p.nice)],
       ['age', `${age != null ? esc(dur(age)) : '—'} <span class="dim">(started ${esc(started)})</span>`],
       ['working dir', d?.cwd ? `<span class="mono">${esc(tilde(d.cwd))}</span>` : `<span class="dim">${d ? 'not readable' : '…'}</span>`],
       ['program', d?.exe ? `<span class="mono">${esc(tilde(d.exe))}</span>` : '<span class="dim">—</span>'],
@@ -164,7 +167,7 @@ function rProc(pid) {
     <h3 class="ds-h">Command line</h3><pre class="code">${esc(cmd) || '<span class="dim">not readable</span>'}</pre>
     ${own && !d?.protected ? actions([btn('Quit…', da('p-term', pid), 'danger'), btn('Force quit…', da('p-kill', pid), 'danger'), x.stopped ? btn('Resume…', da('p-cont', pid)) : btn('Pause…', da('p-stop', pid)), canLower(p) ? btn('Lower priority…', da('p-renice', pid)) : '', d?.children?.length ? btn('Quit with children…', da('p-tree', pid), 'danger') : ''])
       : own ? '' : '<div class="muted" style="margin-top:10px">Owned by another user; Mulchie will not signal it.</div>'}`;
-  return { title: `${x.name}`, sub: `<span class="dim mono">pid ${pid}</span>`, html,
+  return { title: `${x.name}`, sub: `${kindTag('process')} <span class="dim mono">pid ${pid}</span>`, html,
     copy: { kind: 'process', ...pick(x, ['pid', 'ppid', 'name', 'kind', 'cpu_pct', 'mem_bytes', 'start_time', 'workspace', 'cwd', 'exe', 'signature', 'listening', 'protected']), cmd, parents: d?.parents, children: d?.children, findings: fs.map(f => f.id) } };
 }
 
@@ -175,14 +178,14 @@ function rGroup(key) {
     if (ws) return rWorkspace(ws.path);
     return gone('Group', key.replace(/^\w+:/, ''), 'It is not among the biggest users of CPU or memory right now.');
   }
-  const html = `${kv([['kind', esc(KIND_TEXT[c.kind] || c.kind)], ['cpu', `${esc(cores(c.cpu_pct))} <span class="dim">(${P(c.share * 100)} of the machine)</span>`], ['memory', `${B(c.mem_bytes)} <span class="dim">(${P(c.mem_share_pct)})</span>`],
+  const html = `${kv([['kind', esc(KIND_TEXT[c.kind] || c.kind)], ['cpu', `${esc(cores(c.cpu_pct))} <span class="dim">(${P(c.share * 100)} of the machine)</span>`], ['memory', `${B(c.mem_bytes)} <span class="dim">(${P(c.mem_share_pct)})</span>`], c.swap_bytes > 0 && ['swap', `${B(c.swap_bytes)} <span class="dim">compressed or swapped out</span>`],
     ['processes', `${c.count}${c.agents ? ` · ${c.agents} agent(s)` : ''}${c.builds ? ` · ${c.builds} build(s)` : ''}`], ['main process', procName(c.main_pid, c.top?.find(t => t.pid === c.main_pid)?.name || c.label)],
     c.bundle_id && ['bundle id', `<span class="mono">${esc(c.bundle_id)}</span>`], c.path && ['path', esc(tilde(c.path))]])}
     <p class="dim">${esc(S().snapshot.consumers?.memory_note || '')}</p>
     ${groupButtons(c, { path: c.path })}
     ${c.kind === 'workspace' ? `<div class="actions">${btn('Workspace details →', dl('ws', c.path))}</div>` : ''}
     ${sec(`Biggest processes (${(c.top || []).length} of ${c.count})`, memberRows(c))}`;
-  return { title: c.label, sub: `<span class="chip">${esc(c.kind)}</span>`, html, copy: { kind: 'group', ...pick(c, ['key', 'label', 'kind', 'path', 'bundle_id', 'cpu_pct', 'cpu_cores', 'cpu_share_pct', 'mem_bytes', 'count', 'main_pid', 'main_start_time', 'actions', 'protected']), top: c.top } };
+  return { title: c.label, sub: kindTag(c.kind), html, copy: { kind: 'group', ...pick(c, ['key', 'label', 'kind', 'path', 'bundle_id', 'cpu_pct', 'cpu_cores', 'cpu_share_pct', 'mem_bytes', 'swap_bytes', 'count', 'main_pid', 'main_start_time', 'actions', 'protected']), top: c.top } };
 }
 
 const fmtEvidence = e => [
@@ -220,6 +223,7 @@ function rFinding(id) {
   const cmds = ups.length ? [...new Set(ups.map(u => u.command).filter(Boolean))] : f.suggested.map(runCommand).filter(Boolean);
   const html = `<p class="why-s ${SEV_LVL[f.severity] === 'bad' ? 'warn' : ''}">${esc(f.why)}</p>
     ${kv(fmtEvidence(e))}
+    ${e.culprits?.length ? sec(/swap/i.test(f.title) ? 'Holding swap' : 'Using memory', rankHtml(e.culprits, /swap/i.test(f.title) ? 'swap' : 'mem')) : ''}
     ${e.cmd ? `<h3 class="ds-h">Command line</h3><pre class="code">${esc(e.cmd)}</pre>` : ''}
     ${kv([['first seen', when(f.first_seen_unix)], ['last seen', when(f.last_seen_unix)], f.dismissed && ['dismissed', f.dismissed_until ? `until ${esc(until(f.dismissed_until))}` : 'indefinitely']])}
     ${sug.length ? sec('What you can do', `<div class="actions">${sug.join('')}</div><div class="dim">Each action is planned first and shows the processes it affects before anything is sent.</div>`) : ''}
@@ -264,8 +268,10 @@ function rResource(res) {
       <span class="bar"><i style="width:${(cpu ? c.cpu_pct : c.mem_bytes) / max * 100}%"></i></span>
       <span class="nm" title="${esc(c.label)}">${esc(c.short)}</span><span class="v">${cpu ? esc(cores(c.cpu_pct)) : B(c.mem_bytes)}</span></summary>
       <div class="cons-b">${memberRows(c)}${groupButtons(c, { path: c.path })}<div class="actions">${btn('Details →', dl('group', c.key))}</div></div></details>`).join('');
+  const sess = topSessions(cpu ? 'cpu' : 'mem', 10);
   const html = `<p class="why-s ${sum.level}">${esc(sum.headline)}</p><p class="dim">${esc(sum.detail)}</p>
-    ${sec(cpu ? 'Using the CPU' : 'Using memory', rows || '<div class="dim">Nothing measurable.</div>')}`;
+    ${sec(cpu ? 'Using the CPU' : 'Using memory', rows || '<div class="dim">Nothing measurable.</div>')}
+    ${sec(`Sessions by ${cpu ? 'CPU' : 'memory'} (${runningSessions(S()).length} running)`, rankHtml(sess, cpu ? 'cpu' : 'mem'))}`;
   return { title: cpu ? 'CPU' : 'Memory', sub: `<span class="chip ${sum.level === 'ok' ? 'ok' : sum.level}">${esc(sum.word)}</span>`, html,
     copy: { kind: cpu ? 'cpu' : 'memory', summary: cpu ? s.cpu_summary : s.mem_summary,
       top: list.slice(0, 8).map(c => ({ ...pick(c, ['key', 'label', 'kind', 'path', 'cpu_pct', 'mem_bytes', 'count', 'main_pid']), top_pids: (c.top || []).map(p => p.pid) })) } };
@@ -330,7 +336,7 @@ function rSegment(seg) {
 // ------------------------------------------------------------- sessions
 
 // One session from the engine (`GET /v1/sessions/{id}`) and its activity
-// record (`GET /v1/sessions/{id}/events`), refreshed while the drawer shows
+// record (`GET /v1/sessions/{id}/events`), refreshed while the inspector shows
 // it. The first read takes the newest events (`tail`); "Show older" pages
 // back with `before`/`prev_before`; each poll reads only what follows the
 // newest seq. An engine without backward reads (no `prev_before` in its
@@ -496,7 +502,7 @@ function rSession(id) {
       <div class="dim">Without it, only what the agent started is affected and the agent keeps running. Each action is planned first and lists the processes before anything is sent.</div>`) : ''}
     ${sec(`Processes (${procs.length})`, procs.length ? `<table class="mini-t"><colgroup><col><col style="width:70px"><col style="width:76px"></colgroup>${procs.slice(0, 60).map(p => `<tr class="click" role="button" tabindex="0" ${dl('proc', p.pid)}><td><span class="cell">${esc(p.name)} <span class="dim mono">${p.pid}</span>${p.root ? ' <span class="chip agent">agent</span>' : ''}${p.stopped ? ' <span class="chip warn">paused</span>' : ''}</span></td><td class="n">${esc(cores(p.cpu_pct))}</td><td class="n">${B(p.mem_bytes)}</td></tr>`).join('')}</table>${procs.length > 60 ? `<div class="dim">and ${procs.length - 60} more</div>` : ''}` : `<div class="dim">${running ? (d ? 'None at the last sample.' : 'Reading…') : 'The session has ended.'}</div>`)}
     ${sec('Activity', activityHtml(id))}`;
-  return { title: `${x.agent || 'Session'}${x.workspace ? ` · ${tilde(x.workspace).split('/').pop()}` : ''}`, sub: `<span class="dim mono">${esc(id)}</span>${running ? '' : ' <span class="chip">ended</span>'}${breaches.some(b => b.cleared_unix == null) ? ' <span class="chip bad">over a limit</span>' : ''}`, html,
+  return { title: `${x.agent || 'Session'}${x.workspace ? ` · ${tilde(x.workspace).split('/').pop()}` : ''}`, sub: `${kindTag('session')} <span class="dim mono">${esc(id)}</span>${running ? '' : ' <span class="chip">ended</span>'}${breaches.some(b => b.cleared_unix == null) ? ' <span class="chip bad">over a limit</span>' : ''}`, html,
     copy: { kind: 'session', id, ...pick(x, ['agent', 'source', 'status', 'workspace', 'cwd', 'root_pid', 'started_unix', 'ended_unix', 'last_active_unix']), usage: u, peak: s.peak, breaches: breaches.map(b => pick(b, ['cap', 'max', 'value', 'action', 'action_state', 'cleared_unix'])), hint: 'Act on it with POST /v1/process/plan {"session": id, "action": …} then /v1/process/execute.' } };
 }
 
@@ -523,14 +529,46 @@ function rAction(key) {
   return { title: `${a.kind}${a.status === 'skipped' ? ' · skipped' : ''}`, sub: `<span class="dim">${esc(ago(a.at_unix))} ago</span>`, html, copy: { kind: 'activity', ...a } };
 }
 
+// Running sessions, biggest first by 'cpu' or 'mem'.
+const topSessions = (what, n) => runningSessions(S()).map(sessionCulprit).sort((a, b) => what === 'cpu' ? b.cpu_pct - a.cpu_pct : b.mem_bytes - a.mem_bytes).slice(0, n);
+const culpritCopy = x => pick(x, ['kind', 'key', 'name', 'cpu_pct', 'mem_bytes', 'swap_bytes', 'processes']);
+
+// Swap: how much is in use and what is holding it.
+function rSwap() {
+  const s = S().snapshot, list = behind(S(), 'swap', 15);
+  const fromEngine = (S().findings || []).some(f => f.kind === 'memory_low' && f.evidence?.culprits?.length);
+  const html = `${kv([['in use', B(s.swap_used)], ['memory free', `${B(s.mem_available)} of ${B(s.mem_total)}`]])}
+    <p class="dim">Swap per process is estimated from its footprint minus what is resident, so it counts memory the system compressed as well as memory written to disk. It is known only for your own processes.</p>
+    ${sec('Holding swap', rankHtml(list, 'swap'))}
+    ${fromEngine ? '' : '<p class="dim">Sessions are counted here only while the memory warning is on; until then, the list shows apps, workspaces and processes.</p>'}
+    ${sec('Using memory now', rankHtml(behind(S(), 'mem', 8), 'mem'))}`;
+  return { title: 'Swap', sub: `<span class="dim">${B(s.swap_used)} in use</span>`, html, copy: { kind: 'swap', swap_used: s.swap_used, mem_available: s.mem_available, mem_total: s.mem_total, holding: list.map(culpritCopy) } };
+}
+
+// With nothing selected: what is using the machine, each row opening its detail.
+function rMachine() {
+  const s = S().snapshot, apps = (s.consumers?.apps || []).slice(0, 8).map(groupCulprit);
+  const running = runningSessions(S()).length, swap = behind(S(), 'swap', 5);
+  const cpuS = topSessions('cpu', 8), memS = topSessions('mem', 8);
+  const html = `<p class="dim">Select a row, chip or tile to see its detail and what you can do here. ${kindTag('session')} ${kindTag('app')} ${kindTag('workspace')} ${kindTag('process')}</p>
+    ${sec('Using the CPU', rankHtml(behind(S(), 'cpu', 6), 'cpu'), ` ${link('cpu', '', 'All →')}`)}
+    ${sec('Using memory', rankHtml(behind(S(), 'mem', 6), 'mem'), ` ${link('mem', '', 'All →')}`)}
+    ${s.swap_used > 0 ? sec(`Holding swap (${B(s.swap_used)} in use)`, rankHtml(swap, 'swap'), ` ${link('swap', '', 'All →')}`) : ''}
+    ${sec(`Busiest sessions (${running} running)`, rankHtml(cpuS, 'cpu'))}
+    ${sec('Biggest sessions by memory', rankHtml(memS, 'mem'))}
+    ${sec(`Apps by memory (${(s.consumers?.apps || []).length})`, rankHtml(apps, 'mem'))}`;
+  return { title: 'What is using the machine', html,
+    copy: { kind: 'machine', cpu: behind(S(), 'cpu', 6).map(culpritCopy), memory: behind(S(), 'mem', 6).map(culpritCopy), swap: swap.map(culpritCopy), sessions_by_cpu: cpuS.map(culpritCopy), sessions_by_memory: memS.map(culpritCopy), apps: apps.map(culpritCopy) } };
+}
+
 function gone(title, path, why = 'It is no longer reported by the engine.') {
   return { title, html: `<p class="muted">${path ? esc(tilde(path)) + '<br><br>' : ''}${esc(why)}</p>`, copy: { kind: 'gone', title, path } };
 }
 
-const RENDER = { wt: rWorktree, ws: rWorkspace, proc: rProc, group: rGroup, cpu: () => rResource('cpu'), mem: () => rResource('mem'), agents: rAgents, cache: rCache, cat: rCategory, seg: rSegment, act: rAction, finding: rFinding, findings: rFindings, session: rSession };
+const RENDER = { wt: rWorktree, ws: rWorkspace, proc: rProc, group: rGroup, cpu: () => rResource('cpu'), mem: () => rResource('mem'), agents: rAgents, cache: rCache, cat: rCategory, seg: rSegment, act: rAction, finding: rFinding, findings: rFindings, session: rSession, swap: rSwap };
 export const NEEDS_ACTIONS = new Set(['wt', 'act']);
 
-// ------------------------------------------------------------- the drawer
+// ------------------------------------------------------------- the inspector
 
 let last = '', opener = null;
 
@@ -550,9 +588,12 @@ export function openDetail(type, key) {
   if (NEEDS_ACTIONS.has(type)) hooks.refresh(true);
 }
 
+// Back to the summary of the machine.
 export function closeDetail() {
   st.ui.detail = null;
+  last = '';
   renderDetail();
+  $('#dBody').scrollTop = 0;
   if (opener?.isConnected) opener.focus();
   opener = null;
 }
@@ -573,11 +614,9 @@ function focusSel(el) {
 export function renderDetail() {
   const d = st.ui.detail, el = $('#drawer');
   if (!el) return;
-  el.classList.toggle('on', !!(d && st.S));
-  el.setAttribute('aria-hidden', d && st.S ? 'false' : 'true');
-  document.body.classList.toggle('drawer-on', !!(d && st.S));
-  if (!d || !st.S) { last = ''; return; }
-  const r = RENDER[d.type](d.key);
+  el.classList.toggle('home', !d);
+  if (!st.S) { last = ''; return; }
+  const r = d ? RENDER[d.type](d.key) : rMachine();
   st.ui.detailCopy = { title: r.title, data: r.copy };
   $('#dTitle').textContent = r.title;
   $('#dSub').innerHTML = r.sub || '';
@@ -649,7 +688,7 @@ export async function detailAction(t) {
     case 'ev-more': last = ''; return olderEvents(arg);
     case 'resume-paused': return resumePaused(arg.split(',').filter(Boolean).map(x => { const [pid, start] = x.split(':'); return { pid: +pid, start_time: +start }; }));
     case 'fcat':
-      // Filter in place: the same drawer, focus stays on the pressed button.
+      // Filter in place: the same inspector, focus stays on the pressed button.
       st.ui.detail = { type: 'findings', key: arg || '' };
       return renderDetail();
     case 'fx': {

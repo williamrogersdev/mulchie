@@ -19,6 +19,8 @@ use crate::watch::{ApiRequest, Evidence, FindingCategory, FindingKind, Suggestio
 
 /// Sessions listed in [`State`] (running first, then the latest ended).
 pub const STATE_SESSIONS_KEPT: usize = 50;
+/// Running sessions listed in the state, at most.
+pub const STATE_RUNNING_KEPT: usize = 500;
 /// The file of processes Mulchie paused, under `<config dir>/sessions/`.
 pub const PAUSED_FILE: &str = "paused.json";
 /// The limits worker wakes at least this often for scheduled jobs.
@@ -225,7 +227,7 @@ pub struct SessionsState {
     pub write_bytes_available: bool,
     pub running: usize,
     pub ended: usize,
-    /// Running sessions, then the most recently ended, at most 50.
+    /// Every running session (at most 500), then the 50 most recently ended.
     pub list: Vec<SessionBrief>,
     /// Active breaches, and cleared ones whose paused processes are not
     /// resumed yet.
@@ -1278,9 +1280,19 @@ impl Engine {
             write_bytes_available: write,
             running,
             ended,
+            // Every running session (a machine can run a hundred), then the
+            // most recently ended.
             list: list
                 .into_iter()
-                .take(STATE_SESSIONS_KEPT)
+                .enumerate()
+                .filter(|(i, s)| {
+                    if s.status == SessionStatus::Running {
+                        *i < STATE_RUNNING_KEPT
+                    } else {
+                        *i < running.min(STATE_RUNNING_KEPT) + STATE_SESSIONS_KEPT
+                    }
+                })
+                .map(|(_, s)| s)
                 .map(|s| SessionBrief::of(&Self::with_enforcement(s.clone(), cfg, automating)))
                 .collect(),
             breaches_active: breaches.iter().filter(|b| b.active()).count(),

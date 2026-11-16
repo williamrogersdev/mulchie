@@ -9,7 +9,7 @@ use crate::engine::tests::engine_with_procs;
 use crate::limits::Machine;
 use crate::monitor::ProcKind;
 use crate::process::FakeProcesses;
-use crate::session::{Session, SessionProc};
+use crate::session::{Session, SessionProc, Tracker};
 
 const WS: &str = "/code/a";
 const GB: u64 = 1 << 30;
@@ -100,6 +100,7 @@ fn ps(pid: u32, ppid: u32, start: u64, name: &str, mem: u64) -> ProcSample {
         kind: ProcKind::Other,
         cpu_pct: 0.0,
         mem_bytes: mem,
+        swap_bytes: 0,
         start_time: start,
         stopped: false,
     }
@@ -406,4 +407,35 @@ fn units_leave_out_protected_groups_hosts_and_session_members() {
     let su = units.iter().find(|u| u.key == session).unwrap();
     assert_eq!(su.procs.len(), 2);
     assert_eq!(su.mem_mb, 3.0 * 1024.0);
+}
+
+/// A memory finding names what holds the memory, and with swap filling up,
+/// what holds the swap: ranked by that measure, groups named by kind.
+#[test]
+fn culprits_rank_by_memory_or_by_swap() {
+    let mut chrome = ps(10, 1, 5, "Google Chrome", 6 * GB);
+    chrome.swap_bytes = GB;
+    let mut node = ps(20, 1, 5, "node", 2 * GB);
+    node.swap_bytes = 5 * GB;
+    let s = snap(
+        3,
+        &[],
+        &[
+            ("app:/Applications/Google Chrome.app", vec![chrome]),
+            ("process:node", vec![node]),
+            ("process:idle", vec![ps(30, 1, 5, "idle", 0)]),
+        ],
+    );
+    let t = Tracker::default();
+    let by_mem = memory_culprits(&s, &t, false);
+    assert_eq!(
+        by_mem
+            .iter()
+            .map(|c| (c.kind.as_str(), c.name.as_str()))
+            .collect::<Vec<_>>(),
+        [("app", "Google Chrome.app"), ("process", "node")]
+    );
+    let by_swap = memory_culprits(&s, &t, true);
+    assert_eq!(by_swap[0].key, "process:node");
+    assert_eq!(by_swap[0].swap_bytes, 5 * GB);
 }

@@ -7,6 +7,7 @@ import { act } from './act.js';
 import { renderTop, renderOverview } from './views/overview.js';
 import { renderProcs, procBulk } from './views/processes.js';
 import { renderWss } from './views/workspaces.js';
+import { renderApps } from './views/apps.js';
 import { renderSessions, endSelectedSessions } from './views/sessions.js';
 import { renderDisk, removeSelectedWorktrees, sweep, clearSelectedCaches, clearStale } from './views/disk.js';
 import { renderActs } from './views/activity.js';
@@ -19,7 +20,7 @@ import { cpuSummary, memSummary, ranked, findConsumer } from './consumers.js';
 import { groupAction } from './signals.js';
 
 const POLL_MS = 3000;
-const VIEWS = ['overview', 'processes', 'workspaces', 'sessions', 'disk', 'activity', 'agents', 'settings'];
+const VIEWS = ['overview', 'processes', 'workspaces', 'apps', 'sessions', 'disk', 'activity', 'agents', 'settings'];
 const TEXT_KEYS = ['name', 'group', 'label', 'branch', 'repo_name', 'kind', 'agent', 'workspace'];
 
 document.body.classList.add(MODE === 'panel' ? 'panel' : 'dashboard');
@@ -32,6 +33,7 @@ function render() {
   if (v === 'overview') renderOverview();
   else if (v === 'processes') renderProcs();
   else if (v === 'workspaces') renderWss();
+  else if (v === 'apps') renderApps();
   else if (v === 'sessions') renderSessions();
   else if (v === 'disk') renderDisk();
   else if (v === 'activity') renderActs();
@@ -133,7 +135,7 @@ function go(v, opts = {}) {
   if (changed && (v === 'activity' || v === 'settings')) refresh(true);
 }
 
-// Named actions for findings, the panel and the drawer.
+// Named actions for findings, the panel and the inspector.
 function run(name) {
   if (name === 'sweep') return sweep();
   if (name === 'stale') return clearStale();
@@ -244,7 +246,7 @@ document.addEventListener('click', async e => {
     return openDetail(d.d, d.dk);
   }
   if (d.sort) {
-    const [tbl, k] = d.sort.split(':'), key = { p: 'pSort', w: 'wSort', wt: 'wtSort', s: 'sSort' }[tbl];
+    const [tbl, k] = d.sort.split(':'), key = { p: 'pSort', w: 'wSort', wt: 'wtSort', s: 'sSort', ap: 'apSort' }[tbl];
     if (!key) return;
     ui[key] = ui[key][0] === k ? [k, -ui[key][1]] : [k, TEXT_KEYS.includes(k) ? 1 : -1];
     return render();
@@ -259,6 +261,7 @@ document.addEventListener('click', async e => {
 const on = (sel, ev, fn) => { const el = $(sel); if (el) el.addEventListener(ev, fn); };
 on('#pFilter', 'input', render);
 on('#wFilter', 'input', render);
+on('#aFilter', 'input', render);
 on('#sFilter', 'input', render);
 document.addEventListener('change', e => { if (e.target.id === 'sIncAgent') st.ui.sIncAgent = e.target.checked; });
 on('#pMine', 'change', render);

@@ -98,3 +98,16 @@ export function th(cols, sort, id) {
 export const meter = (v, max, color) => `<span class="meter"><i style="width:${Math.min(100, max ? v / max * 100 : 0)}%;background:${color || 'var(--c1)'}"></i></span>`;
 export const kindChip = k => `<span class="chip ${esc(k)}">${esc(k)}</span>`;
 export const legend = items => items.map(([l, c]) => `<span><i style="background:${c}"></i>${esc(l)}</span>`).join('');
+
+// Kinds: what each row, message and detail is about. Each kind has a colour,
+// a shape and a word (css .kt / .kt-g), the same everywhere.
+export const KIND_WORD = { session: 'Session', app: 'App', workspace: 'Workspace', process: 'Process', system: 'System' };
+export const KIND_HELP = {
+  session: 'A session: one agent and everything it started',
+  app: 'An app: a program bundle with all its helper processes',
+  workspace: 'A workspace: a repo or worktree folder, with every process running in it',
+  process: 'A process: one running program instance (all processes of that name when grouped)',
+  system: 'The operating system',
+};
+export const kindTag = k => `<span class="kt ${esc(k)}" title="${esc(KIND_HELP[k] || '')}">${esc(KIND_WORD[k] || k)}</span>`;
+export const kindGlyph = k => `<span class="kt-g ${esc(k)}" role="img" aria-label="${esc(KIND_WORD[k] || k)}" title="${esc(KIND_HELP[k] || KIND_WORD[k] || k)}"></span>`;

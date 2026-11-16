@@ -2,6 +2,7 @@
 import { st } from '../store.js';
 import { $, into, esc, B, BS, P, ago, clock, th, meter, legend, css } from '../util.js';
 import { chart } from '../chart.js';
+import { behind, rankHtml, runningSessions, sessionCulprit } from '../culprits.js';
 import { findings, findingsHtml, notices, noticesHtml, modeHtml, modeTitle } from '../findings.js';
 import { barsHtml, consumers, cores as coresTxt, cpuSummary, memSummary, cpuTile, memTile, KIND_ICON } from '../consumers.js';
 
@@ -24,6 +25,7 @@ export function renderTop() {
   $('#tTime').textContent = s.at_unix ? clock(s.at_unix) : '';
   $('#nProc').textContent = s.proc_count;
   $('#nWs').textContent = s.workspaces.length;
+  $('#nApps').textContent = s.consumers?.apps?.length || '';
   $('#nSess').textContent = S.sessions?.running || '';
   $('#nDisk').textContent = S.diskmap ? B(S.diskmap.worktree_bytes, 0) : '';
   $('#nAct').textContent = S.actions_count || '';
@@ -46,6 +48,9 @@ export function renderOverview() {
   ].map(([l, v, sub, pct, col, to, tip]) => `<div class="card kpi" role="button" tabindex="0" ${to} title="${esc(tip)}"><h3>${l}</h3><div class="v">${esc(v)}</div><div class="s">${esc(sub)}</div><div class="bar"><i style="width:${Math.min(100, pct || 0)}%;background:${col}"></i></div></div>`).join('');
   into($('#oCpuTop')).html = barsHtml(S, 'cpu_pct', 5);
   into($('#oMemTop')).html = barsHtml(S, 'mem_bytes', 5);
+  const sess = runningSessions(S).map(sessionCulprit).sort((x, y) => y.cpu_pct - x.cpu_pct || y.mem_bytes - x.mem_bytes).slice(0, 5);
+  into($('#oSessTop')).html = sess.length ? rankHtml(sess, 'cpu') : '<div class="dim">No agent sessions running.</div>';
+  into($('#oSwapTop')).html = s.swap_used > 0 ? rankHtml(behind(S, 'swap', 5), 'swap') : '<div class="dim">No swap in use.</div>';
 
   const cores = s.cpu_count || 1;
   chart($('#chCpu'), [
@@ -77,7 +82,7 @@ export function renderOverview() {
 }
 
 // "All observations (11 · 2 dismissed) →": the engine's findings, with the
-// dismissed ones, in one drawer.
+// dismissed ones, in the inspector.
 export function watchLink(S) {
   const c = S.finding_counts;
   if (!c) return '';

@@ -2,6 +2,7 @@
 import { st } from './store.js';
 import { esc, B, ago, clock } from './util.js';
 import { cpuSummary, memSummary, ranked } from './consumers.js';
+import { behind, whoHtml } from './culprits.js';
 
 // The engine's watch findings ("observations"), most severe first. Dismissed
 // ones only when asked for.
@@ -60,6 +61,7 @@ function fromWatch(f) {
   const i = f.suggested.findIndex(sg => sg.request || planApi(sg));
   return {
     lvl: SEV_LVL[f.severity] || 'info', t: f.title, d: f.why, open: ['finding', f.id], since: f.first_seen_unix,
+    who: f.evidence?.culprits?.length ? [f.evidence.culprits.slice(0, 5), /swap/i.test(f.title) ? 'swap' : 'mem'] : null,
     act: i >= 0 ? { label: suggestionLabel(f.suggested[i]), run: `fx:${i}:${f.id}` } : { label: 'Details', run: `d:finding:${f.id}` },
   };
 }
@@ -110,12 +112,13 @@ export function findings() {
   if (S.forecast?.hours_to_low != null && S.forecast.hours_to_low < 24) out.push({ lvl: 'warn', t: `Disk filling at ${B(S.forecast.bytes_per_hour)}/h`, d: `Reaches the ${c.low_disk_gb} GB floor in about ${S.forecast.hours_to_low.toFixed(1)} h at this rate.`, go: 'disk', act: diskAct });
   if (s.cpu_count && s.load[0] > s.cpu_count * 2) {
     const sum = cpuSummary(S), top = ranked(S, 'cpu_pct')[0];
-    out.push({ lvl: s.load[0] > s.cpu_count * 6 ? 'bad' : 'warn', t: `CPU ${sum.word}: ${(s.load[0] / s.cpu_count).toFixed(1)}× more work than cores`, d: sum.headline, open: ['cpu', ''], act: top ? { label: `Show ${top.short}`, run: `d:group:${top.key}` } : { label: 'Show CPU', run: 'd:cpu:' } });
+    out.push({ lvl: s.load[0] > s.cpu_count * 6 ? 'bad' : 'warn', t: `CPU ${sum.word}: ${(s.load[0] / s.cpu_count).toFixed(1)}× more work than cores`, d: sum.headline, open: ['cpu', ''], act: top ? { label: `Show ${top.short}`, run: `d:group:${top.key}` } : { label: 'Show CPU', run: 'd:cpu:' }, who: [behind(S, 'cpu', 5), 'cpu'] });
   }
   const mp = s.mem_total ? s.mem_available / s.mem_total * 100 : 100;
   if (mp < c.throttle_mem_free_pct || s.swap_used > 8e9) {
     const sum = memSummary(S), top = ranked(S, 'mem_bytes')[0];
-    out.push({ lvl: mp < c.throttle_mem_free_pct ? 'bad' : 'warn', t: mp < c.throttle_mem_free_pct ? `Memory pressure: ${mp.toFixed(0)}% available` : `${B(s.swap_used)} in swap`, d: sum.headline, open: ['mem', ''], act: top ? { label: `Show ${top.short}`, run: `d:group:${top.key}` } : { label: 'Show memory', run: 'd:mem:' } });
+    const swapFirst = mp >= c.throttle_mem_free_pct, sw = swapFirst ? behind(S, 'swap', 5) : [];
+    out.push({ lvl: mp < c.throttle_mem_free_pct ? 'bad' : 'warn', t: mp < c.throttle_mem_free_pct ? `Memory pressure: ${mp.toFixed(0)}% available` : `${B(s.swap_used)} in swap`, d: sum.headline, open: [swapFirst ? 'swap' : 'mem', ''], act: top ? { label: `Show ${top.short}`, run: `d:group:${top.key}` } : { label: 'Show memory', run: 'd:mem:' }, who: sw.length ? [sw, 'swap'] : [behind(S, 'mem', 5), 'mem'] });
   }
   out.push(...cleanup(S));
   if (S.throttled) out.push({ lvl: 'ok', t: `${S.throttled} build process(es) at lower priority`, d: 'The optimizer reniced them under pressure.', open: ['agents', ''], act: { label: 'Show', run: 'd:agents:' } });
@@ -132,7 +135,7 @@ export function findingsHtml(list, compact, empty = 'Nothing needs attention.') 
   if (!list.length) return `<div class="empty" style="padding:12px">${esc(empty)}</div>`;
   return list.slice(0, compact ? (compact === true ? 3 : compact) : 99).map(f => {
     const age = f.age || (f.since ? `for ${ago(f.since)}` : '');
-    return `<div class="finding"><span class="ic" style="background:var(--${f.lvl})"></span><div class="t" role="button" tabindex="0" ${target(f)} title="${esc(f.t)}${compact && f.d ? '\n' + esc(f.d) : ''}"><div class="ft"><span class="ftt">${esc(f.t)}</span>${age ? `<span class="age">${esc(age)}</span>` : ''}</div>${compact ? '' : `<div class="muted">${esc(f.d)}</div>`}</div>${f.act ? `<button class="btn sm" data-run="${esc(f.act.run)}">${esc(f.act.label)}</button>` : ''}</div>`;
+    return `<div class="finding"><span class="ic" style="background:var(--${f.lvl})"></span><div class="t" role="button" tabindex="0" ${target(f)} title="${esc(f.t)}${compact && f.d ? '\n' + esc(f.d) : ''}"><div class="ft"><span class="ftt">${esc(f.t)}</span>${age ? `<span class="age">${esc(age)}</span>` : ''}</div>${compact ? '' : `<div class="muted">${esc(f.d)}</div>`}${!compact && f.who?.[0]?.length ? whoHtml(f.who[0], f.who[1], f.who[1] === 'swap' ? 'Holding swap:' : f.who[1] === 'cpu' ? 'Using the CPU:' : 'Using memory:') : ''}</div>${f.act ? `<button class="btn sm" data-run="${esc(f.act.run)}">${esc(f.act.label)}</button>` : ''}</div>`;
   }).join('');
 }
 

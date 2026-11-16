@@ -14,7 +14,7 @@ use crate::consumers::Severity;
 use crate::limits::ActionState;
 use crate::memguard::{fmt_mb, Candidate, Closing, MemGuard, Memory, Trigger, Unit, UnitKind};
 use crate::session::{RootSource, SessionStatus, Tracker};
-use crate::watch::{ApiRequest, Evidence, FindingCategory, FindingKind, Suggestion};
+use crate::watch::{ApiRequest, Culprit, Evidence, FindingCategory, FindingKind, Suggestion};
 
 /// `state.memory_guard` and `memory_guard` in `GET /v1/limits/status`.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
@@ -199,6 +199,104 @@ pub(crate) fn build_units(
 }
 
 /// The guard's finding while memory is low or a unit is over the cap.
+/// Culprits listed on a memory finding.
+const CULPRITS: usize = 8;
+
+/// What holds the memory (or, with `by_swap`, the swap) now: the biggest
+/// sessions first (what an agent started), then the biggest apps,
+/// workspaces and processes outside them. A process counts once, in its
+/// session when it has one.
+pub(crate) fn memory_culprits(snap: &Snapshot, tracker: &Tracker, by_swap: bool) -> Vec<Culprit> {
+    use crate::consumers::GroupKind;
+    let mut sessions: HashMap<String, Culprit> = HashMap::new();
+    let mut groups: Vec<Culprit> = Vec::new();
+    for (key, members) in snap.members.iter() {
+        let mut rest = Culprit {
+            key: key.clone(),
+            ..Culprit::default()
+        };
+        for p in members {
+            match tracker.session_of(p.pid, p.start_time) {
+                Some(id) => {
+                    let s = sessions.entry(id.to_string()).or_insert_with(|| {
+                        let name = tracker.get(id).map_or_else(
+                            || id.to_string(),
+                            |s| match &s.workspace {
+                                Some(w) => format!(
+                                    "{} in {}",
+                                    s.agent,
+                                    w.file_name().map_or_else(
+                                        || w.display().to_string(),
+                                        |n| n.to_string_lossy().to_string()
+                                    )
+                                ),
+                                None => s.agent.clone(),
+                            },
+                        );
+                        Culprit {
+                            kind: "session".into(),
+                            key: id.to_string(),
+                            name,
+                            ..Culprit::default()
+                        }
+                    });
+                    s.cpu_pct += p.cpu_pct;
+                    s.mem_bytes += p.mem_bytes;
+                    s.swap_bytes += p.swap_bytes;
+                }
+                None => {
+                    rest.cpu_pct += p.cpu_pct;
+                    rest.mem_bytes += p.mem_bytes;
+                    rest.swap_bytes += p.swap_bytes;
+                }
+            }
+        }
+        if rest.mem_bytes == 0 && rest.swap_bytes == 0 {
+            continue;
+        }
+        let g = snap
+            .consumers
+            .by_mem
+            .iter()
+            .chain(&snap.consumers.by_cpu)
+            .chain(&snap.consumers.by_swap)
+            .chain(&snap.consumers.apps)
+            .find(|g| &g.key == key);
+        let (kind, name) = match g {
+            Some(g) => (g.kind, g.name.clone()),
+            None => (
+                if key.starts_with("app:") {
+                    GroupKind::App
+                } else if key.starts_with("workspace:") {
+                    GroupKind::Workspace
+                } else if key == "system" {
+                    GroupKind::System
+                } else {
+                    GroupKind::Process
+                },
+                key.split_once(':')
+                    .map_or(key.as_str(), |x| x.1)
+                    .rsplit('/')
+                    .next()
+                    .unwrap_or(key)
+                    .to_string(),
+            ),
+        };
+        rest.kind = serde_json::to_value(kind)
+            .ok()
+            .and_then(|v| v.as_str().map(String::from))
+            .unwrap_or_else(|| "process".into());
+        rest.name = name;
+        groups.push(rest);
+    }
+    let weight = |c: &Culprit| if by_swap { c.swap_bytes } else { c.mem_bytes };
+    let mut all: Vec<Culprit> = sessions.into_values().chain(groups).collect();
+    all.retain(|c| weight(c) > 0);
+    all.sort_by(|a, b| weight(b).cmp(&weight(a)).then(a.key.cmp(&b.key)));
+    all.truncate(CULPRITS);
+    all
+}
+
 fn guard_findings(g: &MemGuard, cfg: &MemoryGuardConfig, can_act: bool, now: u64) -> Vec<Finding> {
     let cand = g.candidate();
     if !g.low() && cand.is_none() {
@@ -340,7 +438,14 @@ impl Engine {
             } else {
                 sup.guard.take_announcement()
             };
-            let fresh = guard_findings(&sup.guard, g, can_act, now);
+            let mut fresh = guard_findings(&sup.guard, g, can_act, now);
+            if !fresh.is_empty() {
+                let by_swap = g.swap_pct > 0 && mem.swap_pct >= g.swap_pct as f32;
+                let culprits = memory_culprits(snap, &sup.tracker, by_swap);
+                for f in &mut fresh {
+                    f.evidence.culprits = culprits.clone();
+                }
+            }
             let changed = !fresh.is_empty() || !sup.guard_findings.is_empty();
             sup.guard_findings = fresh;
             (queued.is_some(), announce, changed)
