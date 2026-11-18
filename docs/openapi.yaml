@@ -1,7 +1,7 @@
 openapi: 3.1.0
 info:
   title: Mulchie local API
-  version: 0.3.0-rc.2
+  version: 0.3.0-rc.6
   summary: The engine's HTTP API on 127.0.0.1, for the CLI, the app, the MCP server and scripts.
   description: |
     The engine (the menu bar app or `mulchie serve`) listens on 127.0.0.1 only, on the
@@ -81,19 +81,32 @@ paths:
         `cpu_summary` and `mem_summary` in words), health, config error, build slots, forecast,
         last scan, disk map and recent actions. Also `journal_error`, `journal_lost`, `restore_failed`,
         `scan_age_secs`, `scan_stale`, `findings` (as in `GET /v1/findings?dismissed=1`),
-        `finding_counts` and `findings_unix`, `sessions` (as `SessionsState`) and `updates`
+        `finding_counts` and `findings_unix`, `sessions` (as `SessionsState`; its `list` holds every
+        running session, up to 500, and the 50 most recently ended) and `updates`
         (as `GET /v1/updates` without `report`). Command lines and lease labels are redacted.
         `failures` lists each cache, cache key or worktree that was skipped at least twice in
         a row and is still there: `kind` (`reclaim` or `worktree`), `target`, `count`, the
         last `reason` and `detail`, `first_unix`, `last_unix`, `advice` and, from the third skip,
         `retry_after_unix` (the engine's automatic sweep and reclaim leave the target alone
         until then). A success clears the record.
+
+        Swap: each process in `snapshot.top` and each consumer group carries `swap_bytes`, its memory
+        compressed or swapped out (on macOS its physical footprint minus what is resident; 0 for
+        other users' processes and on other systems). `snapshot.consumers.by_swap` ranks the groups
+        holding the most, and `snapshot.consumers.apps` lists every app group (up to 100), biggest
+        memory first.
       responses:
         "200": { $ref: "#/components/responses/Json" }
         default: { $ref: "#/components/responses/Error" }
   /v1/history:
     get:
       summary: Samples from the last 30 minutes, every 3 seconds
+      parameters:
+        - name: since
+          in: query
+          required: false
+          description: Only samples taken after this time (unix seconds, compared with each sample's `t`)
+          schema: { type: integer, minimum: 0 }
       responses:
         "200": { $ref: "#/components/responses/Json" }
         default: { $ref: "#/components/responses/Error" }
@@ -948,6 +961,69 @@ paths:
                   queued: { type: boolean }
         "409": { description: "`updates_off`: `updates.check` is off", content: { application/json: { schema: { type: object } } } }
         default: { $ref: "#/components/responses/Error" }
+  /v1/feedback:
+    get:
+      summary: Feedback reports, newest first
+      parameters:
+        - name: limit
+          in: query
+          required: false
+          description: "How many to return (1 to 1000, default 50)"
+          schema: { type: integer, minimum: 1, maximum: 1000 }
+      responses:
+        "200":
+          description: The newest reports
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  feedback:
+                    type: array
+                    items: { $ref: "#/components/schemas/Feedback" }
+                  total: { type: integer, description: Reports stored in all }
+                  path: { type: string, description: The feedback file }
+        default: { $ref: "#/components/responses/Error" }
+    post:
+      summary: Report a problem with Mulchie or the machine
+      description: |
+        Adds one line to `<config dir>/feedback.jsonl` (private to the user; renamed to
+        `feedback.jsonl.1` at 4 MB) with the machine's state from the last sample, and a `feedback`
+        entry to the action journal. Secrets in the text are hidden word by word. Nothing is sent
+        anywhere. The read-only token is accepted.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [summary]
+              additionalProperties: false
+              properties:
+                summary: { type: string, description: "One or two sentences; kept to 500 characters" }
+                category:
+                  type: string
+                  enum: [bug, wrong_advice, false_positive, missed, blocked, slow, environment, idea, other]
+                  default: other
+                severity: { type: string, enum: [low, medium, high], default: medium }
+                details: { type: string, description: Kept to 8000 characters }
+                tool: { type: string, description: "The Mulchie tool, command or route it is about" }
+                client: { type: string, description: "Who reports, such as an agent's name" }
+                cwd: { type: string }
+                source: { type: string, description: "`mcp` or `cli` when a Mulchie front end passes the report on; otherwise stored as `api`" }
+      responses:
+        "200":
+          description: Saved
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  ok: { type: boolean }
+                  feedback: { $ref: "#/components/schemas/Feedback" }
+        "400": { description: "`invalid_body`: no summary, an unknown category or severity, or an unknown field", content: { application/json: { schema: { type: object } } } }
+        "500": { description: "`feedback_not_saved`: the file could not be written", content: { application/json: { schema: { type: object } } } }
+        default: { $ref: "#/components/responses/Error" }
 components:
   securitySchemes:
     bearer:
@@ -996,6 +1072,32 @@ components:
               error: { type: string }
               code: { type: string, description: "A stable code, e.g. unauthorized, read_only_token, items_required, invalid_body" }
   schemas:
+    Feedback:
+      type: object
+      properties:
+        id: { type: string, description: "`fb-<unix seconds>-<random>`" }
+        at_unix: { type: integer }
+        source: { type: string, enum: [api, mcp, cli] }
+        category: { type: string }
+        severity: { type: string }
+        summary: { type: string }
+        details: { type: string }
+        tool: { type: string }
+        client: { type: string }
+        cwd: { type: string }
+        mulchie_version: { type: string }
+        os: { type: string }
+        machine:
+          type: object
+          description: "The machine at the last sample; absent when no engine took the report"
+          properties:
+            health: { type: string }
+            cpu_pct: { type: number }
+            load1: { type: number }
+            cores: { type: integer }
+            mem_free_pct: { type: number }
+            disk_free_gb: { type: number }
+            sessions: { type: integer }
     Health:
       type: string
       enum: [good, busy, strained, critical, stale]
@@ -1147,6 +1249,22 @@ components:
             quarantined: { type: boolean }
             cpu_pct: { type: number }
             mem_bytes: { type: integer }
+            culprits:
+              type: array
+              description: |
+                Memory findings only: what is using the most memory now, or holding the most swap when
+                swap crossed its threshold. Processes in an agent session are counted under the session,
+                the rest under their app, workspace or program. At most 8, biggest first.
+              items:
+                type: object
+                required: [kind, key, name, cpu_pct, mem_bytes, swap_bytes]
+                properties:
+                  kind: { type: string, enum: [session, app, workspace, process, system] }
+                  key: { type: string, description: "A session id, or a consumer group key (`app:…`, `workspace:…`, `process:…`, `system`)" }
+                  name: { type: string }
+                  cpu_pct: { type: number }
+                  mem_bytes: { type: integer }
+                  swap_bytes: { type: integer }
             path: { type: string }
             mode: { type: string }
             detail: { type: string }
@@ -1200,6 +1318,13 @@ components:
         workspace: { type: [string, "null"] }
         started_unix: { type: integer }
         ended_unix: { type: [integer, "null"] }
+        last_active_unix:
+          type: integer
+          description: >-
+            When the session last did something this engine saw: it used 5% of a core or more,
+            started a process, or its agent called a hook. A heuristic, never earlier than when
+            this engine first saw the session, and frozen once the session ends. Also on each
+            entry of `state.sessions.list`.
         listening: { type: array, items: { type: integer }, description: "Ports the session's processes listen on, from the last watch run" }
         enforced:
           type: boolean

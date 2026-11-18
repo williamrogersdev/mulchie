@@ -19,6 +19,8 @@ use crate::watch::{ApiRequest, Evidence, FindingCategory, FindingKind, Suggestio
 
 /// Sessions listed in [`State`] (running first, then the latest ended).
 pub const STATE_SESSIONS_KEPT: usize = 50;
+/// Running sessions listed in the state, at most.
+pub const STATE_RUNNING_KEPT: usize = 500;
 /// The file of processes Mulchie paused, under `<config dir>/sessions/`.
 pub const PAUSED_FILE: &str = "paused.json";
 /// The limits worker wakes at least this often for scheduled jobs.
@@ -75,6 +77,11 @@ pub(crate) enum LimitJob {
     RunawayStop { id: String },
 }
 
+/// `breach_id` prefix of the paused-list entries a runaway stopping writes
+/// before it freezes a chain, so a crash between the freeze and the kill
+/// still leaves them for the next engine to resume.
+pub(crate) const RUNAWAY_FREEZE: &str = "runaway:";
+
 /// Paused processes whose pause no longer applies and that no queued job
 /// resumes yet: every one when sessions are off; otherwise those whose breach
 /// is gone or whose budget no longer has that cap with action `pause`.
@@ -89,7 +96,11 @@ fn paused_without_a_pause(sup: &Supervision, cfg: &Config) -> (Vec<PausedProc>, 
         .flatten()
         .map(|p| (p.pid, p.start_time))
         .collect();
-    let fresh = |p: &&PausedProc| !queued.contains(&(p.pid, p.start_time));
+    // A runaway stopping's freeze is its own: it ends in a kill or a resume
+    // within the same job.
+    let fresh = |p: &&PausedProc| {
+        !queued.contains(&(p.pid, p.start_time)) && !p.breach_id.starts_with(RUNAWAY_FREEZE)
+    };
     if !cfg.sessions.enabled {
         let v = sup.paused.iter().filter(fresh).cloned().collect();
         return (v, "sessions are turned off");
@@ -165,6 +176,9 @@ pub struct SessionBrief {
     pub client: Option<String>,
     pub started_unix: u64,
     pub ended_unix: Option<u64>,
+    /// As on [`Session`].
+    #[serde(default)]
+    pub last_active_unix: u64,
     pub cpu_cores: f64,
     pub memory_mb: f64,
     pub processes: u32,
@@ -191,6 +205,7 @@ impl SessionBrief {
             client: s.client.clone(),
             started_unix: s.started_unix,
             ended_unix: s.ended_unix,
+            last_active_unix: s.last_active_unix,
             cpu_cores: s.usage.cpu_cores,
             memory_mb: s.usage.memory_mb,
             processes: s.usage.processes,
@@ -212,7 +227,7 @@ pub struct SessionsState {
     pub write_bytes_available: bool,
     pub running: usize,
     pub ended: usize,
-    /// Running sessions, then the most recently ended, at most 50.
+    /// Every running session (at most 500), then the 50 most recently ended.
     pub list: Vec<SessionBrief>,
     /// Active breaches, and cleared ones whose paused processes are not
     /// resumed yet.
@@ -696,7 +711,7 @@ impl Engine {
         }
     }
 
-    fn persist_paused(&self) {
+    pub(crate) fn persist_paused(&self) {
         let paused = lock(&self.sup).paused.clone();
         if let Err(e) = save_paused(&self.paths, &paused) {
             self.log(
@@ -1107,7 +1122,7 @@ impl Engine {
     /// SIGCONT these paused processes through the gate and forget them
     /// (whatever the outcome: a process that exited or whose pid was reused
     /// needs nothing more). Returns how many were resumed.
-    fn resume_entries(&self, entries: &[PausedProc], source: &str) -> usize {
+    pub(crate) fn resume_entries(&self, entries: &[PausedProc], source: &str) -> usize {
         if entries.is_empty() {
             return 0;
         }
@@ -1265,9 +1280,19 @@ impl Engine {
             write_bytes_available: write,
             running,
             ended,
+            // Every running session (a machine can run a hundred), then the
+            // most recently ended.
             list: list
                 .into_iter()
-                .take(STATE_SESSIONS_KEPT)
+                .enumerate()
+                .filter(|(i, s)| {
+                    if s.status == SessionStatus::Running {
+                        *i < STATE_RUNNING_KEPT
+                    } else {
+                        *i < running.min(STATE_RUNNING_KEPT) + STATE_SESSIONS_KEPT
+                    }
+                })
+                .map(|(_, s)| s)
                 .map(|s| SessionBrief::of(&Self::with_enforcement(s.clone(), cfg, automating)))
                 .collect(),
             breaches_active: breaches.iter().filter(|b| b.active()).count(),

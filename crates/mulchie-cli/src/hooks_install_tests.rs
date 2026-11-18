@@ -1,6 +1,7 @@
 //! Install and uninstall round trips on temp files only.
 
 use super::*;
+use mulchie_core::Paths;
 use HookClient::*;
 
 struct T {
@@ -18,6 +19,7 @@ fn t() -> T {
         codex_home: None,
         copilot_home: None,
         exe: PathBuf::from("/opt/my tools/bin/mulchie"),
+        config_dir: home.join(".config/mulchie"),
     };
     T { _d: d, env }
 }
@@ -534,4 +536,68 @@ fn gemini_note_depends_on_tools_enable_hooks() {
             settings.is_some_and(|s| s.contains("true"))
         );
     }
+}
+
+#[test]
+fn status_reports_a_hook_that_ran_with_another_config_dir() {
+    let t = t();
+    let now = mulchie_core::monitor::now_unix();
+    // An agent with XDG_CONFIG_HOME set: its hook looks in another directory.
+    let agent = Paths {
+        home: t.env.home.clone(),
+        config_dir: t.env.home.join("xdg/mulchie"),
+        backups_dir: t.env.home.join("xdg/mulchie/backups"),
+        temp_dir: t.env.home.join("tmp"),
+        xdg_config_home: Some(t.env.home.join("xdg")),
+    };
+    crate::hook::note_config_dir(&agent, Copilot, false, now);
+    let file = crate::hook::dirs_file(&t.env.home);
+    let note = read(&file);
+    assert_eq!(note["copilot"]["reached"], false, "{note}");
+    let v = status_in(&t.env);
+    let c = v
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|c| c["client"] == "copilot")
+        .unwrap();
+    let m = &c["config_dir_mismatch"];
+    assert_eq!(m["hook_config_dir"], json!(agent.config_dir), "{c}");
+    assert_eq!(m["config_dir"], json!(t.env.config_dir));
+    assert!(render_status(&v).contains("XDG_CONFIG_HOME differs"));
+    // Other clients have no note.
+    let cc = v
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|c| c["client"] == "claude-code")
+        .unwrap();
+    assert!(cc.get("config_dir_mismatch").is_none());
+    // The same note is not rewritten within a minute.
+    let before = std::fs::metadata(&file).unwrap().modified().unwrap();
+    std::thread::sleep(std::time::Duration::from_millis(20));
+    crate::hook::note_config_dir(&agent, Copilot, false, now + 1);
+    assert_eq!(
+        std::fs::metadata(&file).unwrap().modified().unwrap(),
+        before
+    );
+    // Once the hook runs in the default directory and reaches the engine,
+    // the note goes.
+    let fine = Paths {
+        config_dir: t.env.config_dir.clone(),
+        xdg_config_home: None,
+        ..agent.clone()
+    };
+    crate::hook::note_config_dir(&fine, Copilot, true, now + 2);
+    assert!(read(&file).get("copilot").is_none());
+    let v = status_in(&t.env);
+    assert!(v
+        .as_array()
+        .unwrap()
+        .iter()
+        .all(|c| c.get("config_dir_mismatch").is_none()));
+    // A hook in the default directory that reached the engine writes nothing.
+    std::fs::remove_file(&file).unwrap();
+    crate::hook::note_config_dir(&fine, Cursor, true, now);
+    assert!(!file.exists());
 }

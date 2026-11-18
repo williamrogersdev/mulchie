@@ -476,7 +476,7 @@ fn warn_asks_where_the_client_can_and_advises_where_it_cannot() {
     let (_, o) = go(Gemini, "pre_tool", r.clone(), None);
     assert_eq!(
         parsed(&o),
-        json!({ "decision": "allow", "systemMessage": format!("Mulchie warns: {why}") })
+        json!({ "systemMessage": format!("Mulchie warns: {why}") })
     );
     // A warning on a prompt is advice.
     let (_, o) = go(ClaudeCode, "prompt", r, None);
@@ -619,6 +619,84 @@ fn the_engines_reply_and_limits_fit() {
 }
 
 #[test]
+fn long_commands_reach_the_guard_whole_or_flagged_too_long() {
+    use mulchie_core::config::GuardConfig;
+    use mulchie_core::guard::{self, GuardInput, MAX_COMMAND_BYTES};
+    let cmd_req = |cmd: &str| {
+        let input = json!({ "tool_name": "Bash", "tool_input": { "command": cmd } });
+        request(ClaudeCode, "pre_tool", &input, 1).command.unwrap()
+    };
+    // Up to the guard's limit, the command is sent whole.
+    let fits = format!("echo {}", "x".repeat(MAX_COMMAND_BYTES - 5));
+    assert_eq!(fits.len(), MAX_COMMAND_BYTES);
+    assert_eq!(cmd_req(&fits), fits);
+    // Longer: cut, but still past the limit, so the guard says too_long.
+    let long = format!("echo {}", "é".repeat(MAX_COMMAND_BYTES));
+    let sent = cmd_req(&long);
+    assert!(
+        sent.len() > MAX_COMMAND_BYTES && sent.len() <= MAX_COMMAND,
+        "{}",
+        sent.len()
+    );
+    let home = std::path::Path::new("/Users/nobody");
+    let v = guard::check(
+        &GuardInput {
+            command: &sent,
+            cwd: home,
+            workspace: None,
+            home,
+            config_dir: home,
+            current_branch: None,
+            mulchie_pids: &[],
+            runaways: &[],
+        },
+        &GuardConfig::default(),
+    );
+    assert_eq!(serde_json::to_value(&v).unwrap()["rule"], "too_long");
+}
+
+#[test]
+fn copilot_sends_only_shell_tools_to_the_engine() {
+    let calls = RefCell::new(0);
+    let counting = |_: &HookRequest| -> Result<Value, String> {
+        *calls.borrow_mut() += 1;
+        Ok(json!({ "decision": "warn", "reason": "r" }))
+    };
+    for (event, tool, sent) in [
+        ("preToolUse", "view", false),
+        ("postToolUse", "edit", false),
+        ("preToolUse", "bash", true),
+        ("preToolUse", "PowerShell", true),
+        ("postToolUse", "bash", true),
+    ] {
+        *calls.borrow_mut() = 0;
+        let input =
+            json!({ "sessionId": "s", "toolName": tool, "toolArgs": "{\"command\":\"ls\"}" });
+        let out = handle(
+            Copilot,
+            event,
+            input.to_string().as_bytes(),
+            None,
+            1,
+            &counting,
+        )
+        .unwrap();
+        assert_eq!(*calls.borrow() == 1, sent, "{event} {tool}");
+        if !sent {
+            assert_eq!(out, fail_open(Copilot, event));
+        }
+    }
+    // A tool event with no tool name is not a shell call either.
+    *calls.borrow_mut() = 0;
+    handle(Copilot, "preToolUse", b"{}", None, 1, &counting).unwrap();
+    assert_eq!(*calls.borrow(), 0);
+    // Other events and other clients still reach the engine.
+    handle(Copilot, "sessionStart", b"{}", None, 1, &counting).unwrap();
+    handle(ClaudeCode, "pre_tool", b"{}", None, 1, &counting).unwrap();
+    assert_eq!(*calls.borrow(), 2);
+}
+
+#[test]
 fn bad_input_and_errors_fail() {
     let ok = |_: &HookRequest| -> Result<Value, String> { Ok(json!({ "decision": "block" })) };
     let calls = RefCell::new(0);
@@ -635,7 +713,7 @@ fn bad_input_and_errors_fail() {
     // Empty input is an empty event, not an error.
     assert!(handle(ClaudeCode, "session_start", b"", None, 1, &counting).is_ok());
     let failing = |_: &HookRequest| -> Result<Value, String> { Err("no engine is running".into()) };
-    assert!(handle(Copilot, "pre_tool", b"{}", None, 1, &failing).is_err());
+    assert!(handle(Copilot, "session_start", b"{}", None, 1, &failing).is_err());
     let odd = |_: &HookRequest| -> Result<Value, String> { Ok(json!("nope")) };
     assert!(handle(Cursor, "pre_tool", b"{}", None, 1, &odd).is_err());
 }

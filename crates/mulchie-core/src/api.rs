@@ -99,6 +99,8 @@ pub const ROUTES: &[(&str, &str)] = &[
     ("POST", "/v1/guard/check"),
     ("GET", "/v1/updates"),
     ("POST", "/v1/updates/check"),
+    ("GET", "/v1/feedback"),
+    ("POST", "/v1/feedback"),
 ];
 
 // ------------------------------------------------------------------ token
@@ -126,13 +128,19 @@ pub const READ_ONLY_LEASE_POSTS: &[&str] = &["/v1/lease", "/v1/release"];
 /// activity and answer, and change nothing on the machine.
 pub const READ_ONLY_HOOK_POSTS: &[&str] = &["/v1/hook", "/v1/guard/check"];
 
+/// A feedback report is taken with the read-only token too: it adds a line
+/// to Mulchie's own feedback file and changes nothing else, and a read-only
+/// agent has as much to report as any other.
+pub const READ_ONLY_FEEDBACK_POSTS: &[&str] = &["/v1/feedback"];
+
 /// Whether the read-only token may call `method path`.
 pub fn read_only_allowed(method: &str, path: &str) -> bool {
     method == "GET"
         || (method == "POST"
             && (READ_ONLY_POSTS.contains(&path)
                 || READ_ONLY_LEASE_POSTS.contains(&path)
-                || READ_ONLY_HOOK_POSTS.contains(&path)))
+                || READ_ONLY_HOOK_POSTS.contains(&path)
+                || READ_ONLY_FEEDBACK_POSTS.contains(&path)))
 }
 
 /// The token file for this user's environment.
@@ -1134,7 +1142,10 @@ fn route(req: &Req, engine: &Engine, read_only: bool) -> Resp {
     let r = (|| -> Result<Resp, Resp> {
         Ok(match (req.method.as_str(), req.path.as_str()) {
             ("GET", "/v1/state") => ok(&engine.snapshot_state()),
-            ("GET", "/v1/history") => ok(&engine.history()),
+            ("GET", "/v1/history") => {
+                let since = query_u64(req, "since")?.unwrap_or(0);
+                ok(&engine.history_since(since))
+            }
             ("GET", "/v1/advice") => ok(&engine.advice()),
             ("POST", "/v1/scan") => {
                 ok(&serde_json::json!({ "ok": true, "queued": engine.request_scan() }))
@@ -1310,6 +1321,25 @@ fn route(req: &Req, engine: &Engine, read_only: bool) -> Resp {
             ("POST", "/v1/guard/check") => {
                 let b: crate::engine::GuardCheckRequest = body(req)?;
                 ok(&engine.guard_check(&b))
+            }
+            ("GET", "/v1/feedback") => {
+                let limit = query_u64(req, "limit")?.unwrap_or(50);
+                if !(1..=1000).contains(&limit) {
+                    return Ok(fail(400, "invalid_query", "limit must be 1 to 1000"));
+                }
+                ok(&engine.feedback_list(limit as usize))
+            }
+            ("POST", "/v1/feedback") => {
+                let b: crate::feedback::Report = body(req)?;
+                let source = match b.source.as_deref() {
+                    Some("mcp") => "mcp",
+                    Some("cli") => "cli",
+                    _ => "api",
+                };
+                match engine.feedback_add(b, source) {
+                    Ok(e) => ok(&serde_json::json!({ "ok": true, "feedback": e })),
+                    Err((status, code, m)) => fail(status, code, m),
+                }
             }
             ("GET", "/v1/updates") => ok(&engine.updates_status(true)),
             ("POST", "/v1/updates/check") => match engine.request_update_check() {

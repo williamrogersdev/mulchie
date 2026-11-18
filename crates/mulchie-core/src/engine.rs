@@ -44,6 +44,10 @@ pub use runaway_glue::RunawayStatus;
 mod hook;
 pub use hook::{GuardCheckReply, GuardCheckRequest, HookEvent, HookReply, HookRequest};
 
+#[path = "engine_feedback.rs"]
+mod feedback_glue;
+pub use feedback_glue::FeedbackList;
+
 #[path = "engine_updates.rs"]
 mod updates_glue;
 pub use sessions::{
@@ -77,6 +81,11 @@ const HEALTHY_RUN: Duration = Duration::from_secs(60);
 const MAX_BACKOFF: Duration = Duration::from_secs(60);
 /// A non-holder engine compares the config file with its copy this often.
 const CONFIG_RECHECK: Duration = Duration::from_secs(1);
+/// Samples in a row under pressure before builds are throttled (15 seconds):
+/// one busy sample is not pressure.
+pub const THROTTLE_AFTER: u32 = 5;
+/// Calm samples in a row before lowered priorities are put back (30 seconds).
+pub const RESTORE_AFTER: u32 = 10;
 
 #[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -109,7 +118,7 @@ pub enum Health {
     Stale,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Default)]
 pub struct Sample {
     pub t: u64,
     pub cpu: f32,
@@ -475,12 +484,19 @@ impl State {
 pub fn health_of(s: &Snapshot, cfg: &Config) -> Health {
     let free_gb = s.disk_free_gb();
     let mem = s.mem_free_pct();
-    let overload = s.cpu_count > 0 && s.load[0] > s.cpu_count as f64 * 4.0;
+    // Load is runnable work per core: past 2 things queue and feel slow,
+    // past 3 the machine is overloaded (the same levels `diagnose` words).
+    let per_core = if s.cpu_count > 0 {
+        s.load[0] / s.cpu_count as f64
+    } else {
+        0.0
+    };
+    let overload = per_core > 3.0;
     if free_gb < (cfg.low_disk_gb as f64) / 3.0 || mem < cfg.throttle_mem_free_pct / 2.0 {
         Health::Critical
     } else if free_gb < cfg.low_disk_gb as f64 || mem < cfg.throttle_mem_free_pct || overload {
         Health::Strained
-    } else if s.cpu_pct > cfg.throttle_cpu_pct {
+    } else if s.cpu_pct > cfg.throttle_cpu_pct || per_core > 2.0 {
         Health::Busy
     } else {
         Health::Good
@@ -620,6 +636,9 @@ struct Reniced {
 pub struct SampleCtx {
     monitor: Option<Monitor>,
     last_reclaim: Option<Instant>,
+    /// Samples in a row under pressure, and in a row without.
+    pressured_for: u32,
+    calm_for: u32,
 }
 
 /// What the scan loop keeps between ticks.
@@ -727,6 +746,9 @@ pub struct Engine {
     procs: Arc<dyn ProcessSource>,
     shutdown: Arc<AtomicBool>,
     automation_enabled: Arc<AtomicBool>,
+    /// Whether this engine can raise a priority it lowered (see
+    /// [`can_raise_priority`]). Without it builds are not throttled.
+    can_restore: Arc<AtomicBool>,
     notify: Arc<AtomicBool>,
     reniced: Arc<Mutex<HashMap<u32, Reniced>>>,
     threads: Arc<Mutex<Vec<JoinHandle<()>>>>,
@@ -754,6 +776,8 @@ pub struct Engine {
     updates: Arc<Updates>,
     /// Targets that keep being skipped, from the journal ([`crate::failures`]).
     failures: Arc<Mutex<crate::failures::Memory>>,
+    /// What the last disk scan measured, for the periodic scan to reuse.
+    scan_memo: Arc<Mutex<diskmap::ScanMemo>>,
 }
 
 impl Engine {
@@ -818,12 +842,14 @@ impl Engine {
             state: Arc::new(Mutex::new(state)),
             history: Arc::new(Mutex::new(VecDeque::with_capacity(HISTORY_LEN))),
             jobs: Arc::new(Jobs::default()),
+            scan_memo: Arc::new(Mutex::new(diskmap::ScanMemo::default())),
             next_id: Arc::new(AtomicU64::new(1)),
             paths: Arc::new(paths),
             journal: Arc::new(journal),
             procs,
             shutdown: Arc::new(AtomicBool::new(false)),
             automation_enabled: Arc::new(AtomicBool::new(true)),
+            can_restore: Arc::new(AtomicBool::new(can_raise_priority())),
             notify: Arc::new(AtomicBool::new(false)),
             reniced: Arc::new(Mutex::new(HashMap::new())),
             threads: Arc::new(Mutex::new(Vec::new())),
@@ -947,6 +973,15 @@ impl Engine {
 
     pub fn history(&self) -> Vec<Sample> {
         lock(&self.history).iter().cloned().collect()
+    }
+
+    /// The samples taken after `since` (unix seconds; 0 for all).
+    pub fn history_since(&self, since: u64) -> Vec<Sample> {
+        lock(&self.history)
+            .iter()
+            .filter(|s| s.t > since)
+            .cloned()
+            .collect()
     }
 
     pub fn config(&self) -> Config {
@@ -1156,6 +1191,17 @@ impl Engine {
     /// runs with it off.
     pub fn set_automation_enabled(&self, on: bool) {
         self.automation_enabled.store(on, Ordering::SeqCst);
+    }
+
+    /// Whether automatic build throttling may lower priorities: only an
+    /// engine that can put them back does.
+    pub fn can_restore_priority(&self) -> bool {
+        self.can_restore.load(Ordering::SeqCst)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_can_restore_priority(&self, on: bool) {
+        self.can_restore.store(on, Ordering::SeqCst);
     }
 
     /// Show desktop notifications for alerts and automatic actions (headless
@@ -1381,13 +1427,29 @@ impl Engine {
         let pressured =
             snap.mem_free_pct() < cfg.throttle_mem_free_pct || snap.cpu_pct > cfg.throttle_cpu_pct;
         let automation = self.automation_allowed();
-        let newly = if automation && cfg.throttle_builds && pressured {
-            self.throttle(kinds, cfg.build_nice)
+        if pressured {
+            ctx.pressured_for = ctx.pressured_for.saturating_add(1);
+            ctx.calm_for = 0;
         } else {
-            // Pressure cleared, throttling turned off, or this engine is not
-            // the one that throttles: put priorities back.
+            ctx.calm_for = ctx.calm_for.saturating_add(1);
+            ctx.pressured_for = 0;
+        }
+        // Only an engine that can put a priority back lowers one: without
+        // privilege a renice lasts for the life of the process, which turns
+        // a brief busy spell into a permanently slow build or dev server.
+        let may_throttle = automation && cfg.throttle_builds && self.can_restore_priority();
+        let newly = if may_throttle && ctx.pressured_for >= THROTTLE_AFTER {
+            self.throttle(kinds, cfg.build_nice)
+        } else if !may_throttle || ctx.calm_for >= RESTORE_AFTER {
+            // Pressure stayed away, throttling turned off, or this engine is
+            // not the one that throttles: put priorities back.
             self.forget_exited(kinds);
             self.restore_priorities("optimizer");
+            Vec::new()
+        } else {
+            // Between the two: leave things as they are, so a load that
+            // hovers around the threshold does not flip priorities.
+            self.forget_exited(kinds);
             Vec::new()
         };
         let throttled = lock(&self.reniced).len();
@@ -1573,7 +1635,7 @@ impl Engine {
             .unwrap_or(true);
         if due {
             let first = ctx.last_scan.is_none();
-            self.run_scan();
+            self.run_periodic_scan();
             ctx.last_scan = Some(Instant::now());
             if !first && cfg.auto_sweep_worktrees && self.automation_allowed() {
                 self.jobs.push(Job::Sweep {
@@ -1619,17 +1681,41 @@ impl Engine {
         }
     }
 
+    /// Scan now, measuring everything again: for a scan someone asked for
+    /// (the Rescan button, `mulchie scan`, a settings change).
     pub fn run_scan(&self) -> ScanReport {
+        self.scan_now(false)
+    }
+
+    /// The scan the loop runs every `scan_interval_mins`. It must not be
+    /// felt: it runs at background priority on two threads, and re-measures
+    /// only what may have changed since the last scan (see
+    /// [`diskmap::WorktreeMemo`]); the rest keeps its figures for up to
+    /// [`reclaim::REMEASURE_SECS`].
+    pub fn run_periodic_scan(&self) -> ScanReport {
+        self.scan_now(true)
+    }
+
+    fn scan_now(&self, quiet: bool) -> ScanReport {
         let cfg = {
             let mut st = lock(&self.state);
             st.scanning = true;
             st.config.clone()
         };
+        let _bg = quiet.then(crate::measure::Background::enter);
+        let mut memo = if quiet {
+            lock(&self.scan_memo).clone()
+        } else {
+            diskmap::ScanMemo::default()
+        };
         let cwds = own_cwds(&*self.procs);
         let now = now_unix();
-        let report = reclaim::scan(&cfg, &self.paths, &cwds, now);
+        let (report, caches) =
+            reclaim::scan_with(&cfg, &self.paths, &cwds, now, &memo.caches, quiet);
         lock(&self.state).scan = Some(Arc::new(report.clone()));
-        let map = diskmap::scan(&cfg, &self.paths, &cwds, now);
+        memo.caches = caches;
+        let map = diskmap::scan_with(&cfg, &self.paths, &cwds, now, &mut memo, quiet);
+        *lock(&self.scan_memo) = memo;
         let mut st = lock(&self.state);
         st.diskmap = Some(Arc::new(map));
         st.scanning = false;
@@ -3262,6 +3348,11 @@ impl Engine {
     }
 
     #[cfg(test)]
+    pub(crate) fn push_history(&self, s: Sample) {
+        lock(&self.history).push_back(s);
+    }
+
+    #[cfg(test)]
     pub(crate) fn begin_shutdown(&self) {
         self.shutdown.store(true, Ordering::SeqCst);
     }
@@ -3418,6 +3509,13 @@ pub fn nice_of(pid: u32) -> Option<i32> {
 
 /// Raise `pid`'s nice value to `nice` when it is lower. Returns the previous
 /// value when it changed.
+/// Whether this process can raise another process's priority again after
+/// lowering it: lowering a nice value needs privilege (root).
+pub fn can_raise_priority() -> bool {
+    // SAFETY: geteuid has no preconditions and cannot fail.
+    unsafe { libc::geteuid() == 0 }
+}
+
 fn lower_priority(pid: u32, nice: i32) -> Option<i32> {
     let cur = nice_of(pid)?;
     if cur >= nice {

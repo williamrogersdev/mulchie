@@ -274,3 +274,46 @@ fn listening_ports_follow_membership() {
         vec![3000]
     );
 }
+
+#[test]
+fn last_active_follows_cpu_new_processes_and_hooks() {
+    let mut t = Tracker::default();
+    let quiet = |pid, ppid, name, agent| SessionProc {
+        cpu_pct: 1.0,
+        ..p(pid, ppid, name, agent)
+    };
+    let id = Session::id_for(10, 1010);
+    // First seen: active now, whatever it uses.
+    t.observe(100, &[quiet(10, 1, "claude", Some("claude"))], &[], 3600);
+    assert_eq!(t.get(&id).unwrap().last_active_unix, 100);
+    // Waiting (1% of a core, nothing new): the time stays.
+    t.observe(200, &[quiet(10, 1, "claude", Some("claude"))], &[], 3600);
+    assert_eq!(t.get(&id).unwrap().last_active_unix, 100);
+    // A process it starts counts, even a quiet one.
+    let two = [
+        quiet(10, 1, "claude", Some("claude")),
+        quiet(11, 10, "sleep", None),
+    ];
+    t.observe(300, &two, &[], 3600);
+    assert_eq!(t.get(&id).unwrap().last_active_unix, 300);
+    t.observe(400, &two, &[], 3600);
+    assert_eq!(t.get(&id).unwrap().last_active_unix, 300);
+    // So does CPU at the threshold, summed over its processes.
+    let busy = [
+        quiet(10, 1, "claude", Some("claude")),
+        SessionProc {
+            cpu_pct: 4.0,
+            ..p(11, 10, "sleep", None)
+        },
+    ];
+    t.observe(500, &busy, &[], 3600);
+    assert_eq!(t.get(&id).unwrap().last_active_unix, 500);
+    // A hook call counts; an earlier time never moves it back.
+    t.touch(&id, 600);
+    t.touch(&id, 550);
+    assert_eq!(t.get(&id).unwrap().last_active_unix, 600);
+    // Ended: frozen.
+    t.observe(700, &[], &[], 3600);
+    t.touch(&id, 800);
+    assert_eq!(t.get(&id).unwrap().last_active_unix, 600);
+}

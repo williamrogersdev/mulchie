@@ -2,7 +2,7 @@
 // them: `snapshot.consumers` (ranked groups: workspaces, apps, processes,
 // the system) and `snapshot.cpu_summary` / `snapshot.mem_summary` (the
 // headline in words). This module only shapes them for display.
-import { B, esc } from './util.js';
+import { B, esc, kindGlyph } from './util.js';
 
 // Every process the engine lists individually, once: the top list and each
 // workspace's.
@@ -41,12 +41,12 @@ const shape = g => ({
   count: g.procs,
 });
 
-// The groups the engine ranked, by CPU and by memory, each once.
+// The groups the engine ranked (by CPU, memory and swap) and every app, each once.
 export function consumers(S) {
   const c = S.snapshot.consumers;
   if (!c) return [];
   const seen = new Map();
-  for (const g of [...c.by_cpu, ...c.by_mem]) if (!seen.has(g.key)) seen.set(g.key, shape(g));
+  for (const g of [...c.by_cpu, ...c.by_mem, ...(c.by_swap || []), ...(c.apps || [])]) if (!seen.has(g.key)) seen.set(g.key, shape(g));
   return [...seen.values()];
 }
 
@@ -84,7 +84,7 @@ export function barsHtml(S, by, n = 5) {
   const max = Math.max(1e-9, ...list.map(c => c[by]));
   const cpu = by === 'cpu_pct';
   return list.map(c => `<div class="cb" role="button" tabindex="0" data-d="group" data-dk="${esc(c.key)}" title="${esc(c.label)} · ${esc(cores(c.cpu_pct))} (${(c.share * 100).toFixed(0)}% of the machine) · ${B(c.mem_bytes)} · ${c.count} process(es)">
-    <span class="nm"><span class="ki ${esc(c.kind)}">${KIND_ICON[c.kind] || '●'}</span>${esc(c.short)}</span>
+    <span class="nm">${kindGlyph(c.kind)}${esc(c.short)}</span>
     <span class="v">${cpu ? esc(cores(c.cpu_pct)) : B(c.mem_bytes)}</span>
     <span class="bar"><i class="${cpu ? '' : 'mem'}" style="width:${(c[by] / max * 100).toFixed(1)}%"></i></span></div>`).join('');
 }

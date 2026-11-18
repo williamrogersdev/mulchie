@@ -57,7 +57,10 @@ Back up the private key and its password. If you lose them, installed apps canno
 
 The updater is wired in the app (`crates/mulchie-app/src/update.rs`). The app registers the Tauri
 updater plugin only when `plugins.updater.pubkey` in `tauri.conf.json` is set, and "Check for
-Updates…" in its menu then reads `latest.json` from the latest GitHub Release. Until you have run
+Updates…" in its menu then lists the releases on GitHub and reads `latest.json` from the newest one
+that has it (`app_manifest_url` in `crates/mulchie-core/src/updates.rs`). A stable app skips
+pre-releases; an app that is itself a pre-release follows them. The `endpoints` entry in
+`tauri.conf.json` is not used by the app's own checks. Until you have run
 the script and committed the result, a build says that updates are not configured, and
 `release.yml` makes a CLI-only release (see "CLI-only release" below). It checks
 `bundle.createUpdaterArtifacts` and the public key, so a release never ships an app that cannot update.
@@ -198,8 +201,8 @@ nobody installs. Anything with a `-` suffix after `X.Y.Z` is a pre-release. The 
 notarizes it exactly like a release, and then differs in four ways:
 
 - The GitHub Release is published with the pre-release flag, so `releases/latest` does not move. `install.sh` with no
-  version, the in-app updater (`releases/latest/download/latest.json`) and Mulchie's own update check keep seeing the last
-  stable release.
+  version keeps seeing the last stable release. The in-app updater and Mulchie's own update check do the same for a
+  stable install; an install that is itself a pre-release is offered the newest release of any kind.
 - `publish.yml` skips Homebrew and crates.io (a crates.io publish cannot be undone). The crates job prints a notice.
 - The release notes are the `## [X.Y.Z]` section of `CHANGELOG.md`, with a first line saying they are for a release
   candidate. The section may still say Unreleased. A `## [X.Y.Z-rc.N]` section, if you write one, is used instead.
@@ -253,7 +256,7 @@ hdiutil detach /tmp/mulchie-dmg
 gh attestation verify "Mulchie_${V}_universal.dmg" --repo williamrogersdev/mulchie
 
 # Updater manifest (and, from an installed app, "Check for Updates…" in its menu)
-curl -fsSL https://github.com/williamrogersdev/mulchie/releases/latest/download/latest.json | jq '.version, (.platforms | keys)'
+curl -fsSL "https://github.com/williamrogersdev/mulchie/releases/download/v${V}/latest.json" | jq '.version, (.platforms | keys)'
 
 # Installer, in a clean shell
 curl -fsSL https://mulchie.com/install.sh | MULCHIE_INSTALL_DIR="$(mktemp -d)" sh

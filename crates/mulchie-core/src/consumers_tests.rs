@@ -15,6 +15,7 @@ fn p(pid: u32, ppid: u32, name: &str, exe: Option<&str>) -> ProcSample {
         kind: ProcKind::Other,
         cpu_pct: 0.0,
         mem_bytes: 0,
+        swap_bytes: 0,
         start_time: 1000 + pid as u64,
         stopped: false,
     }
@@ -458,6 +459,7 @@ fn linux_session_services_are_protected() {
         kind: ProcKind::Other,
         cpu_pct: 1.0,
         mem_bytes: 1,
+        swap_bytes: 0,
         start_time: 1,
         stopped: false,
     };

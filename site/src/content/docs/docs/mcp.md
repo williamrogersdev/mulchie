@@ -24,7 +24,7 @@ What each client's setup does:
 | `claude-desktop` | Edits `claude_desktop_config.json`: `~/Library/Application Support/Claude/` on macOS, `~/.config/Claude/` on Linux. |
 | `cursor` | Edits `~/.cursor/mcp.json`. |
 
-When Mulchie edits a config file, it keeps the other entries, copies the old file to `<file>.mulchie-backup-<unix time>`, writes the new one atomically, and leaves a file it cannot parse alone. An existing, different `mulchie` entry is not replaced unless you pass `--force`. `<mulchie>` is the absolute path of the `mulchie` binary you ran.
+When Mulchie edits a config file, it keeps the other entries, copies the old file to `<file>.mulchie-backup-<unix time>-<random>` (keeping the newest five such copies), writes the new one atomically, and leaves a file it cannot parse alone. An existing, different `mulchie` entry is not replaced unless you pass `--force`. `<mulchie>` is the absolute path of the `mulchie` binary you ran.
 
 To remove it:
 
@@ -91,6 +91,8 @@ Agents should start with `diagnose`.
 | `limits_status` | No | Whether budgets only report or act, the budgets, sessions over a cap and what was done, sessions hogging the machine, and processes Mulchie paused. |
 | `list_updates` | No | The last update check and the update findings, with the command that would update each. See [Update checks](/docs/updates/). |
 | `check_command` | No | Ask the [guard rules](/docs/hooks/#guard-rules) about a shell command before running it: allow, warn or block, with the reason. Records and runs nothing. Arguments: `command`, `cwd`. |
+| `report_feedback` | No | Report a problem the agent hit: a Mulchie tool that failed, wrong advice, a finding that was noise, a problem Mulchie missed, work it got in the way of, or a slow or broken environment. Saved in a private file on this machine with the machine's state; nothing is sent anywhere. Offered by a read-only server too, and kept even when no engine runs. Arguments: `summary`, and optionally `category`, `severity`, `details`, `tool`, `cwd`. |
+| `list_feedback` | No | The saved reports, newest first. Argument: `limit`. |
 | `inspect_process` | No | Everything known about one process, read now. Argument: `pid`. |
 | `plan_cache_cleanup` | No | Plan deleting build caches: `stale=true`, or `paths`. |
 | `plan_worktree_removal` | No | Plan removing specific worktrees: `paths`, and `allow_dirty` to save uncommitted changes as a patch and remove anyway. |

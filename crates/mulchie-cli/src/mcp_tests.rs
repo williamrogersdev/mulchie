@@ -156,7 +156,7 @@ fn tools_have_titles_and_annotations() {
     let f = Fake::default();
     let r = one(&f, req(1, "tools/list", json!({})));
     let tools = r["result"]["tools"].as_array().unwrap();
-    assert_eq!(tools.len(), 25);
+    assert_eq!(tools.len(), 27);
     assert_eq!(tools[0]["name"], "diagnose", "diagnose comes first");
     for t in tools {
         let name = t["name"].as_str().unwrap();
@@ -258,7 +258,7 @@ fn read_only_mode_hides_and_refuses_destructive_tools() {
     let mut s = Session::read_only(&f);
     let r = s.handle(req(1, "tools/list", json!({}))).unwrap();
     let names = tool_names(&r);
-    assert_eq!(names.len(), 21, "{names:?}");
+    assert_eq!(names.len(), 23, "{names:?}");
     for n in [
         "execute_plan",
         "prune_cache",
@@ -1808,4 +1808,86 @@ fn past_failures_are_shown_in_plans_and_status() {
     assert!(shown["ready"][1]["failed_before"].is_null());
     let st = result(&s.handle(call(2, "get_status", json!({}))).unwrap());
     assert_eq!(st["repeated_failures"][0]["target"], "/w/a");
+}
+
+/// A fake with no engine behind it and a home to fall back on.
+struct NoEngine(Paths);
+
+impl Api for NoEngine {
+    fn call(&self, _m: &str, _p: &str, _b: Option<&Value>) -> Result<Value, ApiError> {
+        Err(ApiError::new(0, "engine_not_running", "not running"))
+    }
+    fn paths(&self) -> Option<&Paths> {
+        Some(&self.0)
+    }
+}
+
+#[test]
+fn feedback_goes_to_the_engine_with_the_client_name() {
+    let f = Fake::default().with(
+        "POST /v1/feedback",
+        json!({ "ok": true, "feedback": { "id": "fb-1-aaaa" } }),
+    );
+    for read_only in [false, true] {
+        let mut s = if read_only {
+            Session::read_only(&f)
+        } else {
+            Session::new(&f)
+        };
+        s.handle(req(
+            1,
+            "initialize",
+            json!({ "protocolVersion": LEGACY_VERSIONS[0], "clientInfo": { "name": "claude-code", "version": "2" } }),
+        ))
+        .unwrap();
+        let r = s
+            .handle(call(
+                2,
+                "report_feedback",
+                json!({ "summary": "diagnose was wrong", "category": "wrong_advice", "tool": "diagnose", "cwd": "/code/a" }),
+            ))
+            .unwrap();
+        let out: Value = serde_json::from_str(&text(&r)).unwrap();
+        assert_eq!(out["saved"], true, "{r}");
+        assert_eq!(out["id"], "fb-1-aaaa");
+        assert_eq!(out["with_machine_state"], true);
+    }
+    let sent = f.posted("/v1/feedback");
+    assert_eq!(sent.len(), 2, "a read-only server reports too");
+    assert_eq!(sent[0]["source"], "mcp");
+    assert_eq!(sent[0]["client"], "claude-code");
+    assert_eq!(sent[0]["category"], "wrong_advice");
+    assert_eq!(sent[0]["cwd"], "/code/a");
+    assert!(sent[0].get("severity").is_none());
+
+    // The schema refuses a report with no summary or an unknown category.
+    let mut s = Session::new(&f);
+    for bad in [json!({}), json!({ "summary": "x", "category": "rant" })] {
+        let r = s.handle(call(3, "report_feedback", bad)).unwrap();
+        assert_eq!(r["result"]["isError"], true, "{r}");
+    }
+}
+
+#[test]
+fn feedback_is_kept_when_no_engine_runs() {
+    let t = tempfile::tempdir().unwrap();
+    let api = NoEngine(Paths::under(t.path()));
+    let mut s = Session::read_only(&api);
+    let r = s
+        .handle(call(
+            1,
+            "report_feedback",
+            json!({ "summary": "the engine is not running", "severity": "high" }),
+        ))
+        .unwrap();
+    let out: Value = serde_json::from_str(&text(&r)).unwrap();
+    assert_eq!(out["saved"], true, "{r}");
+    assert_eq!(out["with_machine_state"], false);
+    let r = s.handle(call(2, "list_feedback", json!({}))).unwrap();
+    let out: Value = serde_json::from_str(&text(&r)).unwrap();
+    assert_eq!(out["total"], 1, "{r}");
+    assert_eq!(out["feedback"][0]["summary"], "the engine is not running");
+    assert_eq!(out["feedback"][0]["source"], "mcp");
+    assert_eq!(out["feedback"][0]["severity"], "high");
+    assert_eq!(out["feedback"][0]["id"], out["feedback"][0]["id"]);
 }

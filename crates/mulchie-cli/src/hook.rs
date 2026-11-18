@@ -24,6 +24,10 @@ pub const BUDGET: Duration = Duration::from_millis(300);
 pub const MAX_INPUT: u64 = 1 << 20;
 /// Context text handed to an agent at most.
 const MAX_CONTEXT: usize = 9_000;
+/// The command sent to the engine at most. One byte past the guard's own
+/// limit, so a longer command still reaches the engine longer than that limit
+/// and the guard warns `too_long` instead of checking a silently cut copy.
+pub const MAX_COMMAND: usize = mulchie_core::guard::MAX_COMMAND_BYTES + '…'.len_utf8() + 1;
 const LOG_EVERY: Duration = Duration::from_secs(60);
 const LOG_MAX: u64 = 256 * 1024;
 
@@ -131,7 +135,7 @@ pub fn request(client: HookClient, event: &str, input: &Value, pid: u32) -> Hook
         pid,
         cwd,
         tool: tool.map(|t| cap(&t, 128)),
-        command: command.map(|c| cap(&c, 8_192)),
+        command: command.map(|c| cap(&c, MAX_COMMAND)),
         detail: detail.map(|d| cap(&d, 256)),
     }
 }
@@ -321,9 +325,9 @@ pub fn translate(
                 Out::json(json!({ "decision": "deny", "reason": reason }))
             }
             // No "ask" and no agent context before a tool: tell the user.
-            // Plain advice waits for AfterTool, which can add context.
+            // Plain advice waits for AfterTool, which can add context. No
+            // `decision`: Mulchie never answers "allow" for the user.
             "pre_tool" if d == Warn => Out::json(json!({
-                "decision": "allow",
                 "systemMessage": format!("Mulchie warns: {reason}"),
             })),
             _ => Out::default(),
@@ -339,6 +343,20 @@ pub fn translate(
             _ => Out::default(),
         },
     }
+}
+
+/// Copilot runs its tool hooks for every tool (its hook files have no
+/// matcher). Only shell tools go to the engine, as for the other clients;
+/// the rest are allowed at once.
+pub fn skip_without_engine(client: HookClient, req: &HookRequest) -> bool {
+    use crate::hooks_install::COPILOT_SHELL_TOOLS;
+    client == HookClient::Copilot
+        && matches!(req.event.as_str(), "pre_tool" | "post_tool")
+        && !req.tool.as_deref().is_some_and(|t| {
+            COPILOT_SHELL_TOOLS
+                .iter()
+                .any(|s| s.eq_ignore_ascii_case(t))
+        })
 }
 
 /// Parse the input, ask the engine through `call`, translate.
@@ -362,6 +380,9 @@ pub fn handle(
         return Err("input is not a JSON object".into());
     }
     let req = request(client, event, &v, pid);
+    if skip_without_engine(client, &req) {
+        return Ok(fail_open(client, event));
+    }
     let reply = call(&req)?;
     let reply: HookReply =
         serde_json::from_value(reply).map_err(|e| format!("unexpected reply: {e}"))?;
@@ -451,6 +472,7 @@ pub fn command(paths: &Paths, client: HookClient, event: &str, guard: Option<Gua
         };
         handle(client, &ev, &input, guard, pid, &call)
     });
+    let reached = r.is_ok();
     let out = match r {
         Ok(o) => o,
         Err(e) => {
@@ -465,7 +487,71 @@ pub fn command(paths: &Paths, client: HookClient, event: &str, guard: Option<Gua
             fail_open(client, event)
         }
     };
-    emit(&out)
+    let code = emit(&out);
+    note_config_dir(paths, client, reached, mulchie_core::monitor::now_unix());
+    code
+}
+
+/// `hook-dirs.json` in the default config directory (`~/.config/mulchie`,
+/// whatever `XDG_CONFIG_HOME` says), where hooks note a config directory
+/// that differs from it, or that had no engine, for `mulchie hooks status`.
+pub fn dirs_file(home: &Path) -> std::path::PathBuf {
+    home.join(".config/mulchie/hook-dirs.json")
+}
+
+/// Do not rewrite an unchanged note more often than this.
+const NOTE_EVERY: u64 = 60;
+
+/// Note, per client, the config directory this hook ran with, when it is
+/// not the default one or no engine answered; forget the note once the hook
+/// runs in the default directory and reaches the engine. An agent whose
+/// `XDG_CONFIG_HOME` differs from the engine's looks for the engine in the
+/// wrong place and allows everything; `hooks status` shows the note. Best
+/// effort: any error leaves the file as it was.
+pub fn note_config_dir(paths: &Paths, client: HookClient, reached: bool, now: u64) {
+    let file = dirs_file(&paths.home);
+    let default_dir = file.parent().map(Path::to_path_buf).unwrap_or_default();
+    let odd = paths.config_dir != default_dir || !reached;
+    if !odd && !file.exists() {
+        return;
+    }
+    let mut all: serde_json::Map<String, Value> = std::fs::read(&file)
+        .ok()
+        .and_then(|b| serde_json::from_slice(&b).ok())
+        .unwrap_or_default();
+    let key = client.name();
+    if !odd {
+        if all.remove(key).is_none() {
+            return;
+        }
+    } else {
+        let dir = paths.config_dir.display().to_string();
+        let old = all.get(key);
+        let same = old.is_some_and(|o| {
+            o["config_dir"].as_str() == Some(dir.as_str())
+                && o["reached"].as_bool() == Some(reached)
+                && o["seen"]
+                    .as_u64()
+                    .is_some_and(|t| now.saturating_sub(t) < NOTE_EVERY)
+        });
+        if same {
+            return;
+        }
+        all.insert(
+            key.to_string(),
+            json!({
+                "config_dir": dir,
+                "xdg_config_home": paths.xdg_config_home,
+                "reached": reached,
+                "seen": now,
+            }),
+        );
+    }
+    if mulchie_core::config::create_private_dir(&default_dir).is_err() {
+        return;
+    }
+    let _ =
+        mulchie_core::config::write_atomic(&file, Value::Object(all).to_string().as_bytes(), 0o600);
 }
 
 /// `mulchie hook …` with arguments this build cannot read: settings written

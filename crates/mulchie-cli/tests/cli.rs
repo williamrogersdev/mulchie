@@ -477,6 +477,62 @@ fn diagnose_without_an_engine() {
 }
 
 #[test]
+fn feedback_is_saved_without_an_engine_and_through_one() {
+    let h = Home::new();
+    let o = h.run(&["feedback", "list"]);
+    assert!(o.status.success(), "{}", text(&o.stderr));
+    assert!(text(&o.stdout).contains("No feedback yet"));
+
+    let o = h.run(&[
+        "feedback",
+        "report",
+        "--category",
+        "missed",
+        "--severity",
+        "high",
+        "load",
+        "was",
+        "50",
+    ]);
+    assert!(o.status.success(), "{}", text(&o.stderr));
+    assert!(text(&o.stdout).contains("Saved feedback fb-"));
+    assert!(h.paths().config_dir.join("feedback.jsonl").exists());
+
+    let o = h.run(&["feedback", "report", "--category", "rant", "x"]);
+    assert_eq!(o.status.code(), Some(2));
+    let o = h.run(&["feedback", "report"]);
+    assert_eq!(o.status.code(), Some(2));
+
+    let (_engine, _lk, server) = h.engine();
+    let o = h.run(&[
+        "feedback",
+        "report",
+        "--json",
+        "--tool",
+        "diagnose",
+        "second one",
+    ]);
+    assert!(o.status.success(), "{}", text(&o.stderr));
+    let v: serde_json::Value = serde_json::from_slice(&o.stdout).unwrap();
+    assert_eq!(v["source"], "cli");
+    assert_eq!(v["tool"], "diagnose");
+    server.stop();
+
+    let o = h.run(&["feedback", "list", "--json"]);
+    let v: serde_json::Value = serde_json::from_slice(&o.stdout).unwrap();
+    assert_eq!(v["total"], 2);
+    assert_eq!(v["feedback"][0]["summary"], "second one");
+    assert_eq!(v["feedback"][1]["summary"], "load was 50");
+    assert_eq!(v["feedback"][1]["category"], "missed");
+    let o = h.run(&["feedback", "list"]);
+    assert!(
+        text(&o.stdout).contains("[high] missed"),
+        "{}",
+        text(&o.stdout)
+    );
+}
+
+#[test]
 fn token_prints_paths_not_secrets() {
     let h = Home::new();
     let o = h.run(&["token"]);

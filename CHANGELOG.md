@@ -6,7 +6,32 @@ All notable changes to Mulchie are listed here. The format follows
 
 ## [0.3.0] - Unreleased
 
+### Fixed
+
+- `mulchie hook` sends the command text up to the guard's 64 KiB limit (it cut it at 8 KiB), and a longer command arrives longer than that limit, so the guard warns `too_long` instead of checking a cut copy.
+- Copilot CLI runs its tool hooks for every tool. The hook now sends only shell tools (`bash`, `shell`, `powershell`) to the engine and allows the rest at once.
+- `mulchie hooks status` warns when an agent app's hook ran with a different config directory (`XDG_CONFIG_HOME`) than its own: such a hook cannot find the engine and allows everything. The hook notes this in `~/.config/mulchie/hook-dirs.json`.
+- `mcp install` and `hooks install` name each backup `<file>.mulchie-backup-<unix>-<random>`, so two in one second no longer collide, and keep only the newest five per file.
+- `~/Library/Logs/mulchie-serve.log` no longer grows without end: past 10 MiB `mulchie serve` copies it to `mulchie-serve.log.1` and empties it.
+- App connected to another engine: one `/v1/health` call per tick (an authenticated check every 30 s), and history fetched with the new `GET /v1/history?since=` instead of whole each time.
+- App: a click on the menu bar icon that closes the panel by taking its focus no longer opens it again.
+
+- Mulchie's own update check never offered a release candidate to someone running one: it asked GitHub for the latest release, which leaves pre-releases out. An install that is itself a pre-release now asks for the newest releases and is offered the highest version, pre-releases included. A stable install is still offered stable releases only.
+
+- Build throttling no longer leaves builds slow for good. Mulchie lowered the priority of every build it saw during one busy 3-second sample and then could not raise it again, because raising a priority needs root: builds and dev servers stayed at the lower priority until they exited. Now builds are throttled only after 15 seconds of sustained pressure, priorities go back after 30 calm seconds, and an engine that cannot put a priority back (one not running as root) does not lower any.
+- Health counts load: more than 2 runnable tasks per core is `busy` and more than 3 is `strained`. Before, load had to pass 4 per core, so a machine with 50 tasks queued on 16 cores read as `good`.
+- `diagnose` recommends lowering the priority of builds only for the workspace whose builds use the most CPU, and only when that is at least half a core.
+- The watch no longer reports the system daemons inside an iOS Simulator runtime (`syslogd`, `cfprefsd`, `securityd`, `trustd`) as `system_name_mismatch`.
+- With no engine running, the MCP server's `diagnose` scanned the disk at full priority on every call, in every agent's server. It now scans at background priority and reuses the result for 15 minutes.
+
 ### Added
+
+- App: Settings has a **Runaway chains** section next to the memory guard (action, nesting depth, how long agents are warned) and shows chains running now, what was stopped and which commands agents are warned about.
+- `GET /v1/history?since=<unix seconds>` returns only the samples taken after that time.
+
+- App: **Check for Updates…** in the Mulchie menu at the top left, with the standard About, Services, Hide and Quit items and Edit and Window menus. The dashboard and the panel show an update button while a newer version is known: **Update to X** installs it in a build that can update itself, **Get X** says how to get it in one that cannot. A build that can update itself looks for a new version a minute after launch and every six hours.
+
+- Feedback: agents and people can report problems with Mulchie or the machine, and the reports are kept for fixing them. Agents call the MCP tool `report_feedback` (offered by a read-only server too) and read reports with `list_feedback`; people run `mulchie feedback report <what happened>` and `mulchie feedback list`; anything else uses `POST /v1/feedback` and `GET /v1/feedback`. A report has a summary and optionally a category (`bug`, `wrong_advice`, `false_positive`, `missed`, `blocked`, `slow`, `environment`, `idea`, `other`), a severity, details and the tool it is about. It is saved as a line in `feedback.jsonl` in the config directory, readable only by the user, with the machine's state at that moment when the engine runs, and with secrets in the text hidden. A report is kept even when no engine runs. Mulchie sends the file nowhere.
 
 - Runaway chains (`runaway` in the config): Mulchie looks in every sample for a command running nested inside copies of itself, with the same command line and working directory (a build script that calls itself, such as an `npm run build` whose build step runs `npm run build`). At `runaway.depth` copies (default 6) it is a `runaway_chain` finding and a notification. With `mulchie config set runaway.action stop` Mulchie stops the chain through the safety gate: it freezes every process of it (SIGSTOP, from a fresh process list, repeated until nothing new appears), then kills them (SIGKILL), so a level started in the meantime does not carry on. The agent and unrelated work are spared. `mulchie limits`, `GET /v1/limits/status` (`runaway`) and the MCP `limits_status` tool show chains, what was stopped and what is remembered.
 - Guard rule `runaway_repeat`: for `runaway.remember_secs` (default one hour) after a chain was seen, running the same command in the same directory gets a warning (or a block) from agent hooks, `mulchie guard check` and the MCP `check_command` tool. A session whose chain Mulchie stopped is told so at its next hook call.
@@ -47,6 +72,10 @@ All notable changes to Mulchie are listed here. The format follows
 
 ### Changed
 
+- Releases ship the desktop app again: the updater is configured (public key, update endpoint, updater artifacts), so a release builds the signed and notarized app with the files it needs to update itself, not only the CLI.
+
+- The periodic disk scan costs far less. It measures a directory in one pass (on macOS with `getattrlistbulk`), reuses what it measured for worktrees, caches and stores that show no change (for at most 6 hours), and runs on two threads at background priority. A scan you ask for still measures everything.
+- The app: every row has its own action (remove a worktree, clear a cache, prune a store, stop a workspace, quit a process, end a session), each through the same review dialog as before. Sessions show how long they have been idle (`last_active_unix` in the API) and can be filtered by it and ended several at once. "Needs attention" says how long each item has been so. The menu bar panel shows three figures, the biggest users with a Stop or Quit button, what needs attention, and what can be cleaned up.
 - Command-line parsing uses clap: every command has `--help` with examples, flags are strict, and unknown flags are errors.
 - `clean` and `sweep` no longer delete in one step. They show what they would do and, briefly, what they would skip and why.
 - Worktree removal backs up first and removes only if every backup step worked. Uncommitted changes become a patch that is checked to apply cleanly, gitignored files that are not caches go into a `tar.gz`, and a detached HEAD gets a `backup/<name>-<shortsha>` branch. Each backup set is a directory under the config directory's `backups/` with a `manifest.json` that says how to restore it.

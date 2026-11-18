@@ -19,10 +19,12 @@ export const st = {
   ui: {
     pSort: ['cpu_pct', -1], pKind: '', pSel: new Set(), pFocus: null,
     wSort: ['cpu_pct', -1], wFocus: null,
+    apSort: ['mem_bytes', -1],
     wtF: 'all', wtSel: new Set(), wtSort: ['bytes', -1],
     bcF: 'stale', bcSel: new Set(),
     aSrc: '', cfgDirty: false,
     sSort: ['cpu_cores', -1], sIncAgent: false, limDirty: false,
+    sSel: new Set(), sF: 'all',
   },
 };
 

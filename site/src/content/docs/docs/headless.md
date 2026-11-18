@@ -61,7 +61,7 @@ To keep it running after you log out, enable lingering with `loginctl enable-lin
 
 ### macOS: launchd agent
 
-`mulchie service install` writes `~/Library/LaunchAgents/dev.mulchie.serve.plist` and loads it with `launchctl bootstrap`. The agent starts at login, restarts if `mulchie serve` exits with an error, and logs to `~/Library/Logs/mulchie-serve.log`.
+`mulchie service install` writes `~/Library/LaunchAgents/dev.mulchie.serve.plist` and loads it with `launchctl bootstrap`. The agent starts at login, restarts if `mulchie serve` exits with an error, and logs to `~/Library/Logs/mulchie-serve.log`. Past 10 MiB, `mulchie serve` copies that log to `mulchie-serve.log.1` (replacing the previous copy) and empties it; it checks at start and every 10 minutes.
 
 To remove it yourself:
 

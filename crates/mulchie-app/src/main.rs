@@ -12,9 +12,9 @@ use serde_json::{json, Value};
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tauri::image::Image;
-use tauri::menu::{Menu, MenuItem, PredefinedMenuItem};
+use tauri::menu::{Menu, MenuItem, PredefinedMenuItem, Submenu};
 use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
 use tauri::{AppHandle, Emitter, Manager, PhysicalPosition, RunEvent, WebviewWindow, WindowEvent};
 
@@ -255,6 +255,83 @@ fn link_target(paths: &Paths) -> PathBuf {
     paths.home.join(".local/bin/mulchie")
 }
 
+/// The engine's last update report, for a build that cannot check by itself.
+fn engine_update_report(b: &Backend) -> Option<Value> {
+    b.updates_status().ok().map(|v| v["report"].clone())
+}
+
+/// This version, a newer one if known, and whether the app can install it.
+#[tauri::command]
+async fn app_update(b: B<'_>, app: AppHandle) -> Result<Value, String> {
+    let report = blocking(&b, |b| Ok(engine_update_report(b))).await?;
+    Ok(update::status(&app, report.as_ref()))
+}
+
+/// The window's update button: the same flow as "Check for Updates…".
+#[tauri::command]
+async fn start_update(b: B<'_>, app: AppHandle) -> Result<(), String> {
+    let report = blocking(&b, |b| Ok(engine_update_report(b))).await?;
+    update::check(app, report);
+    Ok(())
+}
+
+/// "Check for Updates…" from a menu.
+fn check_from_menu(app: &AppHandle) {
+    let report = app
+        .try_state::<Arc<Backend>>()
+        .and_then(|b| engine_update_report(&b));
+    update::check(app.clone(), report);
+}
+
+/// The menu bar menus, as Mac apps have them: the app menu with About,
+/// Check for Updates…, Services, Hide and Quit, then Edit and Window.
+fn app_menu(app: &AppHandle) -> tauri::Result<Menu<tauri::Wry>> {
+    let sep = || PredefinedMenuItem::separator(app);
+    let mulchie = Submenu::with_items(
+        app,
+        "Mulchie",
+        true,
+        &[
+            &PredefinedMenuItem::about(app, Some("About Mulchie"), None)?,
+            &MenuItem::with_id(app, "app-update", "Check for Updates…", true, None::<&str>)?,
+            &sep()?,
+            &PredefinedMenuItem::services(app, None)?,
+            &sep()?,
+            &PredefinedMenuItem::hide(app, Some("Hide Mulchie"))?,
+            &PredefinedMenuItem::hide_others(app, None)?,
+            &PredefinedMenuItem::show_all(app, None)?,
+            &sep()?,
+            &MenuItem::with_id(app, "app-quit", "Quit Mulchie", true, Some("CmdOrCtrl+Q"))?,
+        ],
+    )?;
+    let edit = Submenu::with_items(
+        app,
+        "Edit",
+        true,
+        &[
+            &PredefinedMenuItem::undo(app, None)?,
+            &PredefinedMenuItem::redo(app, None)?,
+            &sep()?,
+            &PredefinedMenuItem::cut(app, None)?,
+            &PredefinedMenuItem::copy(app, None)?,
+            &PredefinedMenuItem::paste(app, None)?,
+            &PredefinedMenuItem::select_all(app, None)?,
+        ],
+    )?;
+    let window = Submenu::with_items(
+        app,
+        "Window",
+        true,
+        &[
+            &PredefinedMenuItem::minimize(app, None)?,
+            &PredefinedMenuItem::maximize(app, None)?,
+            &sep()?,
+            &PredefinedMenuItem::close_window(app, None)?,
+        ],
+    )?;
+    Menu::with_items(app, &[&mulchie, &edit, &window])
+}
+
 #[tauri::command]
 fn integration(b: B<'_>, app: AppHandle) -> Integration {
     let paths = b.paths();
@@ -488,6 +565,30 @@ fn tray_title(t: &TrayInfo) -> String {
     format!("{mark}{:.0}G · {:.0}%", t.disk_free as f64 / 1e9, t.cpu_pct)
 }
 
+/// When the panel last hid because it lost focus. A click on the tray icon
+/// takes the focus first, so without this the click would hide the panel
+/// and then show it again.
+static BLUR_HIDDEN_AT: std::sync::Mutex<Option<Instant>> = std::sync::Mutex::new(None);
+/// A tray click this soon after a focus-loss hide is the click that caused it.
+pub const BLUR_CLICK_WINDOW: Duration = Duration::from_millis(400);
+
+fn note_blur_hide(now: Instant) {
+    if let Ok(mut g) = BLUR_HIDDEN_AT.lock() {
+        *g = Some(now);
+    }
+}
+
+/// Whether the panel hid on focus loss within [`BLUR_CLICK_WINDOW`] before
+/// `now`; forgets that hide either way.
+fn take_recent_blur_hide(now: Instant) -> bool {
+    let at = BLUR_HIDDEN_AT.lock().ok().and_then(|mut g| g.take());
+    blur_hide_is_recent(at, now)
+}
+
+pub fn blur_hide_is_recent(at: Option<Instant>, now: Instant) -> bool {
+    at.is_some_and(|t| now.saturating_duration_since(t) <= BLUR_CLICK_WINDOW)
+}
+
 fn toggle_panel(app: &AppHandle, rect: Option<tauri::Rect>) {
     let Some(win) = app.get_webview_window("panel") else {
         return;
@@ -616,6 +717,8 @@ fn main() {
             limits_status,
             updates_status,
             check_updates,
+            app_update,
+            start_update,
             patch_config,
             integration,
             install_cli,
@@ -629,6 +732,14 @@ fn main() {
         .setup(move |app| {
             #[cfg(target_os = "macos")]
             app.set_activation_policy(tauri::ActivationPolicy::Accessory);
+
+            app.set_menu(app_menu(app.handle())?)?;
+            app.on_menu_event(|app, e| match e.id().as_ref() {
+                "app-update" => check_from_menu(app),
+                "app-quit" => app.exit(0),
+                _ => {}
+            });
+            update::watch(app.handle().clone());
 
             let open = MenuItem::with_id(app, "open", "Open Dashboard", true, None::<&str>)?;
             let check = MenuItem::with_id(app, "update", "Check for Updates…", true, None::<&str>)?;
@@ -645,7 +756,7 @@ fn main() {
                 .show_menu_on_left_click(false)
                 .on_menu_event(|app, e| match e.id().as_ref() {
                     "open" => show_dashboard(app, None),
-                    "update" => update::check(app.clone()),
+                    "update" => check_from_menu(app),
                     "quit" => app.exit(0),
                     _ => {}
                 })
@@ -657,7 +768,11 @@ fn main() {
                         ..
                     } = event
                     {
-                        toggle_panel(tray.app_handle(), Some(rect));
+                        // The click that hid the panel by taking its focus
+                        // must not show it again.
+                        if !take_recent_blur_hide(Instant::now()) {
+                            toggle_panel(tray.app_handle(), Some(rect));
+                        }
                     }
                 })
                 .build(app)?;
@@ -667,6 +782,9 @@ fn main() {
                 let w = win.clone();
                 win.on_window_event(move |e| {
                     if let WindowEvent::Focused(false) = e {
+                        if w.is_visible().unwrap_or(false) {
+                            note_blur_hide(Instant::now());
+                        }
                         let _ = w.hide();
                         set_visible(&w, false);
                     }

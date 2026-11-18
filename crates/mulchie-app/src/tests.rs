@@ -326,7 +326,10 @@ fn updater_is_configured_only_with_a_public_key() {
     let mut p: HashMap<String, Value> = HashMap::new();
     assert_eq!(update::pubkey(&p), None);
     assert!(!update::Updates::from_plugins(&p).configured());
-    p.insert("updater".into(), json!({"endpoints": [update::ENDPOINT]}));
+    p.insert(
+        "updater".into(),
+        json!({"endpoints": ["https://example.invalid/latest.json"]}),
+    );
     assert_eq!(update::pubkey(&p), None);
     p.insert("updater".into(), json!({"pubkey": "  "}));
     assert_eq!(update::pubkey(&p), None);
@@ -864,8 +867,10 @@ fn cli_link_state_tells_our_link_from_other_files() {
     assert_eq!(link_state(&link, Some(&bin)), LinkState::OtherFile);
 }
 
+/// The page may listen to the app's events and drag the window by its
+/// title areas (`data-tauri-drag-region`), nothing else.
 #[test]
-fn capabilities_grant_only_event_listening() {
+fn capabilities_grant_only_event_listening_and_dragging() {
     let caps: Value = serde_json::from_str(include_str!("../capabilities/default.json")).unwrap();
     let perms: Vec<&str> = caps["permissions"]
         .as_array()
@@ -875,7 +880,11 @@ fn capabilities_grant_only_event_listening() {
         .collect();
     assert_eq!(
         perms,
-        ["core:event:allow-listen", "core:event:allow-unlisten"]
+        [
+            "core:event:allow-listen",
+            "core:event:allow-unlisten",
+            "core:window:allow-start-dragging"
+        ]
     );
 }
 
@@ -1397,4 +1406,50 @@ fn session_plans_record_paging_end_and_unreadable_record() {
     }
     drop(b);
     a.shutdown();
+}
+
+#[test]
+fn a_client_tick_reads_health_once_for_the_tray() {
+    let f = fixture();
+    let a = Backend::start(f.paths.clone(), f.opts());
+    let b = client_of(&f, f.opts());
+    // The first tick after connecting is the authenticated check.
+    b.tick();
+    assert!(!b.has_health_reading());
+    assert!(b.tray_info().is_ok());
+    // Later ticks read /v1/health, and tray_info uses that reading once.
+    b.tick();
+    assert!(b.has_health_reading());
+    let t = b.tray_info().unwrap();
+    assert!(t.disk_total > 0 || t.health == "stale", "{t:?}");
+    assert!(!b.has_health_reading());
+    assert!(
+        b.tray_info().is_ok(),
+        "no reading left: it asks the engine itself"
+    );
+    // A gone engine is still noticed by the plain health tick.
+    b.tick();
+    a.shutdown();
+    b.tick();
+    assert_eq!(b.mode(), Mode::Disconnected);
+    assert!(!b.has_health_reading());
+}
+
+#[test]
+fn a_tray_click_right_after_a_focus_loss_hide_is_ignored() {
+    let now = Instant::now();
+    assert!(!blur_hide_is_recent(None, now));
+    assert!(blur_hide_is_recent(Some(now), now));
+    assert!(blur_hide_is_recent(
+        Some(now),
+        now + BLUR_CLICK_WINDOW - Duration::from_millis(1)
+    ));
+    assert!(!blur_hide_is_recent(
+        Some(now),
+        now + BLUR_CLICK_WINDOW + Duration::from_millis(1)
+    ));
+    // The hide is forgotten once a click has looked at it.
+    note_blur_hide(now);
+    assert!(take_recent_blur_hide(now));
+    assert!(!take_recent_blur_hide(now));
 }

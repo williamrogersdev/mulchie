@@ -2,6 +2,7 @@
 import { st } from './store.js';
 import { esc, B, ago, clock } from './util.js';
 import { cpuSummary, memSummary, ranked } from './consumers.js';
+import { behind, whoHtml } from './culprits.js';
 
 // The engine's watch findings ("observations"), most severe first. Dismissed
 // ones only when asked for.
@@ -59,9 +60,41 @@ export function suggestionLabel(sg) {
 function fromWatch(f) {
   const i = f.suggested.findIndex(sg => sg.request || planApi(sg));
   return {
-    lvl: SEV_LVL[f.severity] || 'info', t: f.title, d: f.why, open: ['finding', f.id],
+    lvl: SEV_LVL[f.severity] || 'info', t: f.title, d: f.why, open: ['finding', f.id], since: f.first_seen_unix,
+    who: f.evidence?.culprits?.length ? [f.evidence.culprits.slice(0, 5), /swap/i.test(f.title) ? 'swap' : 'mem'] : null,
     act: i >= 0 ? { label: suggestionLabel(f.suggested[i]), run: `fx:${i}:${f.id}` } : { label: 'Details', run: `d:finding:${f.id}` },
   };
+}
+
+// How long a running session has done nothing the engine saw, in seconds;
+// null for an ended one, or an engine that does not report it.
+export const idleSecs = r => r.status === 'running' && r.last_active_unix ? Math.max(0, Date.now() / 1000 - r.last_active_unix) : null;
+export const IDLE_SESSION_SECS = 86400;
+
+// What can be cleaned up now, each with how long it has been unused and the
+// action that resolves it: stale build caches, idle agent worktrees, and
+// agent sessions that have done nothing for a day.
+export function cleanup(S) {
+  const out = [], c = S.config || {};
+  const oldest = ts => ts.filter(Boolean).reduce((a, t) => Math.min(a, t), Infinity);
+  const sweep = (S.diskmap?.worktrees || []).filter(w => w.sweepable);
+  if (sweep.length) {
+    const t = oldest(sweep.map(w => w.last_activity_unix));
+    out.push({ kind: 'cleanup', lvl: 'warn', t: `${sweep.length} idle agent worktree${sweep.length === 1 ? '' : 's'} · ${B(S.diskmap.sweepable_bytes)}`, age: isFinite(t) ? `idle up to ${ago(t)}` : '',
+      d: `Idle ${c.worktree_idle_days ?? '?'}+ days with nothing running in them. A sweep keeps branches and saves uncommitted changes first.`, go: 'disk', act: { label: 'Sweep…', run: 'sweep' } });
+  }
+  const stale = (S.scan?.items || []).filter(i => i.stale), bytes = S.scan?.stale_bytes || 0;
+  if (bytes > 1e9) {
+    const t = oldest(stale.map(i => i.last_used_unix));
+    out.push({ kind: 'cleanup', lvl: 'warn', t: `${B(bytes)} of stale build caches`, age: isFinite(t) ? `unused up to ${ago(t)}` : '',
+      d: `${stale.length} cache(s) unused within the stale window, with nothing running in the project. The next build recreates them.`, go: 'disk', act: { label: 'Clear…', run: 'stale' } });
+  }
+  const idle = (S.sessions?.list || []).map(idleSecs).filter(s => s != null && s >= IDLE_SESSION_SECS);
+  if (idle.length) {
+    out.push({ kind: 'cleanup', lvl: 'info', t: `${idle.length} agent session${idle.length === 1 ? '' : 's'} idle for over a day`, age: `longest ${ago(Date.now() / 1000 - Math.max(...idle))}`,
+      d: 'They used almost no CPU, started nothing and reported nothing in that time. Review them and end the ones you are done with.', go: 'sessions', act: { label: 'Review…', run: 'idle-sessions' } });
+  }
+  return out;
 }
 
 // What needs attention, each with where it leads (`open`: a detail, or `go`:
@@ -79,15 +112,15 @@ export function findings() {
   if (S.forecast?.hours_to_low != null && S.forecast.hours_to_low < 24) out.push({ lvl: 'warn', t: `Disk filling at ${B(S.forecast.bytes_per_hour)}/h`, d: `Reaches the ${c.low_disk_gb} GB floor in about ${S.forecast.hours_to_low.toFixed(1)} h at this rate.`, go: 'disk', act: diskAct });
   if (s.cpu_count && s.load[0] > s.cpu_count * 2) {
     const sum = cpuSummary(S), top = ranked(S, 'cpu_pct')[0];
-    out.push({ lvl: s.load[0] > s.cpu_count * 6 ? 'bad' : 'warn', t: `CPU ${sum.word}: ${(s.load[0] / s.cpu_count).toFixed(1)}× more work than cores`, d: sum.headline, open: ['cpu', ''], act: top ? { label: `Show ${top.short}`, run: `d:group:${top.key}` } : { label: 'Show CPU', run: 'd:cpu:' } });
+    out.push({ lvl: s.load[0] > s.cpu_count * 6 ? 'bad' : 'warn', t: `CPU ${sum.word}: ${(s.load[0] / s.cpu_count).toFixed(1)}× more work than cores`, d: sum.headline, open: ['cpu', ''], act: top ? { label: `Show ${top.short}`, run: `d:group:${top.key}` } : { label: 'Show CPU', run: 'd:cpu:' }, who: [behind(S, 'cpu', 5), 'cpu'] });
   }
   const mp = s.mem_total ? s.mem_available / s.mem_total * 100 : 100;
   if (mp < c.throttle_mem_free_pct || s.swap_used > 8e9) {
     const sum = memSummary(S), top = ranked(S, 'mem_bytes')[0];
-    out.push({ lvl: mp < c.throttle_mem_free_pct ? 'bad' : 'warn', t: mp < c.throttle_mem_free_pct ? `Memory pressure: ${mp.toFixed(0)}% available` : `${B(s.swap_used)} in swap`, d: sum.headline, open: ['mem', ''], act: top ? { label: `Show ${top.short}`, run: `d:group:${top.key}` } : { label: 'Show memory', run: 'd:mem:' } });
+    const swapFirst = mp >= c.throttle_mem_free_pct, sw = swapFirst ? behind(S, 'swap', 5) : [];
+    out.push({ lvl: mp < c.throttle_mem_free_pct ? 'bad' : 'warn', t: mp < c.throttle_mem_free_pct ? `Memory pressure: ${mp.toFixed(0)}% available` : `${B(s.swap_used)} in swap`, d: sum.headline, open: [swapFirst ? 'swap' : 'mem', ''], act: top ? { label: `Show ${top.short}`, run: `d:group:${top.key}` } : { label: 'Show memory', run: 'd:mem:' }, who: sw.length ? [sw, 'swap'] : [behind(S, 'mem', 5), 'mem'] });
   }
-  if (n) out.push({ lvl: 'warn', t: `${n} idle agent worktree(s), ${B(S.diskmap.sweepable_bytes)}`, d: `Idle ${c.worktree_idle_days}+ days. A sweep keeps branches and saves patches.`, go: 'disk', act: { label: 'Sweep…', run: 'sweep' } });
-  if (stale > 1e9) out.push({ lvl: 'warn', t: `${B(stale)} of stale build caches`, d: 'Unused within the stale window, with no agent running in the project.', go: 'disk', act: { label: 'Clean…', run: 'stale' } });
+  out.push(...cleanup(S));
   if (S.throttled) out.push({ lvl: 'ok', t: `${S.throttled} build process(es) at lower priority`, d: 'The optimizer reniced them under pressure.', open: ['agents', ''], act: { label: 'Show', run: 'd:agents:' } });
   if (S.slots?.waiting?.length) out.push({ lvl: 'ok', t: `${S.slots.waiting.length} job(s) queued for a build slot`, d: S.slots.waiting.map(w => w.label).join(', '), open: ['agents', ''], act: { label: 'Show', run: 'd:agents:' } });
   return out;
@@ -97,10 +130,13 @@ export function findings() {
 const target = f => f.open ? `data-d="${esc(f.open[0])}" data-dk="${esc(f.open[1])}"` : `data-go="${esc(f.go || 'overview')}"`;
 
 // `compact`: the tray panel's short list, at most that many (true: 3).
-export function findingsHtml(list, compact) {
-  if (!list.length) return '<div class="empty" style="padding:12px">Nothing needs attention.</div>';
-  return list.slice(0, compact ? (compact === true ? 3 : compact) : 99).map(f =>
-    `<div class="finding"><span class="ic" style="background:var(--${f.lvl})"></span><div class="t" role="button" tabindex="0" ${target(f)}><div>${esc(f.t)}</div>${compact ? '' : `<div class="muted">${esc(f.d)}</div>`}</div>${f.act ? `<button class="btn sm" data-run="${esc(f.act.run)}">${esc(f.act.label)}</button>` : ''}</div>`).join('');
+// Each row says how long it has been so (`age`, or `since` as "for 3h").
+export function findingsHtml(list, compact, empty = 'Nothing needs attention.') {
+  if (!list.length) return `<div class="empty" style="padding:12px">${esc(empty)}</div>`;
+  return list.slice(0, compact ? (compact === true ? 3 : compact) : 99).map(f => {
+    const age = f.age || (f.since ? `for ${ago(f.since)}` : '');
+    return `<div class="finding"><span class="ic" style="background:var(--${f.lvl})"></span><div class="t" role="button" tabindex="0" ${target(f)} title="${esc(f.t)}${compact && f.d ? '\n' + esc(f.d) : ''}"><div class="ft"><span class="ftt">${esc(f.t)}</span>${age ? `<span class="age">${esc(age)}</span>` : ''}</div>${compact ? '' : `<div class="muted">${esc(f.d)}</div>`}${!compact && f.who?.[0]?.length ? whoHtml(f.who[0], f.who[1], f.who[1] === 'swap' ? 'Holding swap:' : f.who[1] === 'cpu' ? 'Using the CPU:' : 'Using memory:') : ''}</div>${f.act ? `<button class="btn sm" data-run="${esc(f.act.run)}">${esc(f.act.label)}</button>` : ''}</div>`;
+  }).join('');
 }
 
 // An error string as a sentence: capitalised and ending in a full stop.

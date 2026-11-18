@@ -7,7 +7,8 @@ import { act } from './act.js';
 import { renderTop, renderOverview } from './views/overview.js';
 import { renderProcs, procBulk } from './views/processes.js';
 import { renderWss } from './views/workspaces.js';
-import { renderSessions } from './views/sessions.js';
+import { renderApps } from './views/apps.js';
+import { renderSessions, endSelectedSessions } from './views/sessions.js';
 import { renderDisk, removeSelectedWorktrees, sweep, clearSelectedCaches, clearStale } from './views/disk.js';
 import { renderActs } from './views/activity.js';
 import { renderAgents, loadIntegration } from './views/agents.js';
@@ -15,11 +16,11 @@ import { renderSettings, saveCfg } from './views/settings.js';
 import { renderPanel } from './views/panel.js';
 import { openDetail, closeDetail, detailOpen, renderDetail, detailAction, copyText, runSuggestion, NEEDS_ACTIONS } from './detail.js';
 import { findings, watchFindings } from './findings.js';
-import { cpuSummary, memSummary, ranked } from './consumers.js';
+import { cpuSummary, memSummary, ranked, findConsumer } from './consumers.js';
 import { groupAction } from './signals.js';
 
 const POLL_MS = 3000;
-const VIEWS = ['overview', 'processes', 'workspaces', 'sessions', 'disk', 'activity', 'agents', 'settings'];
+const VIEWS = ['overview', 'processes', 'workspaces', 'apps', 'sessions', 'disk', 'activity', 'agents', 'settings'];
 const TEXT_KEYS = ['name', 'group', 'label', 'branch', 'repo_name', 'kind', 'agent', 'workspace'];
 
 document.body.classList.add(MODE === 'panel' ? 'panel' : 'dashboard');
@@ -32,6 +33,7 @@ function render() {
   if (v === 'overview') renderOverview();
   else if (v === 'processes') renderProcs();
   else if (v === 'workspaces') renderWss();
+  else if (v === 'apps') renderApps();
   else if (v === 'sessions') renderSessions();
   else if (v === 'disk') renderDisk();
   else if (v === 'activity') renderActs();
@@ -133,12 +135,25 @@ function go(v, opts = {}) {
   if (changed && (v === 'activity' || v === 'settings')) refresh(true);
 }
 
-// Named actions for findings, the panel and the drawer.
+// Named actions for findings, the panel and the inspector.
 function run(name) {
   if (name === 'sweep') return sweep();
   if (name === 'stale') return clearStale();
   if (name.startsWith('go:')) return go(name.slice(3));
   if (name.startsWith('d:')) return go(name);
+  if (name === 'idle-sessions') {
+    // The sessions idle for a day, longest first.
+    st.ui.sF = 'd1';
+    st.ui.sSort = ['idle', -1];
+    return go('sessions');
+  }
+  if (name.startsWith('quit:')) return (async () => {
+    // From the panel the dashboard may have been hidden and not polling:
+    // look again before deciding what to quit.
+    await refresh(true);
+    const c = st.S && findConsumer(st.S, name.slice(5));
+    return c ? groupAction(c.key, 'quit', c.label) : toast('That is no longer among the biggest users.', true);
+  })();
   if (name.startsWith('stop:')) {
     const w = st.S?.snapshot.workspaces.find(x => x.path === name.slice(5));
     return groupAction('workspace:' + name.slice(5), 'quit', w?.label || name.slice(5));
@@ -182,7 +197,7 @@ function overviewCopy() {
   });
 }
 
-const SEL = '[data-psel],[data-wtsel],[data-bcsel],[data-all],[data-da],[data-run],[data-reveal],[data-term],[data-copy],[data-copy-token],[data-copy-el],[data-bulk],[data-v],[data-sort],[data-open],[data-go],[data-gproc],[data-k],[data-d],#wtSeg button,#bcSeg button,#aSeg button,#showTok,#dClose,#dCopy,#copyOverview';
+const SEL = '[data-psel],[data-wtsel],[data-bcsel],[data-ssel],[data-sbulk],#sSeg button,[data-all],[data-da],[data-run],[data-reveal],[data-term],[data-copy],[data-copy-token],[data-copy-el],[data-bulk],[data-v],[data-sort],[data-open],[data-go],[data-gproc],[data-k],[data-d],#wtSeg button,#bcSeg button,#aSeg button,#showTok,#dClose,#dCopy,#copyOverview';
 
 document.addEventListener('click', async e => {
   const t = e.target.closest(SEL);
@@ -215,19 +230,23 @@ document.addEventListener('click', async e => {
     const on = t.checked;
     if (d.all === 'p') $$('[data-psel]').filter(x => !x.disabled).forEach(x => on ? ui.pSel.add(+x.dataset.psel) : ui.pSel.delete(+x.dataset.psel));
     if (d.all === 'wt') $$('[data-wtsel]').filter(x => !x.disabled).forEach(x => on ? ui.wtSel.add(x.dataset.wtsel) : ui.wtSel.delete(x.dataset.wtsel));
+    if (d.all === 's') $$('[data-ssel]').forEach(x => on ? ui.sSel.add(x.dataset.ssel) : ui.sSel.delete(x.dataset.ssel));
     if (d.all === 'bc') $$('[data-bcsel]').filter(x => !x.disabled).forEach(x => on ? ui.bcSel.add(x.dataset.bcsel) : ui.bcSel.delete(x.dataset.bcsel));
     return render();
   }
   if (d.psel) { const pid = +d.psel; t.checked ? ui.pSel.add(pid) : ui.pSel.delete(pid); return render(); }
   if (d.wtsel) { t.checked ? ui.wtSel.add(d.wtsel) : ui.wtSel.delete(d.wtsel); return render(); }
   if (d.bcsel) { t.checked ? ui.bcSel.add(d.bcsel) : ui.bcSel.delete(d.bcsel); return render(); }
+  if (d.ssel) { t.checked ? ui.sSel.add(d.ssel) : ui.sSel.delete(d.ssel); return render(); }
+  if (d.sbulk) return endSelectedSessions();
+  if (t.closest('#sSeg')) { ui.sF = d.f; return render(); }
   if (d.d) {
     if (MODE === 'panel') return toDash(`d:${d.d}:${d.dk ?? ''}`);
     if (modalOpen()) dismissModal();
     return openDetail(d.d, d.dk);
   }
   if (d.sort) {
-    const [tbl, k] = d.sort.split(':'), key = { p: 'pSort', w: 'wSort', wt: 'wtSort', s: 'sSort' }[tbl];
+    const [tbl, k] = d.sort.split(':'), key = { p: 'pSort', w: 'wSort', wt: 'wtSort', s: 'sSort', ap: 'apSort' }[tbl];
     if (!key) return;
     ui[key] = ui[key][0] === k ? [k, -ui[key][1]] : [k, TEXT_KEYS.includes(k) ? 1 : -1];
     return render();
@@ -242,12 +261,14 @@ document.addEventListener('click', async e => {
 const on = (sel, ev, fn) => { const el = $(sel); if (el) el.addEventListener(ev, fn); };
 on('#pFilter', 'input', render);
 on('#wFilter', 'input', render);
+on('#aFilter', 'input', render);
 on('#sFilter', 'input', render);
 document.addEventListener('change', e => { if (e.target.id === 'sIncAgent') st.ui.sIncAgent = e.target.checked; });
 on('#pMine', 'change', render);
 on('#pClear', 'click', () => { st.ui.pSel.clear(); render(); });
 on('#wtClear', 'click', () => { st.ui.wtSel.clear(); render(); });
 on('#bcClear', 'click', () => { st.ui.bcSel.clear(); render(); });
+on('#sClear', 'click', () => { st.ui.sSel.clear(); render(); });
 on('#rescan', 'click', () => act(() => invoke('rescan'), 'Rescan started'));
 on('#saveCfg', 'click', saveCfg);
 on('#form', 'input', () => { st.ui.cfgDirty = true; });
@@ -285,3 +306,29 @@ loadIntegration().then(I => { if (I?.home) setHome(I.home); render(); });
 go(st.view);
 refresh(true);
 setInterval(refresh, POLL_MS);
+
+// The update button (top right of the dashboard, and the panel's header):
+// shown while a newer version of Mulchie is known. It starts the same flow
+// as "Check for Updates…" in the menu.
+const UPDATE_POLL_MS = 60000;
+async function refreshUpdate() {
+  let u = null;
+  try { u = await invoke('app_update'); } catch (e) { u = null; }
+  for (const id of ['tUpdate', 'pUpdate']) {
+    const b = $('#' + id);
+    if (!b) continue;
+    const v = u && u.available;
+    b.hidden = !v;
+    if (!v) continue;
+    b.textContent = u.can_install ? `Update to ${v}` : `Get ${v}`;
+    b.title = u.can_install
+      ? `Mulchie ${v} is available (you have ${u.current}). Install it and relaunch.`
+      : `Mulchie ${v} is available (you have ${u.current}). Shows how to get it.`;
+  }
+}
+for (const id of ['tUpdate', 'pUpdate']) {
+  const b = $('#' + id);
+  if (b) b.addEventListener('click', () => invoke('start_update').catch(e => toast(String(e))));
+}
+refreshUpdate();
+setInterval(refreshUpdate, UPDATE_POLL_MS);

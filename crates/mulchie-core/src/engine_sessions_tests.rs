@@ -632,6 +632,7 @@ fn session_plans_cover_the_session_without_the_agent() {
         kind: ProcKind::Other,
         cpu_pct: 0.0,
         mem_bytes: 1,
+        swap_bytes: 0,
         start_time: st,
         stopped: false,
     };

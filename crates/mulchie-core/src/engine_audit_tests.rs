@@ -48,6 +48,7 @@ fn sample(pid: u32, ppid: u32, st: u64) -> ProcSample {
         kind: ProcKind::Other,
         cpu_pct: 0.0,
         mem_bytes: 1,
+        swap_bytes: 0,
         start_time: st,
         stopped: false,
     }

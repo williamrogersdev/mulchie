@@ -28,7 +28,7 @@ The engine writes two tokens when it starts, in the config directory (`~/.config
 | Token | File | Accepted for |
 | --- | --- | --- |
 | Full | `token` | Every route. |
-| Read-only | `token.read` | Every `GET` route, `POST /v1/clean/plan`, `POST /v1/worktree/plan`, `POST /v1/process/plan`, `POST /v1/lease` (only with `ttl_secs` and no `pid`), `POST /v1/release`, and the agent-hook routes `POST /v1/hook` and `POST /v1/guard/check`. Any other route answers 403 `read_only_token`. |
+| Read-only | `token.read` | Every `GET` route, `POST /v1/clean/plan`, `POST /v1/worktree/plan`, `POST /v1/process/plan`, `POST /v1/lease` (only with `ttl_secs` and no `pid`), `POST /v1/release`, the agent-hook routes `POST /v1/hook` and `POST /v1/guard/check`, and `POST /v1/feedback`. Any other route answers 403 `read_only_token`. |
 
 `POST /v1/hook` writes to the session's activity record and can register a session, so anyone who can read `token.read` can add events to it. The record is not tamper-proof (see [Sessions and limits](/docs/sessions/#the-activity-record)).
 
@@ -44,7 +44,7 @@ Requests are capped at 8 KB per line, 64 KB of headers and a 1 MB body. The serv
 | --- | --- | --- |
 | GET | `/v1/health` | Open. Health, disk, load, free build slots, finding counts. |
 | GET | `/v1/state` | Everything the engine knows: snapshot, consumer groups, health, build slots, forecast, last scan, disk map, recent actions and findings. |
-| GET | `/v1/history` | Samples from the last 30 minutes, every 3 seconds. |
+| GET | `/v1/history` | Samples from the last 30 minutes, every 3 seconds. `?since=<unix seconds>` returns only samples taken after then. |
 | GET | `/v1/advice` | Whether to start heavy work now, free slots and the suggested job count. |
 | POST | `/v1/scan` | Queue a scan of build caches and worktrees. |
 | GET | `/v1/clean/plan` | Plan deleting stale build caches. |
@@ -74,6 +74,8 @@ Requests are capped at 8 KB per line, 64 KB of headers and a 1 MB body. The serv
 | POST | `/v1/guard/check` | Check a command against the guard rules. Records nothing. |
 | GET | `/v1/updates` | The last update check and its result. |
 | POST | `/v1/updates/check` | Ask for an update check now. Full token only. 409 `updates_off` when checks are off. |
+| GET | `/v1/feedback` | Feedback reports, newest first (`limit`, default 50). |
+| POST | `/v1/feedback` | Save a report about Mulchie or the machine (`summary`, and optionally `category`, `severity`, `details`, `tool`, `client`, `cwd`). It goes to `feedback.jsonl` in the config directory with the machine's state. Nothing is sent anywhere. |
 | POST | `/v1/lease` | Join the build queue, poll a ticket, or renew a slot. |
 | POST | `/v1/release` | Release a slot or leave the queue. |
 

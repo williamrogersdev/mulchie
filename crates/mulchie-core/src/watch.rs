@@ -238,6 +238,28 @@ pub struct Evidence {
     /// came from and the command to update it.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub updates: Vec<UpdateItem>,
+    /// What is behind a machine-wide finding (low memory, swap filling up):
+    /// the biggest sessions, apps, workspaces and processes, biggest first.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub culprits: Vec<Culprit>,
+}
+
+/// One thing behind a machine-wide finding.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
+pub struct Culprit {
+    /// `session`, `app`, `workspace`, `process` or `system`.
+    pub kind: String,
+    /// What opens it: a session id (`GET /v1/sessions/{id}`) or a consumer
+    /// group key (`app:…`, `workspace:…`, `process:…`, for
+    /// `POST /v1/process/plan`).
+    pub key: String,
+    pub name: String,
+    /// Percent of one core.
+    pub cpu_pct: f32,
+    /// Resident memory.
+    pub mem_bytes: u64,
+    /// Memory compressed or swapped out (macOS).
+    pub swap_bytes: u64,
 }
 
 /// One package an update finding is about.

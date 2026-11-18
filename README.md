@@ -24,14 +24,14 @@ Full documentation is at [mulchie.com/docs](https://mulchie.com/docs/).
 - A session is an agent and everything it started, found in the process table by name (Claude Code, Codex, Gemini CLI, Copilot CLI, Cursor's `cursor-agent`, aider, opencode and others; add more with `agents.extra`). `mulchie sessions` shows what each uses. See [sessions and limits](https://mulchie.com/docs/sessions/).
 - Limits are budgets per session for CPU, memory, processes, writes and runtime. The action is `notify` unless you choose `deprioritize`, `pause` or `stop`. `pause` and `stop` spare the agent itself unless the budget sets `include_agent`. A session that only a hook registered is reported, never enforced, and only the engine that holds the lock acts. A pause ends after `resume_after_secs`.
 - The memory guard watches the whole machine. When memory stays low it reports the biggest consumer it may close, and with `mulchie config set memory_guard.action stop` it closes it (SIGTERM, then SIGKILL), one at a time, until memory is back. By default that is what agent sessions started, never the agent itself; `memory_guard.scope all` extends it to your other apps and programs. Closing a process loses what it had not saved.
-- Runaway chains: a command running nested inside copies of itself (a build script that calls itself) is reported after `runaway.depth` copies (default 6). With `mulchie config set runaway.action stop` Mulchie freezes the whole chain and kills it before it uses up memory and swap, and for an hour the `runaway_repeat` guard rule warns before the same command is run in that directory again. The memory guard also treats swap filling up as low memory.
+- Runaway chains: a command running nested inside copies of itself (a build script that calls itself) is reported after `runaway.depth` copies (default 6). With `mulchie config set runaway.action stop` Mulchie freezes the whole chain and kills it before it uses up memory and swap, but only after it has kept growing over several samples; shells and agents are never treated as the repeating command, and for an hour the `runaway_repeat` guard rule warns before the same command is run in that directory again. The memory guard also treats swap filling up as low memory.
 - Each session has an activity record in `<config dir>/sessions/`. Command lines in it are redacted by pattern, as well as Mulchie can. It is not tamper-proof.
 - Hooks (`mulchie hooks install`) let Claude Code, Codex, Cursor, Gemini CLI and Copilot CLI tell Mulchie about session starts, prompts and shell commands. A hook fails open: with no engine, a slow one (300 ms) or any error, the action is allowed. Prompt text is never sent to the engine. See [hooks and guard rules](https://mulchie.com/docs/hooks/).
 - Guard rules check the text of a shell command for risky shapes (deleting outside the workspace, `curl | sh`, `sudo`, force-pushing a protected branch, disabling Mulchie, reading credentials, writing startup files). Every rule defaults to `warn`. They are a tripwire, not a sandbox, and miss obfuscated commands.
 - Update checks report newer versions of Mulchie and of installed agent tools, and outdated Homebrew packages. They never install anything. Vulnerability lookups against OSV.dev are off unless you turn them on. See [update checks](https://mulchie.com/docs/updates/).
 
 **Optimize**
-- Lowers the priority of build processes when CPU or memory is under pressure.
+- Lowers the priority of build processes when CPU or memory stays under pressure, where it can put the priority back afterwards (an engine running as root). Run as you, it leaves build priorities alone.
 - Runs a machine-wide build queue. `mulchie run -- cargo build` waits for a free slot and runs with a fair job count. Agents use the same queue over MCP.
 - Answers "is now a good time for heavy work?" with reasons (`mulchie advice`).
 
@@ -97,6 +97,7 @@ Run `mulchie --help` or `mulchie <command> --help` for every flag.
 | `limits` | Session budgets: who is over, what Mulchie paused, and whether limits act. Needs the engine. |
 | `updates` | The last update check. `updates --check` asks for one now. Needs the engine. |
 | `guard check -- <command>` | Ask the guard rules about a command without running it. Needs the engine. |
+| `feedback report <what happened>` | Save a report about Mulchie or the machine. `feedback list` shows what agents and people reported. Works without the engine. |
 | `hooks install\|uninstall\|status` | Connect Mulchie to an agent's own hooks. |
 | `hook <client> <event>` | Run by an agent's hook system, not by hand. Fails open. |
 | `slots` | List build slots. `slots release <ticket>` ends one whose holder is gone. Needs the engine. |
@@ -138,7 +139,7 @@ mulchie hooks install --client claude-code --dry-run
 mulchie hooks install --client claude-code
 ```
 
-Supported clients are `claude-code`, `codex`, `cursor`, `gemini` and `copilot`. The install edits one file (`~/.claude/settings.json`, `~/.codex/hooks.json`, `~/.cursor/hooks.json`, `~/.gemini/settings.json` or `~/.copilot/hooks/mulchie.json`), keeps your other hooks, and first copies the old file to `<file>.mulchie-backup-<unix time>`. Codex runs new hooks only after you trust them with its `/hooks` command. Windsurf, Antigravity, opencode and Aider have no hook support.
+Supported clients are `claude-code`, `codex`, `cursor`, `gemini` and `copilot`. The install edits one file (`~/.claude/settings.json`, `~/.codex/hooks.json`, `~/.cursor/hooks.json`, `~/.gemini/settings.json` or `~/.copilot/hooks/mulchie.json`), keeps your other hooks, and first copies the old file to `<file>.mulchie-backup-<unix time>-<random>`, keeping the newest five. Codex runs new hooks only after you trust them with its `/hooks` command. Windsurf, Antigravity, opencode and Aider have no hook support.
 
 ## HTTP API
 

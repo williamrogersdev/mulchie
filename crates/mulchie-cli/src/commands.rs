@@ -419,21 +419,47 @@ pub fn prune(paths: &Paths, key: &str, json_out: bool) -> i32 {
 
 // ------------------------------------------------------------------- serve
 
+/// How often a waiting `serve` tries the engine lock again.
+const LOCK_RETRY_SECS: u64 = 15;
+
 pub fn serve(paths: &Paths) -> i32 {
+    crate::serve_log::start();
     let engine = Engine::new(paths.clone(), Config::load_from(paths));
     if let Some(e) = engine.config_error() {
         eprintln!("mulchie: {e}; running with safe defaults (automatic cleanup off)");
     }
     let port = mulchie_core::config::effective_port(&engine.config());
-    let mut lock = match engine.acquire_lock() {
-        Ok(l) => l,
-        Err(e) => {
-            eprintln!("mulchie: {e}; not starting a second one");
-            return 1;
-        }
-    };
     if let Err(e) = mulchie_core::shutdown::install_termination_handler() {
         eprintln!("mulchie: cannot handle SIGTERM/SIGINT: {e}");
+    }
+    // Another engine (the app, or a `serve` in a terminal) holds the lock:
+    // wait for it to go instead of exiting, so a service manager that
+    // restarts a failed `serve` (launchd's KeepAlive, systemd's Restart) does
+    // not start a new process every few seconds for as long as it runs.
+    let mut said = false;
+    let mut lock = loop {
+        match engine.acquire_lock() {
+            Ok(l) => break l,
+            Err(e @ mulchie_core::lock::LockError::Io(_)) => {
+                eprintln!("mulchie: cannot take the engine lock: {e}");
+                return 1;
+            }
+            Err(e) => {
+                if !said {
+                    eprintln!("mulchie: {e}; waiting for it to stop before starting");
+                    said = true;
+                }
+                for _ in 0..LOCK_RETRY_SECS * 10 {
+                    if mulchie_core::shutdown::termination_requested() {
+                        return 0;
+                    }
+                    std::thread::sleep(Duration::from_millis(100));
+                }
+            }
+        }
+    };
+    if said {
+        eprintln!("mulchie: the other engine stopped; starting");
     }
     engine.enable_notifications();
     engine.start();

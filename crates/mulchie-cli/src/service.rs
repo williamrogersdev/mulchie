@@ -324,7 +324,7 @@ fn install(paths: &Paths, platform: Platform, force: bool, dry_run: bool) -> i32
             eprintln!(
                 "mulchie: the Mulchie app is running the engine (pid {}), so a service is not needed; \
                  the app's engine serves the CLI and MCP. Use --force to install one anyway \
-                 (it waits, restarting every 10 s, while the app runs).",
+                 (it waits while the app runs and takes over when the app quits).",
                 h.pid
             );
             if !force && !dry_run {

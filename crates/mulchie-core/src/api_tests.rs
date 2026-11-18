@@ -413,6 +413,33 @@ fn host_and_origin_are_checked_before_anything_else() {
 }
 
 #[test]
+fn history_since_returns_only_newer_samples() {
+    let r = running(Limits::default());
+    for t in [100, 103, 106] {
+        r.engine.push_history(crate::engine::Sample {
+            t,
+            ..Default::default()
+        });
+    }
+    let auth = format!("Bearer {}", r.token);
+    let ts = |path: &str| {
+        let (code, v) = send(r.port, "GET", path, Some(&auth), "");
+        assert_eq!(code, 200, "{path}: {v}");
+        v.as_array()
+            .unwrap()
+            .iter()
+            .map(|s| s["t"].as_u64().unwrap())
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(ts("/v1/history"), [100, 103, 106]);
+    assert_eq!(ts("/v1/history?since=0"), [100, 103, 106]);
+    assert_eq!(ts("/v1/history?since=103"), [106]);
+    assert!(ts("/v1/history?since=106").is_empty());
+    let (code, v) = send(r.port, "GET", "/v1/history?since=x", Some(&auth), "");
+    assert_eq!((code, v["code"].as_str()), (400, Some("invalid_query")));
+}
+
+#[test]
 fn health_reports_staleness() {
     let r = running(Limits::default());
     let (code, v) = send(r.port, "GET", "/v1/health", None, "");
@@ -1549,4 +1576,73 @@ fn stop_waits_until_the_port_refuses_connections() {
     let port = r.port;
     r.server.take().unwrap().stop();
     assert!(refused(port), "nothing accepts once stop returns");
+}
+
+/// Feedback: either token may report; the entry carries what was sent, is
+/// kept in the feedback file and the journal, and comes back newest first.
+#[test]
+fn feedback_is_taken_with_either_token_and_listed() {
+    let r = running(Limits::default());
+    let ro = format!("Bearer {}", read_read_only_token(r.engine.paths()).unwrap());
+    let full = format!("Bearer {}", r.token);
+    assert!(read_only_allowed("POST", "/v1/feedback"));
+
+    let body = json!({
+        "summary": "diagnose said health good at load 50",
+        "category": "wrong_advice",
+        "severity": "high",
+        "details": "expected strained\nsaw good",
+        "tool": "diagnose",
+        "client": "claude-code",
+        "cwd": "/code/a",
+    })
+    .to_string();
+    let (code, v) = send(r.port, "POST", "/v1/feedback", Some(&ro), &body);
+    assert_eq!(code, 200, "{v}");
+    let id = v["feedback"]["id"].as_str().unwrap().to_string();
+    assert!(id.starts_with("fb-"), "{v}");
+    assert_eq!(v["feedback"]["source"], "api");
+    assert_eq!(v["feedback"]["category"], "wrong_advice");
+
+    let (code, v) = send(
+        r.port,
+        "POST",
+        "/v1/feedback",
+        Some(&full),
+        r#"{"summary":"second"}"#,
+    );
+    assert_eq!(code, 200, "{v}");
+    assert_eq!(v["feedback"]["category"], "other");
+
+    for bad in [
+        r#"{"summary":"  "}"#,
+        r#"{"summary":"x","category":"rant"}"#,
+        r#"{"summary":"x","extra":1}"#,
+        r#"{}"#,
+    ] {
+        let (code, v) = send(r.port, "POST", "/v1/feedback", Some(&ro), bad);
+        assert_eq!(code, 400, "{bad} -> {v}");
+    }
+    let (code, _) = send(r.port, "POST", "/v1/feedback", None, r#"{"summary":"x"}"#);
+    assert_eq!(code, 401);
+
+    let (code, v) = send(r.port, "GET", "/v1/feedback", Some(&ro), "");
+    assert_eq!(code, 200, "{v}");
+    assert_eq!(v["total"], 2);
+    let list = v["feedback"].as_array().unwrap();
+    assert_eq!(list[0]["summary"], "second");
+    assert_eq!(list[1]["id"], id.as_str());
+    assert_eq!(list[1]["details"], "expected strained\nsaw good");
+    assert!(v["path"].as_str().unwrap().ends_with("feedback.jsonl"));
+    let (code, v) = send(r.port, "GET", "/v1/feedback?limit=1", Some(&ro), "");
+    assert_eq!((code, v["feedback"].as_array().unwrap().len()), (200, 1));
+    let (code, _) = send(r.port, "GET", "/v1/feedback?limit=0", Some(&ro), "");
+    assert_eq!(code, 400);
+
+    assert!(r
+        .engine
+        .snapshot_state()
+        .actions
+        .iter()
+        .any(|a| a.kind == "feedback" && a.detail.contains(&id)));
 }

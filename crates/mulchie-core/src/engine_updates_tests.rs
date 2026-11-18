@@ -13,6 +13,11 @@ fn fake_http() -> Arc<FakeHttp> {
         MULCHIE_RELEASE_URL.into(),
         reply(200, json!({"tag_name": "v99.0.0"})),
     );
+    // What a pre-release build of the engine asks instead.
+    h.gets.insert(
+        crate::updates::MULCHIE_RELEASES_URL.into(),
+        reply(200, json!([{"tag_name": "v99.0.0"}])),
+    );
     Arc::new(h)
 }
 

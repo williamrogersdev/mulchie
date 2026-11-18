@@ -370,7 +370,7 @@ pub fn build(state: &Value, advice: &Value, origin: Origin) -> Value {
             "memory pressure: {mem_free_pct:.0}% free (floor {mem_floor:.0}%)"
         ));
     }
-    if cores > 0 && load1 > cores as f64 * 4.0 {
+    if cores > 0 && load1 > cores as f64 * 3.0 {
         why.push(format!("overloaded: load {load1:.0} on {cores} cores"));
     } else if cores > 0 && load1 > cores as f64 * 2.0 {
         why.push(format!("heavy load: {load1:.0} on {cores} cores"));
@@ -474,9 +474,12 @@ pub fn build(state: &Value, advice: &Value, origin: Origin) -> Value {
     let pressure =
         (mem_total > 0 && mem_free_pct < mem_floor) || (cores > 0 && load1 > cores as f64 * 2.0);
     if pressure {
+        // The busiest workspace with builds, and only one whose CPU use is
+        // worth lowering: an idle build is not what slows the machine.
         if let Some(w) = ws
             .iter()
-            .find(|w| u(w, "builds") > 0 && w["paused"] != true)
+            .filter(|w| u(w, "builds") > 0 && w["paused"] != true && f(w, "cpu_pct") >= 50.0)
+            .max_by(|a, b| f(a, "cpu_pct").total_cmp(&f(b, "cpu_pct")))
         {
             recs.push(Rec {
                 priority: 2,

@@ -25,7 +25,7 @@ It ships three ways:
 
 | Path | What it is |
 | --- | --- |
-| `crates/mulchie-core` | Engine, monitor, scanners, safety gate (`safety.rs`), sessions (`session.rs`), limits (`limits.rs`), memory guard (`memguard.rs`), runaway chains (`runaway.rs`), activity record (`record.rs`), guard rules (`guard.rs`), update checks (`updates.rs`), local HTTP API (`api.rs`). No UI. |
+| `crates/mulchie-core` | Engine, monitor, scanners, safety gate (`safety.rs`), sessions (`session.rs`), limits (`limits.rs`), memory guard (`memguard.rs`), runaway chains (`runaway.rs`), activity record (`record.rs`), guard rules (`guard.rs`), update checks (`updates.rs`), feedback reports (`feedback.rs`), local HTTP API (`api.rs`). No UI. |
 | `crates/mulchie-cli` | The `mulchie` binary: commands, `serve`, `run`, the MCP server (`mcp.rs`, `mcp_tools.rs`), `mcp install` (`mcp_install.rs`), `hook` and `hooks install` (`hook.rs`, `hooks_install.rs`), `sessions.rs`, `diagnose.rs`. |
 | `crates/mulchie-app` | Tauri desktop app. macOS only. Not a default workspace member. |
 | `docs/ARCHITECTURE.md` | How the pieces fit, and the rules the code keeps. Read it before touching deletion or signals. |
@@ -114,6 +114,8 @@ Other clients are `claude-desktop`, `cursor` and `codex`. Add `--read-only` to l
 5. Wrap heavy builds in `acquire_build_slot` and `release_build_slot`. A slot lasts at most an hour per renewal, and the server releases the slots it still holds when it exits. `mulchie slots` lists slots; `mulchie slots release <ticket>` ends one whose holder is gone. The release secret stays inside the MCP server.
 
 Findings (`list_findings`, `mulchie://findings`) are observations from heuristics, not verdicts; never call them malware. `inspect_process` shows one process with secrets in its command line redacted. `dismiss_finding` hides one the user says is expected.
+
+When Mulchie or the machine gets in your way, call `report_feedback` (or run `mulchie feedback report <what happened>`): a tool that failed or answered wrongly, advice or a finding that was wrong, a real problem it missed, work it blocked or slowed. Give a `summary`, and in `details` what you did, expected and saw. The report is saved in `<config dir>/feedback.jsonl` with the machine's state and sent nowhere; a read-only server takes it too, and it is kept when no engine runs. `list_feedback` and `mulchie feedback list` read the reports.
 
 Sessions, limits, guard rules and updates:
 

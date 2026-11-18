@@ -52,7 +52,7 @@ Saves are atomic: Mulchie writes a temporary file and renames it.
 | `backup_ignored_max_mb` | 200 | Gitignored files in a worktree that are not caches are archived before removal. Above this size the worktree is skipped instead. |
 | `include_node_modules` | `false` | Treat `node_modules` as a reclaimable cache. |
 | `include_xcode` | `true` on macOS, `false` elsewhere | Treat Xcode DerivedData as a reclaimable cache. |
-| `throttle_builds` | `true` | Lower the priority of builds under pressure. |
+| `throttle_builds` | `true` | Lower the priority of builds while CPU or memory stays under pressure (15 seconds), and put it back after 30 calm seconds. Used only by an engine that can put a priority back, which means one running as root; otherwise Mulchie leaves build priorities alone. |
 | `throttle_cpu_pct` | 92 | CPU use above which builds are throttled. |
 | `throttle_mem_free_pct` | 8 | Free memory below which builds are throttled. |
 | `build_nice` | 10 | Nice value applied to throttled builds, 0 to 20. |
@@ -190,3 +190,4 @@ All of these are in the config directory.
 | `sessions/` | One `<id>.jsonl` [activity record](/docs/sessions/#the-activity-record) per session (mode `0600`, in a `0700` folder), and `paused.json`, the processes Mulchie paused for a limit and has not resumed. |
 | `updates.json` | The last [update check](/docs/updates/), so a restart shows it. |
 | `hook.log` | Why a [hook](/docs/hooks/) allowed an action without the engine, at most one line a minute. |
+| `hook-dirs.json` | In `~/.config/mulchie` only: per agent app, a hook's config directory when it was not this one or had no engine, for `mulchie hooks status`. |

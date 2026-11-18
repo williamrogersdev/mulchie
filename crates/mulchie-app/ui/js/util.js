@@ -3,6 +3,21 @@
 export const $ = s => document.querySelector(s);
 export const $$ = s => [...document.querySelectorAll(s)];
 
+// Replace a block's content only when it changed, and give focus back to
+// the same control (by its data attributes) when it was inside. Views redraw
+// on every poll; rewriting identical HTML would drop focus, a selection or a
+// click that spans the redraw.
+export function setHtml(el, html) {
+  if (!el || el.__html === html) return;
+  const f = document.activeElement, inside = f && f !== el && el.contains(f);
+  const key = inside ? [...f.attributes].filter(a => a.name.startsWith('data-')).map(a => `[${a.name}="${CSS.escape(a.value)}"]`).join('') : '';
+  el.innerHTML = html;
+  el.__html = html;
+  if (key) el.querySelector(key)?.focus({ preventScroll: true });
+}
+// `into(el).html = …`: setHtml as an assignment.
+export const into = el => ({ set html(v) { setHtml(el, v); } });
+
 export const esc = s => String(s ?? '').replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
 
 export function B(n, d = 1) {
@@ -25,6 +40,13 @@ export function ago(t) {
   if (s < 86400) return (s / 3600).toFixed(s < 36000 ? 1 : 0) + 'h';
   return Math.round(s / 86400) + 'd';
 }
+
+// How long ago, for a table cell: the short age, with the date as a tooltip.
+export const agoCell = t => t ? `<span title="${esc(new Date(t * 1000).toLocaleString())}">${ago(t)}</span>` : '<span class="dim">—</span>';
+// A row's own action button (`data-da` is run by detail.js). `off`: why it
+// cannot run now, shown as the tooltip of a disabled button.
+export const rowBtn = (label, name, arg, { danger = false, off = '', title = '' } = {}) =>
+  `<button class="btn sm${danger ? ' danger' : ''}" data-da="${esc(name)}" data-arg="${esc(arg)}" ${off ? `disabled title="${esc(off)}"` : title ? `title="${esc(title)}"` : ''}>${esc(label)}</button>`;
 
 export function dur(s) {
   if (s < 60) return s + 's';
@@ -76,3 +98,16 @@ export function th(cols, sort, id) {
 export const meter = (v, max, color) => `<span class="meter"><i style="width:${Math.min(100, max ? v / max * 100 : 0)}%;background:${color || 'var(--c1)'}"></i></span>`;
 export const kindChip = k => `<span class="chip ${esc(k)}">${esc(k)}</span>`;
 export const legend = items => items.map(([l, c]) => `<span><i style="background:${c}"></i>${esc(l)}</span>`).join('');
+
+// Kinds: what each row, message and detail is about. Each kind has a colour,
+// a shape and a word (css .kt / .kt-g), the same everywhere.
+export const KIND_WORD = { session: 'Session', app: 'App', workspace: 'Workspace', process: 'Process', system: 'System' };
+export const KIND_HELP = {
+  session: 'A session: one agent and everything it started',
+  app: 'An app: a program bundle with all its helper processes',
+  workspace: 'A workspace: a repo or worktree folder, with every process running in it',
+  process: 'A process: one running program instance (all processes of that name when grouped)',
+  system: 'The operating system',
+};
+export const kindTag = k => `<span class="kt ${esc(k)}" title="${esc(KIND_HELP[k] || '')}">${esc(KIND_WORD[k] || k)}</span>`;
+export const kindGlyph = k => `<span class="kt-g ${esc(k)}" role="img" aria-label="${esc(KIND_WORD[k] || k)}" title="${esc(KIND_HELP[k] || KIND_WORD[k] || k)}"></span>`;

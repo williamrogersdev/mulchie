@@ -5,7 +5,8 @@
 //! PATH. Claude Desktop, Cursor and Codex without its CLI get their
 //! user-level config file edited: other entries are kept, a file that does
 //! not parse is refused, a symbolic link is followed (a dangling one is
-//! refused), the old file is copied to `<file>.mulchie-backup-<unix>`, and
+//! refused), the old file is copied to `<file>.mulchie-backup-<unix>-<random>` (the
+//! newest [`KEEP_BACKUPS`] such copies are kept), and
 //! the new one is written through a temp file and a rename with the old
 //! mode, after checking the app did not save the file meanwhile. Output
 //! names only the mulchie entry; other entries' env values are never shown.
@@ -17,6 +18,79 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 const NAME: &str = "mulchie";
+
+/// Backups of one file kept by [`back_up`]; older ones are removed.
+pub const KEEP_BACKUPS: usize = 5;
+
+/// Copy `target` to `<target>.mulchie-backup-<now>-<random>`, then remove
+/// all but the newest [`KEEP_BACKUPS`] of this file's backups. Only regular
+/// files whose names have exactly that form are removed. Returns the new
+/// backup's path.
+pub fn back_up(target: &Path, now: u64) -> Result<PathBuf, String> {
+    use std::io::Write;
+    use std::os::unix::fs::OpenOptionsExt;
+    let rand = mulchie_core::paths::random_hex(4).map_err(|e| e.to_string())?;
+    let backup = PathBuf::from(format!("{}.mulchie-backup-{now}-{rand}", target.display()));
+    let err = |e: std::io::Error| format!("cannot back up {}: {e}", target.display());
+    let data = std::fs::read(target).map_err(err)?;
+    let mut f = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(&backup)
+        .map_err(err)?;
+    f.write_all(&data).and_then(|_| f.sync_all()).map_err(err)?;
+    prune_backups(target, KEEP_BACKUPS);
+    Ok(backup)
+}
+
+/// The time in a backup name made for `file_name`, or `None` when `name` is
+/// not one: `<file_name>.mulchie-backup-<unix>` (older Mulchie) or
+/// `<file_name>.mulchie-backup-<unix>-<hex>`.
+fn backup_time(name: &str, file_name: &str) -> Option<u64> {
+    let rest = name
+        .strip_prefix(file_name)?
+        .strip_prefix(".mulchie-backup-")?;
+    let (time, rand) = match rest.split_once('-') {
+        Some((t, r)) => (t, Some(r)),
+        None => (rest, None),
+    };
+    let digits = |s: &str, f: fn(&u8) -> bool| !s.is_empty() && s.as_bytes().iter().all(f);
+    if !digits(time, u8::is_ascii_digit) || rand.is_some_and(|r| !digits(r, u8::is_ascii_hexdigit))
+    {
+        return None;
+    }
+    time.parse().ok()
+}
+
+/// Remove all but the newest `keep` backups of `target`. Best effort.
+pub fn prune_backups(target: &Path, keep: usize) {
+    let (Some(dir), Some(file_name)) =
+        (target.parent(), target.file_name().and_then(|n| n.to_str()))
+    else {
+        return;
+    };
+    let Ok(rd) = std::fs::read_dir(dir) else {
+        return;
+    };
+    let mut found: Vec<(u64, std::time::SystemTime, PathBuf)> = rd
+        .flatten()
+        .filter_map(|e| {
+            let name = e.file_name().into_string().ok()?;
+            let t = backup_time(&name, file_name)?;
+            // symlink_metadata: a link is never followed or removed.
+            let m = std::fs::symlink_metadata(e.path()).ok()?;
+            m.file_type()
+                .is_file()
+                .then(|| (t, m.modified().unwrap_or(std::time::UNIX_EPOCH), e.path()))
+        })
+        .collect();
+    found.sort();
+    let n = found.len().saturating_sub(keep);
+    for (_, _, p) in found.into_iter().take(n) {
+        let _ = std::fs::remove_file(p);
+    }
+}
 
 /// Finds a program on PATH.
 pub type Which = Box<dyn Fn(&str) -> Option<PathBuf>>;
@@ -563,13 +637,7 @@ fn apply(
         if let Ok(m) = std::fs::metadata(target) {
             mode = m.permissions().mode() & 0o7777;
         }
-        let backup = PathBuf::from(format!(
-            "{}.mulchie-backup-{}",
-            target.display(),
-            now_unix()
-        ));
-        std::fs::copy(target, &backup)
-            .map_err(|e| format!("cannot back up {}: {e}", target.display()))?;
+        let backup = back_up(target, now_unix())?;
         note = format!(" (old file saved as {})", backup.display());
     } else if let Some(dir) = target.parent() {
         std::fs::create_dir_all(dir)
