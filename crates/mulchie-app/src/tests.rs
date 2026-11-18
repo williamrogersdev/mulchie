@@ -247,6 +247,7 @@ fn plan_book_accepts_subsets_of_the_last_plan_only() {
         ready,
         reason: None,
         verdict: String::new(),
+        past_failures: None,
     };
     let plan = Plan {
         created_unix: 0,

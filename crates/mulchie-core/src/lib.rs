@@ -3,6 +3,7 @@ pub mod config;
 pub mod consumers;
 pub mod diskmap;
 pub mod engine;
+pub mod failures;
 pub mod feedback;
 pub mod git;
 pub mod guard;

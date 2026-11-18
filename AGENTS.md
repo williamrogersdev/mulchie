@@ -84,10 +84,11 @@ gh pr merge --auto --squash         # merges by itself when the "CI passed" chec
   - the build throttle in `engine.rs` calls `lower_priority`, after re-reading the pid's start time;
   - `engine.rs` (`own_pid_alive`) and `safety.rs` (`pid_alive`) probe liveness with `kill(pid, 0)`, which sends nothing;
   - `diskmap.rs` (`prune_cache`) runs a package manager's own prune command, which deletes inside that tool's cache.
+  - `safety.rs` (`discard_backup_set`) removes a backup set the gate wrote a moment ago for a removal that then did not happen: a real directory directly inside the backups directory, and only before `git worktree remove` has started.
 
   A change to a deletion or signal rule needs a test for that rule. Do not add another exception without adding it here and to `docs/ARCHITECTURE.md`.
 - **Session records** (`<config dir>/sessions/*.jsonl`) are opened only through `record::open_plain` (private to `record.rs`): it refuses symlinks, FIFOs and hard links. Read them through `GET /v1/sessions/{id}/events`, never by scanning files.
-- **Plan, then execute.** Destructive API routes take the `request` objects from a plan. The MCP server keeps each plan it shows. `execute_plan` accepts only ready items from that stored plan. Do not add a one-step delete.
+- **Plan, then execute.** Destructive API routes take the `request` objects from a plan. The MCP server keeps each plan it shows. `execute_plan` accepts only ready items from that stored plan. `prune_cache` runs only a cache key it previewed in the same server within 30 minutes, once per preview. Do not add a one-step delete.
 - **Additive API changes.** The app, the CLI and the MCP server all use the core API, so add routes and fields rather than change them. When you change routes, update `docs/openapi.yaml`.
 - Docs describe only what the code does.
 
@@ -106,8 +107,9 @@ Other clients are `claude-desktop`, `cursor` and `codex`. Add `--read-only` to l
    - `plan_cache_cleanup`
    - `plan_worktree_sweep`
    - `plan_worktree_removal`
-   - `plan_process_action`: one pid with a signal, a consumer group (`app:…`, `workspace:…`, `process:…`) with an action, or a session (`session`, from `list_sessions`) with an action. A session plan leaves out the agent's own process unless `include_agent` is true. Protected processes and the agent's own app and terminal come back blocked, with the reason.
+   - `plan_process_action`: one pid with a signal, a consumer group (`app:…`, `workspace:…`, `process:…`) with an action, or a session (`session`, from `list_sessions`) with an action. A session plan leaves out the agent's own process unless `include_agent` is true, and always leaves out the caller and its ancestors. Protected processes and the agent's own app and terminal come back blocked, with the reason.
 3. Show the user the plan.
+   A ready item with `failed_before` was skipped at least twice in a row before; tell the user why (it says what to do) before asking again.
 4. Call `execute_plan` with the `plan_id` and only the items the user approved. The result lists every backup and how to restore it. Processes are re-checked by start time.
 5. Wrap heavy builds in `acquire_build_slot` and `release_build_slot`. A slot lasts at most an hour per renewal, and the server releases the slots it still holds when it exits. `mulchie slots` lists slots; `mulchie slots release <ticket>` ends one whose holder is gone. The release secret stays inside the MCP server.
 
