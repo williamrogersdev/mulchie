@@ -84,6 +84,9 @@ pub enum FindingKind {
     MemoryLow,
     /// A command is running nested inside copies of itself (`runaway`).
     RunawayChain,
+    /// Many copies of one program whose parents all exited
+    /// ([`ORPHAN_SWARM_MIN`] or more), wherever they run.
+    OrphanSwarm,
 }
 
 impl FindingKind {
@@ -106,6 +109,7 @@ impl FindingKind {
             | UnsignedExecutable
             | QuarantinedExecutable => FindingCategory::Security,
             OrphanedProcess
+            | OrphanSwarm
             | MissingWorkingDirectory
             | StaleProcess
             | StoppedProcess
@@ -1317,6 +1321,7 @@ pub fn detect(i: &WatchInput) -> Vec<Finding> {
         .iter()
         .filter(|p| p.uid == Some(i.uid) && p.pid != i.self_pid && p.pid > 1)
         .collect();
+    detect_orphan_swarms(&mut d, &own);
     for p in &own {
         detect_leftovers(&mut d, p);
         detect_activity(&mut d, p);
@@ -1328,6 +1333,120 @@ pub fn detect(i: &WatchInput) -> Vec<Finding> {
     let mut seen = HashSet::new();
     d.out.retain(|f| seen.insert(f.id.clone()));
     d.out
+}
+
+/// How many orphaned copies of one program make a swarm.
+pub const ORPHAN_SWARM_MIN: usize = 20;
+/// A swarm this big, or using this much CPU (percent of one core) in all, is
+/// high severity.
+const ORPHAN_SWARM_HIGH_COUNT: usize = 100;
+const ORPHAN_SWARM_HIGH_CPU_PCT: f32 = 400.0;
+
+/// Many copies of one program, each reparented to pid 1 (or the user's
+/// subreaper) and not started by the service manager. Unlike
+/// `orphaned_process` this does not need a workspace or a process kind: a
+/// test that leaves 160 `yes` processes behind loads the machine wherever
+/// they run. One finding per program.
+fn detect_orphan_swarms(d: &mut Det, own: &[&ProcFacts]) {
+    let i = d.i;
+    let mut groups: HashMap<String, Vec<&ProcFacts>> = HashMap::new();
+    for p in own {
+        if (p.ppid == 1 || i.subreapers.contains(&p.ppid)) && !i.service_started.contains(&p.pid) {
+            let key = p
+                .exe
+                .as_ref()
+                .map(|e| e.display().to_string())
+                .unwrap_or_else(|| p.name.clone());
+            groups.entry(key).or_default().push(p);
+        }
+    }
+    let mut keys: Vec<&String> = groups
+        .iter()
+        .filter(|(_, v)| v.len() >= ORPHAN_SWARM_MIN)
+        .map(|(k, _)| k)
+        .collect();
+    keys.sort();
+    for key in keys {
+        let members = &groups[key];
+        let Some(first) = members
+            .iter()
+            .min_by_key(|p| (p.start_time, p.pid))
+            .copied()
+        else {
+            continue;
+        };
+        let (mut cpu, mut mem) = (0f32, 0u64);
+        let mut in_workspace = false;
+        for p in members {
+            if let Some(s) = i.samples.get(&p.pid) {
+                cpu += s.cpu_pct;
+                mem += s.mem_bytes;
+                in_workspace |= s.workspace.is_some();
+            }
+        }
+        let n = members.len();
+        let severity = if n >= ORPHAN_SWARM_HIGH_COUNT || cpu >= ORPHAN_SWARM_HIGH_CPU_PCT {
+            Severity::High
+        } else {
+            Severity::Medium
+        };
+        let mut evidence = d.evidence(first);
+        evidence.pid = None;
+        evidence.start_time = None;
+        evidence.parent = None;
+        evidence.listen = None;
+        evidence.cpu_pct = Some(cpu);
+        evidence.mem_bytes = Some(mem);
+        evidence.detail = Some(format!(
+            "{n} processes; the oldest, pid {}, started {} ago; {:.0}% of one core in all",
+            first.pid,
+            fmt_age(i.now.saturating_sub(first.start_time)),
+            cpu
+        ));
+        let mut suggested = Vec::new();
+        // A process group holds the copies outside workspaces and apps
+        // (`consumers::app_or_process`): plan quitting it, for review. It
+        // also holds copies of the same program that still have a parent.
+        let in_app = first
+            .exe
+            .as_deref()
+            .is_some_and(|e| e.to_string_lossy().contains(".app/"));
+        if !in_workspace && !in_app {
+            let name = first
+                .exe
+                .as_deref()
+                .and_then(|e| e.file_name())
+                .map(|n| n.to_string_lossy().to_string())
+                .filter(|n| !n.is_empty())
+                .unwrap_or_else(|| first.name.clone());
+            suggested.push(Suggestion::call(
+                format!("Plan quitting every {name} process (review the list first)"),
+                ApiRequest::post(
+                    "/v1/process/plan",
+                    serde_json::json!({ "group": format!("process:{name}"), "action": "quit" }),
+                ),
+                false,
+            ));
+        }
+        suggested.push(quit(first));
+        d.out.push(Finding {
+            id: format!("{}:{key}", FindingKind::OrphanSwarm.code()),
+            category: FindingKind::OrphanSwarm.category(),
+            kind: FindingKind::OrphanSwarm,
+            severity,
+            title: format!(
+                "{n} copies of {} are running after their parents exited",
+                first.name
+            ),
+            why: "Whatever started them (a test, a script, a closed terminal) is gone and nothing will stop them; together they can hold the CPU and slow every build and test on this machine.".into(),
+            evidence,
+            suggested,
+            first_seen_unix: i.now,
+            last_seen_unix: i.now,
+            dismissed: false,
+            dismissed_until: None,
+        });
+    }
 }
 
 fn detect_leftovers(d: &mut Det, p: &ProcFacts) {

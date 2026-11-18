@@ -28,6 +28,10 @@ pub struct Config {
     pub scan_interval_mins: u64,
     pub api_port: u16,
     pub max_heavy_jobs: usize,
+    /// The build queue holds new slots while the 1-minute load average is
+    /// above this many times the core count (each waiter at most
+    /// `QUEUE_LOAD_HOLD_MAX_SECS`). 0 turns it off.
+    pub queue_hold_load_per_core: f32,
     pub worktree_idle_days: u64,
     pub worktree_target_stale_hours: u64,
     pub auto_sweep_worktrees: bool,
@@ -175,6 +179,7 @@ impl Default for Config {
             scan_interval_mins: 30,
             api_port: 47474,
             max_heavy_jobs: 0,
+            queue_hold_load_per_core: 4.0,
             worktree_idle_days: 10,
             worktree_target_stale_hours: 48,
             auto_sweep_worktrees: false,
@@ -874,6 +879,9 @@ impl Config {
         }
         if !(0.0..=100.0).contains(&self.throttle_mem_free_pct) {
             e.push("throttle_mem_free_pct must be between 0 and 100".into());
+        }
+        if !(0.0..=1000.0).contains(&self.queue_hold_load_per_core) {
+            e.push("queue_hold_load_per_core must be between 0 and 1000".into());
         }
         if !(0.0..=100.0).contains(&self.throttle_cpu_pct) {
             e.push("throttle_cpu_pct must be between 0 and 100".into());

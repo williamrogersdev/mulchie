@@ -57,6 +57,7 @@ Saves are atomic: Mulchie writes a temporary file and renames it.
 | `throttle_mem_free_pct` | 8 | Free memory below which builds are throttled. |
 | `build_nice` | 10 | Nice value applied to throttled builds, 0 to 20. |
 | `max_heavy_jobs` | 0 | Build slots in the queue. 0 picks one slot per four CPU cores, at least 2. |
+| `queue_hold_load_per_core` | 4 | The build queue grants no new slot while the 1-minute load average is above this many times the number of CPU cores, so a job does not start into a machine too loaded to run it. Each waiter is held at most 15 minutes, then granted anyway. 0 turns it off. |
 | `scan_interval_mins` | 30 | How often caches and the disk map are rescanned. |
 | `api_port` | 47474 | Port for the local API. |
 

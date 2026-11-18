@@ -31,6 +31,7 @@ const CFG = [
   ['throttle_mem_free_pct', 'Pressure when free memory is below (%)', 'num'],
   ['build_nice', 'Nice level for throttled builds', 'int'],
   ['max_heavy_jobs', 'Build slots (0 = cores ÷ 4)', 'int', 'How many heavy jobs `mulchie run` and acquire_build_slot allow at once.'],
+  ['queue_hold_load_per_core', 'Hold new build slots above load per core (0 = off)', 'num', 'While the load average is above this many times the cores, the queue waits up to 15 minutes before starting a job.'],
   ['scan_interval_mins', 'Disk scan interval (minutes)', 'int'],
   ['api_port', 'API port', 'int', 'Takes effect after restart.'],
 ];

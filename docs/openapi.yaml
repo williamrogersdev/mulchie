@@ -1213,6 +1213,7 @@ components:
         - paused_list_unreadable
         - memory_low
         - runaway_chain
+        - orphan_swarm
     FindingCounts:
       type: object
       properties:
