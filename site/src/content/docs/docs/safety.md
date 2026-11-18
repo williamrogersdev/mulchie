@@ -55,7 +55,7 @@ Build caches are not backed up. The next build recreates them.
   - a detached `HEAD` gets a new branch `backup/<name>-<shortsha>`. An existing branch is never moved.
 - Branches are never deleted.
 - An idle worktree with uncommitted changes can be swept, because the patch is made first. Removing a worktree by name skips one with uncommitted changes unless the request sets `allow_dirty`.
-- These are skipped, not removed, because a patch could not hold what they have: a checked-out submodule, another git repository inside the worktree, local edits that git hides (skip-worktree or assume-unchanged files), and a worktree locked by git.
+- These are skipped, not removed, because a patch could not hold what they have: a checked-out submodule, another git repository inside the worktree, local edits that git hides (skip-worktree or assume-unchanged files), a worktree locked by git, and a worktree in the middle of a rebase, merge, cherry-pick, revert or bisect (`operation_in_progress`: that operation's state lives only in the worktree's git directory).
 - If anything in the worktree changes while the backup is taken, the removal is skipped.
 - A worktree that is missing from disk is pruned only when git reports it prunable and it is an agent worktree.
 

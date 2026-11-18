@@ -128,6 +128,9 @@ pub enum SkipReason {
     /// several times in a row; see [`crate::failures`]. Never the answer to
     /// an explicit request, and never journaled.
     BackingOff,
+    /// A worktree is in the middle of a rebase, merge, cherry-pick, revert or
+    /// bisect: removing it would lose that operation's state.
+    OperationInProgress,
 }
 
 impl SkipReason {
@@ -1306,6 +1309,12 @@ impl<'a> Gate<'a> {
         }
         if entry.locked {
             return skip(SkipReason::Locked, "locked by git");
+        }
+        if let Some(op) = operation_in_progress(self.paths, &canon) {
+            return skip(
+                SkipReason::OperationInProgress,
+                format!("a {op} is in progress; finish or abort it first"),
+            );
         }
         self.busy_check(&canon, false)?;
         let name = file_name(&canon);
@@ -2564,6 +2573,48 @@ fn nested_disposable(paths: &Paths, repo: &Path) -> Result<(), String> {
 /// `add -A` and `ls-files --others`, so a patch would not hold them. Returns the
 /// count and the first path. A sparse-checkout entry that is not on disk is no
 /// change.
+/// Files in a worktree's git directory that mean an operation is under way,
+/// and its name in words. `sequencer` holds a multi-commit cherry-pick or
+/// revert.
+const OPERATION_MARKERS: &[(&str, &str)] = &[
+    ("rebase-merge", "rebase"),
+    ("rebase-apply", "rebase or am"),
+    ("MERGE_HEAD", "merge"),
+    ("CHERRY_PICK_HEAD", "cherry-pick"),
+    ("REVERT_HEAD", "revert"),
+    ("sequencer", "cherry-pick or revert"),
+    ("BISECT_LOG", "bisect"),
+];
+
+/// The worktree's own git directory: from the `gitdir:` line of its `.git`
+/// file (relative to the worktree when not absolute), else from git.
+fn worktree_git_dir(paths: &Paths, wt: &Path) -> Option<PathBuf> {
+    let dot = wt.join(".git");
+    if let Ok(text) = std::fs::read_to_string(&dot) {
+        if let Some(rest) = text.lines().next().and_then(|l| l.strip_prefix("gitdir:")) {
+            let p = PathBuf::from(rest.trim());
+            return Some(if p.is_absolute() { p } else { wt.join(p) });
+        }
+    }
+    if dot.is_dir() {
+        return Some(dot);
+    }
+    git::git(paths, wt, &["rev-parse", "--absolute-git-dir"])
+        .ok()
+        .map(|s| PathBuf::from(s.trim()))
+        .filter(|p| p.is_absolute())
+}
+
+/// The operation in progress in a worktree, if any. When the git directory
+/// cannot be found, `None`: git's own checks still run after this.
+fn operation_in_progress(paths: &Paths, wt: &Path) -> Option<&'static str> {
+    let dir = worktree_git_dir(paths, wt)?;
+    OPERATION_MARKERS
+        .iter()
+        .find(|(f, _)| std::fs::symlink_metadata(dir.join(f)).is_ok())
+        .map(|(_, op)| *op)
+}
+
 fn hidden_changes(paths: &Paths, wt: &Path) -> Result<Option<(usize, String)>, Skip> {
     let out = Git::new(paths, wt)
         .args(["ls-files", "-z", "-v", "-s"])
