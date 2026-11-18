@@ -77,6 +77,7 @@ const REASONS = {
   missing_expected_head: 'No expected commit given',
   head_moved: 'New commits since the plan was made',
   locked: 'Locked in git',
+  operation_in_progress: 'Rebase, merge or bisect under way',
   not_agent: 'Not an agent worktree',
   not_idle: 'Not idle long enough',
   dirty: 'Has uncommitted changes',

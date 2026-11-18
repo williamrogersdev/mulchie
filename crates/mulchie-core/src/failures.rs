@@ -113,6 +113,7 @@ pub fn advice(reason: Option<SkipReason>) -> &'static str {
         Some(HasSubmodules) | Some(NestedRepo) | Some(HiddenChanges) => "It holds work Mulchie cannot back up (a submodule, another repository, or files git hides): look at it and remove it by hand if nothing in it is needed.",
         Some(GitFailed) | Some(TimedOut) | Some(CommandFailed) => "A command failed or ran out of time: run `git status` there (or the package manager's own prune) to see the error.",
         Some(Locked) => "git has it locked: `git worktree unlock <path>` if the lock is stale.",
+        Some(OperationInProgress) => "A rebase, merge, cherry-pick, revert or bisect is under way there: finish it or abort it (`git rebase --abort`, `git merge --abort`, …) in that worktree.",
         Some(Dirty) => "It has uncommitted changes: commit them, or plan the removal with allow_dirty so a patch is saved first.",
         Some(PruneDeferred) | Some(NotPrunable) => "git still keeps the entry: `git worktree prune` in the repository removes it once git agrees it is stale.",
         Some(ToolNotFound) | Some(NoPruneCommand) => "The tool that owns this cache is not installed or has no prune command; clear it with that tool yourself.",

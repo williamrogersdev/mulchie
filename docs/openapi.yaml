@@ -1181,7 +1181,8 @@ components:
           description: >-
             Why it was skipped. `backing_off` is returned only by the automatic passes
             (`{"auto": true}`), for a target that was skipped three or more times in a row
-            and is inside its wait; it was not run.
+            and is inside its wait; it was not run. `operation_in_progress` means a worktree
+            is in the middle of a rebase, merge, cherry-pick, revert or bisect.
         detail: { type: string }
         journal_error: { type: string, description: Set when the action ran but could not be written to the journal }
     FindingKind:

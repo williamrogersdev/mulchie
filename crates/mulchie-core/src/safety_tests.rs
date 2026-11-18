@@ -646,6 +646,54 @@ fn locked_and_main_worktrees_are_refused() {
     assert!(wt.exists() && repo.exists());
 }
 
+/// A worktree in the middle of a rebase, merge, cherry-pick, revert or
+/// bisect is not removed: that state lives only in its git directory.
+#[test]
+fn a_worktree_with_an_operation_in_progress_is_refused() {
+    let env = Env::new();
+    let repo = env.repo("repo");
+    let wt = env.worktree(&repo, "agent-x", false);
+    let git_dir = PathBuf::from(
+        env.git(&wt, &["rev-parse", "--absolute-git-dir"])
+            .trim()
+            .to_string(),
+    );
+    for (marker, says) in [
+        ("rebase-merge", "rebase"),
+        ("MERGE_HEAD", "merge"),
+        ("CHERRY_PICK_HEAD", "cherry-pick"),
+        ("BISECT_LOG", "bisect"),
+    ] {
+        let m = git_dir.join(marker);
+        if marker.contains('-') && !marker.ends_with("HEAD") {
+            std::fs::create_dir_all(&m).unwrap();
+        } else {
+            std::fs::write(&m, "x\n").unwrap();
+        }
+        let r = env
+            .gate()
+            .execute_one(&env.remove_req(&wt, &env.head(&wt)), "t");
+        assert_eq!(
+            reason(&r),
+            Some(SkipReason::OperationInProgress),
+            "{marker}"
+        );
+        assert!(format!("{r:?}").contains(says), "{marker}: {r:?}");
+        assert!(wt.exists());
+        if m.is_dir() {
+            std::fs::remove_dir_all(&m).unwrap();
+        } else {
+            std::fs::remove_file(&m).unwrap();
+        }
+    }
+    // With the operation over, the removal goes ahead.
+    let r = env
+        .gate()
+        .execute_one(&env.remove_req(&wt, &env.head(&wt)), "t");
+    assert!(matches!(r.outcome, Outcome::Done { .. }), "{r:?}");
+    assert!(!wt.exists());
+}
+
 #[test]
 fn a_check_that_cannot_complete_skips() {
     let env = Env::new();

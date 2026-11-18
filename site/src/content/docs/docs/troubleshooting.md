@@ -54,7 +54,7 @@ Each skipped item has a reason. The usual ones:
 - The path is not under a scan root, or is a symlink.
 - The directory is not a recognised cache. A `target/` without `CACHEDIR.TAG` is left alone.
 - The worktree is not idle past `worktree_idle_days`, or is not an agent worktree.
-- The worktree has a checked-out submodule, holds another git repository, has local edits git hides, or is locked.
+- The worktree has a checked-out submodule, holds another git repository, has local edits git hides, is locked, or is in the middle of a rebase, merge, cherry-pick, revert or bisect. Finish or abort that operation first.
 
 `actions.jsonl` in the config directory has the record of every executed and skipped action. See the [safety model](/docs/safety/).
 
