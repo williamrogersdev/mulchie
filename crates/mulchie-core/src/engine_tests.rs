@@ -1844,3 +1844,65 @@ fn renice_requests_go_through_the_gate() {
     let _ = child.kill();
     let _ = child.wait();
 }
+
+/// Under extreme load the queue holds a new job instead of letting it start
+/// into a machine that cannot run it, but never past the cap; 0 turns it off.
+#[test]
+fn the_queue_holds_new_jobs_under_extreme_load_for_a_while() {
+    let set_load = |e: &Engine, load: f64| {
+        let mut st = e.state_mut();
+        let mut s = (*st.snapshot).clone();
+        s.cpu_count = 16;
+        s.load = [load, load, load];
+        st.snapshot = Arc::new(s);
+    };
+    let (_t, e) = engine();
+    one_slot(&e);
+    set_load(&e, 365.0);
+    let a = e
+        .acquire_at(&lease("a", None, None, Some(600)), 1000)
+        .unwrap();
+    assert!(!a.granted, "held: {}", a.reason);
+    assert!(
+        a.reason.contains("load average (365 on 16 cores)") && a.reason.contains("15 min"),
+        "{}",
+        a.reason
+    );
+    // Polled as a client does, it stays held until the cap...
+    let mut t = 1000;
+    let mut r = a.clone();
+    while t + 20 < 1000 + QUEUE_LOAD_HOLD_MAX_SECS {
+        t += 20;
+        r = e.acquire_at(&again(&a, None), t).unwrap();
+        assert!(!r.granted, "at {t}: {}", r.reason);
+    }
+    assert!(r.reason.contains("1 min"), "{}", r.reason);
+    // ...and is granted then, though the load is still high.
+    let r = e
+        .acquire_at(&again(&a, None), 1000 + QUEUE_LOAD_HOLD_MAX_SECS)
+        .unwrap();
+    assert!(r.granted, "{}", r.reason);
+
+    // Below the threshold (4 × 16 = 64) nothing is held.
+    let (_t, e) = engine();
+    one_slot(&e);
+    set_load(&e, 60.0);
+    assert!(
+        e.acquire_at(&lease("b", None, None, Some(60)), 10)
+            .unwrap()
+            .granted
+    );
+
+    // 0 turns the hold off.
+    let (_t, e) = engine_with(Config {
+        queue_hold_load_per_core: 0.0,
+        ..Config::default()
+    });
+    one_slot(&e);
+    set_load(&e, 365.0);
+    assert!(
+        e.acquire_at(&lease("c", None, None, Some(60)), 10)
+            .unwrap()
+            .granted
+    );
+}

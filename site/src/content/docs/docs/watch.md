@@ -48,6 +48,7 @@ To never report a program, add its absolute path to `watch.allow_exes`. To never
 | Kind | What was seen | Severity |
 | --- | --- | --- |
 | `orphaned_process` | An agent, build or runtime process whose parent exited, still running from a workspace. Nothing is watching it, so it may be a dev server or build left behind that uses CPU, memory or a port. | low; medium once older than `watch.stale_process_hours` |
+| `orphan_swarm` | 20 or more copies of one program whose parents exited, wherever they run (for example `yes` processes a test left behind). One finding per program, with the count and their CPU and memory together. When the copies are outside workspaces and apps it suggests a plan to quit the program's process group. | medium; high at 100 copies or 4 cores of CPU together |
 | `missing_working_directory` | A process whose working directory no longer exists, often a removed worktree. | medium |
 | `stale_process` | An agent or build process older than `watch.stale_process_hours` (default 72) that has been idle: under `watch.stale_idle_cpu_pct` average CPU (default 1) over at least 30 minutes. | low |
 | `stopped_process` | A process paused with SIGSTOP for longer than `watch.stopped_hours` (default 6). It keeps its memory, locks and ports. | low |

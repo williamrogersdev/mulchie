@@ -1157,3 +1157,89 @@ fn session_check_on_the_real_system() {
         "unreadable counts as a service"
     );
 }
+
+/// Many orphaned copies of one program are one finding, wherever they run and
+/// whatever their kind; copies with a parent, service jobs and small groups
+/// are not counted.
+#[test]
+fn a_swarm_of_orphans_is_one_finding() {
+    let mut w = World::new();
+    let yes = w.exe("bin/yes");
+    let other = w.exe("bin/other");
+    // 25 orphaned `yes`, outside any workspace, kind Other.
+    for pid in 100..125 {
+        w.add(
+            facts(pid, 1, "yes", &yes, None, NOW - 300 + u64::from(pid)),
+            ProcKind::Other,
+            None,
+        );
+    }
+    // A `yes` with a living parent and one started by launchd do not count.
+    w.add(
+        facts(200, 99, "yes", &yes, None, NOW - 60),
+        ProcKind::Other,
+        None,
+    );
+    w.add(
+        facts(201, 1, "yes", &yes, None, NOW - 60),
+        ProcKind::Other,
+        None,
+    );
+    w.services.insert(201);
+    // 5 orphaned copies of another program: too few.
+    for pid in 300..305 {
+        w.add(
+            facts(pid, 1, "other", &other, None, NOW - 60),
+            ProcKind::Other,
+            None,
+        );
+    }
+    for s in w.samples.values_mut() {
+        s.cpu_pct = 20.0;
+    }
+    let f = w.run();
+    let swarms: Vec<&Finding> = f
+        .iter()
+        .filter(|f| f.kind == FindingKind::OrphanSwarm)
+        .collect();
+    assert_eq!(swarms.len(), 1, "{swarms:#?}");
+    let s = swarms[0];
+    assert_eq!(s.id, format!("orphan_swarm:{}", yes.display()));
+    assert_eq!(s.category, FindingCategory::Hygiene);
+    assert_eq!(s.severity, Severity::High, "25 × 20% = 500% of one core");
+    assert!(s.title.starts_with("25 copies of yes"), "{}", s.title);
+    assert_eq!(s.evidence.cpu_pct, Some(500.0));
+    assert!(s.evidence.pid.is_none());
+    assert!(
+        s.evidence.detail.as_deref().unwrap().contains("pid 100"),
+        "{:?}",
+        s.evidence.detail
+    );
+    let plan = s.suggested[0].api_request.as_ref().unwrap();
+    assert_eq!(plan.route, "/v1/process/plan");
+    assert_eq!(
+        plan.body.as_ref().unwrap(),
+        &serde_json::json!({ "group": "process:yes", "action": "quit" })
+    );
+
+    // Below the CPU and count thresholds it is medium; in a workspace there
+    // is no process-group plan (the copies belong to the workspace group).
+    let mut w = World::new();
+    let yes = w.exe("bin/yes");
+    let ws = w.root.join("repo");
+    std::fs::create_dir_all(&ws).unwrap();
+    for pid in 100..(100 + ORPHAN_SWARM_MIN as u32) {
+        w.add(
+            facts(pid, 1, "yes", &yes, Some(&ws), NOW - 60),
+            ProcKind::Other,
+            Some(&ws),
+        );
+    }
+    let f = w.run();
+    let s = one(&f, FindingKind::OrphanSwarm);
+    assert_eq!(s.severity, Severity::Medium);
+    assert!(s.suggested.iter().all(|g| g
+        .api_request
+        .as_ref()
+        .is_none_or(|r| r.route != "/v1/process/plan")));
+}

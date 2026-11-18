@@ -496,6 +496,22 @@ pub fn health_of(s: &Snapshot, cfg: &Config) -> Health {
     }
 }
 
+/// How long the build queue holds one waiter for high load before granting
+/// it anyway.
+pub const QUEUE_LOAD_HOLD_MAX_SECS: u64 = 15 * 60;
+
+/// `Some("the load average (365 on 16 cores)")` while the 1-minute load is
+/// above `queue_hold_load_per_core` times the cores.
+fn load_hold_reason(s: &Snapshot, cfg: &Config) -> Option<String> {
+    let per_core = f64::from(cfg.queue_hold_load_per_core);
+    (per_core > 0.0 && s.cpu_count > 0 && s.load[0] > s.cpu_count as f64 * per_core).then(|| {
+        format!(
+            "the load average ({:.0} on {} cores)",
+            s.load[0], s.cpu_count
+        )
+    })
+}
+
 fn capacity(cfg: &Config, cores: usize) -> usize {
     if cfg.max_heavy_jobs > 0 {
         cfg.max_heavy_jobs
@@ -3000,7 +3016,17 @@ impl Engine {
         let mem_ok = st.snapshot.mem_total == 0
             || st.snapshot.mem_free_pct() >= st.config.throttle_mem_free_pct
             || st.slots.active.is_empty();
-        if position == 0 && st.slots.active.len() < cap && mem_ok {
+        // Under extreme load (often processes left behind, not builds) a new
+        // job would only time out; hold it, but never past the cap, since
+        // nothing the queue does brings that load down.
+        let waited = st
+            .slots
+            .waiting
+            .get(position)
+            .map_or(0, |w| now.saturating_sub(w.since_unix));
+        let load_hold = load_hold_reason(&st.snapshot, &st.config)
+            .filter(|_| waited < QUEUE_LOAD_HOLD_MAX_SECS);
+        if position == 0 && st.slots.active.len() < cap && mem_ok && load_hold.is_none() {
             let w = st.slots.waiting.remove(0);
             let expires_unix = w.ttl_secs.map(|t| now + t);
             st.slots.active.push(Lease {
@@ -3027,6 +3053,11 @@ impl Engine {
         }
         let reason = if !mem_ok {
             "waiting for memory pressure to drop".to_string()
+        } else if let Some(r) = load_hold {
+            format!(
+                "waiting for {r} to drop (at most {} min more)",
+                QUEUE_LOAD_HOLD_MAX_SECS.saturating_sub(waited).div_ceil(60)
+            )
         } else if position > 0 {
             format!("{position} job(s) ahead in the queue")
         } else {
