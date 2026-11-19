@@ -5,22 +5,25 @@
 const REPO = 'williamrogersdev/mulchie';
 const CACHE_SECS = 600;
 
+// GitHub's releases feed lists the newest releases first, pre-releases
+// included. It is used instead of the REST API, which refuses unauthenticated
+// calls from Cloudflare's shared addresses. A release without a DMG (a
+// CLI-only release) is skipped by checking the asset before redirecting to it.
 async function latestDmg(ctx) {
   const cache = caches.default;
   const key = new Request('https://mulchie.com/__cache/latest-dmg');
   const hit = await cache.match(key);
   if (hit) return hit.text();
-  const res = await fetch(`https://api.github.com/repos/${REPO}/releases?per_page=10`, {
-    headers: { 'User-Agent': 'mulchie-site', Accept: 'application/vnd.github+json' },
-  });
+  const res = await fetch(`https://github.com/${REPO}/releases.atom`, { headers: { 'User-Agent': 'mulchie-site' } });
   if (!res.ok) return null;
-  const releases = await res.json();
-  for (const r of releases) {
-    if (r.draft) continue;
-    const dmg = (r.assets || []).find((a) => a.name.endsWith('_universal.dmg'));
-    if (dmg) {
-      ctx.waitUntil(cache.put(key, new Response(dmg.browser_download_url, { headers: { 'Cache-Control': `max-age=${CACHE_SECS}` } })));
-      return dmg.browser_download_url;
+  const feed = await res.text();
+  const tags = [...feed.matchAll(/\/releases\/tag\/(v[0-9A-Za-z.+-]+)/g)].map((m) => m[1]);
+  for (const tag of [...new Set(tags)].slice(0, 5)) {
+    const url = `https://github.com/${REPO}/releases/download/${tag}/Mulchie_${tag.slice(1)}_universal.dmg`;
+    const head = await fetch(url, { method: 'HEAD', redirect: 'manual', headers: { 'User-Agent': 'mulchie-site' } });
+    if (head.status === 302 || head.status === 200) {
+      ctx.waitUntil(cache.put(key, new Response(url, { headers: { 'Cache-Control': `max-age=${CACHE_SECS}` } })));
+      return url;
     }
   }
   return null;
