@@ -813,8 +813,9 @@ pub struct Engine {
     updates: Arc<Updates>,
     /// Targets that keep being skipped, from the journal ([`crate::failures`]).
     failures: Arc<Mutex<crate::failures::Memory>>,
-    /// What the last disk scan measured, for the periodic scan to reuse.
-    scan_memo: Arc<Mutex<diskmap::ScanMemo>>,
+    /// What the last disk scan measured, for the periodic scan to reuse;
+    /// `None` until a scan has run or read the one saved on disk.
+    scan_memo: Arc<Mutex<Option<diskmap::ScanMemo>>>,
 }
 
 impl Engine {
@@ -879,7 +880,7 @@ impl Engine {
             state: Arc::new(Mutex::new(state)),
             history: Arc::new(Mutex::new(VecDeque::with_capacity(HISTORY_LEN))),
             jobs: Arc::new(Jobs::default()),
-            scan_memo: Arc::new(Mutex::new(diskmap::ScanMemo::default())),
+            scan_memo: Arc::new(Mutex::new(None)),
             next_id: Arc::new(AtomicU64::new(1)),
             paths: Arc::new(paths),
             journal: Arc::new(journal),
@@ -1764,19 +1765,25 @@ impl Engine {
             st.config.clone()
         };
         let _bg = quiet.then(crate::measure::Background::enter);
+        let now = now_unix();
         let mut memo = if quiet {
-            lock(&self.scan_memo).clone()
+            // The first periodic scan after a start picks up what the last
+            // engine measured, so a restart does not walk everything again.
+            lock(&self.scan_memo)
+                .get_or_insert_with(|| diskmap::ScanMemo::load(&self.paths, now))
+                .clone()
         } else {
             diskmap::ScanMemo::default()
         };
         let cwds = own_cwds(&*self.procs);
-        let now = now_unix();
         let (report, caches) =
             reclaim::scan_with(&cfg, &self.paths, &cwds, now, &memo.caches, quiet);
         lock(&self.state).scan = Some(Arc::new(report.clone()));
         memo.caches = caches;
         let map = diskmap::scan_with(&cfg, &self.paths, &cwds, now, &mut memo, quiet);
-        *lock(&self.scan_memo) = memo;
+        // A memo that cannot be saved only costs the next engine a full walk.
+        let _ = memo.save(&self.paths);
+        *lock(&self.scan_memo) = Some(memo);
         let mut st = lock(&self.state);
         st.diskmap = Some(Arc::new(map));
         st.scanning = false;

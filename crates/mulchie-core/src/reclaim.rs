@@ -69,7 +69,7 @@ pub fn scan(cfg: &Config, paths: &Paths, busy_cwds: &[PathBuf], now: u64) -> Sca
 pub const REMEASURE_SECS: u64 = 6 * 3600;
 
 /// A directory's size as a scan measured it.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct SizeMemo {
     pub at_unix: u64,
     pub bytes: u64,

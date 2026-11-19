@@ -1941,3 +1941,62 @@ fn config_changes_rescan_only_what_the_scan_reads() {
     e.set_config(cfg).unwrap();
     assert_eq!(e.pending_jobs(), vec![Job::Scan]);
 }
+
+/// A restarted engine's first periodic scan reuses what the last one
+/// measured, instead of walking every worktree again; a requested scan still
+/// measures everything.
+#[test]
+fn a_restart_reuses_the_saved_scan_memo() {
+    let t = tempfile::tempdir().unwrap();
+    let root = code_root(&t);
+    let paths = Paths::under(t.path());
+    let repo = root.join("repo");
+    std::fs::create_dir_all(&repo).unwrap();
+    let git = |args: &[&str]| {
+        Git::new(&paths, &repo)
+            .args(["-c", "user.name=t", "-c", "user.email=t@t"])
+            .args(args)
+            .text()
+            .unwrap()
+    };
+    git(&["init", "-q", "-b", "main"]);
+    git(&["commit", "-q", "--allow-empty", "-m", "init"]);
+    let wt = repo.join(".claude/worktrees/agent-x");
+    git(&["worktree", "add", "-q", "-b", "feat", wt.to_str().unwrap()]);
+    std::fs::write(wt.join("a.txt"), "small").unwrap();
+    let start = || {
+        Engine::with_processes(
+            paths.clone(),
+            LoadedConfig {
+                config: Config {
+                    scan_roots: vec![root.clone()],
+                    ..Config::default()
+                },
+                error: None,
+            },
+            Arc::new(FakeProcesses::empty()),
+        )
+        .with_watch_probe(Arc::new(crate::watch::NoProbe))
+    };
+    let bytes = |e: &Engine| {
+        let map = e.snapshot_state().diskmap.unwrap();
+        map.worktrees
+            .iter()
+            .find(|w| w.name == "agent-x")
+            .unwrap()
+            .bytes
+    };
+
+    let first = start();
+    first.run_periodic_scan();
+    let measured = bytes(&first);
+    drop(first);
+    assert!(paths.config_dir.join("scan-memo.json").is_file());
+
+    std::fs::write(wt.join("a.txt"), vec![b'x'; 200_000]).unwrap();
+    let second = start();
+    second.run_periodic_scan();
+    assert_eq!(bytes(&second), measured, "figures from the saved memo");
+    second.run_scan();
+    assert!(bytes(&second) > measured, "a requested scan measures again");
+}

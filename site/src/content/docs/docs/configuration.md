@@ -190,5 +190,6 @@ All of these are in the config directory.
 | `engine.lock` | Makes sure one engine runs per user. |
 | `sessions/` | One `<id>.jsonl` [activity record](/docs/sessions/#the-activity-record) per session (mode `0600`, in a `0700` folder), and `paused.json`, the processes Mulchie paused for a limit and has not resumed. |
 | `updates.json` | The last [update check](/docs/updates/), so a restart shows it. |
+| `scan-memo.json` | What the last disk scan measured (sizes per worktree and cache), mode `0600`, so the first scan after a restart re-measures only what changed. Safe to delete: the next scan measures everything. |
 | `hook.log` | Why a [hook](/docs/hooks/) allowed an action without the engine, at most one line a minute. |
 | `hook-dirs.json` | In `~/.config/mulchie` only: per agent app, a hook's config directory when it was not this one or had no engine, for `mulchie hooks status`. |
