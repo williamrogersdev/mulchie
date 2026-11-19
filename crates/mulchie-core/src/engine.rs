@@ -503,6 +503,22 @@ pub fn health_of(s: &Snapshot, cfg: &Config) -> Health {
     }
 }
 
+/// The settings the disk scan reads ([`reclaim::scan_with`],
+/// [`diskmap::scan_with`] and the cache rules they apply). A config change
+/// that leaves these alone does not rescan.
+fn scan_inputs(cfg: &Config, paths: &Paths) -> impl PartialEq {
+    (
+        cfg.roots(paths),
+        cfg.include_node_modules,
+        cfg.include_xcode,
+        cfg.stale_hours,
+        cfg.worktree_idle_days,
+        cfg.worktree_target_stale_hours,
+        cfg.backup_ignored_max_mb,
+        cfg.agents.extra.clone(),
+    )
+}
+
 /// How long the build queue holds one waiter for high load before granting
 /// it anyway.
 pub const QUEUE_LOAD_HOLD_MAX_SECS: u64 = 15 * 60;
@@ -591,16 +607,15 @@ pub(crate) fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
 /// Work the scan loop does on request.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Job {
+    /// Measure everything again (someone asked for a rescan).
     Scan,
+    /// Scan as the periodic scan does, re-measuring only what may have
+    /// changed: after a config change that the scan reads.
+    Refresh,
     /// Delete stale caches until about `want_bytes` are free.
-    Reclaim {
-        want_bytes: u64,
-        source: String,
-    },
+    Reclaim { want_bytes: u64, source: String },
     /// Remove idle agent worktrees.
-    Sweep {
-        source: String,
-    },
+    Sweep { source: String },
 }
 
 #[derive(Default)]
@@ -610,12 +625,16 @@ struct Jobs {
 }
 
 impl Jobs {
-    /// Queue `job` unless one of the same kind is already waiting.
+    /// Queue `job` unless one of the same kind is already waiting. A waiting
+    /// full scan covers a refresh; a full scan replaces a waiting refresh.
     fn push(&self, job: Job) -> bool {
         let mut q = lock(&self.queue);
         let same = |j: &Job| std::mem::discriminant(j) == std::mem::discriminant(&job);
-        if q.iter().any(same) {
+        if q.iter().any(same) || (job == Job::Refresh && q.contains(&Job::Scan)) {
             return false;
+        }
+        if job == Job::Scan {
+            q.retain(|j| *j != Job::Refresh);
         }
         q.push_back(job);
         self.ready.notify_all();
@@ -761,6 +780,8 @@ pub struct Engine {
     journal: Arc<Journal>,
     procs: Arc<dyn ProcessSource>,
     shutdown: Arc<AtomicBool>,
+    /// Wakes [`Engine::nap`] at shutdown, so loops sleep without polling.
+    nap_wake: Arc<(Mutex<()>, Condvar)>,
     automation_enabled: Arc<AtomicBool>,
     /// Whether this engine can raise a priority it lowered (see
     /// [`can_raise_priority`]). Without it builds are not throttled.
@@ -864,6 +885,7 @@ impl Engine {
             journal: Arc::new(journal),
             procs,
             shutdown: Arc::new(AtomicBool::new(false)),
+            nap_wake: Arc::new((Mutex::new(()), Condvar::new())),
             automation_enabled: Arc::new(AtomicBool::new(true)),
             can_restore: Arc::new(AtomicBool::new(can_raise_priority())),
             notify: Arc::new(AtomicBool::new(false)),
@@ -1182,13 +1204,21 @@ impl Engine {
     ) -> Result<(), ConfigError> {
         cfg.save_to(&self.paths, now_unix())?;
         *disk = read_config_bytes(&self.paths);
-        {
+        let rescan = {
             let mut st = lock(&self.state);
+            // A config that failed to load ran with defaults: scan again.
+            let rescan = st.config_error.is_some()
+                || scan_inputs(&st.config, &self.paths) != scan_inputs(&cfg, &self.paths);
             st.config = cfg;
             st.config_error = None;
             st.automation = true;
+            rescan
+        };
+        // Dismissing a finding or changing a setting the scan does not read
+        // must not walk every worktree again.
+        if rescan {
+            self.jobs.push(Job::Refresh);
         }
-        self.request_scan();
         Ok(())
     }
 
@@ -1288,7 +1318,12 @@ impl Engine {
     /// its current step first), restore build priorities Mulchie lowered and
     /// resume processes it paused for a limit.
     pub fn shutdown(&self, wait: Duration) {
-        self.shutdown.store(true, Ordering::SeqCst);
+        {
+            // Under the nap lock: a nap checks the flag before it waits.
+            let _g = lock(&self.nap_wake.0);
+            self.shutdown.store(true, Ordering::SeqCst);
+            self.nap_wake.1.notify_all();
+        }
         self.jobs.ready.notify_all();
         self.limit_wake.notify_all();
         self.updates.wake.notify_all();
@@ -1311,15 +1346,21 @@ impl Engine {
         self.flush_record();
     }
 
-    /// Sleep up to `d`, returning early on shutdown.
+    /// Sleep up to `d`, returning early on shutdown. One wait, not a poll:
+    /// the thread wakes only when the time is up or the engine stops.
     fn nap(&self, d: Duration) {
         let end = Instant::now() + d;
+        let (m, cv) = &*self.nap_wake;
+        let mut g = lock(m);
         while !self.is_shut_down() {
             let left = end.saturating_duration_since(Instant::now());
             if left.is_zero() {
                 break;
             }
-            std::thread::sleep(left.min(Duration::from_millis(100)));
+            g = cv
+                .wait_timeout(g, left)
+                .map(|(g, _)| g)
+                .unwrap_or_else(|e| e.into_inner().0);
         }
     }
 
@@ -1670,6 +1711,10 @@ impl Engine {
         match job {
             Job::Scan => {
                 self.run_scan();
+                ctx.last_scan = Some(Instant::now());
+            }
+            Job::Refresh => {
+                self.run_periodic_scan();
                 ctx.last_scan = Some(Instant::now());
             }
             Job::Reclaim { want_bytes, source } => {
@@ -3385,7 +3430,9 @@ impl Engine {
 
     #[cfg(test)]
     pub(crate) fn begin_shutdown(&self) {
+        let _g = lock(&self.nap_wake.0);
         self.shutdown.store(true, Ordering::SeqCst);
+        self.nap_wake.1.notify_all();
     }
 }
 

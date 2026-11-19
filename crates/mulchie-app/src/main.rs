@@ -665,7 +665,29 @@ fn tray_loop(backend: Arc<Backend>, tray: tauri::tray::TrayIcon) {
         .expect("start the tray thread");
 }
 
+/// Tell macOS the app does work while no window is open, so App Nap does not
+/// throttle it. A menu bar app with its window closed is napped: every thread
+/// drops to background priority, and on a loaded machine (load average 120 on
+/// 16 cores) the engine inside took 2 to 10 s to answer `/v1/health`, so
+/// agent hooks, the build queue and the memory guard waited exactly when the
+/// machine needed them. Idle system sleep stays allowed, and the periodic disk
+/// scan still runs its own threads at background priority
+/// (`measure::Background`). The activity lasts as long as the process.
+#[cfg(target_os = "macos")]
+fn keep_awake_for_work() {
+    use objc2_foundation::{NSActivityOptions, NSProcessInfo, NSString};
+    let reason = NSString::from_str("Mulchie watches this machine for its coding agents");
+    let token = NSProcessInfo::processInfo().beginActivityWithOptions_reason(
+        NSActivityOptions::UserInitiatedAllowingIdleSystemSleep,
+        &reason,
+    );
+    // Never ended: the activity is for the life of the process.
+    std::mem::forget(token);
+}
+
 fn main() {
+    #[cfg(target_os = "macos")]
+    keep_awake_for_work();
     let backend = Arc::new(Backend::start(Paths::from_env(), Options::default()));
     match backend.info() {
         ConnInfo {
