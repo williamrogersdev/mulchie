@@ -175,7 +175,18 @@ fn a_taken_port_is_a_posture_finding_not_a_crash() {
     e.perf_tick(now + 1);
     assert!(e.otel_posture().0.is_none(), "not retried at once");
     e.perf_tick(now + RETRY_SECS + 1);
-    assert_eq!(e.otel_posture(), (Some(port), None));
+    let after = e.otel_posture();
+    if after.0.is_none() {
+        // Another process on the machine took the freed port in between;
+        // then the receiver must still say why it is not listening.
+        assert!(
+            std::net::TcpListener::bind(("127.0.0.1", port)).is_err(),
+            "the port is free, yet the receiver is not listening: {after:?}"
+        );
+        assert_eq!(after.1.as_ref().map(|x| x.0), Some(port));
+    } else {
+        assert_eq!(after, (Some(port), None));
+    }
 }
 
 #[test]
