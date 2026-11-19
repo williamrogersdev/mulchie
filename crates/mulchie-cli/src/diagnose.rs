@@ -123,6 +123,22 @@ pub fn tool_for_api_request(r: &Value) -> Option<(&'static str, Value, Option<St
             }
             Some(("list_timings", Value::Object(args), Some(line)))
         }
+        ("GET", "/v1/devservers") => {
+            let mut args = serde_json::Map::new();
+            let mut line = "mulchie devservers".to_string();
+            for pair in query.split('&') {
+                let Some((k, v)) = pair.split_once('=') else {
+                    continue;
+                };
+                if k != "workspace" {
+                    continue;
+                }
+                let v = unescape(v)?;
+                line.push_str(&format!(" --workspace {}", q(&v)));
+                args.insert(k.into(), json!(v));
+            }
+            Some(("list_dev_servers", Value::Object(args), Some(line)))
+        }
         ("GET", "/v1/otel") => {
             let mut args = serde_json::Map::new();
             let mut line = "mulchie traces".to_string();
@@ -701,6 +717,7 @@ pub fn build(state: &Value, advice: &Value, origin: Origin) -> Value {
     let sessions = sessions_brief(&state["sessions"], &mut recs);
     let updates = updates_brief(&state["updates"], &state["findings"], &mut recs);
     slower_builds(&state["findings"], &mut recs);
+    dev_servers(&state["findings"], &mut recs);
     let traces = traces_brief(&state["otel"], &state["findings"], &mut recs);
 
     let machine = json!({
@@ -968,6 +985,37 @@ fn slower_builds(findings: &Value, recs: &mut Vec<Rec>) {
         risk: "none",
         next_call: call("list_findings", json!({ "kind": "build_slower" })),
         command: Some("mulchie findings --kind build_slower".into()),
+    });
+}
+
+/// One recommendation when a dev server got slower to start or heavier
+/// (`performance` findings).
+fn dev_servers(findings: &Value, recs: &mut Vec<Rec>) {
+    let slow: Vec<&Value> = findings
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter(|f| {
+            (f["kind"] == "dev_server_slow_start" || f["kind"] == "dev_server_heavier")
+                && f["dismissed"] != true
+        })
+        .collect();
+    let Some(first) = slow.first() else {
+        return;
+    };
+    recs.push(Rec {
+        priority: 3,
+        id: "slower_dev_servers",
+        title: format!("{} dev server(s) got slower to start or heavier", slow.len()),
+        reason: format!(
+            "{} The finding names the commits between the last normal run and the first one that was not, and the sessions that made them.",
+            first["title"].as_str().unwrap_or("")
+        ),
+        gain_bytes: None,
+        gain: "dev servers back to their usual start time and memory".into(),
+        risk: "none",
+        next_call: call("list_dev_servers", json!({})),
+        command: Some("mulchie devservers".into()),
     });
 }
 
@@ -1794,5 +1842,30 @@ mod tests {
         let recs = d["recommendations"].as_array().unwrap();
         let r = recs.iter().find(|r| r["id"] == "slower_builds").unwrap();
         assert_eq!(r["next_call"]["arguments"]["kind"], "build_slower");
+    }
+
+    #[test]
+    fn a_heavier_dev_server_leads_to_list_dev_servers_and_one_recommendation() {
+        let mut st = state();
+        st["findings"] = json!([{ "id": "dev_server_heavier:0123456789abcdef",
+            "kind": "dev_server_heavier", "category": "performance", "severity": "low",
+            "title": "`next dev` in repo-x settles at 1.4 GB of memory, 2.8× its usual 500 MB",
+            "why": "", "evidence": { "cmd": "next dev" },
+            "suggested": [{ "label": "Show this workspace's dev servers", "reversible": true,
+                "api_request": { "method": "GET",
+                    "route": "/v1/devservers?workspace=/w/repo%20x" } }] }]);
+        let d = build(&st, &json!({}), Origin::Engine);
+        let f = &d["findings"]["top"][0];
+        let next = f["next_calls"].as_array().unwrap();
+        assert_eq!(next[0]["name"], "list_dev_servers");
+        assert_eq!(next[0]["arguments"], json!({ "workspace": "/w/repo x" }));
+        assert_eq!(f["cli"][0], "mulchie devservers --workspace '/w/repo x'");
+        let recs = d["recommendations"].as_array().unwrap();
+        let r = recs
+            .iter()
+            .find(|r| r["id"] == "slower_dev_servers")
+            .unwrap();
+        assert_eq!(r["next_call"]["name"], "list_dev_servers");
+        assert!(!recs.iter().any(|r| r["id"] == "slower_builds"));
     }
 }

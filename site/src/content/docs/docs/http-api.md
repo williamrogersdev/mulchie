@@ -84,6 +84,7 @@ Requests are capped at 8 KB per line, 64 KB of headers and a 1 MB body. The serv
 | POST | `/v1/lease` | Join the build queue, poll a ticket, or renew a slot. |
 | POST | `/v1/release` | Release a slot or leave the queue. Optionally with a timing: `duration_ms`, `exit_code`, `command`, `cwd`. |
 | GET | `/v1/timings` | Build and test timings, newest first. Query: `workspace`, `command`, `limit` (default 50). |
+| GET | `/v1/devservers` | Each project's [dev server](/docs/watch/#dev-servers), run by run, newest first: time to listen, settled memory, memory slope, peak CPU. Query: `workspace`, `limit` (default 50). |
 | GET | `/v1/otel` | The [trace receiver](/docs/traces/): whether it is on and listening, its port and drops, and per service each operation's count, errors, p50/p95/p99, usual p95 and error rate, and where the service runs. Query: `service`, `minutes` (1 to 1440, default 15). |
 | GET | `/v1/commits` | Recorded moves of workspaces' `HEAD`, each with the agent session working there, newest first. Query: `workspace`, `since`, `limit` (default 100). |
 

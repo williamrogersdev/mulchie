@@ -1,6 +1,7 @@
 mod cli;
 mod commands;
 mod conn;
+mod devservers;
 mod diagnose;
 mod doctor;
 mod feedback;
@@ -182,6 +183,9 @@ fn dispatch(paths: &Paths, cmd: Command) -> i32 {
             t.limit as usize,
             t.out.json,
         ),
+        Command::Devservers(d) => {
+            devservers::list(paths, d.workspace.as_deref(), d.limit as usize, d.out.json)
+        }
         Command::Traces(t) => traces::list(paths, t.service.as_deref(), t.minutes, t.out.json),
         Command::Inspect(i) => observe::inspect(paths, i.pid, i.out.json),
         Command::Slots(a) => match &a.action {

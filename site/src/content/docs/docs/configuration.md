@@ -214,6 +214,7 @@ All of these are in the config directory.
 | `sessions/` | One `<id>.jsonl` [activity record](/docs/sessions/#the-activity-record) per session (mode `0600`, in a `0700` folder), and `paused.json`, the processes Mulchie paused for a limit and has not resumed. |
 | `updates.json` | The last [update check](/docs/updates/), so a restart shows it. |
 | `timings.jsonl` | [Build and test timings](/docs/watch/#slower-builds), mode `0600`. Renamed to `timings.jsonl.1` at 4 MB. |
+| `devservers.jsonl` | One record per [dev server](/docs/watch/#dev-servers) run, when it ends and every 30 minutes while it lasts, mode `0600`. Renamed to `devservers.jsonl.1` at 2 MB. |
 | `commits.jsonl` | Moves of workspaces' `HEAD` with the agent session working there, mode `0600`. Renamed to `commits.jsonl.1` at 2 MB. |
 | `scan-memo.json` | What the last disk scan measured (sizes per worktree and cache), mode `0600`, so the first scan after a restart re-measures only what changed. Safe to delete: the next scan measures everything. |
 | `hook.log` | Why a [hook](/docs/hooks/) allowed an action without the engine, at most one line a minute. |

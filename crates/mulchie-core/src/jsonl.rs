@@ -1,5 +1,5 @@
 //! An append-only file of JSON lines that Mulchie keeps for itself
-//! (`commits.jsonl`, `timings.jsonl`): mode 0600 in the private config
+//! (`commits.jsonl`, `timings.jsonl`, `devservers.jsonl`): mode 0600 in the private config
 //! directory, never opened through a symbolic link, renamed to `<file>.1`
 //! (replacing the one before) when the next line would pass its size, as the
 //! action journal is. Nothing is deleted.

@@ -56,7 +56,7 @@ pub struct CommitEntry {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub agent: Option<String>,
     /// What noticed it: `poll` (the periodic check), `hook` (an agent's
-    /// hook reported a git command), `timing` (a build timing came in) or
+    /// hook reported a git command), `timing` (a build timing came in), `devserver` (a dev server run was first seen listening) or
     /// `otel` (an app sending traces runs from this checkout).
     #[serde(default)]
     pub via: String,

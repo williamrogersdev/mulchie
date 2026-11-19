@@ -2,6 +2,7 @@ pub mod api;
 pub mod commits;
 pub mod config;
 pub mod consumers;
+pub mod devservers;
 pub mod diskmap;
 pub mod endpoints;
 pub mod engine;

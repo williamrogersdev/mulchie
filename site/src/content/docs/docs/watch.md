@@ -109,6 +109,8 @@ An update finding never installs anything. It names the command you can run.
 | `build_slower` | A build or test command's latest successful runs each took much longer than its usual time. The title says the command, the workspace and both times; the evidence names the commits in between and the agent sessions that made them. See [Slower builds](#slower-builds). | low; medium at twice the usual time or more |
 | `endpoint_slower` | An endpoint of a local app that sends traces to Mulchie was much slower at p95 over the last 15 minutes than usual. The title says the operation, the service and both p95s; the evidence names the workspace, the commits since it was last normal and the sessions that made them. See [Traces](/docs/traces/#slower-endpoints). | low; medium at twice the usual p95 or more |
 | `endpoint_errors` | An endpoint of a local app failed much more often over the last 15 minutes than usual. Same evidence as `endpoint_slower`. | low; medium at 25% of requests failing or more |
+| `dev_server_slow_start` | A dev server's latest runs each took much longer than usual to start listening. The title says the command, the workspace and both times; the evidence names the commits in between and the sessions that made them. Only raised when the usual time is longer than the watch interval can resolve. See [Dev servers](#dev-servers). | low; medium at twice the usual time or more |
+| `dev_server_heavier` | A dev server's latest runs each settled at much more memory than usual. Same evidence as `dev_server_slow_start`. See [Dev servers](#dev-servers). | low; medium at twice the usual memory or more |
 
 ## Slower builds
 
@@ -120,6 +122,34 @@ Runs are grouped by workspace and command, with the command compared the way iss
 - its usual time is the median of up to `perf.baseline_runs` successful runs (default 10, at least 3) before the slow ones, so slow runs never raise their own baseline and one odd run does not move it.
 
 The `build_slower` finding names the commit `HEAD` pointed to at the last normal run and at the first slow run, and the moves of `HEAD` Mulchie recorded in between, each with the agent session that was working in the workspace then. When `HEAD` did not move, the finding says the cause is outside the code: the build cache, dependencies, the toolchain or a busy machine. The finding goes away when the latest runs are back to the usual time. Like every finding it only reports: nothing is stopped, changed or rolled back.
+
+## Dev servers
+
+A dev server is a process of yours that sits in a workspace and listens on a TCP port: `next dev`, `vite`, `rails s`, a web app started with `cargo run`. Mulchie finds them from what it already reads: the process table, each process's memory and CPU, and the listening sockets the watch looks at (`watch.check_listeners`, on by default). It probes nothing more and acts on nothing. `mulchie devservers` lists the runs, and agents use `list_dev_servers`.
+
+Each run (a process id and its start time) gets one record, written to `devservers.jsonl` when the process ends and every 30 minutes while it lasts. A run seen listening for less than a minute is not recorded. A record has:
+
+- the command (redacted), the ports, the workspace, the branch, `HEAD` and the agent session. `HEAD` and the session are read when Mulchie first sees the run listening.
+- **time to listen**: from the process's start to the first watch run that saw it listening.
+- **settled memory**: the median resident memory of the process and everything it started, over minutes 2 to 5 of the run. It needs at least three samples in that window, so a run Mulchie met after minute 5 has none.
+- **memory slope**: how fast that memory grew from minute 2 on, in MB per hour, as a least-squares line. It needs 10 minutes of watching.
+- **peak CPU**, as a percent of one core with the whole tree summed, and peak memory. Both are read from the 3-second samples.
+- how it ended: `running` for a record written while it lives, `exited` once the process is gone.
+
+### How exact the time to listen is
+
+The watch looks at listening sockets once every `watch.interval_secs` (60 seconds by default, at least 10). The time to listen is therefore an upper bound: the port may have opened any time since the previous watch run. Each record keeps `listen_uncertainty_ms`, how far below `listen_ms` the true time may lie (about one watch interval), and `watch_interval_secs`. A server that was already listening when Mulchie first looked, for instance after the engine started, has no time to listen, because its start was not watched. A process that started after the previous watch run and already listens counts as watched.
+
+### Slower starts and heavier servers
+
+Runs are grouped by workspace and command, the command compared the way issues compare it. Each run counts once, by its newest record. With the same settings as [slower builds](#slower-builds) (`perf.baseline_runs`, `perf.slow_runs`, `perf.slower_ratio`):
+
+- `dev_server_slow_start`: each of the last runs took more than `perf.slower_ratio` times the median of the runs before to start listening, and more than `perf.min_slowdown_secs` or the largest uncertainty of the runs longer, whichever is more. When the usual time is no longer than that uncertainty, the figure is too coarse to tell and no finding is raised. With the default 60-second interval that means a dev server that usually listens within about a minute is not judged; lower `watch.interval_secs` to judge faster ones.
+- `dev_server_heavier`: each of the last runs settled at more than `perf.slower_ratio` times the usual memory and more than 256 MB above it.
+
+Both findings name the commit `HEAD` pointed to at the last normal run and at the first slow one, the recorded moves of `HEAD` in between and the sessions working then, as `build_slower` does, and go away once the latest runs are back to usual. They only report.
+
+`devservers.jsonl` is in the config directory and readable only by you. It is renamed to `.1` at 2 MB, replacing the one before; nothing else is deleted. Without an engine, `mulchie devservers` reads it as the last engine left it.
 
 ### Which session moved HEAD
 

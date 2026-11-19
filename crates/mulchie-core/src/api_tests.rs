@@ -1758,3 +1758,35 @@ fn otel_reports_the_receiver_and_checks_its_query() {
     let (_, st) = send(r.port, "GET", "/v1/state", Some(&ro), "");
     assert_eq!(st["otel"]["enabled"], false);
 }
+
+/// `GET /v1/devservers` answers (also to the read-only token) and checks
+/// its query.
+#[test]
+fn devservers_lists_runs_and_checks_its_query() {
+    let r = running(Limits::default());
+    let ro = format!("Bearer {}", read_read_only_token(r.engine.paths()).unwrap());
+    let (code, v) = send(r.port, "GET", "/v1/devservers", Some(&ro), "");
+    assert_eq!(code, 200, "{v}");
+    assert_eq!(v["total"], 0);
+    assert!(v["dev_servers"].as_array().unwrap().is_empty());
+    let (code, v) = send(
+        r.port,
+        "GET",
+        "/v1/devservers?workspace=%2Fw%2Frepo%20x&limit=5",
+        Some(&ro),
+        "",
+    );
+    assert_eq!((code, v["total"].as_u64()), (200, Some(0)), "{v}");
+    for bad in [
+        "/v1/devservers?limit=0",
+        "/v1/devservers?workspace=relative",
+        "/v1/devservers?workspace=%zz",
+    ] {
+        let (code, v) = send(r.port, "GET", bad, Some(&ro), "");
+        assert_eq!(
+            (code, v["code"].as_str()),
+            (400, Some("invalid_query")),
+            "{bad}"
+        );
+    }
+}
