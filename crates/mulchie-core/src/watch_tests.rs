@@ -709,6 +709,7 @@ fn posture_findings() {
         api_port: Some(7450),
         lock_held_by_other: Some(77),
         config_error: Some("bad".into()),
+        ..Default::default()
     };
     w.listeners = Some(vec![
         Listener {
@@ -752,6 +753,48 @@ fn posture_findings() {
         config_dir_mode: Some(0o40700),
         ..Default::default()
     };
+    assert!(w.run().is_empty());
+}
+
+#[test]
+fn trace_receiver_posture() {
+    let mut w = World::new();
+    w.posture = Posture {
+        otel_port: Some(4318),
+        otel_error: Some((4319, "address in use".into())),
+        ..Default::default()
+    };
+    w.listeners = Some(vec![
+        Listener {
+            pid: 9,
+            addr: "127.0.0.1".into(),
+            port: 4318,
+        },
+        Listener {
+            pid: 12,
+            addr: "*".into(),
+            port: 4318,
+        },
+    ]);
+    let f = w.run();
+    assert_eq!(
+        kinds(&f),
+        vec![FindingKind::ApiExposed, FindingKind::OtelUnavailable]
+    );
+    let exposed = one(&f, FindingKind::ApiExposed);
+    assert_eq!(exposed.id, "api_exposed:otel:4318");
+    assert!(exposed.title.contains("trace receiver port 4318"));
+    let down = one(&f, FindingKind::OtelUnavailable);
+    assert_eq!(down.category, FindingCategory::Posture);
+    assert!(down.title.contains("4319"));
+    assert_eq!(down.evidence.detail.as_deref(), Some("address in use"));
+    // Only the loopback listener: nothing to report.
+    w.posture.otel_error = None;
+    w.listeners = Some(vec![Listener {
+        pid: 9,
+        addr: "127.0.0.1".into(),
+        port: 4318,
+    }]);
     assert!(w.run().is_empty());
 }
 

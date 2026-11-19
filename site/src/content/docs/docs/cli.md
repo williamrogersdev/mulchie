@@ -394,6 +394,22 @@ op read op://dev/vercel/token | mulchie integrations add vercel --project prj_12
 mulchie integrations deploys --provider sentry
 ```
 
+### traces
+
+```sh
+mulchie traces [--service NAME] [--minutes N] [--json]
+```
+
+The endpoints of local apps that send OpenTelemetry traces to Mulchie, with `otel.enabled` on. For each service: where it runs (workspace, commit and the agent that moved `HEAD` there), and each operation over the last `--minutes` (1 to 1440, default 15) with its count, errors, p50, p95, p99 and usual p95, marked `slower` or `more errors` when it is. It also says whether the receiver is listening and on which port. See [Traces](/docs/traces/).
+
+- `--service` keeps one service (its `service.name`).
+- The figures live in the engine's memory, so this needs the engine.
+
+```sh
+mulchie config set otel.enabled true
+mulchie traces --service shop-web --json
+```
+
 ## Agents
 
 ### mcp

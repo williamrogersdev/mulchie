@@ -69,6 +69,7 @@ failed_before, and repeated_failures in diagnose, name a target that keeps being
 to do about it: say so instead of asking for the same thing again. dismiss_finding hides a finding the user chose to ignore. \
 list_issues shows the problems that keep coming back across processes and restarts; resolve_issue (after asking) marks one fixed, and it is reported if it returns. \
 list_timings shows how long builds and tests took; a build_slower finding names the commits and sessions between the last normal run and the first slow one. \
+list_endpoints shows the endpoints of local apps that send traces to Mulchie (when otel.enabled is on), with their usual p95; an endpoint_slower or endpoint_errors finding names the commits and sessions since the endpoint was last normal. \
 Before heavy builds or test suites, call can_i_build, and when other agents share the machine \
 wrap the work in acquire_build_slot / release_build_slot (poll with the ticket until granted, \
 renew before ttl_secs passes, release as soon as the work ends, with duration_ms, exit_code, \

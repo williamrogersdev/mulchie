@@ -31,6 +31,7 @@ fn safe_config(paths: &Paths) -> mulchie_core::LoadedConfig {
     cfg.integrations.vercel.enabled = false;
     cfg.integrations.sentry.enabled = false;
     cfg.integrations.posthog.enabled = false;
+    cfg.otel.enabled = false;
     cfg.save_to(paths, 0).expect("write the test config");
     Config::load_from(paths)
 }

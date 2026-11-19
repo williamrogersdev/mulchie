@@ -191,6 +191,15 @@ pub fn tool_list() -> Vec<Tool> {
                 "limit": { "type": "integer", "minimum": 1, "maximum": 1000, "description": "At most this many (default 50)" }
             }),
         ),
+        read(
+            "list_endpoints",
+            "Endpoints of local apps (traces)",
+            "The endpoints of apps in local development that send OpenTelemetry traces to Mulchie (otel.enabled on; OTEL_EXPORTER_OTLP_ENDPOINT=http://127.0.0.1:4318): per service, each operation's count, errors and p50/p95/p99 over the last minutes, its usual p95 and error rate, whether it is slower or failing more than usual, and where the service runs (workspace, commit, the agent session that moved HEAD). Also whether the receiver is listening and what it dropped. Use it after changing an app's code to see whether an endpoint got slower; an endpoint_slower or endpoint_errors finding (list_findings) names the commits in between. A record only; nothing acts on it.",
+            json!({
+                "service": { "type": "string", "maxLength": 256, "description": "Only this service (its service.name)" },
+                "minutes": { "type": "integer", "minimum": 1, "maximum": 1440, "description": "Figures over the last this many minutes (default 15, the range findings compare)" }
+            }),
+        ),
         Tool {
             name: "get_issue",
             title: "One issue",
@@ -1369,6 +1378,21 @@ pub fn call_tool(cx: &mut Ctx, name: &str, a: &Map<String, Value>) -> ToolResult
                 "/v1/issues".to_string()
             } else {
                 format!("/v1/issues?{}", q.join("&"))
+            };
+            get(&path)
+        }
+        "list_endpoints" => {
+            let mut q = Vec::new();
+            if let Some(m) = a.get("minutes").and_then(Value::as_u64) {
+                q.push(format!("minutes={m}"));
+            }
+            if let Some(svc) = a.get("service").and_then(Value::as_str) {
+                q.push(format!("service={}", mulchie_core::api::query_escape(svc)));
+            }
+            let path = if q.is_empty() {
+                "/v1/otel".to_string()
+            } else {
+                format!("/v1/otel?{}", q.join("&"))
             };
             get(&path)
         }

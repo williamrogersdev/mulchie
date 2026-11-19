@@ -1,11 +1,16 @@
-//! A minimal OTLP/HTTP trace receiver. Not wired into the engine yet.
+//! A minimal OTLP/HTTP trace receiver. The engine that holds the lock runs
+//! it while `otel.enabled` is on (see `engine_otel.rs`).
 //!
 //! It binds loopback addresses only ([`serve`] refuses any other), by default
 //! `127.0.0.1:4318`, and takes `POST /v1/traces` with `Content-Type:
 //! application/json` or `application/x-protobuf`. A compressed body
 //! (`Content-Encoding: gzip`) is refused with 415, since decompressing would
-//! need a new dependency. `Host` must name `localhost`, `127.0.0.1` or
-//! `[::1]`, so a web page using DNS rebinding cannot post spans.
+//! need a new dependency. `Host` must name `localhost`, `127.0.0.1`, `[::1]`
+//! or `host.docker.internal`, so a web page using DNS rebinding cannot post
+//! spans. The last is the name a container uses for the host (Docker
+//! Desktop forwards it to the host's loopback); the bind stays loopback.
+//! A batch posted under that name has its `process.pid` removed, since a
+//! pid from inside a container names some other process on the host.
 //!
 //! Each connection carries one request and is closed after the answer: 200
 //! with an empty `ExportTraceServiceResponse` (`{}` in JSON, an empty body in
@@ -255,7 +260,12 @@ fn handle(req: &Request, sink: &dyn Sink, limits: &Limits) -> Resp {
         Encoding::Protobuf => otel::decode_protobuf(&req.body, &limits.decode),
     };
     match decoded {
-        Ok(batch) => {
+        Ok(mut batch) => {
+            if req.container {
+                for rs in &mut batch.resource_spans {
+                    rs.resource.retain(|a| a.key != "process.pid");
+                }
+            }
             sink.accept(batch);
             Resp::ok(req.encoding)
         }
@@ -276,6 +286,8 @@ pub enum Encoding {
 struct Request {
     encoding: Encoding,
     body: Vec<u8>,
+    /// Posted under `Host: host.docker.internal`.
+    container: bool,
 }
 
 enum ReadError {
@@ -360,7 +372,17 @@ fn media_type(v: &str) -> String {
         .to_ascii_lowercase()
 }
 
-/// Whether a `Host` value names this machine's loopback.
+/// The name containers use for the host.
+const CONTAINER_HOST: &str = "host.docker.internal";
+
+/// The host name of a `Host` value, port and brackets dropped, lowercase.
+fn host_name(host: &str) -> String {
+    let h = host.trim().to_ascii_lowercase();
+    h.split_once(':').map(|(n, _)| n.to_string()).unwrap_or(h)
+}
+
+/// Whether a `Host` value names this machine's loopback, or the host as a
+/// container sees it ([`CONTAINER_HOST`]).
 fn host_ok(host: &str) -> bool {
     let h = host.trim().to_ascii_lowercase();
     let name = if let Some(rest) = h.strip_prefix('[') {
@@ -373,7 +395,7 @@ fn host_ok(host: &str) -> bool {
     } else {
         h.split_once(':').map(|(n, _)| n).unwrap_or(&h)
     };
-    name == "localhost" || name == "127.0.0.1"
+    name == "localhost" || name == "127.0.0.1" || name == CONTAINER_HOST
 }
 
 fn read_request<R: BufRead>(
@@ -478,7 +500,7 @@ fn read_request<R: BufRead>(
             encoding,
             403,
             7,
-            "Host must be localhost, 127.0.0.1 or [::1]",
+            "Host must be localhost, 127.0.0.1, [::1] or host.docker.internal",
         ));
     }
     match content_encoding.as_deref() {
@@ -536,7 +558,14 @@ fn read_request<R: BufRead>(
             Err(e) => return Err(io_err(e, encoding)),
         }
     }
-    Ok(Request { encoding, body })
+    let container = host
+        .as_deref()
+        .is_some_and(|h| host_name(h) == CONTAINER_HOST);
+    Ok(Request {
+        encoding,
+        body,
+        container,
+    })
 }
 
 // --------------------------------------------------------------- responses

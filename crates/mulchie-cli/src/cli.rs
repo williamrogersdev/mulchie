@@ -170,6 +170,18 @@ API host over HTTPS, and nothing about this machine. The token is read from stan
 or in any output."
     )]
     Integrations(IntegrationsCommand),
+    /// Endpoints of local apps that send traces to Mulchie, slowest p95 first (needs the engine)
+    #[command(
+        long_about = "With `otel.enabled` on, the engine that holds the lock receives OpenTelemetry \
+traces (OTLP/HTTP, JSON or protobuf, uncompressed) on 127.0.0.1:<otel.port> (4318). Point an app \
+at it with OTEL_EXPORTER_OTLP_ENDPOINT=http://127.0.0.1:4318. This lists each service with its \
+operations over the last minutes (count, errors, p50, p95, p99), their usual p95 and error rate, \
+and where the service runs (workspace, commit, agent session). An endpoint much slower or \
+failing more than usual becomes an `endpoint_slower` or `endpoint_errors` finding. A record \
+only; Mulchie never acts on it.",
+        after_help = "Examples:\n  mulchie config set otel.enabled true\n  mulchie traces\n  mulchie traces --service shop-web --json"
+    )]
+    Traces(TracesArgs),
 
     /// Agent sessions: what each agent and everything it started is using (needs the engine)
     #[command(
@@ -643,6 +655,18 @@ pub struct TimingsArgs {
     /// At most this many runs (1 to 1000)
     #[arg(long, default_value_t = 50, value_parser = clap::value_parser!(u64).range(1..=1000))]
     pub limit: u64,
+    #[command(flatten)]
+    pub out: JsonArg,
+}
+
+#[derive(Args, Debug)]
+pub struct TracesArgs {
+    /// Only this service (its service.name)
+    #[arg(long)]
+    pub service: Option<String>,
+    /// Figures over the last this many minutes (1 to 1440)
+    #[arg(long, default_value_t = 15, value_parser = clap::value_parser!(u64).range(1..=1440))]
+    pub minutes: u64,
     #[command(flatten)]
     pub out: JsonArg,
 }
@@ -1197,6 +1221,20 @@ mod tests {
         assert_eq!(t.limit, 50);
         assert!(t.out.json);
         assert!(parse(&["timings", "--limit", "0"]).is_err());
+    }
+
+    #[test]
+    fn traces_parse() {
+        let Some(Command::Traces(t)) = parse(&["traces", "--service", "shop-web", "--json"])
+            .unwrap()
+            .command
+        else {
+            panic!("traces");
+        };
+        assert_eq!(t.service.as_deref(), Some("shop-web"));
+        assert_eq!(t.minutes, 15);
+        assert!(t.out.json);
+        assert!(parse(&["traces", "--minutes", "0"]).is_err());
     }
 
     #[test]
