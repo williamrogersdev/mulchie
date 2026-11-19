@@ -930,3 +930,54 @@ fn the_app_reads_the_newest_manifest_it_may_install() {
         None
     );
 }
+
+/// The release list as GitHub returns it while every release is a
+/// pre-release and only the newest ones carry `latest.json`: an installed
+/// candidate finds the next one (numerically, so rc.10 beats rc.9), and
+/// then the stable release that follows it.
+#[test]
+fn a_release_candidate_app_finds_the_next_candidate_then_stable() {
+    let base = "https://github.com/williamrogersdev/mulchie/releases/download";
+    let rel = |tag: &str, pre: bool, manifest: bool| {
+        let assets = if manifest {
+            json!([
+                {"name": "SHA256SUMS", "browser_download_url": format!("{base}/{tag}/SHA256SUMS")},
+                {"name": "latest.json", "browser_download_url": format!("{base}/{tag}/latest.json")},
+            ])
+        } else {
+            json!([])
+        };
+        json!({"tag_name": tag, "prerelease": pre, "draft": false, "assets": assets})
+    };
+    let mut list = vec![
+        rel("v0.3.0-rc.7", true, true),
+        rel("v0.3.0-rc.6", true, true),
+        rel("v0.3.0-rc.5", true, true),
+        rel("v0.3.0-rc.4", true, false),
+        rel("v0.3.0-rc.1", true, false),
+    ];
+    let url = |tag: &str| Some(format!("{base}/{tag}/latest.json"));
+    assert_eq!(
+        pick_app_manifest(&json!(list), "0.3.0-rc.6"),
+        url("v0.3.0-rc.7")
+    );
+    assert_eq!(
+        pick_app_manifest(&json!(list), "0.3.0-rc.7"),
+        url("v0.3.0-rc.7")
+    );
+    assert_eq!(pick_app_manifest(&json!(list), "0.2.0"), None);
+
+    list.insert(0, rel("v0.3.0-rc.10", true, true));
+    list.insert(1, rel("v0.3.0-rc.9", true, true));
+    assert_eq!(
+        pick_app_manifest(&json!(list), "0.3.0-rc.7"),
+        url("v0.3.0-rc.10")
+    );
+
+    list.insert(0, rel("v0.3.0", false, true));
+    assert_eq!(
+        pick_app_manifest(&json!(list), "0.3.0-rc.10"),
+        url("v0.3.0")
+    );
+    assert_eq!(pick_app_manifest(&json!(list), "0.2.0"), url("v0.3.0"));
+}
