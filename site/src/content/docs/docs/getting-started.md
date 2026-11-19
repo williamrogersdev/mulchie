@@ -7,13 +7,13 @@ This page takes you from install to a first look at your machine, a first cleanu
 
 ## Install
 
-On a Mac, install the menu bar app, which includes the `mulchie` command:
+On a Mac, [download the app](/download/), drag it to Applications and open it. It includes the `mulchie` command, so that is the whole install. With Homebrew, this does the same and also puts `mulchie` on your `PATH`:
 
 ```sh
 brew install --cask williamrogersdev/tap/mulchie
 ```
 
-Or install only the CLI, on macOS or Linux:
+On Linux or a server, install only the CLI:
 
 ```sh
 brew install williamrogersdev/tap/mulchie-cli
@@ -25,7 +25,7 @@ or with the install script:
 curl -fsSL https://mulchie.com/install.sh | sh
 ```
 
-Each checks the SHA-256 before it installs. Install the app or the CLI, not both. For other ways, including the DMG download, see [Install](/install/). The app needs macOS 12 or later.
+Each checks the SHA-256 before it installs. Install the app or the CLI, not both. For other ways, see [Install](/install/). The app needs macOS 12 or later.
 
 ## First run
 
