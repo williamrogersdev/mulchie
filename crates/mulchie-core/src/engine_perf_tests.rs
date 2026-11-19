@@ -15,6 +15,7 @@ fn safe() -> Config {
     c.memory_guard.action = crate::config::MemoryAction::Off;
     c.runaway.action = crate::config::MemoryAction::Off;
     c.updates.check = crate::config::UpdateCheck::Off;
+    c.webhook = crate::config::WebhookConfig::default();
     c
 }
 

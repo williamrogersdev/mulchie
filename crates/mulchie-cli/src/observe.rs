@@ -507,7 +507,7 @@ pub fn config_show(paths: &Paths, json_out: bool) -> i32 {
             other.note_local("reading the config file");
             let loaded = Config::load_from(paths);
             (
-                serde_json::to_value(&loaded.config).unwrap_or(Value::Null),
+                serde_json::to_value(loaded.config.redacted()).unwrap_or(Value::Null),
                 loaded.error.map(|e| e.to_string()),
                 paths.config_file().display().to_string(),
                 "file",
@@ -562,6 +562,13 @@ pub fn set_key(cfg: &Value, key: &str, raw: &str) -> Result<Value, String> {
         return Err(unknown());
     };
     obj.insert(parts[parts.len() - 1].to_string(), value.clone());
+    // The webhook URL may hold a secret: errors show it redacted.
+    let shown = if key == "webhook.url" {
+        mulchie_core::webhook::redact_url(raw)
+    } else {
+        raw.to_string()
+    };
+    let raw = shown.as_str();
     let parsed: Config = serde_json::from_value(new.clone())
         .map_err(|e| format!("{key} = {raw} does not fit: {e}"))?;
     // A key neither the engine's config nor this build knows is a typo.
@@ -750,7 +757,7 @@ fn config_set_with(
                 match engine.patch_config(&merge_patch(key, &edited)) {
                     Ok(cfg) => {
                         done = Some((
-                            serde_json::to_value(&cfg).unwrap_or(Value::Null),
+                            serde_json::to_value(cfg.redacted()).unwrap_or(Value::Null),
                             "in the file (no engine is running; it applies when one starts)"
                                 .to_string(),
                         ))

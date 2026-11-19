@@ -61,6 +61,7 @@ pub fn safe_test_config(paths: &Paths) -> mulchie_core::LoadedConfig {
     cfg.integrations.sentry.enabled = false;
     cfg.integrations.posthog.enabled = false;
     cfg.otel.enabled = false;
+    cfg.webhook = mulchie_core::config::WebhookConfig::default();
     cfg.save_to(paths, 0).expect("write the test config");
     let loaded = Config::load_from(paths);
     assert!(loaded.error.is_none(), "{:?}", loaded.error);

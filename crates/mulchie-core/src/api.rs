@@ -115,6 +115,8 @@ pub const ROUTES: &[(&str, &str)] = &[
     ("POST", "/v1/integrations/check"),
     ("GET", "/v1/deploys"),
     ("GET", "/v1/otel"),
+    ("GET", "/v1/webhook"),
+    ("POST", "/v1/webhook/test"),
 ];
 
 // ------------------------------------------------------------------ token
@@ -1553,6 +1555,11 @@ fn route(req: &Req, engine: &Engine, read_only: bool) -> Resp {
                 let service = query_text(req, "service")?;
                 ok(&engine.otel_report(service.as_deref(), minutes))
             }
+            ("GET", "/v1/webhook") => ok(&engine.webhook_status()),
+            ("POST", "/v1/webhook/test") => match engine.webhook_test() {
+                Ok(status) => ok(&serde_json::json!({ "ok": true, "status": status })),
+                Err((http, code, m)) => fail(http, code, m),
+            },
             ("GET", "/v1/updates") => ok(&engine.updates_status(true)),
             ("POST", "/v1/updates/check") => match engine.request_update_check() {
                 Ok(()) => ok(&serde_json::json!({ "ok": true, "queued": true })),
@@ -1561,7 +1568,7 @@ fn route(req: &Req, engine: &Engine, read_only: bool) -> Resp {
             ("GET", "/v1/config") => {
                 let (config, revision) = engine.config_and_revision();
                 ok(&serde_json::json!({
-                    "config": config,
+                    "config": config.redacted(),
                     "revision": revision,
                     "config_error": engine.config_error(),
                     "path": engine.paths().config_file(),
@@ -1585,7 +1592,7 @@ fn route(req: &Req, engine: &Engine, read_only: bool) -> Resp {
                 match engine.set_config_if(cfg, if_revision(req).as_deref()) {
                     Ok(revision) => ok(&serde_json::json!({
                         "ok": true,
-                        "config": engine.config(),
+                        "config": engine.config().redacted(),
                         "revision": revision,
                     })),
                     Err(e @ crate::config::ConfigError::Changed(_)) => {
@@ -1602,7 +1609,7 @@ fn route(req: &Req, engine: &Engine, read_only: bool) -> Resp {
                 match engine.patch_config_if(&patch, if_revision(req).as_deref()) {
                     Ok((cfg, revision)) => ok(&serde_json::json!({
                         "ok": true,
-                        "config": cfg,
+                        "config": cfg.redacted(),
                         "revision": revision,
                     })),
                     Err(e @ crate::config::ConfigError::UnknownKey(_)) => {
@@ -1877,3 +1884,7 @@ mod tests;
 #[cfg(test)]
 #[path = "api_integrations_tests.rs"]
 mod integrations_tests;
+
+#[cfg(test)]
+#[path = "api_webhook_tests.rs"]
+mod webhook_tests;

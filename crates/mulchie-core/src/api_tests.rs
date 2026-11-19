@@ -339,8 +339,10 @@ fn every_route_but_health_needs_the_token() {
                 assert_eq!(code, 200, "{method} {path} {label}");
                 assert_eq!(v["name"], "mulchie");
             } else if label == "good" {
-                // Integrations are off by default, so a check is refused.
-                let off = *path == "/v1/integrations/check" && v["code"] == "integrations_off";
+                // Integrations and the webhook are off by default, so a
+                // check or a test is refused.
+                let off = (*path == "/v1/integrations/check" && v["code"] == "integrations_off")
+                    || (*path == "/v1/webhook/test" && v["code"] == "webhook_off");
                 assert!(
                     code == 200 || code == 400 || (code == 409 && off),
                     "{method} {path} {label}: {code} {v}"

@@ -63,6 +63,9 @@ pub struct Config {
     /// The local OpenTelemetry trace receiver and its `endpoint_slower` and
     /// `endpoint_errors` findings. Off by default.
     pub otel: OtelConfig,
+    /// Where issue events are posted ([`crate::webhook`]). Off while
+    /// `url` is empty, the default.
+    pub webhook: WebhookConfig,
 }
 
 /// A finding id kept quiet until `until_unix` (`None`: until undismissed).
@@ -204,6 +207,7 @@ impl Default for Config {
             perf: PerfConfig::default(),
             integrations: IntegrationsConfig::default(),
             otel: OtelConfig::default(),
+            webhook: WebhookConfig::default(),
         }
     }
 }
@@ -1077,6 +1081,53 @@ impl IntegrationsConfig {
     }
 }
 
+// ------------------------------------------------------------ webhook
+
+/// `webhook`: post issue events to a URL (a Slack incoming webhook, or a
+/// script of your own). Off while `url` is empty, the default. The URL is
+/// shown only redacted ([`crate::webhook::redact_url`]).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(default)]
+pub struct WebhookConfig {
+    /// `https://` to any host, or `http://` to a loopback address. Empty:
+    /// nothing is sent.
+    pub url: String,
+    /// Which events are sent: `new_issue`, `regressed`, `resolved_by_user`.
+    pub events: Vec<crate::webhook::WebhookEvent>,
+    /// Issues below this severity are not sent.
+    pub min_severity: crate::consumers::Severity,
+    /// `json` (the payload) or `slack` (`{"text": ...}`).
+    pub format: crate::webhook::WebhookFormat,
+    /// Add this machine's host name to each event.
+    pub include_host: bool,
+}
+
+impl Default for WebhookConfig {
+    fn default() -> Self {
+        Self {
+            url: String::new(),
+            events: vec![
+                crate::webhook::WebhookEvent::NewIssue,
+                crate::webhook::WebhookEvent::Regressed,
+            ],
+            min_severity: crate::consumers::Severity::Medium,
+            format: crate::webhook::WebhookFormat::Json,
+            include_host: false,
+        }
+    }
+}
+
+impl WebhookConfig {
+    pub fn validate(&self, e: &mut Vec<String>) {
+        if let Some(p) = crate::webhook::url_problem(&self.url) {
+            e.push(p);
+        }
+        if self.events.contains(&crate::webhook::WebhookEvent::Test) {
+            e.push("webhook.events may name new_issue, regressed and resolved_by_user".into());
+        }
+    }
+}
+
 /// Scan roots used when the config names none.
 pub fn default_scan_roots(home: &Path) -> Vec<PathBuf> {
     let mut roots: Vec<PathBuf> = [
@@ -1241,6 +1292,7 @@ impl Config {
         self.perf.validate(&mut e);
         self.integrations.validate(&mut e);
         self.otel.validate(&mut e);
+        self.webhook.validate(&mut e);
         if self.otel.port != 0 && self.otel.port == self.api_port {
             e.push("otel.port must differ from api_port".into());
         }
@@ -1311,6 +1363,14 @@ impl Config {
     /// content survives, then the new file is written.
     pub fn save_to(&self, paths: &Paths, now: u64) -> Result<(), ConfigError> {
         self.validate().map_err(ConfigError::Invalid)?;
+        // A redacted URL stands for the saved one; written as it is, it
+        // would replace that with a value that can never be posted to.
+        if crate::webhook::is_redacted(&self.webhook.url) {
+            return Err(ConfigError::Invalid(vec![format!(
+                "webhook.url is {}, a redacted value; send the full URL",
+                self.webhook.url
+            )]));
+        }
         let mut cfg = self.clone();
         cfg.version = CONFIG_VERSION;
         let path = paths.config_file();
@@ -1327,6 +1387,15 @@ impl Config {
         }
         let data = serde_json::to_vec_pretty(&cfg).map_err(|e| ConfigError::Io(e.to_string()))?;
         write_atomic(&path, &data, 0o600).map_err(|e| ConfigError::Io(e.to_string()))
+    }
+
+    /// This config as Mulchie shows it: the webhook URL redacted
+    /// ([`crate::webhook::redact_url`]). Sent back in a write, the redacted
+    /// URL keeps the saved one.
+    pub fn redacted(&self) -> Self {
+        let mut c = self.clone();
+        c.webhook.url = crate::webhook::redact_url(&c.webhook.url);
+        c
     }
 
     /// Load from the environment's config path. Entry points only.

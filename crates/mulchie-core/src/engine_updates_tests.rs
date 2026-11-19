@@ -65,6 +65,7 @@ fn off_checks_nothing_and_clears_findings() {
     assert_eq!(e.updates_available(), 1);
     let mut c = e.config();
     c.updates.check = crate::config::UpdateCheck::Off;
+    c.webhook = crate::config::WebhookConfig::default();
     e.set_config(c).unwrap();
     assert_eq!(e.request_update_check().unwrap_err().0, "updates_off");
     e.update_tick(u64::MAX / 2);

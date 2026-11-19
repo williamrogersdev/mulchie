@@ -68,9 +68,9 @@ Requests are capped at 8 KB per line, 64 KB of headers and a 1 MB body. The serv
 | POST | `/v1/issues/resolve` | Mark an issue resolved (`{"id"}`). |
 | POST | `/v1/issues/ignore` | Ignore an issue (`{"id"}`). |
 | POST | `/v1/issues/reopen` | Mark an issue open again (`{"id"}`). |
-| GET | `/v1/config` | The config in use, why the file was not used (if so), and its path. |
-| PUT | `/v1/config` | Replace the config (`{"config": {...}}`). Full token only. |
-| PATCH | `/v1/config` | Change some keys with a JSON merge patch. Full token only. |
+| GET | `/v1/config` | The config in use, why the file was not used (if so), and its path. `webhook.url` is shown redacted (`https://hooks.slack.com/[redacted]`), here and in `/v1/state`. |
+| PUT | `/v1/config` | Replace the config (`{"config": {...}}`). Full token only. A `webhook.url` sent back as `GET` showed it keeps the saved URL. |
+| PATCH | `/v1/config` | Change some keys with a JSON merge patch. Full token only. A patch that leaves out `webhook.url`, or sends its redacted form, keeps it. |
 | GET | `/v1/sessions` | Agent sessions, running first. |
 | GET | `/v1/sessions/{id}` | One session with its processes, breaches and paused processes. |
 | GET | `/v1/sessions/{id}/events` | The session's activity record. Query: `since`, `limit`, or `tail` and `before` to read backwards. |
@@ -81,6 +81,8 @@ Requests are capped at 8 KB per line, 64 KB of headers and a 1 MB body. The serv
 | POST | `/v1/updates/check` | Ask for an update check now. Full token only. 409 `updates_off` when checks are off. |
 | GET | `/v1/integrations` | Each [connected provider](/docs/integrations/): on or off, host, project, whether a token file is in place (never the token), the last poll and its error in words. |
 | POST | `/v1/integrations/check` | Poll every enabled provider now. Full token only. 409 `integrations_off` when none is on, `no_network` in a build without network support, `too_soon` within a minute of the last poll. |
+| GET | `/v1/webhook` | The [issue webhook](/docs/watch/#sending-issues-to-slack-or-a-script): its settings with the URL redacted, whether this engine sends, and how many events were sent, failed, dropped and queued, with the last error. |
+| POST | `/v1/webhook/test` | Post one test event to `webhook.url` now and answer with its HTTP status. Full token only. 409 `webhook_off` when no URL is set, `no_network` in a build without network support, `not_lock_holder` on an engine that does not send; 502 `webhook_failed` when it did not answer with a 2xx. |
 | GET | `/v1/deploys` | Recent deploys of the enabled providers, newest first, with their numbers and the commits in each with the agent session behind it. Query: `provider`. |
 | GET | `/v1/feedback` | Feedback reports, newest first (`limit`, default 50). |
 | POST | `/v1/feedback` | Save a report about Mulchie or the machine (`summary`, and optionally `category`, `severity`, `details`, `tool`, `client`, `cwd`). It goes to `feedback.jsonl` in the config directory with the machine's state. Nothing is sent anywhere. |

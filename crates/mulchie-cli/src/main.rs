@@ -24,6 +24,7 @@ mod sessions;
 mod slots;
 mod timings;
 mod traces;
+mod webhook;
 
 use clap::{CommandFactory, Parser};
 use cli::{Cli, Command, ConfigCommand, HooksCommand, McpCommand};
@@ -178,6 +179,10 @@ fn dispatch(paths: &Paths, cmd: Command) -> i32 {
             ),
         },
         Command::Integrations(c) => integrations::command(paths, c),
+        Command::Webhook(w) => match &w.action {
+            Some(cli::WebhookCommand::Test { out }) => webhook::test(paths, out.json),
+            None => webhook::status(paths, w.out.json),
+        },
         Command::Timings(t) => timings::list(
             paths,
             t.workspace.as_deref(),
