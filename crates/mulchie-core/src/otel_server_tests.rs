@@ -57,6 +57,15 @@ fn post(srv: &Server, ctype: &str, extra: &str, body: &[u8]) -> (u16, String, Ve
     )
     .into_bytes();
     req.extend_from_slice(body);
+    // A 503 means the last request's thread had not let go of its slot yet
+    // (it drains after answering); a busy test machine sees that.
+    for _ in 0..50 {
+        let r = raw(srv, &req);
+        if r.0 != 503 {
+            return r;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
     raw(srv, &req)
 }
 
