@@ -232,6 +232,8 @@ pub struct TrayInfo {
     /// Below the alert threshold; `None` in client mode, where the engine that
     /// runs the service sends its own notifications.
     pub low_disk: Option<bool>,
+    /// Unresolved issues that are current now; `None` when unknown.
+    pub issues_active: Option<u64>,
 }
 
 impl TrayInfo {
@@ -245,6 +247,7 @@ impl TrayInfo {
             agents: v["agents"].as_u64().unwrap_or(0),
             builds: v["builds"].as_u64().unwrap_or(0),
             low_disk: None,
+            issues_active: None,
         }
     }
 }
@@ -300,6 +303,8 @@ struct Inner {
     auth_checked: Option<Instant>,
     /// The remote engine's `/v1/health`, as `tick` fetched it.
     health: Option<(Instant, Value)>,
+    /// A remote engine's count of active issues and when it was read.
+    issues_active: Option<(Instant, u64)>,
 }
 
 /// How often `tick` checks a remote engine with an authenticated call. In
@@ -308,6 +313,8 @@ struct Inner {
 pub const AUTH_CHECK_EVERY: Duration = Duration::from_secs(30);
 /// How old a health reading `tray_info` reuses at most.
 const HEALTH_REUSE: Duration = Duration::from_secs(2);
+/// How old a count of a remote engine's active issues the tray reuses.
+const ISSUES_REUSE: Duration = Duration::from_secs(15);
 
 pub struct Backend {
     paths: Paths,
@@ -334,6 +341,16 @@ pub fn failure_kind(e: &ApiError) -> Option<bool> {
         (0, _) => Some(false),
         (401, _) => Some(true),
         _ => None,
+    }
+}
+
+/// An issue change that failed, in words. `not_lock_holder` is the common one:
+/// another Mulchie engine keeps the issues.
+pub fn issue_error(code: &str, message: &str) -> String {
+    match code {
+        "not_lock_holder" => "Not changed: another Mulchie engine holds the engine lock and keeps the issues, so this one cannot change them. Change the issue from that engine (the Mulchie that runs as the service), or quit the other engines and let this app take over.".into(),
+        "not_found" => "That issue is no longer in the list; it may have aged out. The list will refresh.".into(),
+        _ => message.to_string(),
     }
 }
 
@@ -371,6 +388,7 @@ impl Backend {
                 fails: 0,
                 auth_checked: None,
                 health: None,
+                issues_active: None,
             }),
             plans: Mutex::new(PlanBook::default()),
         };
@@ -681,6 +699,7 @@ impl Backend {
                 let mut t = TrayInfo::from_health(&to_value(&e.health_summary())?);
                 t.low_disk =
                     Some(t.disk_total > 0 && t.disk_free < alert.saturating_mul(1_000_000_000));
+                t.issues_active = Some(e.issues(None, false, None).counts.active as u64);
                 Ok(t)
             }
             Conn::Remote(c) => {
@@ -694,9 +713,30 @@ impl Backend {
                     Some(v) => v,
                     None => self.remote(&c, "GET", "/v1/health", None)?,
                 };
-                Ok(TrayInfo::from_health(&h))
+                let mut t = TrayInfo::from_health(&h);
+                t.issues_active = self.remote_issues_active(&c);
+                Ok(t)
             }
             Conn::Down => Err(self.down_error()),
+        }
+    }
+
+    /// A remote engine's active issues: asked for at most every
+    /// [`ISSUES_REUSE`], and the last answer kept when asking fails.
+    fn remote_issues_active(&self, c: &Client) -> Option<u64> {
+        let last = guard(&self.inner).issues_active;
+        if let Some((t, n)) = last {
+            if t.elapsed() <= ISSUES_REUSE {
+                return Some(n);
+            }
+        }
+        match self.remote(c, "GET", "/v1/issues", None) {
+            Ok(v) => {
+                let n = v["counts"]["active"].as_u64()?;
+                guard(&self.inner).issues_active = Some((Instant::now(), n));
+                Some(n)
+            }
+            Err(_) => last.map(|(_, n)| n),
         }
     }
 
@@ -927,6 +967,151 @@ impl Backend {
                 )?;
                 Ok(v["was_dismissed"].as_bool().unwrap_or(false))
             }
+            Conn::Down => Err(self.down_error()),
+        }
+    }
+
+    // -------------------------------------------------- issues and performance
+
+    /// Issues: `{issues, counts}`. `status` is `open`, `regressed`,
+    /// `resolved`, `ignored` or `all` (unresolved ones when absent); `kind`
+    /// is a finding kind.
+    pub fn issues(&self, status: Option<&str>, kind: Option<&str>) -> Result<Value, String> {
+        for (what, v) in [("status", status), ("kind", kind)] {
+            if let Some(v) = v {
+                if v.is_empty() || !v.bytes().all(|c| c.is_ascii_lowercase() || c == b'_') {
+                    return Err(format!("unknown issue {what} {v:?}"));
+                }
+            }
+        }
+        match self.conn() {
+            Conn::Local(e) => {
+                let all = status == Some("all");
+                let status = match status {
+                    Some(s) if !all => Some(
+                        from_value(Value::String(s.into()))
+                            .map_err(|_| format!("unknown issue status {s:?}"))?,
+                    ),
+                    _ => None,
+                };
+                let kind = match kind {
+                    Some(k) => Some(
+                        from_value(Value::String(k.into()))
+                            .map_err(|_| format!("unknown finding kind {k:?}"))?,
+                    ),
+                    None => None,
+                };
+                to_value(&e.issues(status, all, kind))
+            }
+            Conn::Remote(c) => {
+                let mut q = Vec::new();
+                if let Some(s) = status {
+                    q.push(format!("status={s}"));
+                }
+                if let Some(k) = kind {
+                    q.push(format!("kind={k}"));
+                }
+                let path = if q.is_empty() {
+                    "/v1/issues".to_string()
+                } else {
+                    format!("/v1/issues?{}", q.join("&"))
+                };
+                self.remote(&c, "GET", &path, None)
+            }
+            Conn::Down => Err(self.down_error()),
+        }
+    }
+
+    /// Mark issue `id` `resolve`d, `ignore`d or `reopen`ed; returns the issue.
+    /// Only the engine that holds the lock keeps the issues, so a refusal
+    /// for that is told in words.
+    pub fn set_issue_status(&self, id: &str, action: &str) -> Result<Value, String> {
+        let status = match action {
+            "resolve" => mulchie_core::issues::IssueStatus::Resolved,
+            "ignore" => mulchie_core::issues::IssueStatus::Ignored,
+            "reopen" => mulchie_core::issues::IssueStatus::Open,
+            _ => return Err(format!("unknown issue action {action:?}")),
+        };
+        match self.conn() {
+            Conn::Local(e) => e
+                .set_issue_status(id, status)
+                .map_err(|(code, m)| issue_error(code, &m))
+                .and_then(|i| to_value(&i)),
+            Conn::Remote(c) => {
+                let route = format!("/v1/issues/{action}");
+                match c.request(
+                    "POST",
+                    &route,
+                    Some(&json!({ "id": id })),
+                    api::timeout_for("POST", &route),
+                ) {
+                    Ok(v) => {
+                        self.note_ok();
+                        Ok(v["issue"].clone())
+                    }
+                    Err(e) => {
+                        self.note_failure(&e);
+                        Err(issue_error(&e.code, &e.message))
+                    }
+                }
+            }
+            Conn::Down => Err(self.down_error()),
+        }
+    }
+
+    /// `GET /v1/timings`: `{total, timings}`, newest first.
+    pub fn timings(&self, limit: usize) -> Result<Value, String> {
+        match self.conn() {
+            Conn::Local(e) => to_value(&e.timings(None, None, limit)),
+            Conn::Remote(c) => self.remote(&c, "GET", &format!("/v1/timings?limit={limit}"), None),
+            Conn::Down => Err(self.down_error()),
+        }
+    }
+
+    /// `GET /v1/commits`: `{total, commits}`, newest first.
+    pub fn commits(&self, limit: usize) -> Result<Value, String> {
+        match self.conn() {
+            Conn::Local(e) => to_value(&e.commits(None, None, limit)),
+            Conn::Remote(c) => self.remote(&c, "GET", &format!("/v1/commits?limit={limit}"), None),
+            Conn::Down => Err(self.down_error()),
+        }
+    }
+
+    /// `GET /v1/devservers`: dev server runs, newest first.
+    pub fn devservers(&self, limit: usize) -> Result<Value, String> {
+        match self.conn() {
+            Conn::Local(e) => to_value(&e.dev_servers(None, limit)),
+            Conn::Remote(c) => {
+                self.remote(&c, "GET", &format!("/v1/devservers?limit={limit}"), None)
+            }
+            Conn::Down => Err(self.down_error()),
+        }
+    }
+
+    /// `GET /v1/otel`: the trace receiver and its services' endpoints over
+    /// the last `minutes`.
+    pub fn otel(&self, minutes: u64) -> Result<Value, String> {
+        match self.conn() {
+            Conn::Local(e) => to_value(&e.otel_report(None, minutes)),
+            Conn::Remote(c) => self.remote(&c, "GET", &format!("/v1/otel?minutes={minutes}"), None),
+            Conn::Down => Err(self.down_error()),
+        }
+    }
+
+    /// `GET /v1/deploys`: recent deploys of the connected providers.
+    pub fn deploys(&self) -> Result<Value, String> {
+        match self.conn() {
+            Conn::Local(e) => to_value(&e.deploys(None)),
+            Conn::Remote(c) => self.remote(&c, "GET", "/v1/deploys", None),
+            Conn::Down => Err(self.down_error()),
+        }
+    }
+
+    /// `GET /v1/integrations`: the connected providers and their last polls.
+    pub fn integrations(&self) -> Result<Value, String> {
+        match self.conn() {
+            Conn::Local(e) => to_value(&e.integrations_status()),
+            Conn::Remote(c) => self.remote(&c, "GET", "/v1/integrations", None),
             Conn::Down => Err(self.down_error()),
         }
     }

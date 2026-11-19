@@ -29,6 +29,10 @@ export function renderTop() {
   $('#nSess').textContent = S.sessions?.running || '';
   $('#nDisk').textContent = S.diskmap ? B(S.diskmap.worktree_bytes, 0) : '';
   $('#nAct').textContent = S.actions_count || '';
+  // Issues that are current now (unresolved, with a finding for them); the
+  // performance findings are the ones in the list.
+  $('#nIssues').textContent = S.issue_counts?.active || '';
+  $('#nPerf').textContent = (S.findings || []).filter(f => f.category === 'performance' && !f.dismissed).length || '';
   $('#ver').textContent = 'v' + S.version;
   $('#scanInfo').textContent = S.scanning ? 'scanning disk…' : S.diskmap ? `disk scanned ${ago(S.diskmap.at_unix)} ago` : '';
 }

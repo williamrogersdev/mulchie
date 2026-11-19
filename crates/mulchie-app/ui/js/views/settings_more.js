@@ -40,10 +40,10 @@ const RULES = [
   ['runaway_repeat', 'Runaway command again', 'Running again, in the same folder, a command Mulchie just saw starting itself over and over.'],
 ];
 
-const dirty = { lim: false, guard: false, upd: false };
+const dirty = { lim: false, guard: false, upd: false, perf: false };
 // Per card: the config revision and editability the form was drawn from,
 // the config as it was then, and the form's own reading of it.
-const drawn = { lim: null, guard: null, upd: null };
+const drawn = { lim: null, guard: null, upd: null, perf: null };
 let lstat = null, lstatAt = 0, lstatErr = null, lstatBusy = false;
 
 // --------------------------------------------------------------- helpers
@@ -56,6 +56,8 @@ const RANGE = {
   sustain_secs: [0, 86400], resume_after_secs: [10, 86400], stop_grace_secs: [1, 300],
   hog_share_pct: [10, 100], hog_sustain_secs: [10, 3600], interval_hours: [6, 720],
   runaway_depth: [3, 64], runaway_remember_secs: [0, 604800],
+  port: [0, 65535], min_slowdown_ms: [0, 3600000], min_requests: [1, 1000000],
+  baseline_runs: [3, 100], slow_runs: [1, 20], min_slowdown_secs: [0, 86400], head_check_secs: [10, 3600],
 };
 
 // A whole number in a range, or an error for that field.
@@ -116,7 +118,7 @@ function showErrors(card, message, extra) {
   top.textContent = '';
   const parts = String(message).replace(/^config has invalid values: /, '').split('; ');
   for (const part of parts) {
-    const key = (/((?:limits|memory_guard|runaway|guard|updates|sessions)(?:\.[a-z_]+|\[\d+\])+)/.exec(part) || [])[1];
+    const key = (/((?:limits|memory_guard|runaway|guard|updates|sessions|perf|otel)(?:\.[a-z_]+|\[\d+\])+)/.exec(part) || [])[1];
     let placed = false;
     if (key) {
       const [block, rest] = blockOf(card, key);
@@ -441,12 +443,65 @@ function updatesStatusHtml() {
     ${u.errors?.length ? `<div class="warn">${u.errors.map(esc).join('<br>')}</div>` : ''}`;
 }
 
+// ------------------------------------------------- performance and traces
+
+function perfForm(c) {
+  const p = c.perf || {}, o = c.otel || {};
+  return `<p class="why-s">These settings decide when the Performance view and the findings call something slower than usual. Everything here only reports; nothing acts on a slow build, endpoint or server.</p>
+    <h3 class="form-h">Traces from apps in local development</h3>
+    <label class="chk"><input type="checkbox" data-k="otel.enabled" ${o.enabled ? 'checked' : ''}> Receive OpenTelemetry traces</label>
+    <div class="dim">Off by default. When on, the engine listens on this machine only (127.0.0.1) for traces that apps send with OTLP over HTTP, and keeps p50, p95 and p99 per endpoint for 24 hours. It starts and stops when you save this.</div>
+    <div class="row2">
+      <label>Port ${numIn('data-k="otel.port"', o.port ?? 4318, 'Trace receiver port', '1', RANGE.port)}</label>
+      <span class="dim">0 picks a free port. It must differ from the API port.</span>
+    </div>${ferr('otel.port')}
+    <div class="row2">
+      <label>An endpoint is slower only if it is also this many ms above usual ${numIn('data-k="otel.min_slowdown_ms"', o.min_slowdown_ms ?? 100, 'Milliseconds above usual before an endpoint counts as slower', '1', RANGE.min_slowdown_ms)}</label>
+      <label>and had at least this many requests ${numIn('data-k="otel.min_requests"', o.min_requests ?? 20, 'Requests needed before an endpoint is judged', '1', RANGE.min_requests)}</label>
+    </div>${ferr('otel.min_slowdown_ms')}${ferr('otel.min_requests')}
+    <h3 class="form-h">When something counts as slower</h3>
+    <div class="row2">
+      <label>Slower than usual means more than ${numIn('data-k="perf.slower_ratio"', p.slower_ratio ?? 1.5, 'Times the usual figure', 'any', [1.05, 100])} × the usual</label>
+      <label>and at least this many seconds longer (builds) ${numIn('data-k="perf.min_slowdown_secs"', p.min_slowdown_secs ?? 30, 'Seconds longer than usual for a build', '1', RANGE.min_slowdown_secs)}</label>
+    </div>${ferr('perf.slower_ratio')}${ferr('perf.min_slowdown_secs')}
+    <div class="row2">
+      <label>The usual is the median of up to this many earlier runs ${numIn('data-k="perf.baseline_runs"', p.baseline_runs ?? 10, 'Runs the usual figure is taken from', '1', RANGE.baseline_runs)}</label>
+      <label>and this many latest runs must each be slower ${numIn('data-k="perf.slow_runs"', p.slow_runs ?? 3, 'Latest runs that must each be slower', '1', RANGE.slow_runs)}</label>
+    </div>${ferr('perf.baseline_runs')}${ferr('perf.slow_runs')}
+    <div class="row2">
+      <label>Read each active workspace's HEAD every (seconds) ${numIn('data-k="perf.head_check_secs"', p.head_check_secs ?? 60, 'Seconds between HEAD checks', '1', RANGE.head_check_secs)}</label>
+      <span class="dim">This is how a slowdown is tied to commits and agent sessions.</span>
+    </div>${ferr('perf.head_check_secs')}`;
+}
+
+function readPerf(card) {
+  const q = k => card.querySelector(`[data-k="${k}"]`), errors = [];
+  const int = (k, label) => intIn(q(k).value, RANGE[k.split('.')[1]], label, errors, k);
+  const otel = {
+    enabled: q('otel.enabled').checked,
+    port: int('otel.port', 'Port'),
+    min_slowdown_ms: int('otel.min_slowdown_ms', 'Milliseconds above usual'),
+    min_requests: int('otel.min_requests', 'Requests'),
+  };
+  const ratio = Number(q('perf.slower_ratio').value.trim());
+  if (q('perf.slower_ratio').value.trim() === '' || !Number.isFinite(ratio) || ratio < 1.05 || ratio > 100) errors.push(['perf.slower_ratio', 'Times the usual: between 1.05 and 100']);
+  const perf = {
+    slower_ratio: ratio,
+    min_slowdown_secs: int('perf.min_slowdown_secs', 'Seconds longer'),
+    baseline_runs: int('perf.baseline_runs', 'Runs for the usual'),
+    slow_runs: int('perf.slow_runs', 'Latest runs'),
+    head_check_secs: int('perf.head_check_secs', 'HEAD check interval'),
+  };
+  return { errors, patch: { otel, perf } };
+}
+
 // ---------------------------------------------------------------- render
 
 const CARDS = [
   ['lim', 'Limits for agent sessions', limitsForm, readLimits, 'limits'],
   ['guard', 'Command guard', guardForm, readGuard, 'guard'],
   ['upd', 'Update checks', updatesForm, readUpdates, 'updates'],
+  ['perf', 'Performance and traces', perfForm, readPerf, 'perf and otel'],
 ];
 
 export { setHtml };

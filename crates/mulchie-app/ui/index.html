@@ -42,6 +42,8 @@
     <a role="button" tabindex="0" data-v="processes"><span class="nl"><span class="kt-g process" aria-hidden="true"></span>Processes</span> <span class="count" id="nProc"></span></a>
     <a role="button" tabindex="0" data-v="disk">Disk <span class="count" id="nDisk"></span></a>
     <a role="button" tabindex="0" data-v="activity">Activity <span class="count" id="nAct"></span></a>
+    <a role="button" tabindex="0" data-v="issues">Issues <span class="count" id="nIssues"></span></a>
+    <a role="button" tabindex="0" data-v="performance">Performance <span class="count" id="nPerf"></span></a>
     <a role="button" tabindex="0" data-v="agents">Agent API</a>
     <a role="button" tabindex="0" data-v="settings">Settings</a>
     <div class="grow"></div>
@@ -174,6 +176,22 @@
         <span class="dim c-md">last 500 actions, newest first; click one for details and backups</span>
       </div>
       <div class="tbl-wrap"><table id="acts"></table></div>
+    </section>
+
+    <section class="view fill" id="v-issues">
+      <div class="toolbar">
+        <div class="seg" id="iSeg"><button data-f="">Unresolved</button><button data-f="open">Open</button><button data-f="regressed">Regressed</button><button data-f="resolved">Resolved</button><button data-f="ignored">Ignored</button><button data-f="all">All</button></div>
+        <div class="sp"></div>
+        <span class="dim" id="iCount"></span>
+      </div>
+      <div class="notices" id="iNote"></div>
+      <div class="tbl-wrap"><table id="issues" aria-label="Issues"></table></div>
+      <div class="dim" style="margin-top:8px">An issue groups findings about the same problem across processes and restarts: how often it came back, and since when. It is a record; Mulchie never acts on one. Resolve an issue you fixed and Mulchie shows it as regressed if it comes back.</div>
+    </section>
+
+    <section class="view" id="v-performance">
+      <div class="card"><div class="chead"><h3>Performance findings</h3><span class="dim" id="perfCount"></span></div><div id="perfFindings"></div></div>
+      <div class="grid g2 g2-wide" style="margin-top:10px" id="perfLists"></div>
     </section>
 
     <section class="view" id="v-agents">

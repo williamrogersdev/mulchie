@@ -4,7 +4,7 @@ Mulchie keeps a machine healthy while several AI coding agents work on it. With 
 
 Mulchie is a supervisor. It is not a sandbox and not an antivirus: an agent that wants to get around it can.
 
-It ships three ways: the `mulchie` command, a macOS menu bar app with a dashboard, and an MCP server (`mulchie mcp`). The engine also serves a local HTTP API for scripts.
+It ships three ways: the `mulchie` command, a macOS menu bar app with a dashboard (including Issues and Performance pages), and an MCP server (`mulchie mcp`). The engine also serves a local HTTP API for scripts.
 
 Full documentation is at [mulchie.com/docs](https://mulchie.com/docs/).
 

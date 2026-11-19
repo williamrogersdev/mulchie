@@ -113,6 +113,8 @@ An update finding never installs anything. It names the command you can run.
 | `dev_server_slow_start` | A dev server's latest runs each took much longer than usual to start listening. The title says the command, the workspace and both times; the evidence names the commits in between and the sessions that made them. Only raised when the usual time is longer than the watch interval can resolve. See [Dev servers](#dev-servers). | low; medium at twice the usual time or more |
 | `dev_server_heavier` | A dev server's latest runs each settled at much more memory than usual. Same evidence as `dev_server_slow_start`. See [Dev servers](#dev-servers). | low; medium at twice the usual memory or more |
 
+The dashboard's **Performance** page shows the performance findings with their evidence, including each commit between the usual and the slow figures and the agent session that made it, and then short lists of recent build and test timings, endpoints from traces, dev server runs and production deploys. It reads the same data as `GET /v1/timings`, `/v1/otel`, `/v1/devservers`, `/v1/deploys` and `/v1/integrations`. The thresholds (`perf.*`) and the trace receiver (`otel.enabled`, `otel.port`) are under **Settings › Performance and traces**.
+
 ## Slower builds
 
 Every command run with `mulchie run`, and every build slot an agent releases with a duration, is recorded as a timing: how long it ran, its exit status, the command (redacted), the workspace, branch and commit, and the agent session. `mulchie timings` lists them, and agents use `list_timings`.
@@ -172,7 +174,7 @@ A finding lasts as long as its cause: a finding about a process ends when the pr
 - An issue is `open` until you decide. `resolved` means you fixed it: if it appears again it becomes `regressed`, and the journal and, with notifications on, a notification say so. `ignored` keeps counting it but never reports it.
 - Issues are kept in `issues.json` in the config directory (readable only by you) for 90 days after they were last seen, at most 500. Only the engine that holds the lock writes it.
 
-`mulchie issues` lists them, `diagnose` names the ones that came back three times or more, and agents use `list_issues`. An issue is a record: Mulchie never acts because of one.
+`mulchie issues` lists them, `diagnose` names the ones that came back three times or more, and agents use `list_issues`. In the app, the dashboard's **Issues** page lists the unresolved ones (those a finding is about right now are marked), with a filter for open, regressed, resolved and ignored, and each row's title, kind, culprit, workspace, how often it occurred, when it was first and last seen and how many times it came back. **Resolve**, **Ignore** and **Reopen** change the record; if another engine holds the lock, the app says it cannot change issues from here. The count of issues that are current now is shown next to Issues in the sidebar, in the menu bar panel and in the menu bar icon's tooltip. An issue is a record: Mulchie never acts because of one.
 
 ## Turning the watch off
 

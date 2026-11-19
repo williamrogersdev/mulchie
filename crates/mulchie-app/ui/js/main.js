@@ -11,6 +11,8 @@ import { renderApps } from './views/apps.js';
 import { renderSessions, endSelectedSessions } from './views/sessions.js';
 import { renderDisk, removeSelectedWorktrees, sweep, clearSelectedCaches, clearStale } from './views/disk.js';
 import { renderActs } from './views/activity.js';
+import { renderIssues, issueFilter, issueAction } from './views/issues.js';
+import { renderPerformance } from './views/performance.js';
 import { renderAgents, loadIntegration } from './views/agents.js';
 import { renderSettings, saveCfg } from './views/settings.js';
 import { renderPanel } from './views/panel.js';
@@ -20,7 +22,7 @@ import { cpuSummary, memSummary, ranked, findConsumer } from './consumers.js';
 import { groupAction } from './signals.js';
 
 const POLL_MS = 3000;
-const VIEWS = ['overview', 'processes', 'workspaces', 'apps', 'sessions', 'disk', 'activity', 'agents', 'settings'];
+const VIEWS = ['overview', 'processes', 'workspaces', 'apps', 'sessions', 'disk', 'activity', 'issues', 'performance', 'agents', 'settings'];
 const TEXT_KEYS = ['name', 'group', 'label', 'branch', 'repo_name', 'kind', 'agent', 'workspace'];
 
 document.body.classList.add(MODE === 'panel' ? 'panel' : 'dashboard');
@@ -37,6 +39,8 @@ function render() {
   else if (v === 'sessions') renderSessions();
   else if (v === 'disk') renderDisk();
   else if (v === 'activity') renderActs();
+  else if (v === 'issues') renderIssues();
+  else if (v === 'performance') renderPerformance();
   else if (v === 'agents') renderAgents();
   else if (v === 'settings') renderSettings();
   renderDetail();
@@ -198,7 +202,7 @@ function overviewCopy() {
   });
 }
 
-const SEL = '[data-psel],[data-wtsel],[data-bcsel],[data-ssel],[data-sbulk],#sSeg button,[data-all],[data-da],[data-run],[data-reveal],[data-term],[data-copy],[data-copy-token],[data-copy-el],[data-bulk],[data-v],[data-sort],[data-open],[data-go],[data-gproc],[data-k],[data-d],#wtSeg button,#bcSeg button,#aSeg button,#showTok,#dClose,#dCopy,#copyOverview';
+const SEL = '[data-psel],[data-wtsel],[data-bcsel],[data-ssel],[data-sbulk],#sSeg button,[data-all],[data-da],[data-run],[data-reveal],[data-term],[data-copy],[data-copy-token],[data-copy-el],[data-bulk],[data-v],[data-sort],[data-open],[data-go],[data-gproc],[data-k],[data-d],#wtSeg button,#bcSeg button,#aSeg button,#iSeg button,[data-issue],#showTok,#dClose,#dCopy,#copyOverview';
 
 document.addEventListener('click', async e => {
   const t = e.target.closest(SEL);
@@ -225,6 +229,8 @@ document.addEventListener('click', async e => {
   if (d.reveal) return act(() => invoke('reveal', { path: d.reveal, terminal: false }));
   if (d.term) return act(() => invoke('reveal', { path: d.term, terminal: true }));
   if (d.da) return detailAction(t);
+  if (d.issue) return issueAction(t);
+  if (t.closest('#iSeg')) { issueFilter(d.f); return render(); }
   if (!st.S) return;
   // Checkboxes inside clickable rows select; they do not open the row.
   if (d.all) {
