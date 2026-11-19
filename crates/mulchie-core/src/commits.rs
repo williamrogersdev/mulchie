@@ -3,7 +3,8 @@
 //!
 //! The engine that holds the lock reads `HEAD` (branch and commit, one
 //! `git rev-parse` with a timeout) of each workspace an agent session works
-//! in or recently worked in, every `perf.head_check_secs`, and right after an
+//! in or recently worked in (and of each checkout an app sending traces runs
+//! from, see `engine_otel.rs`), every `perf.head_check_secs`, and right after an
 //! agent's hook reports a shell command that moves `HEAD` (`git commit`,
 //! `merge`, `rebase`, `cherry-pick`, `pull` or `am`). Each move is one line
 //! in `<config dir>/commits.jsonl` ([`crate::jsonl`]: mode 0600, never through
@@ -55,7 +56,8 @@ pub struct CommitEntry {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub agent: Option<String>,
     /// What noticed it: `poll` (the periodic check), `hook` (an agent's
-    /// hook reported a git command) or `timing` (a build timing came in).
+    /// hook reported a git command), `timing` (a build timing came in) or
+    /// `otel` (an app sending traces runs from this checkout).
     #[serde(default)]
     pub via: String,
 }
@@ -123,6 +125,27 @@ pub fn attribute<'a>(
     entries
         .iter()
         .find(|e| e.workspace == workspace && same_commit(&e.head, sha))
+}
+
+/// Where `HEAD` of `workspace` pointed at `at_unix`, as recorded: the head
+/// of the last move at or before it. `None` when nothing was recorded by
+/// then.
+pub fn head_at(entries: &[CommitEntry], workspace: &Path, at_unix: u64) -> Option<String> {
+    entries
+        .iter()
+        .rev()
+        .find(|e| e.workspace == workspace && e.at_unix <= at_unix)
+        .map(|e| e.head.clone())
+}
+
+/// The workspace where `HEAD` was recorded at `sha`, the latest one when
+/// several were.
+pub fn workspace_of(entries: &[CommitEntry], sha: &str) -> Option<PathBuf> {
+    entries
+        .iter()
+        .rev()
+        .find(|e| same_commit(&e.head, sha))
+        .map(|e| e.workspace.clone())
 }
 
 /// The recorded moves of `HEAD` in `workspace` that led from `from` to
@@ -251,6 +274,28 @@ mod tests {
         // `from` never recorded: back to the first entry of the workspace.
         let r = between(&v, Path::new("/r"), &sha('f'), &b);
         assert_eq!(r.iter().map(|e| e.at_unix).collect::<Vec<_>>(), vec![1, 2]);
+    }
+
+    #[test]
+    fn head_at_a_time_and_the_workspace_of_a_commit() {
+        let (a, b) = (sha('a'), sha('b'));
+        let v = vec![
+            e(10, "/r", None, &a, None),
+            e(20, "/r", Some(&a), &b, None),
+            e(30, "/x", None, &a, None),
+        ];
+        assert_eq!(head_at(&v, Path::new("/r"), 5), None);
+        assert_eq!(
+            head_at(&v, Path::new("/r"), 10).as_deref(),
+            Some(a.as_str())
+        );
+        assert_eq!(
+            head_at(&v, Path::new("/r"), 25).as_deref(),
+            Some(b.as_str())
+        );
+        assert_eq!(workspace_of(&v, &b[..9]), Some(PathBuf::from("/r")));
+        assert_eq!(workspace_of(&v, &a), Some(PathBuf::from("/x")));
+        assert_eq!(workspace_of(&v, &sha('c')), None);
     }
 
     #[test]

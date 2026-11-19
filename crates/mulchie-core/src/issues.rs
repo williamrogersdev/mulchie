@@ -145,6 +145,14 @@ pub fn fingerprint(f: &Finding) -> Option<(String, String, Option<PathBuf>)> {
             }
         }
         FindingKind::OrphanSwarm => rest.to_string(),
+        // The service and the operation, as they are: a route's path is the
+        // identity, and `normalize_command` would cut it to its last part.
+        FindingKind::EndpointSlower | FindingKind::EndpointErrors => {
+            match f.evidence.endpoint.as_deref() {
+                Some(e) => format!("{} {}", e.service, e.operation),
+                None => rest.to_string(),
+            }
+        }
         _ => {
             let cmd = f
                 .evidence

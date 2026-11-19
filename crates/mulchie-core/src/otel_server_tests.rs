@@ -234,9 +234,16 @@ fn host_must_be_loopback() {
     let no_host =
         "POST /v1/traces HTTP/1.1\r\nContent-Type: application/json\r\nContent-Length: 2\r\n\r\n{}";
     assert_eq!(raw(&srv, no_host.as_bytes()).0, 403);
-    for host in ["localhost", "LOCALHOST:1", "127.0.0.1", "[::1]"] {
+    for host in [
+        "localhost",
+        "LOCALHOST:1",
+        "127.0.0.1",
+        "[::1]",
+        "host.docker.internal:4318",
+    ] {
         assert!(host_ok(host), "{host}");
     }
+    assert!(!host_ok("host.docker.internal.evil.example"));
     assert_eq!(agg.lock().unwrap().status().received_spans, 0);
 }
 
@@ -404,4 +411,26 @@ fn a_poisoned_aggregator_still_takes_batches() {
         .status()
         .recorded_spans;
     assert_eq!(n, 1);
+}
+
+#[test]
+fn a_container_may_post_but_its_pid_is_dropped() {
+    let (srv, agg) = start(test_limits());
+    let body = json_body();
+    let send = |host: &str| {
+        let req = format!(
+            "POST /v1/traces HTTP/1.1\r\nHost: {host}\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
+            body.len()
+        );
+        raw(&srv, req.as_bytes()).0
+    };
+    assert_eq!(send(&format!("host.docker.internal:{}", srv.port())), 200);
+    let svc = agg.lock().unwrap().services();
+    assert_eq!(svc.len(), 1);
+    assert_eq!(
+        svc[0].resource.pid, None,
+        "a container's pid is not the host's"
+    );
+    assert_eq!(send(&format!("127.0.0.1:{}", srv.port())), 200);
+    assert_eq!(agg.lock().unwrap().services()[0].resource.pid, Some(77));
 }

@@ -54,8 +54,11 @@ mod updates_glue;
 #[path = "engine_issues.rs"]
 mod issues_glue;
 pub use issues_glue::IssueList;
+#[path = "engine_otel.rs"]
+mod otel_glue;
 #[path = "engine_perf.rs"]
 mod perf_glue;
+pub use otel_glue::{OperationReport, OtelBrief, OtelReport, ServiceReport};
 pub use perf_glue::{CommitList, TimingList};
 pub use sessions::{
     LimitsStatus, PausedProc, SessionBrief, SessionDetail, SessionMember, SessionsState,
@@ -435,6 +438,9 @@ pub struct State {
     /// ones first).
     #[serde(default)]
     pub top_issues: Vec<crate::issues::Issue>,
+    /// The trace receiver and what it found ([`OtelBrief`]).
+    #[serde(default)]
+    pub otel: OtelBrief,
 }
 
 impl State {
@@ -839,6 +845,9 @@ pub struct Engine {
     /// Commit attribution, build timings and their findings
     /// ([`crate::commits`], [`crate::timings`]).
     perf: Arc<perf_glue::Perf>,
+    /// The trace receiver, its aggregates and endpoint findings
+    /// ([`crate::otel_server`], [`crate::endpoints`]).
+    otel: Arc<otel_glue::Otel>,
 }
 
 impl Engine {
@@ -900,6 +909,7 @@ impl Engine {
             failures: Vec::new(),
             issue_counts: Default::default(),
             top_issues: Vec::new(),
+            otel: OtelBrief::default(),
         };
         Self {
             state: Arc::new(Mutex::new(state)),
@@ -908,6 +918,7 @@ impl Engine {
             scan_memo: Arc::new(Mutex::new(None)),
             issues: Arc::new(Mutex::new(None)),
             perf: Arc::new(perf_glue::Perf::default()),
+            otel: Arc::new(otel_glue::Otel::default()),
             next_id: Arc::new(AtomicU64::new(1)),
             paths: Arc::new(paths),
             journal: Arc::new(journal),
@@ -976,6 +987,7 @@ impl Engine {
         st.memory_guard = self.memory_guard_status();
         st.runaway = self.runaway_status();
         st.updates = self.updates_status(false);
+        st.otel = self.otel_brief(&st.config);
         (st.issue_counts, st.top_issues) = self.issue_summary();
         // A target that is gone (removed by hand since) is no longer a
         // problem to report; cache keys of prunes are not paths and stay.
@@ -1243,6 +1255,8 @@ impl Engine {
             st.automation = true;
             rescan
         };
+        // The perf worker starts or stops the trace receiver.
+        self.perf.wake_all();
         // Dismissing a finding or changing a setting the scan does not read
         // must not walk every worktree again.
         if rescan {
@@ -1358,6 +1372,7 @@ impl Engine {
         self.limit_wake.notify_all();
         self.updates.wake.notify_all();
         self.perf.wake_all();
+        self.otel_stop();
         let handles: Vec<JoinHandle<()>> = lock(&self.threads).drain(..).collect();
         let deadline = Instant::now() + wait;
         for h in handles {
@@ -1959,6 +1974,7 @@ impl Engine {
 
         let mode = |p: &Path| std::fs::metadata(p).ok().map(|m| m.mode());
         let port = self.api_port.load(Ordering::SeqCst);
+        let (otel_port, otel_error) = self.otel_posture();
         let posture = watch::Posture {
             config_dir: self.paths.config_dir.clone(),
             config_dir_mode: mode(&self.paths.config_dir),
@@ -1970,6 +1986,8 @@ impl Engine {
             .filter_map(|p| mode(&p).map(|m| (p, m)))
             .collect(),
             api_port: (port > 0).then_some(port as u16),
+            otel_port,
+            otel_error,
             lock_held_by_other: if self.automation_enabled.load(Ordering::SeqCst) {
                 None
             } else {

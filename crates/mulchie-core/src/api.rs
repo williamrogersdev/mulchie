@@ -110,6 +110,7 @@ pub const ROUTES: &[(&str, &str)] = &[
     ("POST", "/v1/feedback"),
     ("GET", "/v1/commits"),
     ("GET", "/v1/timings"),
+    ("GET", "/v1/otel"),
 ];
 
 // ------------------------------------------------------------------ token
@@ -1513,6 +1514,14 @@ fn route(req: &Req, engine: &Engine, read_only: bool) -> Resp {
                 let ws = query_path(req, "workspace")?;
                 let cmd = query_text(req, "command")?;
                 ok(&engine.timings(ws.as_deref(), cmd.as_deref(), limit))
+            }
+            ("GET", "/v1/otel") => {
+                let minutes = query_u64(req, "minutes")?.unwrap_or(15);
+                if !(1..=1440).contains(&minutes) {
+                    return Err(fail(400, "invalid_query", "minutes must be 1 to 1440"));
+                }
+                let service = query_text(req, "service")?;
+                ok(&engine.otel_report(service.as_deref(), minutes))
             }
             ("GET", "/v1/updates") => ok(&engine.updates_status(true)),
             ("POST", "/v1/updates/check") => match engine.request_update_check() {

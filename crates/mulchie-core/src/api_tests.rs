@@ -1721,3 +1721,40 @@ fn timings_ride_on_a_release_that_frees_a_ticket() {
     assert_eq!(code, 200);
     assert!(v["commits"].is_array());
 }
+
+/// `GET /v1/otel` answers with the receiver off (the default) and checks
+/// its query.
+#[test]
+fn otel_reports_the_receiver_and_checks_its_query() {
+    let r = running(Limits::default());
+    let ro = format!("Bearer {}", read_read_only_token(r.engine.paths()).unwrap());
+    let (code, v) = send(r.port, "GET", "/v1/otel", Some(&ro), "");
+    assert_eq!(code, 200, "{v}");
+    assert_eq!(v["enabled"], false);
+    assert_eq!(v["listening"], false);
+    assert_eq!(v["configured_port"], 4318);
+    assert_eq!(v["minutes"], 15);
+    assert!(v["services"].as_array().unwrap().is_empty());
+    let (code, v) = send(
+        r.port,
+        "GET",
+        "/v1/otel?service=shop%20web&minutes=60",
+        Some(&ro),
+        "",
+    );
+    assert_eq!((code, v["minutes"].as_u64()), (200, Some(60)));
+    for bad in [
+        "/v1/otel?minutes=0",
+        "/v1/otel?minutes=1441",
+        "/v1/otel?service=%zz",
+    ] {
+        let (code, v) = send(r.port, "GET", bad, Some(&ro), "");
+        assert_eq!(
+            (code, v["code"].as_str()),
+            (400, Some("invalid_query")),
+            "{bad}"
+        );
+    }
+    let (_, st) = send(r.port, "GET", "/v1/state", Some(&ro), "");
+    assert_eq!(st["otel"]["enabled"], false);
+}

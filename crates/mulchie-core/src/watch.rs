@@ -90,6 +90,15 @@ pub enum FindingKind {
     /// A build or test command's latest successful runs each took much
     /// longer than its usual time (`perf`, [`crate::perf`]).
     BuildSlower,
+    /// An endpoint of an app sending traces to Mulchie is slower at p95
+    /// than it usually is (`otel`, [`crate::endpoints`]).
+    EndpointSlower,
+    /// An endpoint of an app sending traces to Mulchie fails more often
+    /// than it usually does (`otel`, [`crate::endpoints`]).
+    EndpointErrors,
+    /// The trace receiver is turned on but could not listen (its port is
+    /// taken, say).
+    OtelUnavailable,
 }
 
 impl FindingKind {
@@ -118,14 +127,13 @@ impl FindingKind {
             | StoppedProcess
             | RunawayCpu
             | GrowingMemory => FindingCategory::Hygiene,
-            InsecurePermissions | ApiExposed | EngineLockNotHeld | ConfigNotLoaded => {
-                FindingCategory::Posture
-            }
+            InsecurePermissions | ApiExposed | EngineLockNotHeld | ConfigNotLoaded
+            | OtelUnavailable => FindingCategory::Posture,
             LimitExceeded | SessionHog | PausedListUnreadable | MemoryLow | RunawayChain => {
                 FindingCategory::Limit
             }
             MulchieUpdate | AgentUpdate | HomebrewOutdated | Advisory => FindingCategory::Update,
-            BuildSlower => FindingCategory::Performance,
+            BuildSlower | EndpointSlower | EndpointErrors => FindingCategory::Performance,
         }
     }
 }
@@ -147,7 +155,8 @@ pub enum FindingCategory {
     Limit,
     /// Updates and advisories.
     Update,
-    /// Something got slower than it usually is: builds and tests.
+    /// Something got slower than it usually is: builds, tests and the
+    /// endpoints of apps that send traces.
     Performance,
 }
 
@@ -256,6 +265,10 @@ pub struct Evidence {
     /// what changed in between.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub perf: Option<Box<crate::timings::PerfEvidence>>,
+    /// Endpoint findings: the service and operation, the recent and usual
+    /// figures, and the commits in between.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub endpoint: Option<Box<crate::endpoints::EndpointEvidence>>,
 }
 
 /// One thing behind a machine-wide finding.
@@ -885,6 +898,10 @@ pub struct Posture {
     pub token_modes: Vec<(PathBuf, u32)>,
     /// The engine's API port, when it serves one.
     pub api_port: Option<u16>,
+    /// The trace receiver's port, while it listens.
+    pub otel_port: Option<u16>,
+    /// The trace receiver is on but could not start: the port and why.
+    pub otel_error: Option<(u16, String)>,
     /// Another engine holds the lock (its pid).
     pub lock_held_by_other: Option<u32>,
     pub config_error: Option<String>,
@@ -1860,6 +1877,39 @@ fn detect_posture(d: &mut Det) {
                 },
             );
         }
+    }
+    if let (Some(port), Some(ls)) = (pos.otel_port, i.listeners) {
+        let open: Vec<String> = ls
+            .iter()
+            .filter(|l| l.port == port && !l.loopback())
+            .map(|l| l.shown())
+            .collect();
+        if !open.is_empty() {
+            d.push_other(
+                &format!("otel:{port}"),
+                FindingKind::ApiExposed,
+                Severity::High,
+                format!("Mulchie's trace receiver port {port} is listening beyond this machine"),
+                "Mulchie's trace receiver only listens on 127.0.0.1; something else bound the same port to the network, and apps sending traces may reach it instead.",
+                Evidence {
+                    listen: Some(open),
+                    ..Default::default()
+                },
+            );
+        }
+    }
+    if let Some((port, why)) = &pos.otel_error {
+        d.push_other(
+            "otel",
+            FindingKind::OtelUnavailable,
+            Severity::Low,
+            format!("Mulchie's trace receiver could not listen on port {port}"),
+            "otel.enabled is on, but the receiver is not running, so apps' traces are not received. Another program (an OpenTelemetry Collector, say) may hold the port: stop it or set otel.port to a free port.",
+            Evidence {
+                detail: Some(why.clone()),
+                ..Default::default()
+            },
+        );
     }
     if let Some(pid) = pos.lock_held_by_other {
         d.push_other(
