@@ -33,6 +33,7 @@ Full documentation is at [mulchie.com/docs](https://mulchie.com/docs/).
 - Hooks (`mulchie hooks install`) let Claude Code, Codex, Cursor, Gemini CLI and Copilot CLI tell Mulchie about session starts, prompts and shell commands. A hook fails open: with no engine, a slow one (300 ms) or any error, the action is allowed. Prompt text is never sent to the engine. See [hooks and guard rules](https://mulchie.com/docs/hooks/).
 - Guard rules check the text of a shell command for risky shapes (deleting outside the workspace, `curl | sh`, `sudo`, force-pushing a protected branch, disabling Mulchie, reading credentials, writing startup files). Every rule defaults to `warn`. They are a tripwire, not a sandbox, and miss obfuscated commands.
 - Update checks report newer versions of Mulchie and of installed agent tools, and outdated Homebrew packages. They never install anything. Vulnerability lookups against OSV.dev are off unless you turn them on. See [update checks](https://mulchie.com/docs/updates/).
+- Production integrations (off by default): read-only links to Vercel, Sentry and PostHog. Mulchie lists recent deploys, reads one number per deploy (Vercel build duration, Sentry transaction p95, PostHog LCP and INP), and raises a `production_slower` finding naming the commits in a deploy that made it worse and the agent sessions behind them. `mulchie integrations add <provider>` reads the token from standard input. See [production integrations](https://mulchie.com/docs/integrations/).
 
 **Optimize**
 - Lowers the priority of build processes when CPU or memory stays under pressure, where it can put the priority back afterwards (an engine running as root). Run as you, it leaves build priorities alone.
@@ -100,6 +101,7 @@ Run `mulchie --help` or `mulchie <command> --help` for every flag.
 | `sessions` | Agent sessions and what each uses. `sessions <id> --events` shows its activity record; `sessions stop <id>` plans stopping it. Needs the engine. |
 | `limits` | Session budgets: who is over, what Mulchie paused, and whether limits act. Needs the engine. |
 | `updates` | The last update check. `updates --check` asks for one now. Needs the engine. |
+| `integrations add\|list\|remove\|deploys\|check` | Connect Vercel, Sentry or PostHog read-only; list deploys and the commits in them. |
 | `guard check -- <command>` | Ask the guard rules about a command without running it. Needs the engine. |
 | `feedback report <what happened>` | Save a report about Mulchie or the machine. `feedback list` shows what agents and people reported. Works without the engine. |
 | `hooks install\|uninstall\|status` | Connect Mulchie to an agent's own hooks. |
@@ -151,9 +153,9 @@ The engine listens on `127.0.0.1:47474` by default. Every route except `GET /v1/
 
 ## Configuration
 
-`~/.config/mulchie/config.json` (or under `$XDG_CONFIG_HOME/mulchie`). Print it with `mulchie config` and change one setting with `mulchie config set <key> <value>`. The app has the same settings under **Settings**. `MULCHIE_PORT` overrides the API port for one process. Sections: `watch`, `agents`, `sessions`, `limits`, `memory_guard`, `guard` and `updates`; see [configuration](https://mulchie.com/docs/configuration/).
+`~/.config/mulchie/config.json` (or under `$XDG_CONFIG_HOME/mulchie`). Print it with `mulchie config` and change one setting with `mulchie config set <key> <value>`. The app has the same settings under **Settings**. `MULCHIE_PORT` overrides the API port for one process. Sections: `watch`, `agents`, `sessions`, `limits`, `memory_guard`, `guard`, `updates`, `perf` and `integrations`; see [configuration](https://mulchie.com/docs/configuration/).
 
-The engine contacts the network only for update checks: the GitHub releases API for Mulchie, and the npm registry for installed agent tools. `mulchie config set updates.check off` stops it. A build without the default `network` cargo feature (`--no-default-features`) cannot make requests at all.
+The engine contacts the network only for update checks (the GitHub releases API for Mulchie, and the npm registry for installed agent tools; `mulchie config set updates.check off` stops them) and, only for providers you turned on with `mulchie integrations add`, for production integrations: authenticated read requests to that provider's own API host, carrying nothing about this machine. A build without the default `network` cargo feature (`--no-default-features`) cannot make requests at all.
 
 ## Layout
 

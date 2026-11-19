@@ -616,20 +616,30 @@ impl Engine {
     /// Replace the stored findings of one category (limits, updates) with
     /// `raw`, finalized like the watch's, and journal what changed.
     pub(crate) fn replace_findings(&self, cat: FindingCategory, raw: Vec<Finding>, now: u64) {
+        self.replace_findings_of(cat, &[], raw, now);
+    }
+
+    /// Replace the findings of category `cat` whose kind is in `kinds`
+    /// (every kind of the category when `kinds` is empty), so producers that
+    /// share a category (`build_slower`, `production_slower`) leave each
+    /// other's findings alone.
+    pub(crate) fn replace_findings_of(
+        &self,
+        cat: FindingCategory,
+        kinds: &[watch::FindingKind],
+        raw: Vec<Finding>,
+        now: u64,
+    ) {
+        let mine = |f: &Finding| f.category == cat && (kinds.is_empty() || kinds.contains(&f.kind));
         let watch_cfg = lock(&self.state).config.watch.clone();
         let changes = {
             let mut st = lock(&self.state);
-            let prev: Vec<Finding> = st
-                .findings
-                .iter()
-                .filter(|f| f.category == cat)
-                .cloned()
-                .collect();
+            let prev: Vec<Finding> = st.findings.iter().filter(|f| mine(f)).cloned().collect();
             if raw.is_empty() && prev.is_empty() {
                 return;
             }
             let (fresh, changes) = watch::finalize(raw, &prev, &watch_cfg, now);
-            st.findings.retain(|f| f.category != cat);
+            st.findings.retain(|f| !mine(f));
             st.findings.extend(fresh);
             sort_findings(&mut st.findings);
             st.finding_counts = FindingCounts::of(&st.findings);
