@@ -80,4 +80,7 @@ jobs:
           accountId: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
           workingDirectory: site
           wranglerVersion: 4.159.0
+          # site/ has a bun.lock, from which the action would pick Bun; this job
+          # does not install Bun, and only needs wrangler itself.
+          packageManager: npm
           command: deploy
