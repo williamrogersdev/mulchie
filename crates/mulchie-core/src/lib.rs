@@ -3,6 +3,7 @@ pub mod commits;
 pub mod config;
 pub mod consumers;
 pub mod diskmap;
+pub mod endpoints;
 pub mod engine;
 pub mod failures;
 pub mod feedback;

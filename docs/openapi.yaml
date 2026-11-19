@@ -90,6 +90,8 @@ paths:
         `retry_after_unix` (the engine's automatic sweep and reclaim leave the target alone
         until then). A success clears the record. `issue_counts` counts the unresolved issues
         and `top_issues` holds up to five of them that came back most often (as `GET /v1/issues`).
+        `otel` is the trace receiver in brief: `enabled`, `listening`, `port`, `error`, `services`,
+        `endpoints_slower` and `endpoints_failing` (see `GET /v1/otel`).
 
         Swap: each process in `snapshot.top` and each consumer group carries `swap_bytes`, its memory
         compressed or swapped out (on macOS its physical footprint minus what is resident; 0 for
@@ -1236,6 +1238,99 @@ paths:
                   total: { type: integer, description: How many matched before the limit }
         "400": { description: "`invalid_query`: a bad limit, workspace or command", content: { application/json: { schema: { type: object } } } }
         default: { $ref: "#/components/responses/Error" }
+  /v1/otel:
+    get:
+      summary: The trace receiver and the endpoints of the apps sending traces
+      description: |
+        With `otel.enabled` on, the engine that holds the lock receives OpenTelemetry traces
+        (OTLP/HTTP `POST /v1/traces`, JSON or protobuf, uncompressed) on `127.0.0.1:<otel.port>`.
+        Server, consumer and root spans are aggregated per `service.name` and operation (the HTTP
+        method and route, else the span name) in 5-minute windows kept for 24 hours. This returns
+        the receiver's status and, per service, each operation with requests in the last
+        `minutes`: count, errors, p50/p95/p99, its baseline (the median p95 and error rate of the
+        earlier windows with at least `otel.min_requests` requests) and whether it is slower or
+        failing more than that. `attribution` says where the service runs (its `process.pid`'s
+        working directory, else its `vcs.ref.head.revision` matched against recorded commits),
+        the commit and the agent session that moved HEAD to it; it is refreshed once a minute.
+        Endpoints slower or failing more over the last 15 minutes raise `endpoint_slower` and
+        `endpoint_errors` findings. Nothing acts on them.
+      parameters:
+        - name: service
+          in: query
+          required: false
+          description: Only this service (percent-encoded)
+          schema: { type: string }
+        - name: minutes
+          in: query
+          required: false
+          description: "The range of the figures, in minutes (1 to 1440, default 15)"
+          schema: { type: integer, minimum: 1, maximum: 1440 }
+      responses:
+        "200":
+          description: The receiver and its services
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  enabled: { type: boolean, description: "`otel.enabled`" }
+                  listening: { type: boolean, description: "This engine's receiver is listening" }
+                  port: { type: integer, nullable: true, description: "The port it listens on (with `otel.port` 0, the one picked)" }
+                  configured_port: { type: integer, description: "`otel.port`" }
+                  endpoint: { type: string, nullable: true, description: "The URL to export to (OTEL_EXPORTER_OTLP_ENDPOINT)" }
+                  error: { type: string, nullable: true, description: Why it is not listening while enabled }
+                  minutes: { type: integer }
+                  thresholds:
+                    type: object
+                    properties:
+                      ratio: { type: number, description: "`perf.slower_ratio`" }
+                      min_slowdown_ms: { type: number, description: "`otel.min_slowdown_ms`" }
+                      min_requests: { type: integer, description: "`otel.min_requests`" }
+                  received_spans: { type: integer }
+                  recorded_spans: { type: integer }
+                  ignored_spans: { type: integer, description: "Spans that are neither server, consumer nor root" }
+                  drops: { type: object, description: "Spans not recorded, by reason (services, operations, cells, too_old, invalid, spans_over_request_cap, attributes, truncated_strings)" }
+                  services:
+                    type: array
+                    items:
+                      type: object
+                      properties:
+                        name: { type: string }
+                        first_seen_ms: { type: integer }
+                        last_seen_ms: { type: integer }
+                        resource: { $ref: "#/components/schemas/TraceResource" }
+                        attribution: { $ref: "#/components/schemas/EndpointAttribution" }
+                        operations:
+                          type: array
+                          description: Operations with requests in the range, slowest p95 first
+                          items:
+                            type: object
+                            properties:
+                              operation: { type: string }
+                              count: { type: integer }
+                              errors: { type: integer }
+                              p50_ms: { type: number }
+                              p95_ms: { type: number }
+                              p99_ms: { type: number }
+                              mean_ms: { type: number }
+                              max_ms: { type: number }
+                              error_rate: { type: number, description: "0 to 1" }
+                              baseline:
+                                type: object
+                                nullable: true
+                                description: Null without three busy windows before the range
+                                properties:
+                                  p95_ms: { type: number }
+                                  error_rate: { type: number }
+                                  windows: { type: integer }
+                                  from_ms: { type: integer }
+                                  to_ms: { type: integer }
+                                  revision: { type: string }
+                              slower: { type: boolean }
+                              more_errors: { type: boolean }
+                              resource: { $ref: "#/components/schemas/TraceResource" }
+        "400": { description: "`invalid_query`: a bad service or minutes", content: { application/json: { schema: { type: object } } } }
+        default: { $ref: "#/components/responses/Error" }
 components:
   securitySchemes:
     bearer:
@@ -1428,6 +1523,29 @@ components:
         - runaway_chain
         - orphan_swarm
         - build_slower
+        - endpoint_slower
+        - endpoint_errors
+        - otel_unavailable
+    TraceResource:
+      type: object
+      description: The resource attributes kept from a service's spans
+      properties:
+        pid: { type: integer, description: "`process.pid` (dropped when posted as host.docker.internal)" }
+        service_version: { type: string }
+        vcs_revision: { type: string, description: "`vcs.ref.head.revision`, else `vcs.repository.ref.revision`" }
+        deployment_environment: { type: string }
+    EndpointAttribution:
+      type: object
+      nullable: true
+      description: Where a service runs; null when not found
+      required: [via]
+      properties:
+        workspace: { type: string, description: The checkout the service runs from }
+        branch: { type: string }
+        head: { type: string, description: "The commit it runs: the app's revision, else the workspace's HEAD" }
+        session_id: { type: string, description: The agent session working there when HEAD moved to it }
+        agent: { type: string }
+        via: { type: string, enum: [pid, revision] }
     CommitEntry:
       type: object
       required: [at_unix, workspace, head, via]
@@ -1559,6 +1677,31 @@ components:
                 ratio: { type: number, description: The median of the slow runs over the baseline }
                 from_head: { type: string, description: HEAD at the last normal run }
                 to_head: { type: string, description: HEAD at the first slow run }
+                commits:
+                  type: array
+                  description: "The recorded moves of HEAD between them, oldest first (at most 20, the newest)"
+                  items: { $ref: "#/components/schemas/CommitEntry" }
+                commits_truncated: { type: boolean }
+            endpoint:
+              type: object
+              description: "`endpoint_slower` and `endpoint_errors` only: the recent and usual figures and what changed in between."
+              properties:
+                service: { type: string }
+                operation: { type: string }
+                recent_minutes: { type: integer }
+                recent_count: { type: integer }
+                recent_errors: { type: integer }
+                recent_p95_ms: { type: number }
+                recent_error_rate: { type: number }
+                baseline_p95_ms: { type: number }
+                baseline_error_rate: { type: number }
+                baseline_windows: { type: integer }
+                ratio: { type: number, description: The recent p95 over the baseline p95 }
+                service_version: { type: string }
+                environment: { type: string }
+                attribution: { $ref: "#/components/schemas/EndpointAttribution" }
+                from_revision: { type: string, description: The commit at the end of the baseline }
+                to_revision: { type: string, description: The commit running now }
                 commits:
                   type: array
                   description: "The recorded moves of HEAD between them, oldest first (at most 20, the newest)"

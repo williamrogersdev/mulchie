@@ -21,6 +21,7 @@ mod service;
 mod sessions;
 mod slots;
 mod timings;
+mod traces;
 
 use clap::{CommandFactory, Parser};
 use cli::{Cli, Command, ConfigCommand, HooksCommand, McpCommand};
@@ -181,6 +182,7 @@ fn dispatch(paths: &Paths, cmd: Command) -> i32 {
             t.limit as usize,
             t.out.json,
         ),
+        Command::Traces(t) => traces::list(paths, t.service.as_deref(), t.minutes, t.out.json),
         Command::Inspect(i) => observe::inspect(paths, i.pid, i.out.json),
         Command::Slots(a) => match &a.action {
             Some(cli::SlotsCommand::Release { ticket, yes, out }) => {

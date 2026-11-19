@@ -19,6 +19,7 @@ fn safe_config(paths: &Paths) -> mulchie_core::LoadedConfig {
     cfg.memory_guard.action = mulchie_core::config::MemoryAction::Off;
     cfg.runaway.action = mulchie_core::config::MemoryAction::Off;
     cfg.updates.check = mulchie_core::config::UpdateCheck::Off;
+    cfg.otel.enabled = false;
     cfg.save_to(paths, 0).expect("write the test config");
     Config::load_from(paths)
 }

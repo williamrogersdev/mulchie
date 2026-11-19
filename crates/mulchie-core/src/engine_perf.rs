@@ -63,6 +63,9 @@ pub(crate) struct PerfState {
     published: Option<PerfConfig>,
     /// A timing came in since the findings were built.
     dirty: bool,
+    /// The `build_slower` findings last built, stored together with the
+    /// endpoint findings (one category).
+    build_findings: Vec<Finding>,
 }
 
 impl PerfState {
@@ -80,7 +83,7 @@ impl PerfState {
         }
     }
 
-    fn commits(&self) -> &[CommitEntry] {
+    pub(super) fn commits(&self) -> &[CommitEntry] {
         self.commits.as_deref().unwrap_or_default()
     }
 
@@ -137,19 +140,19 @@ fn real(p: &Path) -> PathBuf {
 }
 
 /// The checkout holding `dir`, symbolic links resolved.
-fn checkout_root(dir: &Path) -> Option<PathBuf> {
+pub(super) fn checkout_root(dir: &Path) -> Option<PathBuf> {
     let d = std::fs::canonicalize(dir).unwrap_or_else(|_| dir.to_path_buf());
     super::hook::checkout_of(&d).0
 }
 
 impl Engine {
     /// This engine holds the engine lock now: only it writes the files.
-    fn keeps_perf(&self) -> bool {
+    pub(super) fn keeps_perf(&self) -> bool {
         self.automation_enabled.load(Ordering::SeqCst)
             && lock::running_engine(&self.paths).is_some_and(|h| h.pid == std::process::id())
     }
 
-    fn with_perf<R>(&self, f: impl FnOnce(&mut PerfState) -> R) -> R {
+    pub(super) fn with_perf<R>(&self, f: impl FnOnce(&mut PerfState) -> R) -> R {
         let mut g = lock(&self.perf.state);
         g.load(&self.paths);
         f(&mut g)
@@ -200,7 +203,8 @@ impl Engine {
     }
 
     /// Workspaces to read `HEAD` of: where sessions work or recently
-    /// worked, and where a timing came from in the last hour.
+    /// worked, where a timing came from in the last hour, and where apps
+    /// sending traces run.
     fn active_workspaces(&self, now: u64) -> Vec<PathBuf> {
         let dirs: Vec<PathBuf> = {
             let sup = lock(&self.sup);
@@ -235,7 +239,7 @@ impl Engine {
                 .filter_map(|t| t.workspace.clone())
                 .collect()
         });
-        for r in recent {
+        for r in recent.into_iter().chain(self.otel_workspaces()) {
             if out.len() >= MAX_POLLED {
                 break;
             }
@@ -249,7 +253,7 @@ impl Engine {
     /// Read `HEAD` of `ws` and record it when it moved. `hint` is the
     /// session a hook named. The first sighting of a workspace is recorded
     /// with no previous head and no session.
-    fn check_head(
+    pub(super) fn check_head(
         &self,
         ws: &Path,
         hint: Option<SessionRef>,
@@ -396,8 +400,9 @@ impl Engine {
     }
 
     /// One step of the worker: run the queued jobs, read `HEAD` of the
-    /// active workspaces when due, and store the `performance` findings
-    /// again when timings or settings changed. Tests call it directly.
+    /// active workspaces when due, start or stop the trace receiver, assess
+    /// endpoints when due, and store the `performance` findings again when
+    /// timings, endpoints or settings changed. Tests call it directly.
     pub(crate) fn perf_tick(&self, now: u64) {
         while let Some(job) = self.with_perf(|p| p.jobs.pop_front()) {
             match job {
@@ -428,7 +433,16 @@ impl Engine {
         });
         if rebuild {
             let found = self.with_perf(|p| timings::findings(p.timings(), p.commits(), &cfg, now));
-            self.replace_findings(watch::FindingCategory::Performance, found, now);
+            self.with_perf(|p| p.build_findings = found);
+        }
+        let had_endpoints = !self.otel_findings().is_empty();
+        self.otel_reconcile(now);
+        let assessed = self.otel_tick(now).is_some();
+        let cleared = had_endpoints && self.otel_findings().is_empty();
+        if rebuild || assessed || cleared {
+            let mut all = self.with_perf(|p| p.build_findings.clone());
+            all.extend(self.otel_findings());
+            self.replace_findings(watch::FindingCategory::Performance, all, now);
         }
     }
 

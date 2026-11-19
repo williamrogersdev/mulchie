@@ -123,6 +123,22 @@ pub fn tool_for_api_request(r: &Value) -> Option<(&'static str, Value, Option<St
             }
             Some(("list_timings", Value::Object(args), Some(line)))
         }
+        ("GET", "/v1/otel") => {
+            let mut args = serde_json::Map::new();
+            let mut line = "mulchie traces".to_string();
+            for pair in query.split('&') {
+                let Some((k, v)) = pair.split_once('=') else {
+                    continue;
+                };
+                if k != "service" {
+                    continue;
+                }
+                let v = unescape(v)?;
+                line.push_str(&format!(" --service {}", q(&v)));
+                args.insert(k.into(), json!(v));
+            }
+            Some(("list_endpoints", Value::Object(args), Some(line)))
+        }
         ("POST", "/v1/findings/dismiss") => {
             let id = body["id"].as_str()?;
             Some((
@@ -254,6 +270,7 @@ pub fn finding_brief(f: &Value) -> Value {
         "cpu_pct",
         "detail",
         "perf",
+        "endpoint",
     ] {
         if !ev[k].is_null() {
             evidence.insert(k.into(), ev[k].clone());
@@ -684,6 +701,7 @@ pub fn build(state: &Value, advice: &Value, origin: Origin) -> Value {
     let sessions = sessions_brief(&state["sessions"], &mut recs);
     let updates = updates_brief(&state["updates"], &state["findings"], &mut recs);
     slower_builds(&state["findings"], &mut recs);
+    let traces = traces_brief(&state["otel"], &state["findings"], &mut recs);
 
     let machine = json!({
         "cpu_pct": (f(snap, "cpu_pct") * 10.0).round() / 10.0,
@@ -711,6 +729,7 @@ pub fn build(state: &Value, advice: &Value, origin: Origin) -> Value {
         "findings": findings,
         "sessions": sessions,
         "updates": updates,
+        "traces": traces,
         "machine": machine,
         "workspaces": { "total": ws_total, "top": top_ws },
         "top_processes": top_procs,
@@ -931,7 +950,7 @@ fn slower_builds(findings: &Value, recs: &mut Vec<Rec>) {
         .as_array()
         .into_iter()
         .flatten()
-        .filter(|f| f["category"] == "performance" && f["dismissed"] != true)
+        .filter(|f| f["kind"] == "build_slower" && f["dismissed"] != true)
         .collect();
     let Some(first) = slow.first() else {
         return;
@@ -950,6 +969,63 @@ fn slower_builds(findings: &Value, recs: &mut Vec<Rec>) {
         next_call: call("list_findings", json!({ "kind": "build_slower" })),
         command: Some("mulchie findings --kind build_slower".into()),
     });
+}
+
+/// The trace receiver (`state.otel`) when it is on, with one
+/// recommendation when endpoints got slower or fail more. `null` when off.
+fn traces_brief(otel: &Value, findings: &Value, recs: &mut Vec<Rec>) -> Value {
+    if otel["enabled"] != true {
+        return Value::Null;
+    }
+    let slow: Vec<&Value> = findings
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter(|f| {
+            (f["kind"] == "endpoint_slower" || f["kind"] == "endpoint_errors")
+                && f["dismissed"] != true
+        })
+        .collect();
+    if let Some(first) = slow.first() {
+        recs.push(Rec {
+            priority: 3,
+            id: "slower_endpoints",
+            title: format!(
+                "{} endpoint(s) of local apps got slower or fail more",
+                slow.len()
+            ),
+            reason: format!(
+                "{} The finding names the commits since the endpoint was last normal, and the sessions that made them.",
+                first["title"].as_str().unwrap_or("")
+            ),
+            gain_bytes: None,
+            gain: "endpoints back to their usual speed".into(),
+            risk: "none",
+            next_call: call("list_endpoints", json!({})),
+            command: Some("mulchie traces".into()),
+        });
+    }
+    let note = match (otel["listening"].as_bool(), otel["error"].as_str()) {
+        (Some(true), _) => format!(
+            "Receiving traces at http://127.0.0.1:{} from {} service(s).",
+            otel["port"], otel["services"]
+        ),
+        (_, Some(e)) => format!("otel.enabled is on, but the receiver is not listening: {e}"),
+        _ => "otel.enabled is on, but this engine does not run the receiver.".into(),
+    };
+    json!({
+        "listening": otel["listening"],
+        "port": otel["port"],
+        "services": otel["services"],
+        "endpoints_slower": otel["endpoints_slower"],
+        "endpoints_failing": otel["endpoints_failing"],
+        "note": note,
+        "slow": slow.iter().take(TOP_FINDINGS).map(|f| json!({
+            "id": f["id"],
+            "kind": f["kind"],
+            "title": f["title"],
+        })).collect::<Vec<_>>(),
+    })
 }
 
 /// Available updates, from `state.updates` and the update findings.
@@ -1122,6 +1198,13 @@ pub fn render(d: &Value) -> String {
         s.push_str("\nEngine:\n");
         for p in problems {
             s.push_str(&format!("  ! {p}\n"));
+        }
+    }
+    let tr = &d["traces"];
+    if let Some(n) = tr["note"].as_str() {
+        s.push_str(&format!("\nTraces: {n}\n"));
+        for f in tr["slow"].as_array().into_iter().flatten() {
+            s.push_str(&format!("  ! {}\n", f["title"].as_str().unwrap_or("")));
         }
     }
     let failed = d["repeated_failures"]["top"]
@@ -1650,6 +1733,39 @@ mod tests {
         for n in next {
             assert_ne!(n["name"], "execute_plan");
         }
+    }
+
+    #[test]
+    fn a_slower_endpoint_leads_to_list_endpoints_and_one_recommendation() {
+        let mut st = state();
+        st["otel"] = json!({ "enabled": true, "listening": true, "port": 4318, "services": 2,
+            "endpoints_slower": 1, "endpoints_failing": 0 });
+        st["findings"] = json!([{ "id": "endpoint_slower:0123456789abcdef", "kind": "endpoint_slower",
+            "category": "performance", "severity": "medium",
+            "title": "`GET /api/orders` in `shop-web` is 4.2× slower at p95 (420 ms vs 100 ms)", "why": "",
+            "evidence": { "name": "shop-web", "endpoint": { "service": "shop-web", "baseline_p95_ms": 100.0 } },
+            "suggested": [{ "label": "Show this service's endpoints", "reversible": true,
+                "api_request": { "method": "GET", "route": "/v1/otel?service=shop-web" } }] }]);
+        let d = build(&st, &json!({}), Origin::Engine);
+        let f = &d["findings"]["top"][0];
+        assert_eq!(f["evidence"]["endpoint"]["baseline_p95_ms"], 100.0);
+        let next = f["next_calls"].as_array().unwrap();
+        assert_eq!(next[0]["name"], "list_endpoints");
+        assert_eq!(next[0]["arguments"], json!({ "service": "shop-web" }));
+        assert_eq!(f["cli"][0], "mulchie traces --service shop-web");
+        let recs = d["recommendations"].as_array().unwrap();
+        assert!(recs.iter().any(|r| r["id"] == "slower_endpoints"));
+        assert!(!recs.iter().any(|r| r["id"] == "slower_builds"));
+        assert_eq!(d["traces"]["endpoints_slower"], 1);
+        let text = render(&d);
+        assert!(
+            text.contains("Receiving traces at http://127.0.0.1:4318 from 2 service(s)."),
+            "{text}"
+        );
+        assert!(text.contains("4.2× slower at p95"), "{text}");
+        // Off: nothing about traces.
+        st["otel"] = json!({ "enabled": false });
+        assert!(build(&st, &json!({}), Origin::Engine)["traces"].is_null());
     }
 
     #[test]

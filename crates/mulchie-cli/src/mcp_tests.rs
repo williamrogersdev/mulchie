@@ -156,7 +156,7 @@ fn tools_have_titles_and_annotations() {
     let f = Fake::default();
     let r = one(&f, req(1, "tools/list", json!({})));
     let tools = r["result"]["tools"].as_array().unwrap();
-    assert_eq!(tools.len(), 31);
+    assert_eq!(tools.len(), 32);
     assert_eq!(tools[0]["name"], "diagnose", "diagnose comes first");
     for t in tools {
         let name = t["name"].as_str().unwrap();
@@ -258,7 +258,7 @@ fn read_only_mode_hides_and_refuses_destructive_tools() {
     let mut s = Session::read_only(&f);
     let r = s.handle(req(1, "tools/list", json!({}))).unwrap();
     let names = tool_names(&r);
-    assert_eq!(names.len(), 26, "{names:?}");
+    assert_eq!(names.len(), 27, "{names:?}");
     for n in [
         "execute_plan",
         "prune_cache",
@@ -2017,4 +2017,35 @@ fn release_build_slot_sends_the_timing_and_list_timings_reads_it() {
         );
     }
     assert_eq!(f.posted("/v1/release").len(), 1);
+}
+
+#[test]
+fn list_endpoints_reads_the_receiver_and_stays_in_read_only_mode() {
+    let f = Fake::default()
+        .with(
+            "GET /v1/otel?minutes=60&service=shop%20web",
+            json!({ "enabled": true, "services": [{ "name": "shop web" }] }),
+        )
+        .with("GET /v1/otel", json!({ "enabled": false, "services": [] }));
+    let v = result(&one(
+        &f,
+        call(
+            1,
+            "list_endpoints",
+            json!({ "minutes": 60, "service": "shop web" }),
+        ),
+    ));
+    assert_eq!(v["services"][0]["name"], "shop web");
+    assert_eq!(
+        result(&one(&f, call(2, "list_endpoints", json!({}))))["enabled"],
+        false
+    );
+    let r = one(&f, call(3, "list_endpoints", json!({ "minutes": 0 })));
+    assert!(
+        r["result"]["isError"] == true || r["error"].is_object(),
+        "{r}"
+    );
+    let mut s = Session::read_only(&f);
+    let r = s.handle(req(4, "tools/list", json!({}))).unwrap();
+    assert!(tool_names(&r).contains(&"list_endpoints".to_string()));
 }

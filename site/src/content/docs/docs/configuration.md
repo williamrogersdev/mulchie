@@ -157,6 +157,17 @@ A budget has any of the caps `cpu_cores`, `memory_mb`, `processes`, `write_mb_pe
 | `perf.min_slowdown_secs` | 30 | ...and more than this many seconds longer. 0 to 86400. |
 | `perf.head_check_secs` | 60 | How often the engine reads `HEAD` of workspaces with agent activity. 10 to 3600. |
 
+## Traces
+
+`otel` controls the [trace receiver](/docs/traces/) for apps in local development and when an endpoint counts as slower or failing more than usual. The ratio is `perf.slower_ratio`. Nothing here makes Mulchie act.
+
+| Setting | Default | Meaning |
+| --- | --- | --- |
+| `otel.enabled` | `false` | Receive OpenTelemetry traces on `127.0.0.1:<otel.port>`. Only the engine that holds the lock runs the receiver; it starts and stops when this changes, without a restart. |
+| `otel.port` | 4318 | The port, on loopback only. 0 picks a free one (`mulchie traces` shows it). Must differ from `api_port`. |
+| `otel.min_slowdown_ms` | 100 | An endpoint is slower when its p95 is more than `perf.slower_ratio` times its usual p95 and more than this many milliseconds above it. 0 to 3600000. |
+| `otel.min_requests` | 20 | A 5-minute window counts toward the usual figures, and the last 15 minutes count at all, only with at least this many requests. 1 to 1000000. |
+
 ## Guard rules
 
 The `guard` settings control the [guard rules](/docs/hooks/#guard-rules) that agent hooks and `mulchie guard check` apply to shell commands.

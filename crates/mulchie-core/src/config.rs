@@ -57,6 +57,9 @@ pub struct Config {
     pub updates: UpdatesConfig,
     /// Build timings, commit attribution and `build_slower` findings.
     pub perf: PerfConfig,
+    /// The local OpenTelemetry trace receiver and its `endpoint_slower` and
+    /// `endpoint_errors` findings. Off by default.
+    pub otel: OtelConfig,
 }
 
 /// A finding id kept quiet until `until_unix` (`None`: until undismissed).
@@ -196,6 +199,7 @@ impl Default for Config {
             guard: GuardConfig::default(),
             updates: UpdatesConfig::default(),
             perf: PerfConfig::default(),
+            otel: OtelConfig::default(),
         }
     }
 }
@@ -678,6 +682,50 @@ impl PerfConfig {
     }
 }
 
+// -------------------------------------------------------------- otel
+
+/// `otel`: the OTLP/HTTP trace receiver ([`crate::otel_server`]) and when an
+/// endpoint counts as slower or failing more than usual
+/// ([`crate::endpoints`]). The ratio comes from `perf.slower_ratio`.
+/// Everything here only reports.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(default)]
+pub struct OtelConfig {
+    /// Run the receiver on `127.0.0.1:<port>`. Only the engine that holds
+    /// the lock runs it; it starts and stops when this changes.
+    pub enabled: bool,
+    /// The port to listen on (loopback only). 0 picks a free one.
+    pub port: u16,
+    /// An endpoint is slower when its p95 is more than `perf.slower_ratio`
+    /// times its usual p95 and more than this many milliseconds above it.
+    pub min_slowdown_ms: u64,
+    /// A 5-minute window, and the last 15 minutes, count only with at least
+    /// this many requests.
+    pub min_requests: u64,
+}
+
+impl Default for OtelConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            port: crate::otel_server::DEFAULT_PORT,
+            min_slowdown_ms: 100,
+            min_requests: 20,
+        }
+    }
+}
+
+impl OtelConfig {
+    pub fn validate(&self, e: &mut Vec<String>) {
+        if self.min_slowdown_ms > 3_600_000 {
+            e.push("otel.min_slowdown_ms must be between 0 and 3600000".into());
+        }
+        if !(1..=1_000_000).contains(&self.min_requests) {
+            e.push("otel.min_requests must be between 1 and 1000000".into());
+        }
+    }
+}
+
 // ------------------------------------------------------------- guard
 
 /// How a guard rule answers a match.
@@ -970,6 +1018,10 @@ impl Config {
         self.guard.validate(&mut e);
         self.updates.validate(&mut e);
         self.perf.validate(&mut e);
+        self.otel.validate(&mut e);
+        if self.otel.port != 0 && self.otel.port == self.api_port {
+            e.push("otel.port must differ from api_port".into());
+        }
         if e.is_empty() {
             Ok(())
         } else {
