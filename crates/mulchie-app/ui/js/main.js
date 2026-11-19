@@ -137,8 +137,9 @@ function go(v, opts = {}) {
 
 // Named actions for findings, the panel and the inspector.
 function run(name) {
-  if (name === 'sweep') return sweep();
-  if (name === 'stale') return clearStale();
+  // Show the Disk view behind the dialog, so what it clears is in view.
+  if (name === 'sweep') { if (st.view !== 'disk') go('disk'); return sweep(); }
+  if (name === 'stale') { if (st.view !== 'disk') go('disk'); return clearStale(); }
   if (name.startsWith('go:')) return go(name.slice(3));
   if (name.startsWith('d:')) return go(name);
   if (name === 'idle-sessions') {
@@ -299,7 +300,8 @@ document.addEventListener('keydown', e => {
 });
 window.addEventListener('resize', () => { if (!modalOpen()) render(); });
 document.addEventListener('visibilitychange', () => { if (!document.hidden) refresh(true); });
-listen('mulchie://view', ev => go(ev.payload));
+// Only the dashboard opens views and runs actions; the panel hands them over.
+listen('mulchie://view', ev => { if (MODE !== 'panel') go(ev.payload); });
 listen('mulchie://visible', ev => { visible = !!ev.payload; if (visible) refresh(true); });
 
 loadIntegration().then(I => { if (I?.home) setHome(I.home); render(); });
