@@ -85,12 +85,13 @@ export function renderPanel() {
     // One line for the rest, each a link to where it is listed. Sessions,
     // not breaches: one session can be over several caps.
     const over = new Set((S.sessions?.breaches || []).filter(b => b.cleared_unix == null).map(b => b.session_id));
-    const nb = over.size, nu = S.updates?.available || 0, more = Math.max(0, f.length - 3);
+    const nb = over.size, nu = S.updates?.available || 0, ni = S.issue_counts?.active || 0, more = Math.max(0, f.length - 3);
     const lnk = (attrs, cls, text) => `<a class="lnk" role="button" tabindex="0" ${attrs}><span class="${cls}">${text}</span></a>`;
     into($('#pLim')).html = [
       more && lnk('data-open="overview"', 'warn', `${more} more to look at`),
       nb && lnk('data-v="sessions"', 'bad', `${nb === 1 ? '1 session' : `${nb} sessions`} over a limit`),
       nu && lnk('data-d="findings" data-dk="update"', 'info', `${nu === 1 ? '1 update' : `${nu} updates`}`),
+      ni && lnk('data-v="issues"', S.issue_counts.regressed ? 'bad' : 'warn', `${ni === 1 ? '1 active issue' : `${ni} active issues`}${S.issue_counts.regressed ? ` (${S.issue_counts.regressed} came back)` : ''}`),
     ].filter(Boolean).join(' · ');
   }
   fit();

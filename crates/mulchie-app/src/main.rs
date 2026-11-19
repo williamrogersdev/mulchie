@@ -130,6 +130,52 @@ async fn undismiss_finding(b: B<'_>, id: String) -> Result<bool, String> {
     blocking(&b, move |b| b.undismiss_finding(&id)).await
 }
 
+/// Issues (`status`: open, regressed, resolved, ignored or all; unresolved
+/// when absent) with the counts.
+#[tauri::command]
+async fn issues(b: B<'_>, status: Option<String>, kind: Option<String>) -> Result<Value, String> {
+    blocking(&b, move |b| b.issues(status.as_deref(), kind.as_deref())).await
+}
+
+/// `action` is `resolve`, `ignore` or `reopen`; returns the issue.
+#[tauri::command]
+async fn issue_status(b: B<'_>, id: String, action: String) -> Result<Value, String> {
+    blocking(&b, move |b| b.set_issue_status(&id, &action)).await
+}
+
+#[tauri::command]
+async fn timings(b: B<'_>, limit: Option<usize>) -> Result<Value, String> {
+    blocking(&b, move |b| b.timings(limit.unwrap_or(50).clamp(1, 1000))).await
+}
+
+#[tauri::command]
+async fn commits(b: B<'_>, limit: Option<usize>) -> Result<Value, String> {
+    blocking(&b, move |b| b.commits(limit.unwrap_or(100).clamp(1, 1000))).await
+}
+
+#[tauri::command]
+async fn devservers(b: B<'_>, limit: Option<usize>) -> Result<Value, String> {
+    blocking(&b, move |b| {
+        b.devservers(limit.unwrap_or(50).clamp(1, 1000))
+    })
+    .await
+}
+
+#[tauri::command]
+async fn otel_report(b: B<'_>, minutes: Option<u64>) -> Result<Value, String> {
+    blocking(&b, move |b| b.otel(minutes.unwrap_or(15).clamp(1, 1440))).await
+}
+
+#[tauri::command]
+async fn deploys(b: B<'_>) -> Result<Value, String> {
+    blocking(&b, |b| b.deploys()).await
+}
+
+#[tauri::command]
+async fn integrations_status(b: B<'_>) -> Result<Value, String> {
+    blocking(&b, |b| b.integrations()).await
+}
+
 #[tauri::command]
 async fn sessions(b: B<'_>) -> Result<Value, String> {
     blocking(&b, |b| b.sessions()).await
@@ -553,6 +599,15 @@ fn show_dashboard(app: &AppHandle, view: Option<String>) {
     }
 }
 
+/// The tooltip's note on issues: nothing when there are none or it is unknown.
+fn issues_tip(active: Option<u64>) -> String {
+    match active {
+        Some(1) => " · 1 active issue".into(),
+        Some(n) if n > 1 => format!(" · {n} active issues"),
+        _ => String::new(),
+    }
+}
+
 fn tray_title(t: &TrayInfo) -> String {
     if t.disk_total == 0 {
         return String::new();
@@ -632,11 +687,12 @@ fn tray_loop(backend: Arc<Backend>, tray: tauri::tray::TrayIcon) {
                             _ => "",
                         };
                         let tip = format!(
-                            "Mulchie{mode}: {} free · load {:.0} · {} agents · {} builds",
+                            "Mulchie{mode}: {} free · load {:.0} · {} agents · {} builds{}",
                             human_bytes(t.disk_free),
                             t.load1,
                             t.agents,
                             t.builds,
+                            issues_tip(t.issues_active),
                         );
                         let _ = tray.set_title(Some(tray_title(&t)));
                         let _ = tray.set_tooltip(Some(tip));
@@ -732,6 +788,14 @@ fn main() {
             process_detail,
             dismiss_finding,
             undismiss_finding,
+            issues,
+            issue_status,
+            timings,
+            commits,
+            devservers,
+            otel_report,
+            deploys,
+            integrations_status,
             set_config,
             sessions,
             session_detail,

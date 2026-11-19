@@ -526,3 +526,19 @@ td .btn.sm { vertical-align: baseline; }
 .btn.upd[hidden] { display: none; }
 .topbar .k.click { cursor: pointer; border-radius: 4px; padding: 1px 3px; margin: -1px -3px; }
 .topbar .k.click:hover { background: var(--bg3); }
+
+/* ---- Performance view: a finding, its evidence and its commits. ---- */
+.pfind { padding: 8px 0; border-top: 1px solid var(--row-line); font-size: 11.5px; }
+.pfind:first-child { border-top: 0; padding-top: 0; }
+.pfind .pf-h { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; margin-bottom: 3px; }
+.pfind .pf-t { font-weight: 600; font-size: 12px; }
+.pfind .ev-cmd { margin: 4px 0 2px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--tx2); }
+.clist { margin: 4px 0 0; padding-left: 16px; color: var(--tx2); }
+.clist li { margin: 1px 0; }
+#v-issues .tbl-wrap { overflow: auto; }
+#v-issues .notices { margin-bottom: 8px; }
+#c-perf .row2 { display: flex; flex-wrap: wrap; gap: 8px 16px; margin-top: 8px; align-items: center; }
+#c-perf .row2 input[type=number] { width: 90px; }
+#c-perf .form-h { margin: 14px 0 4px; }
+#issues .cell { display: block; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+#issues .sub { color: var(--tx3); font: 11px var(--mono); }

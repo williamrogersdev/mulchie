@@ -1453,3 +1453,98 @@ fn a_tray_click_right_after_a_focus_loss_hide_is_ignored() {
     assert!(take_recent_blur_hide(now));
     assert!(!take_recent_blur_hide(now));
 }
+
+/// An engine this process runs, and a client of it.
+fn engine_and_client(f: &Fixture) -> (Backend, Backend) {
+    let a = Backend::start(f.paths.clone(), f.opts());
+    let b = Backend::start(
+        f.paths.clone(),
+        Options {
+            takeover_after: Duration::from_secs(3600),
+            ..f.opts()
+        },
+    );
+    assert_eq!(a.mode(), Mode::Engine);
+    assert_eq!(b.mode(), Mode::Client);
+    (a, b)
+}
+
+#[test]
+fn issues_and_performance_reads_answer_in_both_modes() {
+    let f = fixture();
+    let (a, b) = engine_and_client(&f);
+    for be in [&a, &b] {
+        for status in [
+            None,
+            Some("open"),
+            Some("regressed"),
+            Some("resolved"),
+            Some("ignored"),
+            Some("all"),
+        ] {
+            let v = be.issues(status, None).unwrap();
+            assert_eq!(v["issues"].as_array().map(Vec::len), Some(0), "{v}");
+            assert_eq!(v["counts"]["active"], 0, "{v}");
+        }
+        assert!(be.issues(Some("open"), Some("build_slower")).is_ok());
+        assert!(be.issues(Some("bogus"), None).is_err());
+        assert!(be.issues(None, Some("not_a_kind")).is_err());
+        // Nothing reaches the query string but a plain word.
+        assert!(be.issues(Some("open&x=1"), None).is_err());
+        assert_eq!(be.timings(5).unwrap()["timings"], json!([]));
+        assert_eq!(be.commits(5).unwrap()["commits"], json!([]));
+        assert_eq!(be.devservers(5).unwrap()["dev_servers"], json!([]));
+        let o = be.otel(15).unwrap();
+        assert_eq!(o["enabled"], false, "{o}");
+        assert_eq!(o["services"], json!([]));
+        assert_eq!(be.deploys().unwrap()["deploys"], json!([]));
+        let i = be.integrations().unwrap();
+        assert!(
+            i["providers"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|p| p["enabled"] == false),
+            "{i}"
+        );
+    }
+    drop(b);
+    a.shutdown();
+}
+
+#[test]
+fn an_issue_change_names_what_went_wrong_in_words() {
+    let f = fixture();
+    let (a, b) = engine_and_client(&f);
+    for be in [&a, &b] {
+        for action in ["resolve", "ignore", "reopen"] {
+            let e = be.set_issue_status("0000000000000000", action).unwrap_err();
+            assert!(e.contains("no longer in the list"), "{action}: {e}");
+        }
+        assert!(be
+            .set_issue_status("0000000000000000", "delete")
+            .unwrap_err()
+            .contains("unknown issue action"));
+    }
+    assert!(backend::issue_error("not_lock_holder", "x")
+        .contains("another Mulchie engine holds the engine lock"));
+    assert_eq!(backend::issue_error("invalid_body", "as is"), "as is");
+    drop(b);
+    a.shutdown();
+}
+
+#[test]
+fn the_tray_counts_active_issues_from_either_engine() {
+    let f = fixture();
+    let (a, b) = engine_and_client(&f);
+    a.tick();
+    b.tick();
+    assert_eq!(a.tray_info().unwrap().issues_active, Some(0));
+    assert_eq!(b.tray_info().unwrap().issues_active, Some(0));
+    assert_eq!(issues_tip(None), "");
+    assert_eq!(issues_tip(Some(0)), "");
+    assert_eq!(issues_tip(Some(1)), " · 1 active issue");
+    assert_eq!(issues_tip(Some(3)), " · 3 active issues");
+    drop(b);
+    a.shutdown();
+}
