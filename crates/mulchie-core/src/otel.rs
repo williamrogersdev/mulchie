@@ -335,7 +335,10 @@ pub fn decode_protobuf(body: &[u8], limits: &DecodeLimits) -> Result<TraceBatch,
             expect(wt, WT_LEN, "resource_spans")?;
             let b = r.len_delimited()?;
             let rs = pb_resource_spans(b, limits, &mut spans_left, &mut out.dropped)?;
-            out.resource_spans.push(rs);
+            // A resource with no spans adds nothing.
+            if !rs.spans.is_empty() {
+                out.resource_spans.push(rs);
+            }
         } else {
             r.skip(wt)?;
         }
@@ -587,11 +590,189 @@ const KIND_NAMES: &[&str] = &[
 
 const STATUS_NAMES: &[&str] = &["STATUS_CODE_UNSET", "STATUS_CODE_OK", "STATUS_CODE_ERROR"];
 
+// Arrays are folded while they are parsed ([`Folded`]): each element is
+// converted at once and only what is kept stays in memory, so the caps bound
+// what is allocated, not just what is returned. The caps and drop counts of
+// the request being parsed live in a thread-local [`JsonCtx`].
+
+struct JsonCtx {
+    limits: DecodeLimits,
+    spans_left: usize,
+    drops: DecodeDrops,
+}
+
+thread_local! {
+    static JSON_CTX: std::cell::RefCell<JsonCtx> = const {
+        std::cell::RefCell::new(JsonCtx {
+            limits: DecodeLimits {
+                max_spans: 0,
+                max_attributes: 0,
+                max_string: 0,
+            },
+            spans_left: 0,
+            drops: DecodeDrops {
+                spans: 0,
+                attributes: 0,
+                truncated_strings: 0,
+            },
+        })
+    };
+}
+
+fn with_ctx<T>(f: impl FnOnce(&mut JsonCtx) -> T) -> T {
+    JSON_CTX.with(|c| f(&mut c.borrow_mut()))
+}
+
+/// Folds the elements of a JSON array one at a time.
+trait Fold: Default {
+    type Item: serde::de::DeserializeOwned;
+    /// Whether there is room for another element; if not, the next one is
+    /// skipped unparsed and [`Fold::reject`] counts it.
+    fn has_room(&self) -> bool {
+        true
+    }
+    fn add(&mut self, item: Self::Item);
+    fn reject(&mut self) {}
+}
+
+struct Folded<F>(F);
+
+struct FoldVisitor<F>(std::marker::PhantomData<F>);
+
+impl<'de, F: Fold> serde::de::Visitor<'de> for FoldVisitor<F> {
+    type Value = Folded<F>;
+
+    fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("an array")
+    }
+
+    fn visit_seq<A: serde::de::SeqAccess<'de>>(self, mut seq: A) -> Result<Self::Value, A::Error> {
+        let mut fold = F::default();
+        loop {
+            if fold.has_room() {
+                match seq.next_element::<F::Item>()? {
+                    Some(item) => fold.add(item),
+                    None => break,
+                }
+            } else {
+                match seq.next_element::<serde::de::IgnoredAny>()? {
+                    Some(_) => fold.reject(),
+                    None => break,
+                }
+            }
+        }
+        Ok(Folded(fold))
+    }
+}
+
+impl<'de, F: Fold> Deserialize<'de> for Folded<F> {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        d.deserialize_seq(FoldVisitor(std::marker::PhantomData))
+    }
+}
+
+#[derive(Default)]
+struct ResourceFold(Vec<ResourceSpans>);
+
+impl Fold for ResourceFold {
+    type Item = JResourceSpans;
+    fn add(&mut self, j: JResourceSpans) {
+        let spans = j.scope_spans.map(|f| f.0 .0).unwrap_or_default();
+        // A resource with no spans adds nothing.
+        if spans.is_empty() {
+            return;
+        }
+        let resource = j
+            .resource
+            .and_then(|r| r.attributes)
+            .map(|f| f.0.c.out)
+            .unwrap_or_default();
+        self.0.push(ResourceSpans { resource, spans });
+    }
+}
+
+#[derive(Default)]
+struct ScopeFold(Vec<Span>);
+
+impl Fold for ScopeFold {
+    type Item = JScopeSpans;
+    fn add(&mut self, j: JScopeSpans) {
+        if let Some(f) = j.spans {
+            self.0.extend(f.0 .0);
+        }
+    }
+}
+
+#[derive(Default)]
+struct SpanFold(Vec<Span>);
+
+impl Fold for SpanFold {
+    type Item = JSpan;
+    fn has_room(&self) -> bool {
+        with_ctx(|c| c.spans_left > 0)
+    }
+    fn add(&mut self, j: JSpan) {
+        let span = with_ctx(|c| {
+            c.spans_left = c.spans_left.saturating_sub(1);
+            json_span(j, &c.limits, &mut c.drops)
+        });
+        self.0.push(span);
+    }
+    fn reject(&mut self) {
+        with_ctx(|c| c.drops.spans += 1);
+    }
+}
+
+/// Which attribute keys an [`AttrFold`] keeps.
+trait Keys {
+    const KEYS: &'static [&'static str];
+}
+
+struct SpanKeys;
+
+impl Keys for SpanKeys {
+    const KEYS: &'static [&'static str] = SPAN_KEYS;
+}
+
+struct ResourceKeys;
+
+impl Keys for ResourceKeys {
+    const KEYS: &'static [&'static str] = RESOURCE_KEYS;
+}
+
+struct AttrFold<K> {
+    c: AttrCollector<'static>,
+    _k: std::marker::PhantomData<K>,
+}
+
+impl<K: Keys> Default for AttrFold<K> {
+    fn default() -> Self {
+        Self {
+            c: AttrCollector::new(K::KEYS),
+            _k: std::marker::PhantomData,
+        }
+    }
+}
+
+impl<K: Keys> Fold for AttrFold<K> {
+    type Item = JKeyValue;
+    fn has_room(&self) -> bool {
+        with_ctx(|ctx| self.c.seen < ctx.limits.max_attributes)
+    }
+    fn add(&mut self, kv: JKeyValue) {
+        self.c.seen += 1;
+        with_ctx(|ctx| json_key_value(kv, &mut self.c, &ctx.limits, &mut ctx.drops));
+    }
+    fn reject(&mut self) {
+        with_ctx(|c| c.drops.attributes += 1);
+    }
+}
+
 #[derive(Deserialize, Default)]
 #[serde(default, rename_all = "camelCase")]
 struct JRequest {
     #[serde(alias = "resource_spans")]
-    resource_spans: Option<Vec<JResourceSpans>>,
+    resource_spans: Option<Folded<ResourceFold>>,
 }
 
 #[derive(Deserialize, Default)]
@@ -599,19 +780,19 @@ struct JRequest {
 struct JResourceSpans {
     resource: Option<JResource>,
     #[serde(alias = "scope_spans")]
-    scope_spans: Option<Vec<JScopeSpans>>,
+    scope_spans: Option<Folded<ScopeFold>>,
 }
 
 #[derive(Deserialize, Default)]
 #[serde(default)]
 struct JResource {
-    attributes: Option<Vec<JKeyValue>>,
+    attributes: Option<Folded<AttrFold<ResourceKeys>>>,
 }
 
 #[derive(Deserialize, Default)]
 #[serde(default)]
 struct JScopeSpans {
-    spans: Option<Vec<JSpan>>,
+    spans: Option<Folded<SpanFold>>,
 }
 
 #[derive(Deserialize, Default)]
@@ -625,7 +806,7 @@ struct JSpan {
     start_time_unix_nano: Option<JNum>,
     #[serde(alias = "end_time_unix_nano")]
     end_time_unix_nano: Option<JNum>,
-    attributes: Option<Vec<JKeyValue>>,
+    attributes: Option<Folded<AttrFold<SpanKeys>>>,
     status: Option<JStatus>,
 }
 
@@ -659,39 +840,21 @@ struct JAnyValue {
 /// lowerCamelCase (snake_case is accepted too), unknown fields are ignored,
 /// 64-bit integers may be strings or numbers, enums numbers or names.
 pub fn decode_json(body: &[u8], limits: &DecodeLimits) -> Result<TraceBatch, DecodeError> {
-    let req: JRequest =
-        serde_json::from_slice(body).map_err(|e| derr(format!("invalid JSON: {e}")))?;
-    let mut out = TraceBatch::default();
-    let mut spans_left = limits.max_spans;
-    for jrs in req.resource_spans.unwrap_or_default() {
-        let mut rs = ResourceSpans::default();
-        let mut res = AttrCollector::new(RESOURCE_KEYS);
-        if let Some(r) = jrs.resource {
-            for kv in r.attributes.unwrap_or_default() {
-                json_key_value(kv, &mut res, limits, &mut out.dropped);
-            }
-        }
-        rs.resource = res.out;
-        for ss in jrs.scope_spans.unwrap_or_default() {
-            for js in ss.spans.unwrap_or_default() {
-                if spans_left == 0 {
-                    out.dropped.spans += 1;
-                    continue;
-                }
-                spans_left -= 1;
-                rs.spans.push(json_span(js, limits, &mut out.dropped));
-            }
-        }
-        out.resource_spans.push(rs);
-    }
-    Ok(out)
+    with_ctx(|c| {
+        c.limits = *limits;
+        c.spans_left = limits.max_spans;
+        c.drops = DecodeDrops::default();
+    });
+    let parsed: Result<JRequest, _> = serde_json::from_slice(body);
+    let dropped = with_ctx(|c| std::mem::take(&mut c.drops));
+    let req = parsed.map_err(|e| derr(format!("invalid JSON: {e}")))?;
+    Ok(TraceBatch {
+        resource_spans: req.resource_spans.map(|f| f.0 .0).unwrap_or_default(),
+        dropped,
+    })
 }
 
 fn json_span(js: JSpan, limits: &DecodeLimits, drops: &mut DecodeDrops) -> Span {
-    let mut attrs = AttrCollector::new(SPAN_KEYS);
-    for kv in js.attributes.unwrap_or_default() {
-        json_key_value(kv, &mut attrs, limits, drops);
-    }
     Span {
         name: cut(js.name.unwrap_or_default(), limits.max_string, drops),
         kind: js.kind.map(|k| k.as_enum(KIND_NAMES)).unwrap_or(0),
@@ -709,19 +872,18 @@ fn json_span(js: JSpan, limits: &DecodeLimits, drops: &mut DecodeDrops) -> Span 
             .and_then(|s| s.code)
             .map(|c| c.as_enum(STATUS_NAMES))
             .unwrap_or(0),
-        attributes: attrs.out,
+        attributes: js.attributes.map(|f| f.0.c.out).unwrap_or_default(),
     }
 }
 
+/// Keep one attribute if its key is wanted. The cap was checked before it
+/// was parsed.
 fn json_key_value(
     kv: JKeyValue,
     attrs: &mut AttrCollector<'_>,
     limits: &DecodeLimits,
     drops: &mut DecodeDrops,
 ) {
-    if !attrs.admit(limits, drops) {
-        return;
-    }
     let Some(k) = kv.key.as_deref().and_then(|k| attrs.wants(k.as_bytes())) else {
         return;
     };

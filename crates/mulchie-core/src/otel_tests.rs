@@ -241,11 +241,55 @@ fn protobuf_literal_bytes_fixture() {
 
 #[test]
 fn protobuf_negative_int_and_empty_request() {
-    let req = pb_request(&[pb_kv("process.pid", V::I(-7))], &[]);
+    let span = pb_span(&PbSpan {
+        name: "x",
+        kind: 2,
+        parent: &[],
+        start: 1,
+        end: 2,
+        status: 0,
+        attrs: vec![],
+    });
+    let req = pb_request(&[pb_kv("process.pid", V::I(-7))], &[span]);
     let b = decode_protobuf(&req, &DecodeLimits::default()).unwrap();
     assert_eq!(b.resource_spans[0].resource[0].value, AttrValue::Int(-7));
     let empty = decode_protobuf(&[], &DecodeLimits::default()).unwrap();
     assert!(empty.resource_spans.is_empty());
+    // A resource with no spans is not kept.
+    let req = pb_request(&[pb_kv("process.pid", V::I(1))], &[]);
+    let b = decode_protobuf(&req, &DecodeLimits::default()).unwrap();
+    assert!(b.resource_spans.is_empty());
+}
+
+#[test]
+fn many_empty_groups_allocate_nothing() {
+    // 4 MB of empty resource_spans: two bytes each in protobuf.
+    let body: Vec<u8> = [0x0a, 0x00].repeat(2 * 1024 * 1024);
+    let b = decode_protobuf(&body, &DecodeLimits::default()).unwrap();
+    assert!(b.resource_spans.is_empty());
+    assert_eq!(b.resource_spans.capacity(), 0);
+
+    // The same in JSON: empty resources, empty scopes, and spans and
+    // attributes past their caps, which are skipped unparsed.
+    let limits = DecodeLimits {
+        max_spans: 3,
+        max_attributes: 2,
+        max_string: 16,
+    };
+    let empties = vec!["{}"; 200_000].join(",");
+    let scopes = vec!["{}"; 200_000].join(",");
+    let spans = vec![r#"{"name":"s","kind":2}"#; 100_000].join(",");
+    let attrs = vec![r#"{"key":"k"}"#; 100_000].join(",");
+    let j = format!(
+        r#"{{"resourceSpans":[{empties},
+            {{"resource":{{"attributes":[{attrs}]}},"scopeSpans":[{scopes},{{"spans":[{spans}]}}]}}]}}"#
+    );
+    let b = decode_json(j.as_bytes(), &limits).unwrap();
+    assert_eq!(b.resource_spans.len(), 1);
+    assert_eq!(b.span_count(), 3);
+    assert_eq!(b.dropped.spans, 100_000 - 3);
+    assert_eq!(b.dropped.attributes, 100_000 - 2);
+    assert!(b.resource_spans[0].spans.capacity() < 16);
 }
 
 #[test]
@@ -502,7 +546,7 @@ fn json_rejects_malformed_and_too_deep() {
     ]
     .concat();
     let b = decode_json(deep.as_bytes(), &l).unwrap();
-    assert!(b.resource_spans[0].resource.is_empty());
+    assert!(b.resource_spans.is_empty());
 }
 
 // ----------------------------------------------------------------- caps
