@@ -1,7 +1,7 @@
 //! Disk map: package and toolchain caches, and every git worktree under the scan
 //! roots. Read-only; removal goes through the safety gate.
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -28,7 +28,7 @@ pub const ACTIVE_SECS: u64 = 86_400;
 /// What a scan measured in one worktree: the expensive part (a walk of
 /// every file and a `git status`), kept so the next periodic scan can skip
 /// it for a worktree that shows no sign of change.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WorktreeMemo {
     pub at_unix: u64,
     pub head: Option<String>,
@@ -81,12 +81,87 @@ impl WorktreeMemo {
 pub const BUSY_REMEASURE_SECS: u64 = 2 * 3600;
 
 /// What the last scans measured. The engine keeps one between periodic
-/// scans; a scan someone asked for starts from an empty one.
-#[derive(Debug, Clone, Default)]
+/// scans, and in `<config dir>/scan-memo.json` across restarts; a scan
+/// someone asked for starts from an empty one.
+#[derive(Debug, Clone, Default, PartialEq)]
 pub struct ScanMemo {
     pub worktrees: HashMap<PathBuf, WorktreeMemo>,
     pub caches: HashMap<PathBuf, SizeMemo>,
     pub stores: HashMap<PathBuf, SizeMemo>,
+}
+
+/// Bumped whenever the saved memo's meaning changes; another version is
+/// ignored, and the next scan measures everything.
+const MEMO_FORMAT: u32 = 1;
+
+/// A saved memo larger than this is ignored rather than read.
+const MEMO_MAX_BYTES: u64 = 16 << 20;
+
+#[derive(Serialize, Deserialize)]
+struct SavedMemo {
+    format: u32,
+    worktrees: Vec<(String, WorktreeMemo)>,
+    caches: Vec<(String, SizeMemo)>,
+    stores: Vec<(String, SizeMemo)>,
+}
+
+impl ScanMemo {
+    fn file(paths: &Paths) -> PathBuf {
+        paths.config_dir.join("scan-memo.json")
+    }
+
+    /// The memo the last engine saved, or an empty one when there is none,
+    /// it is not a plain file, or it cannot be read. It is only a cache:
+    /// a figure from it is shown, never acted on (the safety gate measures
+    /// again before it removes anything). Entries measured after `now`
+    /// (the clock moved back) are dropped; [`WorktreeMemo`]'s and
+    /// [`SizeMemo`]'s own age rules drop the old ones.
+    pub fn load(paths: &Paths, now: u64) -> Self {
+        let path = Self::file(paths);
+        let plain = std::fs::symlink_metadata(&path)
+            .is_ok_and(|m| m.file_type().is_file() && m.len() <= MEMO_MAX_BYTES);
+        let saved: Option<SavedMemo> = plain
+            .then(|| std::fs::read(&path).ok())
+            .flatten()
+            .and_then(|b| serde_json::from_slice(&b).ok())
+            .filter(|s: &SavedMemo| s.format == MEMO_FORMAT);
+        let Some(s) = saved else {
+            return Self::default();
+        };
+        fn keep<T>(v: Vec<(String, T)>, now: u64, at: impl Fn(&T) -> u64) -> HashMap<PathBuf, T> {
+            v.into_iter()
+                .filter(|(_, m)| at(m) <= now)
+                .map(|(p, m)| (PathBuf::from(p), m))
+                .collect()
+        }
+        Self {
+            worktrees: keep(s.worktrees, now, |m| m.at_unix),
+            caches: keep(s.caches, now, |m| m.at_unix),
+            stores: keep(s.stores, now, |m| m.at_unix),
+        }
+    }
+
+    /// Write the memo for the next engine (mode 0600: it names the user's
+    /// worktrees). Paths that are not UTF-8 are left out and measured again.
+    pub fn save(&self, paths: &Paths) -> std::io::Result<()> {
+        fn list<T: Clone>(m: &HashMap<PathBuf, T>) -> Vec<(String, T)> {
+            let mut v: Vec<_> = m
+                .iter()
+                .filter_map(|(p, x)| Some((p.to_str()?.to_string(), x.clone())))
+                .collect();
+            v.sort_by(|a, b| a.0.cmp(&b.0));
+            v
+        }
+        let saved = SavedMemo {
+            format: MEMO_FORMAT,
+            worktrees: list(&self.worktrees),
+            caches: list(&self.caches),
+            stores: list(&self.stores),
+        };
+        let data = serde_json::to_vec(&saved).map_err(std::io::Error::other)?;
+        std::fs::create_dir_all(&paths.config_dir)?;
+        crate::config::write_atomic(&Self::file(paths), &data, 0o600)
+    }
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -1047,7 +1122,8 @@ mod tests {
 
     /// `MULCHIE_BENCH_ROOT=<folder of repos> cargo test -p mulchie-core --release
     /// --lib diskmap::tests::bench_periodic_scan -- --ignored --nocapture`:
-    /// the CPU a first periodic scan costs, then the next one. Read-only.
+    /// the CPU a first periodic scan costs, then the next ones, each from the
+    /// memo saved to disk and read back as after a restart. Read-only.
     #[test]
     #[ignore]
     fn bench_periodic_scan() {
@@ -1085,7 +1161,86 @@ mod tests {
                 m.worktrees.len(),
                 memo.worktrees.len()
             );
+            // As a restart does: through the file and back.
+            let (c, at) = (cpu(), std::time::Instant::now());
+            memo.save(&paths).unwrap();
+            memo = ScanMemo::load(&paths, crate::monitor::now_unix());
+            let len = std::fs::metadata(paths.config_dir.join("scan-memo.json"))
+                .unwrap()
+                .len();
+            println!(
+                "  memo saved and read back: {len} bytes, {:.3}s cpu, {:.2?} wall",
+                cpu() - c,
+                at.elapsed()
+            );
         }
+    }
+
+    /// The memo survives a restart: what one engine saved, the next reads
+    /// back as it was, and reuses. A file that is not a plain memo of this
+    /// format is ignored, and entries from the future are dropped.
+    #[test]
+    fn a_saved_memo_reads_back_and_bad_ones_are_ignored() {
+        let t = tempfile::tempdir().unwrap();
+        let paths = Paths::under(t.path());
+        std::fs::create_dir_all(&paths.home).unwrap();
+        std::fs::create_dir_all(t.path().join("code/repo")).unwrap();
+        let root = t.path().join("code").canonicalize().unwrap();
+        let repo = root.join("repo");
+        git(&paths, &repo, &["init", "-q", "-b", "main"]).unwrap();
+        commit(&paths, &repo, "init");
+        let wt = repo.join(".claude/worktrees/agent-x");
+        git(
+            &paths,
+            &repo,
+            &["worktree", "add", "-q", "-b", "feat", wt.to_str().unwrap()],
+        )
+        .unwrap();
+        std::fs::write(wt.join("a.txt"), "small").unwrap();
+        let cfg = Config {
+            scan_roots: vec![root.clone()],
+            ..Config::default()
+        };
+        let now = crate::monitor::now_unix();
+        let mut memo = ScanMemo::default();
+        let first = scan_with(&cfg, &paths, &[], now, &mut memo, true);
+        assert!(!memo.worktrees.is_empty());
+        memo.save(&paths).unwrap();
+        let file = paths.config_dir.join("scan-memo.json");
+        use std::os::unix::fs::PermissionsExt;
+        let mode = std::fs::metadata(&file).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o600);
+
+        let mut back = ScanMemo::load(&paths, now);
+        assert_eq!(back, memo);
+        std::fs::write(wt.join("a.txt"), vec![b'x'; 200_000]).unwrap();
+        let again = scan_with(&cfg, &paths, &[], now + 60, &mut back, true);
+        let bytes = |m: &DiskMap| {
+            m.worktrees
+                .iter()
+                .find(|w| w.name == "agent-x")
+                .unwrap()
+                .bytes
+        };
+        assert_eq!(bytes(&again), bytes(&first), "reused after the restart");
+
+        // Measured after "now": the clock moved back, so measure again.
+        assert!(ScanMemo::load(&paths, now - 1).worktrees.is_empty());
+
+        let text = std::fs::read_to_string(&file).unwrap();
+        for bad in [
+            text.replace("\"format\":1", "\"format\":999"),
+            "not json".to_string(),
+        ] {
+            std::fs::write(&file, bad).unwrap();
+            assert_eq!(ScanMemo::load(&paths, now), ScanMemo::default());
+        }
+        std::fs::remove_file(&file).unwrap();
+        assert_eq!(ScanMemo::load(&paths, now), ScanMemo::default());
+        let elsewhere = t.path().join("elsewhere.json");
+        std::fs::write(&elsewhere, &text).unwrap();
+        std::os::unix::fs::symlink(&elsewhere, &file).unwrap();
+        assert_eq!(ScanMemo::load(&paths, now), ScanMemo::default());
     }
 
     /// The periodic scan reuses a worktree's figures only while nothing
