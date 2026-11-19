@@ -107,6 +107,15 @@ pub struct IssueCounts {
     pub active: usize,
 }
 
+/// What one [`IssueBook::observe_changes`] found.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct Observed {
+    /// Issues seen for the first time.
+    pub new: Vec<Issue>,
+    /// Resolved issues with a new finding.
+    pub regressed: Vec<Issue>,
+}
+
 /// Whether findings of `kind` become issues.
 pub fn tracked(kind: FindingKind) -> bool {
     matches!(
@@ -314,13 +323,24 @@ impl IssueBook {
     /// is a new occurrence of its issue (or a new issue). Returns the issues
     /// that regressed: resolved before, with a new finding now.
     pub fn observe(&mut self, findings: &[Finding], now: u64) -> Vec<Issue> {
+        self.observe_changes(findings, now).regressed
+    }
+
+    /// [`IssueBook::observe`], also returning the issues seen for the first
+    /// time (a fingerprint the book did not have), as they are after this
+    /// call.
+    pub fn observe_changes(&mut self, findings: &[Finding], now: u64) -> Observed {
         let mut regressed = Vec::new();
+        let mut created: Vec<String> = Vec::new();
         let mut current: HashMap<String, String> = HashMap::new();
         for f in findings {
             let Some((id, culprit, ws)) = fingerprint(f) else {
                 continue;
             };
             let new = self.live.get(&f.id) != Some(&id);
+            if !self.issues.contains_key(&id) {
+                created.push(id.clone());
+            }
             let issue = self.issues.entry(id.clone()).or_insert_with(|| Issue {
                 id: id.clone(),
                 kind: f.kind,
@@ -367,7 +387,11 @@ impl IssueBook {
         }
         self.live = current;
         self.prune(now);
-        regressed
+        let new = created
+            .iter()
+            .filter_map(|id| self.issues.get(id).cloned())
+            .collect();
+        Observed { new, regressed }
     }
 
     /// Drop issues not seen for [`RETAIN_SECS`], then the ones seen longest

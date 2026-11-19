@@ -225,6 +225,20 @@ The `integrations` settings control the read-only [production integrations](/doc
 
 Identifiers are letters, digits, `-`, `_` and `.`, at most 128 characters.
 
+## Webhook
+
+`webhook` sends [issue events](/docs/watch/#sending-issues-to-slack-or-a-script) to Slack or a script of your own. Nothing is sent while `webhook.url` is empty, the default.
+
+| Setting | Default | Meaning |
+| --- | --- | --- |
+| `webhook.url` | `""` | Where events are posted. `https://` to any host, or `http://` only to a loopback address (`localhost`, `127.0.0.1`, `[::1]`). No user name or password in the URL. Empty: off. |
+| `webhook.events` | `["new_issue", "regressed"]` | Which events are sent: `new_issue`, `regressed`, `resolved_by_user`. |
+| `webhook.min_severity` | `medium` | Issues below this severity (`info`, `low`, `medium`, `high`) are not sent. |
+| `webhook.format` | `json` | `json` for the payload, or `slack` for `{"text": "..."}` with a one-line summary. |
+| `webhook.include_host` | `false` | Add this machine's host name to each event. |
+
+The URL may hold a secret, as a Slack webhook URL does. It is saved in the config file, and shown everywhere else (`mulchie config`, `GET /v1/config`, `GET /v1/state`, errors, the journal) with only its scheme, host and port: `https://hooks.slack.com/[redacted]`. Sending that redacted value back in a config write keeps the saved URL, so reading the config and writing it back does not wipe it. A redacted value that does not match the saved URL is refused.
+
 ## Files Mulchie writes
 
 All of these are in the config directory.

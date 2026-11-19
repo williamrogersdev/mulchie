@@ -36,6 +36,7 @@ pub mod shutdown;
 pub mod timings;
 pub mod updates;
 pub mod watch;
+pub mod webhook;
 
 pub use config::{Config, ConfigError, LoadedConfig};
 pub use engine::{Engine, Health, LeaseRequest, State, WorkspaceAction};

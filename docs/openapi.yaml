@@ -613,6 +613,10 @@ paths:
   /v1/config:
     get:
       summary: The config in use, why the file was not used (if so), and its path
+      description: |
+        `webhook.url` is shown redacted: its scheme, host and port, and `/[redacted]` for the
+        rest (`https://hooks.slack.com/[redacted]`), since the URL may hold a secret. The same
+        holds for the `config` in `GET /v1/state` and in PUT and PATCH answers.
       responses:
         "200":
           description: The config
@@ -647,6 +651,9 @@ paths:
         With a revision (`If-Match` header, quoted or not, or the `if_revision` query parameter)
         that is not the file's content now, nothing is saved: 409 `config_changed`.
         Prefer `PATCH`, which sends only the keys that change.
+        A `webhook.url` equal to the redacted form of the saved URL (as `GET /v1/config` shows
+        it) keeps the saved URL, so sending back what was read changes nothing. Any other
+        redacted value is 400 `invalid_config`, and nothing is saved.
       parameters:
         - { $ref: "#/components/parameters/IfMatch" }
         - { $ref: "#/components/parameters/IfRevision" }
@@ -687,6 +694,9 @@ paths:
         With a revision (`If-Match` header or `if_revision`) that is not the file's content now,
         nothing is saved: 409 `config_changed`. Without one the patch applies to whatever the
         file holds.
+        A patch that does not name `webhook.url` keeps it. Naming its redacted form (as
+        `GET /v1/config` shows it) keeps it too; another redacted value is 400
+        `invalid_config`. `""` or `{"webhook": null}` turns the webhook off.
       parameters:
         - { $ref: "#/components/parameters/IfMatch" }
         - { $ref: "#/components/parameters/IfRevision" }
@@ -1457,6 +1467,62 @@ paths:
                     type: array
                     items: { $ref: "#/components/schemas/Deploy" }
         "400": { description: "`bad_provider`", content: { application/json: { schema: { type: object } } } }
+        default: { $ref: "#/components/responses/Error" }
+  /v1/webhook:
+    get:
+      summary: The issue webhook's settings and what it sent
+      description: |
+        The webhook posts issue events (`new_issue`, `regressed`, `resolved_by_user`) to
+        `webhook.url`. Nothing is sent while it is empty, the default. Only the engine that holds
+        the lock, in a build with network support, sends (`sending`). The URL is shown only
+        redacted. Errors name the redacted URL and the status or reason, never the URL.
+      responses:
+        "200":
+          description: The status
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  network: { type: boolean, description: "This build can send (the `network` feature)" }
+                  configured: { type: boolean, description: "`webhook.url` is set" }
+                  url: { type: string, description: "Scheme, host and port, then `/[redacted]`; empty when not set" }
+                  format: { type: string, enum: [json, slack] }
+                  events:
+                    type: array
+                    items: { type: string, enum: [new_issue, regressed, resolved_by_user] }
+                  min_severity: { type: string, enum: [info, low, medium, high] }
+                  include_host: { type: boolean }
+                  sending: { type: boolean, description: "This engine sends (it holds the lock and has network support)" }
+                  queued: { type: integer }
+                  sent: { type: integer }
+                  failed: { type: integer }
+                  dropped: { type: integer, description: "Events dropped because the queue (64) was full" }
+                  last_sent_unix: { type: integer }
+                  last_event: { type: string, enum: [new_issue, regressed, resolved_by_user, test] }
+                  last_error: { type: string, description: "Why the last send failed, with the URL redacted" }
+                  last_error_unix: { type: integer }
+                  sends: { type: string, description: "What is sent, in words" }
+        default: { $ref: "#/components/responses/Error" }
+  /v1/webhook/test:
+    post:
+      summary: Post one test event to the webhook now
+      description: |
+        Posts `{"event": "test", "message": ...}` (or, with format `slack`, `{"text": ...}`) to
+        `webhook.url` once, with a 10 s timeout and no redirect followed, and answers with the
+        webhook's HTTP status. Full token only.
+      responses:
+        "200":
+          description: The webhook answered with a 2xx
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  ok: { type: boolean }
+                  status: { type: integer, description: The webhook's HTTP status }
+        "409": { description: "`webhook_off`: webhook.url is not set; `no_network`: this build has no network support; `not_lock_holder`: this engine does not send", content: { application/json: { schema: { type: object } } } }
+        "502": { description: "`webhook_failed`: no 2xx answer; the message names the redacted URL and the status or reason", content: { application/json: { schema: { type: object } } } }
         default: { $ref: "#/components/responses/Error" }
 components:
   securitySchemes:

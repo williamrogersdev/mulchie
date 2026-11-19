@@ -63,12 +63,15 @@ pub use perf_glue::{CommitList, DevServerList, TimingList};
 #[path = "engine_integrations.rs"]
 mod integrations_glue;
 pub use integrations_glue::{DeployList, DeployView, IntegrationsStatus, ProviderStatus};
+#[path = "engine_webhook.rs"]
+mod webhook_glue;
 pub use sessions::{
     LimitsStatus, PausedProc, SessionBrief, SessionDetail, SessionMember, SessionsState,
     PAUSED_FILE, STATE_SESSIONS_KEPT,
 };
 use updates_glue::Updates;
 pub use updates_glue::UpdatesStatus;
+pub use webhook_glue::WebhookStatus;
 
 const HISTORY_LEN: usize = 600;
 pub const SAMPLE_SECS: u64 = 3;
@@ -864,6 +867,8 @@ pub struct Engine {
     /// The trace receiver, its aggregates and endpoint findings
     /// ([`crate::otel_server`], [`crate::endpoints`]).
     otel: Arc<otel_glue::Otel>,
+    /// Issue events posted to `webhook.url` ([`crate::webhook`]).
+    webhook: Arc<webhook_glue::Webhook>,
 }
 
 impl Engine {
@@ -936,6 +941,10 @@ impl Engine {
             perf: Arc::new(perf_glue::Perf::default()),
             integrations: Arc::new(integrations_glue::Integrations::new(integration_http())),
             otel: Arc::new(otel_glue::Otel::default()),
+            webhook: Arc::new(webhook_glue::Webhook::new(
+                webhook_glue::webhook_http(),
+                Duration::from_secs(2),
+            )),
             next_id: Arc::new(AtomicU64::new(1)),
             paths: Arc::new(paths),
             journal: Arc::new(journal),
@@ -990,6 +999,9 @@ impl Engine {
     pub fn snapshot_state(&self) -> State {
         let now = now_unix();
         let mut st = lock(&self.state).clone();
+        // The state is shown (`GET /v1/state`): the webhook URL may hold a
+        // secret.
+        st.config = st.config.redacted();
         st.sample_age_secs = st.sample_age(now);
         st.health = st.health_at(now);
         st.automation = st.automation && self.automation_allowed();
@@ -1194,14 +1206,16 @@ impl Engine {
                 "the config file is not usable ({e}); replace it with PUT /v1/config"
             )]));
         }
-        let mut v = serde_json::to_value(lock(&self.state).config.clone())
-            .map_err(|e| ConfigError::Io(e.to_string()))?;
+        let current = lock(&self.state).config.clone();
+        let mut v = serde_json::to_value(&current).map_err(|e| ConfigError::Io(e.to_string()))?;
         merge_patch(&mut v, patch);
-        let cfg: Config =
+        let mut cfg: Config =
             serde_json::from_value(v).map_err(|e| ConfigError::Parse(e.to_string()))?;
         if let Some(k) = crate::config::unknown_key(patch, &cfg) {
             return Err(ConfigError::UnknownKey(k));
         }
+        crate::webhook::keep_redacted(&mut cfg.webhook.url, &current.webhook.url)
+            .map_err(|e| ConfigError::Invalid(vec![e]))?;
         self.save_config_locked(&mut disk, cfg.clone())?;
         Ok((cfg, config_revision_of(disk.as_deref())))
     }
@@ -1225,7 +1239,7 @@ impl Engine {
     /// (when given). Returns the new revision.
     pub fn set_config_if(
         &self,
-        cfg: Config,
+        mut cfg: Config,
         expected: Option<&str>,
     ) -> Result<String, ConfigError> {
         self.may_write_config()?;
@@ -1239,6 +1253,11 @@ impl Engine {
                 self.paths.config_file().display()
             )));
         }
+        // A config read back from `GET /v1/config` holds the URL redacted:
+        // unchanged, it keeps the saved one.
+        let saved = lock(&self.state).config.webhook.url.clone();
+        crate::webhook::keep_redacted(&mut cfg.webhook.url, &saved)
+            .map_err(|e| ConfigError::Invalid(vec![e]))?;
         self.save_config_locked(&mut disk, cfg)?;
         Ok(config_revision_of(disk.as_deref()))
     }
@@ -1370,6 +1389,7 @@ impl Engine {
         self.start_updates(&mut threads);
         self.start_perf(&mut threads);
         self.start_integrations(&mut threads);
+        self.start_webhook(&mut threads);
     }
 
     pub fn is_shut_down(&self) -> bool {

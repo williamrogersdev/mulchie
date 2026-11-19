@@ -330,7 +330,24 @@ fn redact_one_at(arg: &str, depth: u8) -> Option<String> {
             }
         }
     }
+    if let Some(x) = webhook_secret_url(arg) {
+        return Some(x);
+    }
     redact_url(arg)
+}
+
+/// A webhook URL whose path is its secret (Slack's `hooks.slack.com`,
+/// Discord's `/api/webhooks/`), cut to its scheme and host.
+fn webhook_secret_url(arg: &str) -> Option<String> {
+    let i = arg.find("https://")?;
+    let rest = &arg[i + "https://".len()..];
+    let end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
+    let host = rest[..end].to_ascii_lowercase();
+    let tail = &rest[end..];
+    let secret = host == "hooks.slack.com"
+        || (matches!(host.as_str(), "discord.com" | "discordapp.com")
+            && tail.starts_with("/api/webhooks/"));
+    (secret && tail.len() > 1).then(|| format!("{}https://{}/{REDACTED}", &arg[..i], &rest[..end]))
 }
 
 /// Redact secrets in an argument vector.
@@ -386,6 +403,11 @@ fn redact_args_at(args: &[String], depth: u8) -> Vec<String> {
         if shell && i > 0 && is_script_flag(a) {
             out.push(a.clone());
             script_next = true;
+            continue;
+        }
+        // `mulchie config set webhook.url URL`: the URL may hold a secret.
+        if i > 0 && args[i - 1] == "webhook.url" && a.contains("://") {
+            out.push(crate::webhook::redact_url(a));
             continue;
         }
         // `aws configure set aws_secret_access_key VALUE`.
@@ -557,6 +579,35 @@ mod tests {
 
     fn r(v: &[&str]) -> Vec<String> {
         redact_args(&v.iter().map(|s| s.to_string()).collect::<Vec<_>>())
+    }
+
+    #[test]
+    fn webhook_urls_lose_their_path() {
+        let slack = concat!(
+            "https://hooks.",
+            "slack.com/services/T0ABCDEFG/B0HIJKLMN/",
+            "abcdefghijklmnopqrstuvwx"
+        );
+        for cmd in [
+            format!("mulchie config set webhook.url {slack}"),
+            format!("curl -X POST -d '{{}}' {slack}"),
+            format!("curl -X POST '{slack}'"),
+            "mulchie config set webhook.url https://example.com/hook/s3cretPATH".into(),
+            "curl https://discord.com/api/webhooks/123/s3cretPATH".into(),
+        ] {
+            let out = redact_command_line(&cmd);
+            assert!(!out.contains("abcdefghijklmnopqrstuvwx"), "{out}");
+            assert!(!out.contains("s3cretPATH"), "{out}");
+        }
+        assert_eq!(
+            redact_command_line(&format!("mulchie config set webhook.url {slack}")),
+            "mulchie config set webhook.url https://hooks.slack.com/[redacted]"
+        );
+        // Other URLs keep their path.
+        assert_eq!(
+            redact_command_line("curl https://example.com/api/v1/items"),
+            "curl https://example.com/api/v1/items"
+        );
     }
 
     #[test]

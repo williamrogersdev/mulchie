@@ -144,6 +144,20 @@ for Mulchie to act. Changing an issue needs the running engine.",
     )]
     Issues(IssuesArgs),
 
+    /// Post issue events to Slack or a script: the webhook's status, or a test event
+    #[command(
+        long_about = "With `webhook.url` set, the engine that holds the lock posts issue events \
+to it: a new issue, one that came back after you resolved it, and (if you add it to \
+`webhook.events`) one you resolved. Each post is one small JSON body with the issue's fields \
+(or, with `webhook.format slack`, one line of text), the commit range with its agent sessions \
+for performance issues, and the host name only with `webhook.include_host`. Nothing is sent \
+while `webhook.url` is empty. The URL is shown only with its path redacted. `mulchie webhook` \
+shows what was sent and the last error; `mulchie webhook test` posts one test event now.",
+        args_conflicts_with_subcommands = true,
+        after_help = "Examples:\n  mulchie config set webhook.url https://hooks.slack.com/services/T000/B000/XXXX\n  mulchie config set webhook.format slack\n  mulchie webhook test\n  mulchie webhook --json"
+    )]
+    Webhook(WebhookArgs),
+
     /// How long builds and tests run with `mulchie run` took, newest first
     #[command(
         long_about = "Every command run with `mulchie run` (and every build slot an agent releases \
@@ -658,6 +672,24 @@ pub struct IssuesArgs {
     pub out: JsonArg,
     #[command(subcommand)]
     pub action: Option<IssuesCommand>,
+}
+
+#[derive(Args, Debug)]
+pub struct WebhookArgs {
+    #[command(flatten)]
+    pub out: JsonArg,
+    #[command(subcommand)]
+    pub action: Option<WebhookCommand>,
+}
+
+#[derive(Subcommand, Debug, Clone)]
+pub enum WebhookCommand {
+    /// Post one test event to webhook.url now (needs the engine)
+    #[command(after_help = "Examples:\n  mulchie webhook test\n  mulchie webhook test --json")]
+    Test {
+        #[command(flatten)]
+        out: JsonArg,
+    },
 }
 
 #[derive(Args, Debug)]

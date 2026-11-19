@@ -389,6 +389,24 @@ mulchie devservers
 mulchie devservers --workspace ~/code/repo-x --json
 ```
 
+### webhook
+
+```sh
+mulchie webhook [--json]
+mulchie webhook test [--json]
+```
+
+Issue events posted to `webhook.url`, if you set one. See [Sending issues to Slack or a script](/docs/watch/#sending-issues-to-slack-or-a-script).
+
+- `mulchie webhook` shows the settings, the URL redacted (`https://hooks.slack.com/[redacted]`), and how many events were sent, failed and dropped, with the last error. Without an engine it shows the settings from the file; nothing is sent until an engine runs.
+- `test` needs the engine: it posts one test event now and prints the webhook's HTTP status. It is refused when `webhook.url` is empty.
+
+```sh
+mulchie config set webhook.url https://hooks.slack.com/services/T000/B000/XXXX
+mulchie config set webhook.format slack
+mulchie webhook test
+```
+
 ### integrations
 
 ```sh

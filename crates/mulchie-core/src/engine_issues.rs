@@ -4,6 +4,7 @@
 
 use super::*;
 use crate::issues::{Issue, IssueBook, IssueCounts, IssueStatus};
+use crate::webhook::WebhookEvent;
 
 /// `GET /v1/issues`.
 #[derive(Debug, Clone, Serialize)]
@@ -34,8 +35,8 @@ impl Engine {
     pub(crate) fn observe_issues(&self, now: u64) {
         let findings: Vec<Finding> = lock(&self.state).findings.clone();
         let holder = self.keeps_issues();
-        let regressed = self.with_issues(|book| {
-            let r = book.observe(&findings, now);
+        let seen = self.with_issues(|book| {
+            let r = book.observe_changes(&findings, now);
             if holder {
                 // A book that cannot be saved costs only history.
                 let _ = book.save_if_needed(&self.paths, now);
@@ -45,6 +46,9 @@ impl Engine {
         if !holder {
             return;
         }
+        let regressed = seen.regressed;
+        self.webhook_issues(WebhookEvent::NewIssue, &seen.new, &findings);
+        self.webhook_issues(WebhookEvent::Regressed, &regressed, &findings);
         for i in &regressed {
             let text = format!(
                 "Came back after it was resolved ({} time(s) in all): {}",
@@ -117,14 +121,23 @@ impl Engine {
             ));
         }
         let now = now_unix();
-        let r = self.with_issues(|b| {
+        let (r, before) = self.with_issues(|b| {
+            let before = b.get(id).map(|i| i.status);
             let r = b.set_status(id, status, now);
             if r.is_some() {
                 let _ = b.save_if_needed(&self.paths, now);
             }
-            r
+            (r, before)
         });
         let issue = r.ok_or(("not_found", format!("no issue {id:?}")))?;
+        if status == IssueStatus::Resolved && before != Some(IssueStatus::Resolved) {
+            let findings: Vec<Finding> = lock(&self.state).findings.clone();
+            self.webhook_issues(
+                WebhookEvent::ResolvedByUser,
+                std::slice::from_ref(&issue),
+                &findings,
+            );
+        }
         let word = serde_json::to_value(status)
             .ok()
             .and_then(|v| v.as_str().map(String::from))

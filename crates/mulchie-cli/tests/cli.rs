@@ -23,6 +23,7 @@ fn safe_config(paths: &Paths) -> mulchie_core::LoadedConfig {
     cfg.integrations.sentry.enabled = false;
     cfg.integrations.posthog.enabled = false;
     cfg.otel.enabled = false;
+    cfg.webhook = mulchie_core::config::WebhookConfig::default();
     cfg.save_to(paths, 0).expect("write the test config");
     Config::load_from(paths)
 }
@@ -1080,6 +1081,72 @@ fn hook_logs_why_the_engine_was_not_used_and_drains_big_input() {
     let big = format!("{{\"pad\":\"{}\"}}", "x".repeat(3 << 20));
     let (code, out, _, _) = hook(&h, &["hook", "claude-code", "pre_tool"], Some(&big));
     assert_eq!((code, out.as_str()), (Some(0), ""));
+}
+
+/// The webhook URL is never printed, and `config set` of another key
+/// through the engine (which reads the config back redacted) keeps it.
+#[test]
+fn webhook_url_is_never_printed_and_survives_config_set() {
+    const SECRET: &str = "SENTINELcliWEBHOOK42";
+    let url = format!("https://hooks.example.com/services/{SECRET}");
+    let h = Home::new();
+    // Without an engine: into the file, shown redacted.
+    let o = h.run(&["config", "set", "webhook.url", &url]);
+    assert!(o.status.success(), "{}", text(&o.stderr));
+    assert!(!text(&o.stdout).contains(SECRET), "{}", text(&o.stdout));
+    assert_eq!(Config::load_from(&h.paths()).config.webhook.url, url);
+    let o = h.run(&["config", "--json"]);
+    assert!(!text(&o.stdout).contains(SECRET));
+    let o = h.run(&["webhook", "--json"]);
+    assert!(o.status.success(), "{}", text(&o.stderr));
+    assert!(!text(&o.stdout).contains(SECRET));
+    assert!(text(&o.stdout).contains("https://hooks.example.com/[redacted]"));
+    // A bad URL is refused without being repeated.
+    let o = h.run(&[
+        "config",
+        "set",
+        "webhook.url",
+        "http://example.com/NOTLOOPBACK",
+    ]);
+    assert_eq!(o.status.code(), Some(1));
+    assert!(
+        !text(&o.stderr).contains("NOTLOOPBACK"),
+        "{}",
+        text(&o.stderr)
+    );
+
+    let (engine, _lk, server) = h.engine();
+    // The test helper's safe config cleared it; set it through the engine.
+    let o = h.run(&["config", "set", "webhook.url", &url]);
+    assert!(o.status.success(), "{}", text(&o.stderr));
+    assert!(!text(&o.stdout).contains(SECRET));
+    assert_eq!(engine.config().webhook.url, url);
+    let o = h.run(&["config", "set", "webhook.min_severity", "high"]);
+    assert!(o.status.success(), "{}", text(&o.stderr));
+    let o = h.run(&[
+        "config",
+        "set",
+        "webhook.events",
+        r#"["new_issue","resolved_by_user"]"#,
+    ]);
+    assert!(o.status.success(), "{}", text(&o.stderr));
+    assert_eq!(engine.config().webhook.url, url, "kept");
+    assert_eq!(Config::load_from(&h.paths()).config.webhook.url, url);
+    for args in [
+        &["config", "--json"][..],
+        &["webhook"][..],
+        &["webhook", "--json"][..],
+        &["status", "--json"][..],
+    ] {
+        let o = h.run(args);
+        assert!(!text(&o.stdout).contains(SECRET), "{args:?}");
+        assert!(!text(&o.stderr).contains(SECRET), "{args:?}");
+    }
+    // This in-process engine runs no worker, so it does not send.
+    let o = h.run(&["webhook", "test"]);
+    assert_eq!(o.status.code(), Some(1));
+    assert!(!text(&o.stderr).contains(SECRET));
+    server.stop();
 }
 
 #[test]

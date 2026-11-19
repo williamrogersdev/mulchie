@@ -9,7 +9,7 @@ Use findings to spot processes that look left over, runaway or out of place, and
 
 Findings are observations made by simple heuristics: how long a process has run, how much CPU it uses, where its program file lives, which network addresses it listens on. Each one says what was seen and why it may matter.
 
-A finding is not a verdict. **None of them means malware was found.** Mulchie is not an antivirus. The watch has no signatures, no file hashes and no lookups against any list, and it sends nothing anywhere. A finding that a process runs from a temporary folder is a reason to check that you know what the process is, nothing more. Most turn out to be a dev server or an updated app.
+A finding is not a verdict. **None of them means malware was found.** Mulchie is not an antivirus. The watch has no signatures, no file hashes and no lookups against any list, and it sends nothing anywhere (issue events go to a webhook only if you set one up, as [below](#sending-issues-to-slack-or-a-script)). A finding that a process runs from a temporary folder is a reason to check that you know what the process is, nothing more. Most turn out to be a dev server or an updated app.
 
 The watch only looks at processes owned by you. It never acts on its own. Acting on a finding, for example quitting a process, goes through a plan that you confirm. See the [safety model](/docs/safety/).
 
@@ -175,6 +175,38 @@ A finding lasts as long as its cause: a finding about a process ends when the pr
 - Issues are kept in `issues.json` in the config directory (readable only by you) for 90 days after they were last seen, at most 500. Only the engine that holds the lock writes it.
 
 `mulchie issues` lists them, `diagnose` names the ones that came back three times or more, and agents use `list_issues`. In the app, the dashboard's **Issues** page lists the unresolved ones (those a finding is about right now are marked), with a filter for open, regressed, resolved and ignored, and each row's title, kind, culprit, workspace, how often it occurred, when it was first and last seen and how many times it came back. **Resolve**, **Ignore** and **Reopen** change the record; if another engine holds the lock, the app says it cannot change issues from here. The count of issues that are current now is shown next to Issues in the sidebar, in the menu bar panel and in the menu bar icon's tooltip. An issue is a record: Mulchie never acts because of one.
+
+## Sending issues to Slack or a script
+
+Mulchie can post issue events to a webhook. **Nothing is sent unless `webhook.url` is set**; it is empty by default.
+
+```sh
+mulchie config set webhook.url https://hooks.slack.com/services/T000/B000/XXXX
+mulchie config set webhook.format slack
+mulchie webhook test
+```
+
+The events are `new_issue` (an issue seen for the first time), `regressed` (one you resolved came back) and `resolved_by_user` (you resolved one). By default the first two are sent, for issues of severity `medium` or higher; `webhook.events` and `webhook.min_severity` change that ([Configuration](/docs/configuration/#webhook)).
+
+With `webhook.format json` (the default), each event is one `POST` with a JSON body holding exactly:
+
+- `event`: the event name.
+- `issue`: the issue's `id`, `kind`, `category`, `severity`, `title`, `culprit`, `workspace` (a path on this machine), `occurrences`, `status`, `regressions`, `first_seen_unix` and `last_seen_unix`. The title and culprit are passed through Mulchie's secret redaction again before they are sent.
+- `commits`, for performance issues only, when the finding names them: an object with the commit range (`from`, `to`), a `commits` list of up to 20 commits, the newest, each with its `sha`, `at_unix`, `branch`, and the `session_id` and `agent` that were working then, and `truncated` when there were more.
+- `host`: this machine's host name, only with `webhook.include_host` on.
+
+With `webhook.format slack`, the body is `{"text": "..."}` with the same in one line, for a Slack incoming webhook. `mulchie webhook test` sends `{"event": "test", "message": "..."}` once (or a one-line `text`), with `host` too when `webhook.include_host` is on.
+
+Commands that set or post to a Slack or Discord webhook URL, or that follow `webhook.url`, are kept in session records and findings with the URL cut to its scheme and host.
+
+How it sends:
+
+- Only the engine that holds the engine lock sends, and only in a build with network support. It sends from its own thread, through a queue of 64 events; when the queue is full, an event is dropped and counted.
+- Each post has a 10 second timeout and follows no redirect. A `429`, a `5xx` or no answer is tried again, at most twice, with a wait in between; any other answer is final.
+- The URL is read when an event is sent, so clearing it stops what is queued.
+- `https://` goes to any host; plain `http://` only to a loopback address, for a script on this machine. A URL with a user name or password is refused.
+
+The URL can hold a secret, as Slack's does. Mulchie keeps it in the config file and shows it nowhere else in full: `mulchie webhook`, `mulchie config`, the HTTP API, errors and the journal show `https://hooks.slack.com/[redacted]`. `mulchie webhook` (or `GET /v1/webhook`) shows how many events were sent, failed and dropped, and the last error.
 
 ## Turning the watch off
 
