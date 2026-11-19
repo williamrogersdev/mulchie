@@ -364,6 +364,11 @@ impl Engine {
                 }
             }
         }
+        if req.event == HookEvent::PostTool {
+            if let Some(cmd) = req.command.as_deref() {
+                self.note_shell_command(&cwd, cmd, sid.as_deref());
+            }
+        }
         if req.event == HookEvent::SessionStart {
             reply
                 .context

@@ -180,6 +180,16 @@ pub fn tool_list() -> Vec<Tool> {
                 "kind": { "type": "string", "description": "Only this finding kind, e.g. runaway_cpu" }
             }),
         ),
+        read(
+            "list_timings",
+            "Build and test timings",
+            "How long builds and tests took, newest first: every command run with `mulchie run` and every build slot released with a duration_ms, with its exit code, workspace, branch, commit and the agent session it ran in. Use it to see whether a build got slower and since when; a build_slower finding (list_findings) names the commits in between. A record only; nothing acts on it.",
+            json!({
+                "workspace": { "type": "string", "maxLength": 4096, "description": "Only runs in this workspace (absolute path of the checkout's top directory)" },
+                "command": { "type": "string", "maxLength": 1024, "description": "Only commands that contain this, e.g. cargo test" },
+                "limit": { "type": "integer", "minimum": 1, "maximum": 1000, "description": "At most this many (default 50)" }
+            }),
+        ),
         Tool {
             name: "get_issue",
             title: "One issue",
@@ -357,8 +367,14 @@ pub fn tool_list() -> Vec<Tool> {
         Tool {
             name: "release_build_slot",
             title: "Leave the build queue",
-            description: "Release a build slot or leave the queue. Call it as soon as the heavy work ends.",
-            props: json!({ "ticket": { "type": "integer", "minimum": 1 } }),
+            description: "Release a build slot or leave the queue. Call it as soon as the heavy work ends. Send how the work went (duration_ms, exit_code, command, cwd) so Mulchie can record the timing and notice when this build gets slower (list_timings); the command is redacted before it is stored.",
+            props: json!({
+                "ticket": { "type": "integer", "minimum": 1 },
+                "duration_ms": { "type": "integer", "minimum": 0, "maximum": 604800000u64, "description": "How long the command ran, in milliseconds (not the wait for the slot)" },
+                "exit_code": { "type": "integer", "minimum": -2147483648i64, "maximum": 2147483647, "description": "The command's exit code; only runs with 0 count toward its usual time" },
+                "command": { "type": "string", "maxLength": 4096, "description": "The command line that ran" },
+                "cwd": { "type": "string", "maxLength": 4096, "description": "The absolute directory it ran in" }
+            }),
             required: &["ticket"],
             read_only: false,
             destructive: false,
@@ -1337,6 +1353,30 @@ pub fn call_tool(cx: &mut Ctx, name: &str, a: &Map<String, Value>) -> ToolResult
             };
             get(&path)
         }
+        "list_timings" => {
+            let mut q = Vec::new();
+            if let Some(l) = a.get("limit").and_then(Value::as_u64) {
+                q.push(format!("limit={l}"));
+            }
+            if let Some(w) = a.get("workspace").and_then(Value::as_str) {
+                if !w.starts_with('/') {
+                    return Err("workspace must be an absolute path".into());
+                }
+                q.push(format!(
+                    "workspace={}",
+                    mulchie_core::api::query_escape(w)
+                ));
+            }
+            if let Some(c) = a.get("command").and_then(Value::as_str) {
+                q.push(format!("command={}", mulchie_core::api::query_escape(c)));
+            }
+            let path = if q.is_empty() {
+                "/v1/timings".to_string()
+            } else {
+                format!("/v1/timings?{}", q.join("&"))
+            };
+            get(&path)
+        }
         "get_issue" => {
             let id = a.get("id").and_then(Value::as_str).unwrap_or("");
             check_issue_id(id)?;
@@ -1505,6 +1545,16 @@ pub fn call_tool(cx: &mut Ctx, name: &str, a: &Map<String, Value>) -> ToolResult
         "release_build_slot" => {
             let ticket = a.get("ticket").and_then(Value::as_u64).unwrap_or(0);
             let mut b = json!({ "ticket": ticket });
+            if let Some(c) = a.get("cwd").and_then(Value::as_str) {
+                if !c.starts_with('/') {
+                    return Err("cwd must be an absolute path".into());
+                }
+            }
+            for k in ["duration_ms", "exit_code", "command", "cwd"] {
+                if let Some(v) = a.get(k) {
+                    b[k] = v.clone();
+                }
+            }
             if let Some(s) = lock_secrets(cx.secrets).get(&ticket) {
                 b["secret"] = json!(s);
             }

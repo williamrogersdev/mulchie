@@ -20,6 +20,7 @@ mod serve_log;
 mod service;
 mod sessions;
 mod slots;
+mod timings;
 
 use clap::{CommandFactory, Parser};
 use cli::{Cli, Command, ConfigCommand, HooksCommand, McpCommand};
@@ -173,6 +174,13 @@ fn dispatch(paths: &Paths, cmd: Command) -> i32 {
                 i.out.json,
             ),
         },
+        Command::Timings(t) => timings::list(
+            paths,
+            t.workspace.as_deref(),
+            t.command.as_deref(),
+            t.limit as usize,
+            t.out.json,
+        ),
         Command::Inspect(i) => observe::inspect(paths, i.pid, i.out.json),
         Command::Slots(a) => match &a.action {
             Some(cli::SlotsCommand::Release { ticket, yes, out }) => {

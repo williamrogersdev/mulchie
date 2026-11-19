@@ -144,6 +144,18 @@ for Mulchie to act. Changing an issue needs the running engine.",
     )]
     Issues(IssuesArgs),
 
+    /// How long builds and tests run with `mulchie run` took, newest first
+    #[command(
+        long_about = "Every command run with `mulchie run` (and every build slot an agent releases \
+with a duration) is recorded with how long it took, its exit code, the workspace, branch and \
+commit, and the agent session it ran in. When a command's latest successful runs each take \
+much longer than its usual time, Mulchie raises a `build_slower` finding naming the commits in \
+between and who made them (settings under `perf`). Timings are a record; Mulchie never acts on \
+them. Works without an engine, from the saved file.",
+        after_help = "Examples:\n  mulchie timings\n  mulchie timings --command 'cargo test'\n  mulchie timings --workspace ~/code/repo-x --json"
+    )]
+    Timings(TimingsArgs),
+
     /// Agent sessions: what each agent and everything it started is using (needs the engine)
     #[command(
         long_about = "A session is an agent process and everything it started, found from the \
@@ -605,6 +617,21 @@ pub struct IssuesArgs {
     pub action: Option<IssuesCommand>,
 }
 
+#[derive(Args, Debug)]
+pub struct TimingsArgs {
+    /// Only runs in this workspace (the checkout's top directory)
+    #[arg(long)]
+    pub workspace: Option<std::path::PathBuf>,
+    /// Only commands that contain this, e.g. 'cargo test'
+    #[arg(long)]
+    pub command: Option<String>,
+    /// At most this many runs (1 to 1000)
+    #[arg(long, default_value_t = 50, value_parser = clap::value_parser!(u64).range(1..=1000))]
+    pub limit: u64,
+    #[command(flatten)]
+    pub out: JsonArg,
+}
+
 #[derive(ValueEnum, Debug, Clone, Copy, PartialEq, Eq)]
 pub enum IssueStatusArg {
     Open,
@@ -1048,6 +1075,27 @@ mod tests {
         assert!(parse(&["issues", "show", "0123456789abcdef", "--json"]).is_ok());
         assert!(parse(&["issues", "--status", "closed"]).is_err());
         assert!(parse(&["issues", "resolve"]).is_err());
+    }
+
+    #[test]
+    fn timings_parse() {
+        let Some(Command::Timings(t)) = parse(&[
+            "timings",
+            "--workspace",
+            "/w/r",
+            "--command",
+            "cargo test",
+            "--json",
+        ])
+        .unwrap()
+        .command
+        else {
+            panic!("timings");
+        };
+        assert_eq!(t.command.as_deref(), Some("cargo test"));
+        assert_eq!(t.limit, 50);
+        assert!(t.out.json);
+        assert!(parse(&["timings", "--limit", "0"]).is_err());
     }
 
     #[test]

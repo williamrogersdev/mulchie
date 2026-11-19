@@ -87,6 +87,9 @@ pub enum FindingKind {
     /// Many copies of one program whose parents all exited
     /// ([`ORPHAN_SWARM_MIN`] or more), wherever they run.
     OrphanSwarm,
+    /// A build or test command's latest successful runs each took much
+    /// longer than its usual time (`perf`, [`crate::perf`]).
+    BuildSlower,
 }
 
 impl FindingKind {
@@ -122,6 +125,7 @@ impl FindingKind {
                 FindingCategory::Limit
             }
             MulchieUpdate | AgentUpdate | HomebrewOutdated | Advisory => FindingCategory::Update,
+            BuildSlower => FindingCategory::Performance,
         }
     }
 }
@@ -143,6 +147,8 @@ pub enum FindingCategory {
     Limit,
     /// Updates and advisories.
     Update,
+    /// Something got slower than it usually is: builds and tests.
+    Performance,
 }
 
 /// macOS code signature of an executable, as `codesign` reports it.
@@ -246,6 +252,10 @@ pub struct Evidence {
     /// the biggest sessions, apps, workspaces and processes, biggest first.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub culprits: Vec<Culprit>,
+    /// Performance findings: the baseline, the recent measurements and
+    /// what changed in between.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub perf: Option<Box<crate::timings::PerfEvidence>>,
 }
 
 /// One thing behind a machine-wide finding.

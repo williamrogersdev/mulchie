@@ -145,6 +145,18 @@ A budget has any of the caps `cpu_cores`, `memory_mb`, `processes`, `write_mb_pe
 | `runaway.depth` | 6 | A command running nested inside this many copies of itself, with the same command line and working directory, is a chain. 3 to 64. |
 | `runaway.remember_secs` | 3600 | How long the `runaway_repeat` guard rule matches the command in that directory afterwards. 0 remembers nothing; at most 604800. |
 
+## Performance
+
+`perf` decides when a build or test command counts as [slower than usual](/docs/watch/#slower-builds), and how often the commit a workspace is on is read for [commit attribution](/docs/watch/#which-session-moved-head). Nothing here makes Mulchie act.
+
+| Setting | Default | Meaning |
+| --- | --- | --- |
+| `perf.baseline_runs` | 10 | A command's usual time is the median of up to this many successful runs before the slow ones. 3 to 100. |
+| `perf.slow_runs` | 3 | This many latest successful runs must each be slow. 1 to 20. |
+| `perf.slower_ratio` | 1.5 | A slow run takes more than this many times the usual time. 1.05 to 100. |
+| `perf.min_slowdown_secs` | 30 | ...and more than this many seconds longer. 0 to 86400. |
+| `perf.head_check_secs` | 60 | How often the engine reads `HEAD` of workspaces with agent activity. 10 to 3600. |
+
 ## Guard rules
 
 The `guard` settings control the [guard rules](/docs/hooks/#guard-rules) that agent hooks and `mulchie guard check` apply to shell commands.
@@ -190,6 +202,8 @@ All of these are in the config directory.
 | `engine.lock` | Makes sure one engine runs per user. |
 | `sessions/` | One `<id>.jsonl` [activity record](/docs/sessions/#the-activity-record) per session (mode `0600`, in a `0700` folder), and `paused.json`, the processes Mulchie paused for a limit and has not resumed. |
 | `updates.json` | The last [update check](/docs/updates/), so a restart shows it. |
+| `timings.jsonl` | [Build and test timings](/docs/watch/#slower-builds), mode `0600`. Renamed to `timings.jsonl.1` at 4 MB. |
+| `commits.jsonl` | Moves of workspaces' `HEAD` with the agent session working there, mode `0600`. Renamed to `commits.jsonl.1` at 2 MB. |
 | `scan-memo.json` | What the last disk scan measured (sizes per worktree and cache), mode `0600`, so the first scan after a restart re-measures only what changed. Safe to delete: the next scan measures everything. |
 | `hook.log` | Why a [hook](/docs/hooks/) allowed an action without the engine, at most one line a minute. |
 | `hook-dirs.json` | In `~/.config/mulchie` only: per agent app, a hook's config directory when it was not this one or had no engine, for `mulchie hooks status`. |

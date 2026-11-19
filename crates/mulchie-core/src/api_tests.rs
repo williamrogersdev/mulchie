@@ -1646,3 +1646,78 @@ fn feedback_is_taken_with_either_token_and_listed() {
         .iter()
         .any(|a| a.kind == "feedback" && a.detail.contains(&id)));
 }
+
+/// A timing sent with a release is recorded only when the release freed a
+/// ticket; the command is redacted; the read routes filter and decode.
+#[test]
+fn timings_ride_on_a_release_that_frees_a_ticket() {
+    let r = running(Limits::default());
+    let ro = format!("Bearer {}", read_read_only_token(r.engine.paths()).unwrap());
+    let ws = r.code_root();
+    let lease_body = r#"{"label":"code: cargo test","ttl_secs":600}"#;
+    let (code, v) = send(r.port, "POST", "/v1/lease", Some(&ro), lease_body);
+    assert_eq!(code, 200, "{v}");
+    let secret = v["release_secret"].clone();
+    let ticket = v["ticket"].clone();
+    let timing = json!({
+        "duration_ms": 61_000, "exit_code": 0, "cwd": ws,
+        "command": "cargo test --token ghp_0123456789abcdefghijABCDEFGHIJ012345",
+    });
+    // An unknown ticket frees nothing, so nothing is recorded.
+    let mut b = timing.clone();
+    b["ticket"] = json!(999_999);
+    b["secret"] = json!("x");
+    let (code, v) = send(r.port, "POST", "/v1/release", Some(&ro), &b.to_string());
+    assert_eq!(code, 200, "{v}");
+    assert_eq!(v["released"], false);
+    assert_eq!(v["timing_recorded"], false);
+    assert!(v["timing_error"].is_string());
+    // A bad field is reported, and the slot is still released.
+    let mut b = timing.clone();
+    b["ticket"] = ticket;
+    b["secret"] = secret;
+    b["cwd"] = json!("relative");
+    let (_, v) = send(r.port, "POST", "/v1/release", Some(&ro), &b.to_string());
+    assert_eq!(
+        (v["released"].as_bool(), v["timing_recorded"].as_bool()),
+        (Some(true), Some(false))
+    );
+    // A good one.
+    let (_, v) = send(r.port, "POST", "/v1/lease", Some(&ro), lease_body);
+    let mut b = timing.clone();
+    b["ticket"] = v["ticket"].clone();
+    b["secret"] = v["release_secret"].clone();
+    let (_, v) = send(r.port, "POST", "/v1/release", Some(&ro), &b.to_string());
+    assert_eq!(v["timing_recorded"], true, "{v}");
+    r.engine.perf_tick(crate::monitor::now_unix());
+
+    let q = format!(
+        "/v1/timings?workspace={}&command=cargo%20test",
+        query_escape(&ws.to_string_lossy())
+    );
+    let (code, v) = send(r.port, "GET", &q, Some(&ro), "");
+    assert_eq!(code, 200, "{v}");
+    assert_eq!(v["total"], 1, "{v}");
+    let t = &v["timings"][0];
+    assert_eq!(t["duration_ms"], 61_000);
+    assert_eq!(t["label"], "code: cargo test");
+    assert!(!t["command"].as_str().unwrap().contains("ghp_0123"), "{t}");
+    let (_, v) = send(r.port, "GET", "/v1/timings?command=npm", Some(&ro), "");
+    assert_eq!(v["total"], 0);
+    for bad in [
+        "/v1/timings?limit=0",
+        "/v1/timings?workspace=relative",
+        "/v1/timings?command=%zz",
+        "/v1/commits?since=x",
+    ] {
+        let (code, v) = send(r.port, "GET", bad, Some(&ro), "");
+        assert_eq!(
+            (code, v["code"].as_str()),
+            (400, Some("invalid_query")),
+            "{bad}"
+        );
+    }
+    let (code, v) = send(r.port, "GET", "/v1/commits?limit=5", Some(&ro), "");
+    assert_eq!(code, 200);
+    assert!(v["commits"].is_array());
+}

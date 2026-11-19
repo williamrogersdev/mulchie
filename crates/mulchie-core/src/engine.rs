@@ -54,6 +54,9 @@ mod updates_glue;
 #[path = "engine_issues.rs"]
 mod issues_glue;
 pub use issues_glue::IssueList;
+#[path = "engine_perf.rs"]
+mod perf_glue;
+pub use perf_glue::{CommitList, TimingList};
 pub use sessions::{
     LimitsStatus, PausedProc, SessionBrief, SessionDetail, SessionMember, SessionsState,
     PAUSED_FILE, STATE_SESSIONS_KEPT,
@@ -599,12 +602,15 @@ pub fn merge_patch(target: &mut Value, patch: &Value) {
     }
 }
 
-/// Findings the watch run produces (every category but limits and updates,
-/// which the sample loop and the update checker keep).
-fn watch_owned(f: &Finding) -> bool {
+/// Findings the watch run produces (every category but limits, updates and
+/// performance, which the sample loop, the update checker and the perf
+/// worker keep).
+pub(crate) fn watch_owned(f: &Finding) -> bool {
     !matches!(
         f.kind.category(),
-        watch::FindingCategory::Limit | watch::FindingCategory::Update
+        watch::FindingCategory::Limit
+            | watch::FindingCategory::Update
+            | watch::FindingCategory::Performance
     )
 }
 
@@ -830,6 +836,9 @@ pub struct Engine {
     /// Findings grouped into issues ([`crate::issues`]); `None` until first
     /// used, then read from `issues.json`.
     issues: Arc<Mutex<Option<crate::issues::IssueBook>>>,
+    /// Commit attribution, build timings and their findings
+    /// ([`crate::commits`], [`crate::timings`]).
+    perf: Arc<perf_glue::Perf>,
 }
 
 impl Engine {
@@ -898,6 +907,7 @@ impl Engine {
             jobs: Arc::new(Jobs::default()),
             scan_memo: Arc::new(Mutex::new(None)),
             issues: Arc::new(Mutex::new(None)),
+            perf: Arc::new(perf_glue::Perf::default()),
             next_id: Arc::new(AtomicU64::new(1)),
             paths: Arc::new(paths),
             journal: Arc::new(journal),
@@ -1327,6 +1337,7 @@ impl Engine {
         }
         self.start_limits_worker(&mut threads);
         self.start_updates(&mut threads);
+        self.start_perf(&mut threads);
     }
 
     pub fn is_shut_down(&self) -> bool {
@@ -1346,6 +1357,7 @@ impl Engine {
         self.jobs.ready.notify_all();
         self.limit_wake.notify_all();
         self.updates.wake.notify_all();
+        self.perf.wake_all();
         let handles: Vec<JoinHandle<()>> = lock(&self.threads).drain(..).collect();
         let deadline = Instant::now() + wait;
         for h in handles {

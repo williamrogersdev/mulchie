@@ -72,17 +72,35 @@ struct Lease {
     ticket: u64,
     /// From the reply that created the ticket; the engine needs it to release.
     secret: Option<String>,
+    /// How the command went, sent with the release (`duration_ms`,
+    /// `exit_code`, `command`, `cwd`); `None` when it never ran.
+    timing: Option<serde_json::Value>,
 }
 
 impl Drop for Lease {
     fn drop(&mut self) {
-        let _ = conn::call(
-            &self.client,
-            "POST",
-            "/v1/release",
-            Some(&release_body(self.ticket, self.secret.as_deref())),
-        );
+        let mut body = release_body(self.ticket, self.secret.as_deref());
+        if let (Some(b), Some(serde_json::Value::Object(t))) = (body.as_object_mut(), &self.timing)
+        {
+            b.extend(t.clone());
+        }
+        let _ = conn::call(&self.client, "POST", "/v1/release", Some(&body));
     }
+}
+
+/// What the engine records about a finished command: its wall time from
+/// start to exit (the wait for a slot not included), exit status, command
+/// line (the engine redacts it) and directory.
+fn timing_body(command: &[String], started: Instant, code: i32) -> serde_json::Value {
+    let mut t = json!({
+        "duration_ms": started.elapsed().as_millis() as u64,
+        "exit_code": code,
+        "command": command.join(" "),
+    });
+    if let Ok(d) = std::env::current_dir() {
+        t["cwd"] = json!(d);
+    }
+    t
 }
 
 fn release_body(ticket: u64, secret: Option<&str>) -> serde_json::Value {
@@ -130,6 +148,7 @@ fn queue(client: Client, label: &str) -> Queued {
                                 client: client.clone(),
                                 ticket: t,
                                 secret,
+                                timing: None,
                             })
                         }
                     }
@@ -253,8 +272,12 @@ pub fn run(paths: &Paths, args: &RunArgs) -> i32 {
             cmd.env("MAKEFLAGS", format!("-j{j}"));
         }
     }
+    let started = Instant::now();
     let code = spawn_and_wait(&mut cmd, program);
-    drop(lease);
+    if let Some(mut l) = lease {
+        l.timing = Some(timing_body(&args.command, started, code));
+        drop(l);
+    }
     code
 }
 
@@ -402,6 +425,47 @@ mod tests {
         // This test process is alive, so only a real release frees the slot.
         drop(lease);
         assert!(engine.snapshot_state().slots.active.is_empty());
+        server.stop();
+    }
+
+    /// The release carries the command's timing, and the engine records it.
+    #[test]
+    fn the_release_carries_the_commands_timing() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = Paths::under(dir.path());
+        std::fs::create_dir_all(&paths.home).unwrap();
+        let engine =
+            mulchie_core::Engine::new(paths.clone(), crate::commands::safe_test_config(&paths));
+        let mut lk = engine.acquire_lock().unwrap();
+        let server = mulchie_core::api::serve(engine.clone(), 0).unwrap();
+        lk.set_port(Some(server.port())).unwrap();
+        engine.start();
+        let client = Client::connect_in(&paths, server.port()).unwrap();
+        let Queued::Go(Some(mut lease), _) = queue(client, "t") else {
+            panic!("no lease")
+        };
+        let started = Instant::now() - Duration::from_millis(1500);
+        let cmd = vec!["cargo".to_string(), "build".to_string()];
+        let t = timing_body(&cmd, started, 3);
+        assert!(t["duration_ms"].as_u64().unwrap() >= 1500);
+        assert_eq!(
+            (t["exit_code"].as_i64(), t["command"].as_str()),
+            (Some(3), Some("cargo build"))
+        );
+        assert!(t["cwd"].as_str().is_some_and(|c| c.starts_with('/')));
+        lease.timing = Some(t);
+        drop(lease);
+        assert!(engine.snapshot_state().slots.active.is_empty());
+        let until = Instant::now() + Duration::from_secs(20);
+        let mut got = engine.timings(None, Some("cargo build"), 10);
+        while got.total == 0 && Instant::now() < until {
+            std::thread::sleep(Duration::from_millis(50));
+            got = engine.timings(None, Some("cargo build"), 10);
+        }
+        assert_eq!(got.total, 1);
+        assert_eq!(got.timings[0].exit_code, Some(3));
+        assert_eq!(got.timings[0].label, "t");
+        engine.shutdown(Duration::from_secs(5));
         server.stop();
     }
 }

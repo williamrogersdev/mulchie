@@ -93,7 +93,7 @@ fn severity_rank(s: &Value) -> u8 {
 /// no such tool.
 pub fn tool_for_api_request(r: &Value) -> Option<(&'static str, Value, Option<String>)> {
     let route = r["route"].as_str()?;
-    let (path, _) = route.split_once('?').unwrap_or((route, ""));
+    let (path, query) = route.split_once('?').unwrap_or((route, ""));
     let body = &r["body"];
     match (r["method"].as_str()?, path) {
         ("GET", "/v1/state") => Some(("get_status", json!({}), Some("mulchie status".into()))),
@@ -107,6 +107,22 @@ pub fn tool_for_api_request(r: &Value) -> Option<(&'static str, Value, Option<St
             Some(("limits_status", json!({}), Some("mulchie limits".into())))
         }
         ("GET", "/v1/updates") => Some(("list_updates", json!({}), Some("mulchie updates".into()))),
+        ("GET", "/v1/timings") => {
+            let mut args = serde_json::Map::new();
+            let mut line = "mulchie timings".to_string();
+            for pair in query.split('&') {
+                let Some((k, v)) = pair.split_once('=') else {
+                    continue;
+                };
+                if !matches!(k, "workspace" | "command") {
+                    continue;
+                }
+                let v = unescape(v)?;
+                line.push_str(&format!(" --{k} {}", q(&v)));
+                args.insert(k.into(), json!(v));
+            }
+            Some(("list_timings", Value::Object(args), Some(line)))
+        }
         ("POST", "/v1/findings/dismiss") => {
             let id = body["id"].as_str()?;
             Some((
@@ -237,6 +253,7 @@ pub fn finding_brief(f: &Value) -> Value {
         "listen",
         "cpu_pct",
         "detail",
+        "perf",
     ] {
         if !ev[k].is_null() {
             evidence.insert(k.into(), ev[k].clone());
@@ -666,6 +683,7 @@ pub fn build(state: &Value, advice: &Value, origin: Origin) -> Value {
     let consumers = crate::mcp_tools::consumers_brief(snap, TOP_GROUPS);
     let sessions = sessions_brief(&state["sessions"], &mut recs);
     let updates = updates_brief(&state["updates"], &state["findings"], &mut recs);
+    slower_builds(&state["findings"], &mut recs);
 
     let machine = json!({
         "cpu_pct": (f(snap, "cpu_pct") * 10.0).round() / 10.0,
@@ -886,6 +904,52 @@ fn sessions_brief(ss: &Value, recs: &mut Vec<Rec>) -> Value {
         "limits_report_only": ss["limits_report_only"],
         "next_call": { "name": "limits_status", "arguments": {} },
     })
+}
+
+/// A percent-encoded query value, decoded.
+fn unescape(v: &str) -> Option<String> {
+    let b = v.as_bytes();
+    let mut out = Vec::with_capacity(b.len());
+    let mut i = 0;
+    while i < b.len() {
+        if b[i] == b'%' {
+            let h = std::str::from_utf8(b.get(i + 1..i + 3)?).ok()?;
+            out.push(u8::from_str_radix(h, 16).ok()?);
+            i += 3;
+        } else {
+            out.push(if b[i] == b'+' { b' ' } else { b[i] });
+            i += 1;
+        }
+    }
+    String::from_utf8(out).ok()
+}
+
+/// One recommendation when builds or tests got slower (`performance`
+/// findings).
+fn slower_builds(findings: &Value, recs: &mut Vec<Rec>) {
+    let slow: Vec<&Value> = findings
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter(|f| f["category"] == "performance" && f["dismissed"] != true)
+        .collect();
+    let Some(first) = slow.first() else {
+        return;
+    };
+    recs.push(Rec {
+        priority: 3,
+        id: "slower_builds",
+        title: format!("{} build or test command(s) got slower", slow.len()),
+        reason: format!(
+            "{} The finding names the commits between the last normal run and the first slow one, and the sessions that made them.",
+            first["title"].as_str().unwrap_or("")
+        ),
+        gain_bytes: None,
+        gain: "builds and tests back to their usual time".into(),
+        risk: "none",
+        next_call: call("list_findings", json!({ "kind": "build_slower" })),
+        command: Some("mulchie findings --kind build_slower".into()),
+    });
 }
 
 /// Available updates, from `state.updates` and the update findings.
@@ -1586,5 +1650,33 @@ mod tests {
         for n in next {
             assert_ne!(n["name"], "execute_plan");
         }
+    }
+
+    #[test]
+    fn a_slower_build_leads_to_its_timings_and_one_recommendation() {
+        let mut st = state();
+        st["findings"] = json!([{ "id": "build_slower:0123456789abcdef", "kind": "build_slower",
+            "category": "performance", "severity": "medium",
+            "title": "`cargo test` in repo-x is 2.1× slower than usual (4m10s vs 2m)", "why": "",
+            "evidence": { "cmd": "cargo test", "perf": { "baseline_ms": 120000 } },
+            "suggested": [{ "label": "Show this command's timings", "reversible": true,
+                "api_request": { "method": "GET",
+                    "route": "/v1/timings?workspace=/w/repo%20x&command=cargo%20test" } }] }]);
+        let d = build(&st, &json!({}), Origin::Engine);
+        let f = &d["findings"]["top"][0];
+        assert_eq!(f["evidence"]["perf"]["baseline_ms"], 120000);
+        let next = f["next_calls"].as_array().unwrap();
+        assert_eq!(next[0]["name"], "list_timings");
+        assert_eq!(
+            next[0]["arguments"],
+            json!({ "workspace": "/w/repo x", "command": "cargo test" })
+        );
+        assert_eq!(
+            f["cli"][0],
+            "mulchie timings --workspace '/w/repo x' --command 'cargo test'"
+        );
+        let recs = d["recommendations"].as_array().unwrap();
+        let r = recs.iter().find(|r| r["id"] == "slower_builds").unwrap();
+        assert_eq!(r["next_call"]["arguments"]["kind"], "build_slower");
     }
 }

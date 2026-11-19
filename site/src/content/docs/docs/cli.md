@@ -347,10 +347,28 @@ Waits for a slot in the machine-wide build queue, then runs the command with `CA
 - SIGINT and SIGTERM are forwarded to the command.
 - The exit status is the command's, or 128 plus the signal number when a signal killed it.
 - `--label` names the job in the queue. The default is the directory and the command.
+- When the command ends, the release tells the engine how long it ran (from start to exit, not counting the wait for a slot), its exit status, the command line and the directory. The engine records it as a timing; see [timings](#timings).
 
 ```sh
 mulchie run -- cargo build --release
 mulchie run --label 'api tests' -- cargo test
+```
+
+### timings
+
+```sh
+mulchie timings [--workspace DIR] [--command TEXT] [--limit N] [--json]
+```
+
+How long the commands run with `mulchie run` took, newest first: duration, exit status, workspace, command, the commit `HEAD` pointed to and the agent that ran it. The engine records one for every slot released with a duration, with the workspace, branch and commit of the directory the command ran in and the agent session it ran in. The command line is redacted before it is stored.
+
+- `--workspace` keeps runs in one checkout (its top directory). `--command` keeps commands that contain the text, compared the way runs are grouped (paths cut to their last part, numbers replaced by `#`). `--limit` is 1 to 1000, default 50.
+- When a command's latest successful runs each take much longer than usual, the engine raises a `build_slower` finding. See [Slower builds](/docs/watch/#slower-builds).
+- Without an engine it reads `timings.jsonl` as the last engine left it.
+
+```sh
+mulchie timings --command 'cargo test'
+mulchie timings --workspace ~/code/repo-x --json
 ```
 
 ## Agents

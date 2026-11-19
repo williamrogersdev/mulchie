@@ -13,8 +13,8 @@ export function watchFindings(S, dismissed = false) {
 }
 
 // Finding categories (`Finding.category`), in the order lists show them.
-export const CATEGORY = { security: 'Security', limit: 'Limits', hygiene: 'Hygiene', posture: 'Mulchie setup', update: 'Updates', other: 'Other' };
-export const CATEGORY_ORDER = ['security', 'limit', 'hygiene', 'posture', 'update', 'other'];
+export const CATEGORY = { security: 'Security', limit: 'Limits', hygiene: 'Hygiene', performance: 'Performance', posture: 'Mulchie setup', update: 'Updates', other: 'Other' };
+export const CATEGORY_ORDER = ['security', 'limit', 'hygiene', 'performance', 'posture', 'update', 'other'];
 
 // The API call a suggestion names: `api_request` ({method, route, body}),
 // or for an engine without it, the same call parsed from the `api` words.

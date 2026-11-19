@@ -108,6 +108,8 @@ pub const ROUTES: &[(&str, &str)] = &[
     ("POST", "/v1/updates/check"),
     ("GET", "/v1/feedback"),
     ("POST", "/v1/feedback"),
+    ("GET", "/v1/commits"),
+    ("GET", "/v1/timings"),
 ];
 
 // ------------------------------------------------------------------ token
@@ -986,6 +988,57 @@ fn query_str<'a>(req: &'a Req, key: &str) -> Option<&'a str> {
         .map(|(_, v)| v)
 }
 
+/// `s` for a query string value: every byte but ASCII letters, digits and
+/// `-._~/` percent-encoded.
+pub fn query_escape(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for b in s.bytes() {
+        if b.is_ascii_alphanumeric() || b"-._~/".contains(&b) {
+            out.push(b as char);
+        } else {
+            out.push_str(&format!("%{b:02X}"));
+        }
+    }
+    out
+}
+
+/// A query string value percent-decoded (`+` is a space). `None` when an
+/// escape is malformed or the result is not UTF-8.
+fn query_unescape(v: &str) -> Option<String> {
+    let b = v.as_bytes();
+    let mut out = Vec::with_capacity(b.len());
+    let mut i = 0;
+    while i < b.len() {
+        match b[i] {
+            b'%' => {
+                let h = std::str::from_utf8(b.get(i + 1..i + 3)?).ok()?;
+                out.push(u8::from_str_radix(h, 16).ok()?);
+                i += 3;
+            }
+            b'+' => {
+                out.push(b' ');
+                i += 1;
+            }
+            c => {
+                out.push(c);
+                i += 1;
+            }
+        }
+    }
+    String::from_utf8(out).ok()
+}
+
+/// The percent-decoded value of `key`, `None` when absent or empty.
+fn query_text(req: &Req, key: &str) -> Result<Option<String>, Resp> {
+    match query_str(req, key).filter(|v| !v.is_empty()) {
+        None => Ok(None),
+        Some(v) => query_unescape(v)
+            .filter(|s| s.len() <= 4096 && !s.contains('\0'))
+            .map(Some)
+            .ok_or_else(|| fail(400, "invalid_query", format!("{key} is not a valid value"))),
+    }
+}
+
 fn query_enum<T: serde::de::DeserializeOwned>(req: &Req, key: &str) -> Result<Option<T>, Resp> {
     let Some(v) = query_str(req, key).filter(|v| !v.is_empty()) else {
         return Ok(None);
@@ -1118,6 +1171,60 @@ struct ReleaseBody {
     /// The `release_secret` from the reply that created the ticket.
     #[serde(default)]
     secret: Option<String>,
+    /// How the work done with the slot went; recorded as a timing when the
+    /// release frees a ticket.
+    #[serde(flatten)]
+    timing: crate::timings::TimingReport,
+}
+
+/// Record the timing sent with a release that freed a ticket held as
+/// `holder`, and say in the reply whether it was taken.
+fn release_reply(
+    engine: &Engine,
+    mut reply: serde_json::Value,
+    released: bool,
+    timing: crate::timings::TimingReport,
+    holder: Option<(String, Option<(String, String)>)>,
+) -> Resp {
+    if !timing.is_empty() {
+        let r = match (released, holder) {
+            (true, Some(h)) => engine.queue_timing(timing, h),
+            _ => Err("no build slot was released, so the timing was not recorded".into()),
+        };
+        reply["timing_recorded"] = serde_json::json!(r.is_ok());
+        if let Err(e) = r {
+            reply["timing_error"] = serde_json::json!(e);
+        }
+    }
+    ok(&reply)
+}
+
+/// `limit` from the query: `default` when absent, 1 to 1000.
+fn query_limit(req: &Req, default: u64) -> Result<usize, Resp> {
+    let limit = query_u64(req, "limit")?.unwrap_or(default);
+    if !(1..=1000).contains(&limit) {
+        return Err(fail(400, "invalid_query", "limit must be 1 to 1000"));
+    }
+    Ok(limit as usize)
+}
+
+/// An absolute path from the query, trailing `/` dropped.
+fn query_path(req: &Req, key: &str) -> Result<Option<PathBuf>, Resp> {
+    match query_text(req, key)? {
+        None => Ok(None),
+        Some(s) => {
+            let p = PathBuf::from(s.trim_end_matches('/'));
+            if p.is_absolute() {
+                Ok(Some(p))
+            } else {
+                Err(fail(
+                    400,
+                    "invalid_query",
+                    format!("{key} must be an absolute path"),
+                ))
+            }
+        }
+    }
 }
 
 fn is_cache(r: &Request) -> bool {
@@ -1395,6 +1502,18 @@ fn route(req: &Req, engine: &Engine, read_only: bool) -> Resp {
                     Err((status, code, m)) => fail(status, code, m),
                 }
             }
+            ("GET", "/v1/commits") => {
+                let limit = query_limit(req, 100)?;
+                let ws = query_path(req, "workspace")?;
+                let since = query_u64(req, "since")?;
+                ok(&engine.commits(ws.as_deref(), since, limit))
+            }
+            ("GET", "/v1/timings") => {
+                let limit = query_limit(req, 50)?;
+                let ws = query_path(req, "workspace")?;
+                let cmd = query_text(req, "command")?;
+                ok(&engine.timings(ws.as_deref(), cmd.as_deref(), limit))
+            }
             ("GET", "/v1/updates") => ok(&engine.updates_status(true)),
             ("POST", "/v1/updates/check") => match engine.request_update_check() {
                 Ok(()) => ok(&serde_json::json!({ "ok": true, "queued": true })),
@@ -1485,17 +1604,28 @@ fn route(req: &Req, engine: &Engine, read_only: bool) -> Resp {
             }
             ("POST", "/v1/release") => {
                 let b: ReleaseBody = body(req)?;
+                let holder = engine.lease_holder(b.ticket);
                 // The full token may release any lease without its secret
                 // (a crashed holder takes its secret with it); the read-only
                 // token always needs it. A secret that is sent must match.
                 if !read_only && b.secret.is_none() {
                     let released = engine.release_admin(b.ticket, "api");
-                    return Ok(ok(
-                        &serde_json::json!({ "released": released, "admin": released }),
+                    return Ok(release_reply(
+                        engine,
+                        serde_json::json!({ "released": released, "admin": released }),
+                        released,
+                        b.timing,
+                        holder,
                     ));
                 }
                 match engine.release_with(b.ticket, b.secret.as_deref()) {
-                    Ok(released) => ok(&serde_json::json!({ "released": released })),
+                    Ok(released) => release_reply(
+                        engine,
+                        serde_json::json!({ "released": released }),
+                        released,
+                        b.timing,
+                        holder,
+                    ),
                     Err(e) => fail(
                         403,
                         e.code(),

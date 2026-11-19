@@ -101,11 +101,38 @@ These come from [sessions and limits](/docs/sessions/) and [update checks](/docs
 
 An update finding never installs anything. It names the command you can run.
 
+## Kinds about performance
+
+| Kind | What was seen | Severity |
+| --- | --- | --- |
+| `build_slower` | A build or test command's latest successful runs each took much longer than its usual time. The title says the command, the workspace and both times; the evidence names the commits in between and the agent sessions that made them. See [Slower builds](#slower-builds). | low; medium at twice the usual time or more |
+
+## Slower builds
+
+Every command run with `mulchie run`, and every build slot an agent releases with a duration, is recorded as a timing: how long it ran, its exit status, the command (redacted), the workspace, branch and commit, and the agent session. `mulchie timings` lists them, and agents use `list_timings`.
+
+Runs are grouped by workspace and command, with the command compared the way issues compare it (paths cut to their last part, numbers replaced by `#`). Only runs that exited with 0 count. A group is slower when:
+
+- each of its last `perf.slow_runs` successful runs (default 3) took more than `perf.slower_ratio` times its usual time (default 1.5) and more than `perf.min_slowdown_secs` longer (default 30);
+- its usual time is the median of up to `perf.baseline_runs` successful runs (default 10, at least 3) before the slow ones, so slow runs never raise their own baseline and one odd run does not move it.
+
+The `build_slower` finding names the commit `HEAD` pointed to at the last normal run and at the first slow run, and the moves of `HEAD` Mulchie recorded in between, each with the agent session that was working in the workspace then. When `HEAD` did not move, the finding says the cause is outside the code: the build cache, dependencies, the toolchain or a busy machine. The finding goes away when the latest runs are back to the usual time. Like every finding it only reports: nothing is stopped, changed or rolled back.
+
+### Which session moved HEAD
+
+The engine that holds the lock reads `HEAD` of each workspace an agent session works in, or worked in during the last 15 minutes, every `perf.head_check_secs` seconds (default 60), and right after an agent's hook reports a shell command that runs `git commit`, `merge`, `rebase`, `cherry-pick`, `pull` or `am`. Each move is recorded with the session the hook named, or else the session working in that workspace that was active last.
+
+- A record is a move of `HEAD`, not a commit: one `git pull` that brings in twenty commits is one record, and a commit amended before the next check is never seen.
+- The session is a heuristic, not proof of who wrote the code. Two agents in one workspace, or a person committing while an agent runs, are told apart only through the hook.
+- The first record of a workspace (when Mulchie started watching it) has no previous commit and no session.
+
+`GET /v1/commits` lists the records. They are kept in `commits.jsonl` and timings in `timings.jsonl`, both in the config directory and readable only by you. Each file is renamed to `.1` when it reaches its size (2 MB for commits, 4 MB for timings), replacing the one before; nothing else is deleted.
+
 ## Issues
 
 A finding lasts as long as its cause: a finding about a process ends when the process does. An issue groups the findings that are about the same problem, so you can see what keeps going wrong:
 
-- Findings of the `hygiene` and `limit` kinds become issues (leftover, stale, stopped and runaway processes, growing memory, runaway chains, low memory, sessions over a budget or hogging the machine). Security, setup and update findings do not.
+- Findings of the `hygiene`, `limit` and `performance` kinds become issues (leftover, stale, stopped and runaway processes, growing memory, runaway chains, low memory, sessions over a budget or hogging the machine, slower builds). Security, setup and update findings do not.
 - Two findings are the same issue when they have the same kind, the same workspace and the same subject. For a process the subject is its command line with paths cut to their last part and numbers, ports and long ids replaced by `#`: `/usr/bin/node /code/site/node_modules/.bin/next dev --port=3001` becomes `node next dev --port=#`. For a session it is the agent and the cap; for low memory, the consumer.
 - Each separate finding counts once (`occurrences`): a process that runs away for a day is one occurrence; the same command running away again tomorrow is a second.
 - An issue is `open` until you decide. `resolved` means you fixed it: if it appears again it becomes `regressed`, and the journal and, with notifications on, a notification say so. `ignored` keeps counting it but never reports it.

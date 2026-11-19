@@ -755,6 +755,13 @@ paths:
         403 `release_secret_required`. With the full token and no `secret`, any lease or waiter is
         released (an admin release, for a holder that crashed with its secret); it is journaled as
         such and the reply has `admin: true`. A wrong secret is always 403 `wrong_release_secret`.
+
+        The caller may say how the work done with the slot went (`duration_ms`, `exit_code`,
+        `command`, `cwd`). When the release frees a ticket and `duration_ms` is given, the engine
+        records it as a timing (see `GET /v1/timings`): it adds the workspace holding `cwd`, its
+        branch and `HEAD`, and the agent session, and redacts the command. The reply's
+        `timing_recorded` says whether it was taken; a timing that is refused never stops the
+        release.
       requestBody:
         required: true
         content:
@@ -765,6 +772,10 @@ paths:
               properties:
                 ticket: { type: integer }
                 secret: { type: string, description: The `release_secret` from the reply that created the ticket }
+                duration_ms: { type: integer, minimum: 0, maximum: 604800000, description: "How long the command ran, in milliseconds (not the wait for the slot)" }
+                exit_code: { type: integer, description: "The command's exit code; only runs with 0 count toward its usual time" }
+                command: { type: string, description: "The command line (at most 64 KiB; redacted and cut to 1024 characters before it is stored)" }
+                cwd: { type: string, description: "The absolute directory the command ran in (at most 4096 bytes)" }
       responses:
         "200":
           description: Released
@@ -775,6 +786,8 @@ paths:
                 properties:
                   released: { type: boolean }
                   admin: { type: boolean, description: "Released by the full token without the secret (present only when no secret was sent with the full token)" }
+                  timing_recorded: { type: boolean, description: "Present when `duration_ms` was sent: whether the timing was queued to be recorded" }
+                  timing_error: { type: string, description: "Why the timing was not recorded (nothing released, or a bad field)" }
         default: { $ref: "#/components/responses/Error" }
   /v1/sessions:
     get:
@@ -1142,6 +1155,87 @@ paths:
         "400": { description: "`invalid_body`: no summary, an unknown category or severity, or an unknown field", content: { application/json: { schema: { type: object } } } }
         "500": { description: "`feedback_not_saved`: the file could not be written", content: { application/json: { schema: { type: object } } } }
         default: { $ref: "#/components/responses/Error" }
+  /v1/commits:
+    get:
+      summary: Recorded moves of workspaces' HEAD, with the agent session working there, newest first
+      description: |
+        The engine that holds the lock reads `HEAD` (branch and commit) of each workspace an agent
+        session works in, or recently worked in, every `perf.head_check_secs`, and right after a
+        hook reports a shell command running `git commit`, `merge`, `rebase`, `cherry-pick`, `pull`
+        or `am`. Each move is one entry in `<config dir>/commits.jsonl`. An entry is a move of
+        `HEAD`, not a commit: one pull that brings many commits is one entry. The session is the one
+        the hook named, else the session working in that workspace that was active last: a
+        heuristic, not proof of authorship. The first entry of a workspace has no `previous_head`
+        and no session.
+      parameters:
+        - name: workspace
+          in: query
+          required: false
+          description: Only this workspace (absolute path, percent-encoded)
+          schema: { type: string }
+        - name: since
+          in: query
+          required: false
+          description: Only moves at or after this unix time
+          schema: { type: integer, minimum: 0 }
+        - name: limit
+          in: query
+          required: false
+          description: "How many to return (1 to 1000, default 100)"
+          schema: { type: integer, minimum: 1, maximum: 1000 }
+      responses:
+        "200":
+          description: The moves
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  commits:
+                    type: array
+                    items: { $ref: "#/components/schemas/CommitEntry" }
+                  total: { type: integer, description: How many matched before the limit }
+        "400": { description: "`invalid_query`: a bad limit, since or workspace", content: { application/json: { schema: { type: object } } } }
+        default: { $ref: "#/components/responses/Error" }
+  /v1/timings:
+    get:
+      summary: Build and test timings, newest first
+      description: |
+        One entry per timing sent with `POST /v1/release` (`mulchie run` sends one for every
+        command), with the workspace holding its `cwd` (or `cwd` itself when it is in no checkout),
+        branch, `HEAD` and agent session added by the engine, kept in `<config dir>/timings.jsonl`.
+        A command whose latest successful runs each take much longer than usual raises a
+        `build_slower` finding (settings under `perf`).
+      parameters:
+        - name: workspace
+          in: query
+          required: false
+          description: Only this workspace (absolute path, percent-encoded)
+          schema: { type: string }
+        - name: command
+          in: query
+          required: false
+          description: "Only commands whose grouping key contains this, normalized the same way (percent-encoded)"
+          schema: { type: string }
+        - name: limit
+          in: query
+          required: false
+          description: "How many to return (1 to 1000, default 50)"
+          schema: { type: integer, minimum: 1, maximum: 1000 }
+      responses:
+        "200":
+          description: The timings
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  timings:
+                    type: array
+                    items: { $ref: "#/components/schemas/Timing" }
+                  total: { type: integer, description: How many matched before the limit }
+        "400": { description: "`invalid_query`: a bad limit, workspace or command", content: { application/json: { schema: { type: object } } } }
+        default: { $ref: "#/components/responses/Error" }
 components:
   securitySchemes:
     bearer:
@@ -1333,6 +1427,35 @@ components:
         - memory_low
         - runaway_chain
         - orphan_swarm
+        - build_slower
+    CommitEntry:
+      type: object
+      required: [at_unix, workspace, head, via]
+      properties:
+        at_unix: { type: integer }
+        workspace: { type: string, description: "The checkout's top directory" }
+        branch: { type: string, description: Absent when HEAD is detached }
+        head: { type: string, description: The commit HEAD points to now }
+        previous_head: { type: string, description: "Where it pointed at the check before; absent for a workspace's first entry" }
+        session_id: { type: string }
+        agent: { type: string }
+        via: { type: string, enum: [poll, hook, timing], description: What noticed the move }
+    Timing:
+      type: object
+      required: [at_unix, duration_ms, command, key, label]
+      properties:
+        at_unix: { type: integer }
+        duration_ms: { type: integer }
+        exit_code: { type: integer, description: Absent when the caller did not say; only 0 counts as successful }
+        command: { type: string, description: "Redacted, at most 1024 characters" }
+        key: { type: string, description: "The command as runs are grouped (paths cut to their last part, numbers replaced by #)" }
+        label: { type: string, description: "The build slot's label" }
+        cwd: { type: string }
+        workspace: { type: string, description: "The checkout holding cwd, or cwd itself when it is in no checkout" }
+        branch: { type: string }
+        head: { type: string }
+        session_id: { type: string }
+        agent: { type: string }
     FindingCounts:
       type: object
       properties:
@@ -1353,7 +1476,7 @@ components:
       properties:
         id: { type: string, description: "16 hex digits of the fingerprint; stable across restarts" }
         kind: { $ref: "#/components/schemas/FindingKind" }
-        category: { type: string, enum: [hygiene, limit] }
+        category: { type: string, enum: [hygiene, limit, performance] }
         severity: { type: string, enum: [info, low, medium, high], description: The highest any of its findings had }
         title: { type: string, description: The latest finding's title }
         culprit: { type: string, description: "What it is about, without pids: the normalized command, the agent and cap, or the memory consumer" }
@@ -1372,7 +1495,7 @@ components:
       properties:
         id: { type: string, description: "Stable while the cause lasts: <kind>:<pid>:<start_time>, or <kind>:<path or name>" }
         kind: { $ref: "#/components/schemas/FindingKind" }
-        category: { type: string, enum: [security, hygiene, posture, limit, update] }
+        category: { type: string, enum: [security, hygiene, posture, limit, update, performance] }
         severity: { type: string, enum: [info, low, medium, high] }
         title: { type: string, description: "One sentence, an observation" }
         why: { type: string }
@@ -1425,6 +1548,22 @@ components:
                   latest: { type: string, description: "The latest release; for an advisory, the first fixed version (absent when none is listed)" }
                   source: { type: string, description: "github, npm, homebrew, osv.dev, …" }
                   command: { type: string, description: What the user may run to update it; Mulchie runs nothing }
+            perf:
+              type: object
+              description: "`build_slower` only: the baseline, the slow runs and what changed in between."
+              properties:
+                command: { type: string, description: The command as runs are grouped }
+                baseline_ms: { type: integer, description: The median of the runs before the slow ones }
+                baseline_runs: { type: integer }
+                recent_ms: { type: array, items: { type: integer }, description: "The slow runs, oldest first" }
+                ratio: { type: number, description: The median of the slow runs over the baseline }
+                from_head: { type: string, description: HEAD at the last normal run }
+                to_head: { type: string, description: HEAD at the first slow run }
+                commits:
+                  type: array
+                  description: "The recorded moves of HEAD between them, oldest first (at most 20, the newest)"
+                  items: { $ref: "#/components/schemas/CommitEntry" }
+                commits_truncated: { type: boolean }
         suggested:
           type: array
           items:

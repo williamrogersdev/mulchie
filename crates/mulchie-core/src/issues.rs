@@ -15,9 +15,9 @@
 //! - `regressed`: it came back after being resolved.
 //! - `ignored`: still counted, never reported again.
 //!
-//! Only performance and hygiene findings become issues (the `hygiene` and
-//! `limit` categories, without the unreadable paused list). Security,
-//! posture and update findings keep their own lifecycle.
+//! Only performance and hygiene findings become issues (the `hygiene`,
+//! `limit` and `performance` categories, without the unreadable paused
+//! list). Security, posture and update findings keep their own lifecycle.
 //!
 //! The book is saved in `<config dir>/issues.json` (mode 0600; it names
 //! workspaces and commands, already redacted by the findings) by the engine
@@ -111,7 +111,7 @@ pub struct IssueCounts {
 pub fn tracked(kind: FindingKind) -> bool {
     matches!(
         kind.category(),
-        FindingCategory::Hygiene | FindingCategory::Limit
+        FindingCategory::Hygiene | FindingCategory::Limit | FindingCategory::Performance
     ) && kind != FindingKind::PausedListUnreadable
 }
 
@@ -208,7 +208,7 @@ fn word(w: &str) -> String {
 }
 
 /// 64-bit FNV-1a: small, and the same in every build (std's hasher is not).
-fn fnv1a(b: &[u8]) -> u64 {
+pub(crate) fn fnv1a(b: &[u8]) -> u64 {
     let mut h: u64 = 0xcbf2_9ce4_8422_2325;
     for x in b {
         h ^= u64::from(*x);

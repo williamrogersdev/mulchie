@@ -55,6 +55,8 @@ pub struct Config {
     pub guard: GuardConfig,
     /// Update and advisory checks.
     pub updates: UpdatesConfig,
+    /// Build timings, commit attribution and `build_slower` findings.
+    pub perf: PerfConfig,
 }
 
 /// A finding id kept quiet until `until_unix` (`None`: until undismissed).
@@ -193,6 +195,7 @@ impl Default for Config {
             runaway: RunawayConfig::default(),
             guard: GuardConfig::default(),
             updates: UpdatesConfig::default(),
+            perf: PerfConfig::default(),
         }
     }
 }
@@ -612,6 +615,69 @@ impl RunawayConfig {
     }
 }
 
+// -------------------------------------------------------------- perf
+
+/// `perf`: when a build or test command counts as slower than usual (see
+/// [`crate::perf`]), and how often workspaces' `HEAD` is read for commit
+/// attribution ([`crate::commits`]). Everything here only reports.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(default)]
+pub struct PerfConfig {
+    /// The baseline is the median of up to this many successful runs before
+    /// the slow ones.
+    pub baseline_runs: usize,
+    /// This many latest successful runs must each be slow.
+    pub slow_runs: usize,
+    /// A slow run takes more than this many times the baseline...
+    pub slower_ratio: f64,
+    /// ...and more than this many seconds longer.
+    pub min_slowdown_secs: u64,
+    /// How often the `HEAD` of workspaces with agent activity is read.
+    pub head_check_secs: u64,
+}
+
+impl Default for PerfConfig {
+    fn default() -> Self {
+        Self {
+            baseline_runs: 10,
+            slow_runs: 3,
+            slower_ratio: 1.5,
+            min_slowdown_secs: 30,
+            head_check_secs: 60,
+        }
+    }
+}
+
+impl PerfConfig {
+    pub fn validate(&self, e: &mut Vec<String>) {
+        if !(3..=100).contains(&self.baseline_runs) {
+            e.push("perf.baseline_runs must be between 3 and 100".into());
+        }
+        if !(1..=20).contains(&self.slow_runs) {
+            e.push("perf.slow_runs must be between 1 and 20".into());
+        }
+        if !(self.slower_ratio.is_finite() && (1.05..=100.0).contains(&self.slower_ratio)) {
+            e.push("perf.slower_ratio must be between 1.05 and 100".into());
+        }
+        if self.min_slowdown_secs > 86_400 {
+            e.push("perf.min_slowdown_secs must be between 0 and 86400".into());
+        }
+        if !(10..=3600).contains(&self.head_check_secs) {
+            e.push("perf.head_check_secs must be between 10 and 3600".into());
+        }
+    }
+
+    /// The thresholds for build timings, in milliseconds.
+    pub fn thresholds(&self) -> crate::perf::Thresholds {
+        crate::perf::Thresholds {
+            baseline_runs: self.baseline_runs,
+            slow_runs: self.slow_runs,
+            ratio: self.slower_ratio,
+            min_increase: self.min_slowdown_secs as f64 * 1000.0,
+        }
+    }
+}
+
 // ------------------------------------------------------------- guard
 
 /// How a guard rule answers a match.
@@ -903,6 +969,7 @@ impl Config {
         self.runaway.validate(&mut e);
         self.guard.validate(&mut e);
         self.updates.validate(&mut e);
+        self.perf.validate(&mut e);
         if e.is_empty() {
             Ok(())
         } else {

@@ -485,9 +485,74 @@ pub fn worktree_list(paths: &Paths, dir: &Path) -> Result<Vec<WorktreeEntry>, Gi
     git(paths, dir, &["worktree", "list", "--porcelain"]).map(|s| parse_worktree_list(&s))
 }
 
+/// Where a checkout's `HEAD` points: the commit, and the branch unless it is
+/// detached.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Head {
+    pub sha: String,
+    pub branch: Option<String>,
+}
+
+/// The `HEAD` of the checkout at `dir`, in one `git rev-parse` with
+/// `timeout`. An error for a directory outside git or a branch with no
+/// commit yet.
+pub fn head(paths: &Paths, dir: &Path, timeout: Duration) -> Result<Head, GitError> {
+    let out = Git::new(paths, dir)
+        .args(["rev-parse", "HEAD", "--abbrev-ref", "HEAD"])
+        .timeout(timeout)
+        .text()?;
+    let mut lines = out.lines().map(str::trim);
+    let sha = lines.next().unwrap_or_default().to_string();
+    if sha.len() < 40 || !sha.chars().all(|c| c.is_ascii_hexdigit()) {
+        return Err(GitError::Failed {
+            code: None,
+            stderr: format!("unexpected rev-parse output {sha:?}"),
+        });
+    }
+    let branch = lines
+        .next()
+        .filter(|b| !b.is_empty() && *b != "HEAD")
+        .map(String::from);
+    Ok(Head { sha, branch })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn head_reads_the_commit_and_branch() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = Paths::under(tmp.path());
+        let repo = tmp.path().join("r");
+        std::fs::create_dir_all(&repo).unwrap();
+        let g = |args: &[&str]| {
+            let ok = Command::new("git")
+                .arg("-C")
+                .arg(&repo)
+                .args(["-c", "user.name=t", "-c", "user.email=t@t"])
+                .args(args)
+                .env("HOME", tmp.path())
+                .output()
+                .unwrap()
+                .status
+                .success();
+            assert!(ok, "{args:?}");
+        };
+        g(&["init", "-q", "-b", "main"]);
+        assert!(
+            head(&paths, &repo, DEFAULT_TIMEOUT).is_err(),
+            "no commit yet"
+        );
+        g(&["commit", "-q", "--allow-empty", "-m", "one"]);
+        let h = head(&paths, &repo, DEFAULT_TIMEOUT).unwrap();
+        assert_eq!(h.sha.len(), 40);
+        assert_eq!(h.branch.as_deref(), Some("main"));
+        g(&["checkout", "-q", "--detach"]);
+        let d = head(&paths, &repo, DEFAULT_TIMEOUT).unwrap();
+        assert_eq!((d.sha.as_str(), d.branch), (h.sha.as_str(), None));
+        assert!(head(&paths, tmp.path(), DEFAULT_TIMEOUT).is_err());
+    }
 
     #[test]
     fn parses_porcelain_worktree_list() {

@@ -25,8 +25,8 @@ It ships three ways:
 
 | Path | What it is |
 | --- | --- |
-| `crates/mulchie-core` | Engine, monitor, scanners, safety gate (`safety.rs`), sessions (`session.rs`), limits (`limits.rs`), memory guard (`memguard.rs`), runaway chains (`runaway.rs`), activity record (`record.rs`), guard rules (`guard.rs`), issues (`issues.rs`), update checks (`updates.rs`), feedback reports (`feedback.rs`), local HTTP API (`api.rs`). No UI. |
-| `crates/mulchie-cli` | The `mulchie` binary: commands, `serve`, `run`, the MCP server (`mcp.rs`, `mcp_tools.rs`), `mcp install` (`mcp_install.rs`), `hook` and `hooks install` (`hook.rs`, `hooks_install.rs`), `sessions.rs`, `diagnose.rs`. |
+| `crates/mulchie-core` | Engine, monitor, scanners, safety gate (`safety.rs`), sessions (`session.rs`), limits (`limits.rs`), memory guard (`memguard.rs`), runaway chains (`runaway.rs`), activity record (`record.rs`), guard rules (`guard.rs`), issues (`issues.rs`), build timings and slower builds (`perf.rs`, `timings.rs`, `commits.rs`, `engine_perf.rs`, `jsonl.rs`), update checks (`updates.rs`), feedback reports (`feedback.rs`), local HTTP API (`api.rs`). No UI. |
+| `crates/mulchie-cli` | The `mulchie` binary: commands, `serve`, `run`, the MCP server (`mcp.rs`, `mcp_tools.rs`), `mcp install` (`mcp_install.rs`), `hook` and `hooks install` (`hook.rs`, `hooks_install.rs`), `sessions.rs`, `diagnose.rs`, `timings.rs`. |
 | `crates/mulchie-app` | Tauri desktop app. macOS only. Not a default workspace member. |
 | `docs/ARCHITECTURE.md` | How the pieces fit, and the rules the code keeps. Read it before touching deletion or signals. |
 | `docs/openapi.yaml` | The HTTP API. A test keeps it in step with `ROUTES` in `api.rs`. |
@@ -111,7 +111,7 @@ Other clients are `claude-desktop`, `cursor` and `codex`. Add `--read-only` to l
 3. Show the user the plan.
    A ready item with `failed_before` was skipped at least twice in a row before; tell the user why (it says what to do) before asking again.
 4. Call `execute_plan` with the `plan_id` and only the items the user approved. The result lists every backup and how to restore it. Processes are re-checked by start time.
-5. Wrap heavy builds in `acquire_build_slot` and `release_build_slot`. A slot lasts at most an hour per renewal, and the server releases the slots it still holds when it exits. `mulchie slots` lists slots; `mulchie slots release <ticket>` ends one whose holder is gone. The release secret stays inside the MCP server.
+5. Wrap heavy builds in `acquire_build_slot` and `release_build_slot`. A slot lasts at most an hour per renewal, and the server releases the slots it still holds when it exits. `mulchie slots` lists slots; `mulchie slots release <ticket>` ends one whose holder is gone. The release secret stays inside the MCP server. Pass `duration_ms`, `exit_code`, `command` and `cwd` to `release_build_slot` so the timing is recorded; `list_timings` lists timings, and a `build_slower` finding names the commits and sessions between a normal and a slow run. Nothing acts on them.
 
 Findings (`list_findings`, `mulchie://findings`) are observations from heuristics, not verdicts; never call them malware. `inspect_process` shows one process with secrets in its command line redacted. `dismiss_finding` hides one the user says is expected.
 

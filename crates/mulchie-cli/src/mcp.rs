@@ -68,9 +68,11 @@ is refused until the same cache was previewed; show the preview and ask first. A
 failed_before, and repeated_failures in diagnose, name a target that keeps being skipped and what \
 to do about it: say so instead of asking for the same thing again. dismiss_finding hides a finding the user chose to ignore. \
 list_issues shows the problems that keep coming back across processes and restarts; resolve_issue (after asking) marks one fixed, and it is reported if it returns. \
+list_timings shows how long builds and tests took; a build_slower finding names the commits and sessions between the last normal run and the first slow one. \
 Before heavy builds or test suites, call can_i_build, and when other agents share the machine \
 wrap the work in acquire_build_slot / release_build_slot (poll with the ticket until granted, \
-renew before ttl_secs passes, release as soon as the work ends). \
+renew before ttl_secs passes, release as soon as the work ends, with duration_ms, exit_code, \
+command and cwd so the timing is recorded). \
 When Mulchie or this machine gets in your way, call report_feedback: a Mulchie tool that failed \
 or answered wrongly, advice or a finding that was wrong or noise, a real problem Mulchie did not \
 notice, a command it blocked or slowed without reason, or a slow or broken environment. Say what \
