@@ -7,6 +7,7 @@ mod feedback;
 mod hook;
 mod hook_wire;
 mod hooks_install;
+mod issues;
 mod json_faithful;
 mod mcp;
 mod mcp_install;
@@ -162,6 +163,15 @@ fn dispatch(paths: &Paths, cmd: Command) -> i32 {
         Command::Findings(f) => match &f.action {
             Some(a) => observe::findings_action(paths, a),
             None => observe::findings(paths, f.severity, f.kind.as_deref(), f.all, f.out.json),
+        },
+        Command::Issues(i) => match &i.action {
+            Some(a) => issues::action(paths, a),
+            None => issues::list(
+                paths,
+                i.status.map(|s| s.as_str()),
+                i.kind.as_deref(),
+                i.out.json,
+            ),
         },
         Command::Inspect(i) => observe::inspect(paths, i.pid, i.out.json),
         Command::Slots(a) => match &a.action {

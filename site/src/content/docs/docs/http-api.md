@@ -63,6 +63,11 @@ Requests are capped at 8 KB per line, 64 KB of headers and a 1 MB body. The serv
 | GET | `/v1/findings` | What the watch found. Query: `severity`, `kind`, `dismissed=1`. |
 | POST | `/v1/findings/dismiss` | Hide a finding (`{"id", "days"}`). |
 | POST | `/v1/findings/undismiss` | Show a dismissed finding again (`{"id"}`). |
+| GET | `/v1/issues` | Findings grouped into issues. Query: `status` (`open`, `resolved`, `regressed`, `ignored`, `all`), `kind`. |
+| GET | `/v1/issues/{id}` | One issue. |
+| POST | `/v1/issues/resolve` | Mark an issue resolved (`{"id"}`). |
+| POST | `/v1/issues/ignore` | Ignore an issue (`{"id"}`). |
+| POST | `/v1/issues/reopen` | Mark an issue open again (`{"id"}`). |
 | GET | `/v1/config` | The config in use, why the file was not used (if so), and its path. |
 | PUT | `/v1/config` | Replace the config (`{"config": {...}}`). Full token only. |
 | PATCH | `/v1/config` | Change some keys with a JSON merge patch. Full token only. |

@@ -29,6 +29,7 @@ use std::time::{Duration, Instant};
 
 use crate::config::{create_private_dir, Config};
 use crate::engine::{Engine, LeaseRequest, ProcAction, WorkspaceAction};
+use crate::issues::IssueStatus;
 use crate::lock;
 use crate::paths::{random_hex, Paths};
 use crate::safety::Request;
@@ -85,6 +86,12 @@ pub const ROUTES: &[(&str, &str)] = &[
     ("GET", "/v1/findings"),
     ("POST", "/v1/findings/dismiss"),
     ("POST", "/v1/findings/undismiss"),
+    ("GET", "/v1/issues"),
+    // `{id}` is an issue id (16 hex digits); see `route`.
+    ("GET", "/v1/issues/{id}"),
+    ("POST", "/v1/issues/resolve"),
+    ("POST", "/v1/issues/ignore"),
+    ("POST", "/v1/issues/reopen"),
     // `{pid}` is a whole number; see `route`.
     ("GET", "/v1/process/{pid}"),
     ("GET", "/v1/config"),
@@ -937,6 +944,11 @@ struct ProcessBody {
 }
 
 #[derive(Deserialize)]
+struct IssueBody {
+    id: String,
+}
+
+#[derive(Deserialize)]
 struct DismissBody {
     id: String,
     /// Default 30, 1 to 3650.
@@ -984,6 +996,21 @@ fn query_enum<T: serde::de::DeserializeOwned>(req: &Req, key: &str) -> Result<Op
 }
 
 /// `GET /v1/process/<pid>`.
+/// `GET /v1/issues/{id}`.
+fn issue_route(engine: &Engine, id: &str) -> Resp {
+    if id.len() != 16 || !id.chars().all(|c| c.is_ascii_hexdigit()) {
+        return fail(
+            400,
+            "invalid_issue_id",
+            "expected an issue id of 16 hex digits (from GET /v1/issues)",
+        );
+    }
+    match engine.issue(id) {
+        Some(i) => ok(&i),
+        None => fail(404, "not_found", format!("no issue {id}")),
+    }
+}
+
 /// `GET /v1/sessions/{id}` and `GET /v1/sessions/{id}/events`.
 fn session_route(req: &Req, engine: &Engine, rest: &str) -> Resp {
     let (id, events) = match rest.strip_suffix("/events") {
@@ -1137,6 +1164,9 @@ fn route(req: &Req, engine: &Engine, read_only: bool) -> Resp {
         }
         if let Some(rest) = req.path.strip_prefix("/v1/sessions/") {
             return session_route(req, engine, rest);
+        }
+        if let Some(id) = req.path.strip_prefix("/v1/issues/") {
+            return issue_route(engine, id);
         }
     }
     let r = (|| -> Result<Resp, Resp> {
@@ -1299,6 +1329,30 @@ fn route(req: &Req, engine: &Engine, read_only: bool) -> Resp {
                         ok(&serde_json::json!({ "ok": true, "id": b.id, "was_dismissed": was }))
                     }
                     Err((code @ "not_lock_holder", m)) => fail(409, code, m),
+                    Err((code, m)) => fail(400, code, m),
+                }
+            }
+            ("GET", "/v1/issues") => {
+                let all = matches!(query_str(req, "status"), Some("all"));
+                let status = if all {
+                    None
+                } else {
+                    query_enum(req, "status")?
+                };
+                let kind = query_enum(req, "kind")?;
+                ok(&engine.issues(status, all, kind))
+            }
+            ("POST", p @ ("/v1/issues/resolve" | "/v1/issues/ignore" | "/v1/issues/reopen")) => {
+                let b: IssueBody = body(req)?;
+                let status = match p {
+                    "/v1/issues/resolve" => IssueStatus::Resolved,
+                    "/v1/issues/ignore" => IssueStatus::Ignored,
+                    _ => IssueStatus::Open,
+                };
+                match engine.set_issue_status(&b.id, status) {
+                    Ok(issue) => ok(&serde_json::json!({ "ok": true, "issue": issue })),
+                    Err((code @ "not_lock_holder", m)) => fail(409, code, m),
+                    Err((code @ "not_found", m)) => fail(404, code, m),
                     Err((code, m)) => fail(400, code, m),
                 }
             }

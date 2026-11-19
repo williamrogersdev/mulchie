@@ -156,7 +156,7 @@ fn tools_have_titles_and_annotations() {
     let f = Fake::default();
     let r = one(&f, req(1, "tools/list", json!({})));
     let tools = r["result"]["tools"].as_array().unwrap();
-    assert_eq!(tools.len(), 27);
+    assert_eq!(tools.len(), 30);
     assert_eq!(tools[0]["name"], "diagnose", "diagnose comes first");
     for t in tools {
         let name = t["name"].as_str().unwrap();
@@ -258,7 +258,7 @@ fn read_only_mode_hides_and_refuses_destructive_tools() {
     let mut s = Session::read_only(&f);
     let r = s.handle(req(1, "tools/list", json!({}))).unwrap();
     let names = tool_names(&r);
-    assert_eq!(names.len(), 23, "{names:?}");
+    assert_eq!(names.len(), 25, "{names:?}");
     for n in [
         "execute_plan",
         "prune_cache",
@@ -1890,4 +1890,74 @@ fn feedback_is_kept_when_no_engine_runs() {
     assert_eq!(out["feedback"][0]["source"], "mcp");
     assert_eq!(out["feedback"][0]["severity"], "high");
     assert_eq!(out["feedback"][0]["id"], out["feedback"][0]["id"]);
+}
+
+#[test]
+fn issue_tools_list_get_and_set_status() {
+    let id = "0123456789abcdef";
+    let issue = json!({ "id": id, "kind": "runaway_cpu", "status": "open", "occurrences": 3 });
+    let f = Fake::default()
+        .with(
+            "GET /v1/issues",
+            json!({ "issues": [issue.clone()], "counts": { "open": 1 } }),
+        )
+        .with(
+            "GET /v1/issues?status=all&kind=runaway_cpu",
+            json!({ "issues": [], "counts": {} }),
+        )
+        .with(&format!("GET /v1/issues/{id}"), issue.clone())
+        .with(
+            "POST /v1/issues/resolve",
+            json!({ "ok": true, "issue": issue.clone() }),
+        )
+        .with(
+            "POST /v1/issues/ignore",
+            json!({ "ok": true, "issue": issue }),
+        );
+    let v = result(&one(&f, call(1, "list_issues", json!({}))));
+    assert_eq!(v["issues"][0]["occurrences"], 3);
+    result(&one(
+        &f,
+        call(
+            2,
+            "list_issues",
+            json!({ "status": "all", "kind": "runaway_cpu" }),
+        ),
+    ));
+    let v = result(&one(&f, call(3, "get_issue", json!({ "id": id }))));
+    assert_eq!(v["id"], id);
+    result(&one(
+        &f,
+        call(4, "resolve_issue", json!({ "id": id, "action": "resolve" })),
+    ));
+    result(&one(
+        &f,
+        call(5, "resolve_issue", json!({ "id": id, "action": "ignore" })),
+    ));
+    assert_eq!(f.posted("/v1/issues/resolve"), vec![json!({ "id": id })]);
+    assert_eq!(f.posted("/v1/issues/ignore"), vec![json!({ "id": id })]);
+
+    for (name, args) in [
+        ("list_issues", json!({ "status": "closed" })),
+        ("list_issues", json!({ "kind": "Runaway&x=1" })),
+        ("get_issue", json!({ "id": "../state" })),
+        ("resolve_issue", json!({ "id": id, "action": "delete" })),
+        (
+            "resolve_issue",
+            json!({ "id": "nope", "action": "resolve" }),
+        ),
+    ] {
+        let r = one(&f, call(9, name, args.clone()));
+        assert_eq!(r["result"]["isError"], true, "{name} {args}: {r}");
+    }
+}
+
+#[test]
+fn read_only_mode_keeps_issue_reads_and_drops_resolve() {
+    let f = Fake::default();
+    let mut s = Session::read_only(&f);
+    let names = tool_names(&s.handle(req(1, "tools/list", json!({}))).unwrap());
+    assert!(names.contains(&"list_issues".to_string()));
+    assert!(names.contains(&"get_issue".to_string()));
+    assert!(!names.contains(&"resolve_issue".to_string()));
 }

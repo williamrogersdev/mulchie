@@ -67,6 +67,7 @@ not backed up: the next build recreates them. prune_cache only previews unless e
 is refused until the same cache was previewed; show the preview and ask first. A plan item with \
 failed_before, and repeated_failures in diagnose, name a target that keeps being skipped and what \
 to do about it: say so instead of asking for the same thing again. dismiss_finding hides a finding the user chose to ignore. \
+list_issues shows the problems that keep coming back across processes and restarts; resolve_issue (after asking) marks one fixed, and it is reported if it returns. \
 Before heavy builds or test suites, call can_i_build, and when other agents share the machine \
 wrap the work in acquire_build_slot / release_build_slot (poll with the ticket until granted, \
 renew before ttl_secs passes, release as soon as the work ends). \

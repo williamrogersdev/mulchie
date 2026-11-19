@@ -101,6 +101,18 @@ These come from [sessions and limits](/docs/sessions/) and [update checks](/docs
 
 An update finding never installs anything. It names the command you can run.
 
+## Issues
+
+A finding lasts as long as its cause: a finding about a process ends when the process does. An issue groups the findings that are about the same problem, so you can see what keeps going wrong:
+
+- Findings of the `hygiene` and `limit` kinds become issues (leftover, stale, stopped and runaway processes, growing memory, runaway chains, low memory, sessions over a budget or hogging the machine). Security, setup and update findings do not.
+- Two findings are the same issue when they have the same kind, the same workspace and the same subject. For a process the subject is its command line with paths cut to their last part and numbers, ports and long ids replaced by `#`: `/usr/bin/node /code/site/node_modules/.bin/next dev --port=3001` becomes `node next dev --port=#`. For a session it is the agent and the cap; for low memory, the consumer.
+- Each separate finding counts once (`occurrences`): a process that runs away for a day is one occurrence; the same command running away again tomorrow is a second.
+- An issue is `open` until you decide. `resolved` means you fixed it: if it appears again it becomes `regressed`, and the journal and, with notifications on, a notification say so. `ignored` keeps counting it but never reports it.
+- Issues are kept in `issues.json` in the config directory (readable only by you) for 90 days after they were last seen, at most 500. Only the engine that holds the lock writes it.
+
+`mulchie issues` lists them, `diagnose` names the ones that came back three times or more, and agents use `list_issues`. An issue is a record: Mulchie never acts because of one.
+
 ## Turning the watch off
 
 ```sh

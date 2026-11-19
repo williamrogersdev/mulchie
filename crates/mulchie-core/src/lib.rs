@@ -7,6 +7,7 @@ pub mod failures;
 pub mod feedback;
 pub mod git;
 pub mod guard;
+pub mod issues;
 pub mod journal;
 pub mod limits;
 pub mod lock;
