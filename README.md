@@ -72,7 +72,7 @@ curl -fsSL https://raw.githubusercontent.com/williamrogersdev/mulchie/main/scrip
 
 The install script puts the binary in `~/.local/bin` after checking its SHA-256 against the release's `.sha256` file. Every release asset has a SHA-256 checksum, and the release lists them in `SHA256SUMS`. From source: `cargo install --git https://github.com/williamrogersdev/mulchie mulchie`, or `cargo install --path crates/mulchie-cli` from a checkout. Mulchie is not on crates.io yet.
 
-The menu bar app and its DMG are signed with a Developer ID and notarized. This build of the app does not update itself: use `brew upgrade` or download the newer DMG. The standalone macOS CLI binaries are ad-hoc signed, not Developer ID signed or notarized. Homebrew and the install script both work. A tarball downloaded with a browser is quarantined by Gatekeeper; after extracting it, run `xattr -d com.apple.quarantine ./mulchie`.
+The menu bar app and its DMG are signed with a Developer ID and notarized. The app updates itself: **Check for Updates…** in its menu, and it also looks a minute after launch and every six hours and offers the new version. An app that is a release candidate is offered the next release candidate or stable release; a stable app is offered stable releases only. Versions before 0.3.0-rc.6 cannot find a release candidate, so update those once by hand from [mulchie.com/download](https://mulchie.com/download/). The standalone macOS CLI binaries are ad-hoc signed, not Developer ID signed or notarized. Homebrew and the install script both work. A tarball downloaded with a browser is quarantined by Gatekeeper; after extracting it, run `xattr -d com.apple.quarantine ./mulchie`.
 
 Then check the setup:
 

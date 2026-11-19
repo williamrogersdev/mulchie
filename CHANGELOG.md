@@ -15,6 +15,7 @@ All notable changes to Mulchie are listed here. The format follows
 - `~/Library/Logs/mulchie-serve.log` no longer grows without end: past 10 MiB `mulchie serve` copies it to `mulchie-serve.log.1` and empties it.
 - App connected to another engine: one `/v1/health` call per tick (an authenticated check every 30 s), and history fetched with the new `GET /v1/history?since=` instead of whole each time.
 - App: a click on the menu bar icon that closes the panel by taking its focus no longer opens it again.
+- App: an app that is a release candidate finds the next release candidate. Its updater read `releases/latest/download/latest.json`, and GitHub's `releases/latest` never names a pre-release, so while every release was a pre-release the check failed. It now lists the newest releases and reads the newest manifest it may install, pre-releases included only for a pre-release app. Versions before 0.3.0-rc.6 still read `releases/latest`: update those once by hand.
 
 - Mulchie's own update check never offered a release candidate to someone running one: it asked GitHub for the latest release, which leaves pre-releases out. An install that is itself a pre-release now asks for the newest releases and is offered the highest version, pre-releases included. A stable install is still offered stable releases only.
 

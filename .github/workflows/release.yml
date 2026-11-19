@@ -12,8 +12,10 @@ name: Release
 #     skips signing, notarization, the tag and the release, so it works with no secret.
 #
 # A version with a suffix, such as 0.3.0-rc.1, makes a pre-release: same build and
-# signing, but the release is marked as a pre-release so releases/latest (install.sh, the
-# app updater) keeps pointing at the last stable one, and publish.yml skips it.
+# signing, but the release is marked as a pre-release so releases/latest (install.sh) keeps
+# pointing at the last stable one, and publish.yml skips it. The app updater lists the
+# releases instead (mulchie_core::updates::app_manifest_url), so a release candidate finds
+# the next one.
 #
 # The tag is created with the release, as the last step. A run that fails before that
 # leaves nothing behind: fix main and run it again.
@@ -646,8 +648,8 @@ jobs:
             release/*.tar.gz
             ${{ needs.prepare.outputs.app == 'true' && 'release/*.dmg' || '' }}
 
-      # A pre-release must never become "latest": install.sh and the updater read
-      # releases/latest. With no tag yet, a release that already exists under this name can
+      # A pre-release must never become "latest": install.sh relies on releases/latest
+      # naming only a stable release. With no tag yet, a release that already exists under this name can
       # only be a draft left by a run that failed while uploading; it is finished, not kept.
       - name: Create the tag and publish the release
         run: |

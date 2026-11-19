@@ -28,7 +28,7 @@ const description =
     <p>The app is a universal build, signed with a Developer ID and notarized by Apple, so it opens without a warning.</p>
     <p>With Homebrew, this one command does all of the above, including putting <code>mulchie</code> on your <code>PATH</code>:</p>
     <pre><code>brew install --cask williamrogersdev/tap/mulchie</code></pre>
-    <p>Update with <code>brew upgrade --cask mulchie</code> and remove with <code>brew uninstall --cask mulchie</code>. To build the app from source instead, see <a href={`${REPO}/blob/main/CONTRIBUTING.md`}>CONTRIBUTING</a>.</p>
+    <p>The app updates itself: see <a href="#update">Update</a>. Remove it with <code>brew uninstall --cask mulchie</code> if you installed it with Homebrew. To build the app from source instead, see <a href={`${REPO}/blob/main/CONTRIBUTING.md`}>CONTRIBUTING</a>.</p>
 
     <h2 id="paths">Linux, servers, or the CLI only</h2>
     <p>Skip this section if you installed the app: it already includes the CLI, and installing both gives you two <code>mulchie</code> commands. Pick one of these:</p>
@@ -99,7 +99,7 @@ cargo install --path crates/mulchie-cli</code></pre>
       <li>Homebrew CLI: <code>brew upgrade mulchie-cli</code>.</li>
       <li>Install script: run it again.</li>
       <li>Cargo: run the <code>cargo install --git</code> command again with <code>--force</code>.</li>
-      <li>Menu bar app: <code>brew upgrade --cask mulchie</code>, or download the newer DMG.</li>
+      <li>Menu bar app: it updates itself. Choose <strong>Check for Updates…</strong> in its menu; it also looks a minute after launch and every six hours, and shows an <strong>Update to X</strong> button when a newer version exists. A release candidate is offered the next release candidate or stable release, a stable version stable releases only. Versions before 0.3.0-rc.6 cannot find a release candidate: <a href="/download/">download the newest DMG</a> once and drag it over the old app. <code>brew upgrade --cask mulchie</code> also works when the Homebrew tap has the newer version.</li>
     </ul>
     <p>The engine also checks for newer versions of Mulchie and of the agent tools it finds, and reports them in <code>mulchie updates</code>. It installs nothing. See <a href="/docs/updates/">update checks</a> for what it contacts and how to turn it off.</p>
 
