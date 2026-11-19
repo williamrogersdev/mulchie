@@ -102,6 +102,12 @@ pub enum FindingKind {
     /// The trace receiver is turned on but could not listen (its port is
     /// taken, say).
     OtelUnavailable,
+    /// A dev server's latest runs each took much longer than usual to start
+    /// listening (`perf`, [`crate::devservers`]).
+    DevServerSlowStart,
+    /// A dev server's latest runs each settled at much more memory than
+    /// usual (`perf`, [`crate::devservers`]).
+    DevServerHeavier,
 }
 
 impl FindingKind {
@@ -136,9 +142,8 @@ impl FindingKind {
                 FindingCategory::Limit
             }
             MulchieUpdate | AgentUpdate | HomebrewOutdated | Advisory => FindingCategory::Update,
-            BuildSlower | ProductionSlower | EndpointSlower | EndpointErrors => {
-                FindingCategory::Performance
-            }
+            BuildSlower | ProductionSlower | EndpointSlower | EndpointErrors
+            | DevServerSlowStart | DevServerHeavier => FindingCategory::Performance,
         }
     }
 }
@@ -278,6 +283,10 @@ pub struct Evidence {
     /// figures, and the commits in between.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub endpoint: Option<Box<crate::endpoints::EndpointEvidence>>,
+    /// Dev server findings: the recent and usual figures, and the commits in
+    /// between.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub devserver: Option<Box<crate::devservers::DevServerEvidence>>,
 }
 
 /// One thing behind a machine-wide finding.

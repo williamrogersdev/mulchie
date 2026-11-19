@@ -192,6 +192,15 @@ pub fn tool_list() -> Vec<Tool> {
             }),
         ),
         read(
+            "list_dev_servers",
+            "Dev servers, run by run",
+            "A profile of each project's dev server (next dev, vite, rails s, cargo run of a web app: a long-running process in a workspace that listens on a TCP port), one entry per run, newest first: its command, ports, workspace, branch, commit and agent session, the time to start listening (an upper bound, only as exact as the watch interval; see listen_uncertainty_ms), the memory it settled at over minutes 2 to 5, the memory slope in MB per hour, peak CPU and whether it is still running or exited. Use it after changing an app to see whether its dev server got slower to start or heavier; a dev_server_slow_start or dev_server_heavier finding (list_findings) names the commits in between. A record only; nothing acts on it.",
+            json!({
+                "workspace": { "type": "string", "maxLength": 4096, "description": "Only runs in this workspace (absolute path of the checkout's top directory)" },
+                "limit": { "type": "integer", "minimum": 1, "maximum": 1000, "description": "At most this many (default 50)" }
+            }),
+        ),
+        read(
             "list_endpoints",
             "Endpoints of local apps (traces)",
             "The endpoints of apps in local development that send OpenTelemetry traces to Mulchie (otel.enabled on; OTEL_EXPORTER_OTLP_ENDPOINT=http://127.0.0.1:4318): per service, each operation's count, errors and p50/p95/p99 over the last minutes, its usual p95 and error rate, whether it is slower or failing more than usual, and where the service runs (workspace, commit, the agent session that moved HEAD). Also whether the receiver is listening and what it dropped. Use it after changing an app's code to see whether an endpoint got slower; an endpoint_slower or endpoint_errors finding (list_findings) names the commits in between. A record only; nothing acts on it.",
@@ -1393,6 +1402,24 @@ pub fn call_tool(cx: &mut Ctx, name: &str, a: &Map<String, Value>) -> ToolResult
                 "/v1/otel".to_string()
             } else {
                 format!("/v1/otel?{}", q.join("&"))
+            };
+            get(&path)
+        }
+        "list_dev_servers" => {
+            let mut q = Vec::new();
+            if let Some(l) = a.get("limit").and_then(Value::as_u64) {
+                q.push(format!("limit={l}"));
+            }
+            if let Some(w) = a.get("workspace").and_then(Value::as_str) {
+                if !w.starts_with('/') {
+                    return Err("workspace must be an absolute path".into());
+                }
+                q.push(format!("workspace={}", mulchie_core::api::query_escape(w)));
+            }
+            let path = if q.is_empty() {
+                "/v1/devservers".to_string()
+            } else {
+                format!("/v1/devservers?{}", q.join("&"))
             };
             get(&path)
         }

@@ -88,6 +88,7 @@ Agents should start with `diagnose`.
 | `list_findings` | No | What the watch noticed. Arguments: `severity`, `kind`, `include_dismissed`. See [Findings](/docs/watch/). |
 | `list_issues` | No | Findings grouped into issues that keep coming back, with how often each appeared and its status. Arguments: `status` (`open`, `resolved`, `regressed`, `ignored`, `all`), `kind`. See [Issues](/docs/watch/#issues). |
 | `list_timings` | No | How long builds and tests took, newest first, with exit code, workspace, branch, commit and agent session. Arguments: `workspace`, `command`, `limit`. See [Slower builds](/docs/watch/#slower-builds). |
+| `list_dev_servers` | No | Each project's dev server, run by run, newest first: command, ports, workspace, branch, commit and agent session, time to listen (an upper bound, with its uncertainty), settled memory, memory slope in MB per hour, peak CPU and whether it still runs. Arguments: `workspace`, `limit`. See [Dev servers](/docs/watch/#dev-servers). |
 | `list_endpoints` | No | The endpoints of local apps that send traces to Mulchie: per service, each operation's count, errors and p50/p95/p99, its usual p95 and error rate, whether it is slower or failing more, and where the service runs. Arguments: `service`, `minutes`. See [Traces](/docs/traces/). |
 | `get_issue` | No | One issue. Argument: `id`. |
 | `list_sessions` | No | Agent sessions, running first, with CPU, memory, processes, build slots, runtime and whether their limits are enforced here. See [Sessions and limits](/docs/sessions/). |

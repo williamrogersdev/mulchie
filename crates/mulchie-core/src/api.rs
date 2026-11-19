@@ -110,6 +110,7 @@ pub const ROUTES: &[(&str, &str)] = &[
     ("POST", "/v1/feedback"),
     ("GET", "/v1/commits"),
     ("GET", "/v1/timings"),
+    ("GET", "/v1/devservers"),
     ("GET", "/v1/integrations"),
     ("POST", "/v1/integrations/check"),
     ("GET", "/v1/deploys"),
@@ -1517,6 +1518,11 @@ fn route(req: &Req, engine: &Engine, read_only: bool) -> Resp {
                 let ws = query_path(req, "workspace")?;
                 let cmd = query_text(req, "command")?;
                 ok(&engine.timings(ws.as_deref(), cmd.as_deref(), limit))
+            }
+            ("GET", "/v1/devservers") => {
+                let limit = query_limit(req, 50)?;
+                let ws = query_path(req, "workspace")?;
+                ok(&engine.dev_servers(ws.as_deref(), limit))
             }
             ("GET", "/v1/integrations") => ok(&engine.integrations_status()),
             ("POST", "/v1/integrations/check") => match engine.request_integrations_check() {

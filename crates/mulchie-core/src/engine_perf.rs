@@ -11,6 +11,7 @@
 use super::*;
 use crate::commits::{self, CommitEntry};
 use crate::config::PerfConfig;
+use crate::devservers::{self, DevServer};
 use crate::git;
 use crate::session::SessionStatus;
 use crate::timings::{self, Timing, TimingReport};
@@ -54,6 +55,8 @@ pub(crate) struct PerfState {
     /// [`commits::KEPT`] and [`timings::KEPT`]).
     commits: Option<Vec<CommitEntry>>,
     timings: Option<Vec<Timing>>,
+    /// Dev server records, the newest [`devservers::KEPT`].
+    devservers: Option<Vec<DevServer>>,
     /// The last `HEAD` seen per workspace.
     heads: HashMap<PathBuf, String>,
     jobs: VecDeque<PerfJob>,
@@ -81,6 +84,11 @@ impl PerfState {
             t.drain(..t.len().saturating_sub(timings::KEPT));
             self.timings = Some(t);
         }
+        if self.devservers.is_none() {
+            let mut d: Vec<DevServer> = devservers::file(paths).read_all();
+            d.drain(..d.len().saturating_sub(devservers::KEPT));
+            self.devservers = Some(d);
+        }
     }
 
     pub(super) fn commits(&self) -> &[CommitEntry] {
@@ -90,12 +98,19 @@ impl PerfState {
     fn timings(&self) -> &[Timing] {
         self.timings.as_deref().unwrap_or_default()
     }
+
+    fn devservers(&self) -> &[DevServer] {
+        self.devservers.as_deref().unwrap_or_default()
+    }
 }
 
 #[derive(Default)]
 pub(crate) struct Perf {
     state: Mutex<PerfState>,
     wake: Condvar,
+    /// The dev servers being watched; fed by the watch run and the sample
+    /// loop, in memory only (its own lock: no disk and no git behind it).
+    dev: Mutex<devservers::Tracker>,
 }
 
 impl Perf {
@@ -118,6 +133,16 @@ pub struct CommitList {
 pub struct TimingList {
     /// Newest first.
     pub timings: Vec<Timing>,
+    /// How many matched before `limit`.
+    pub total: usize,
+}
+
+/// `GET /v1/devservers`.
+#[derive(Debug, Clone, Serialize)]
+pub struct DevServerList {
+    /// One record per run, newest run first: the runs alive now as they
+    /// stand, then the newest record of each run that was recorded.
+    pub dev_servers: Vec<DevServer>,
     /// How many matched before `limit`.
     pub total: usize,
 }
@@ -249,7 +274,12 @@ impl Engine {
                 .filter_map(|t| t.workspace.clone())
                 .collect()
         });
-        for r in recent.into_iter().chain(self.otel_workspaces()) {
+        let serving = lock(&self.perf.dev).workspaces();
+        for r in recent
+            .into_iter()
+            .chain(self.otel_workspaces())
+            .chain(serving)
+        {
             if out.len() >= MAX_POLLED {
                 break;
             }
@@ -348,6 +378,115 @@ impl Engine {
         });
     }
 
+    /// A watch run found these processes listening: feed the dev server
+    /// tracker. Memory only.
+    pub(super) fn observe_dev_listeners(
+        &self,
+        now: u64,
+        interval_secs: u64,
+        uid: u32,
+        procs: &[crate::process::ProcFacts],
+        samples: &HashMap<u32, ProcSample>,
+        listeners: Option<&[watch::Listener]>,
+    ) {
+        let own: HashMap<u32, &crate::process::ProcFacts> = procs
+            .iter()
+            .filter(|p| p.uid == Some(uid))
+            .map(|p| (p.pid, p))
+            .collect();
+        let self_pid = self.procs.self_pid();
+        let seen: Vec<(u32, u64)> = own.values().map(|p| (p.pid, p.start_time)).collect();
+        let listening: Option<Vec<devservers::Listening>> = listeners.map(|ls| {
+            let mut by: HashMap<u32, Vec<u16>> = HashMap::new();
+            for l in ls {
+                by.entry(l.pid).or_default().push(l.port);
+            }
+            let mut out = Vec::new();
+            for (pid, ports) in by {
+                let (Some(p), Some(s)) = (own.get(&pid), samples.get(&pid)) else {
+                    continue;
+                };
+                let Some((ws, _)) = &s.workspace else {
+                    continue;
+                };
+                if pid == self_pid || s.start_time != p.start_time {
+                    continue;
+                }
+                let cmd = if p.cmd.is_empty() {
+                    p.name.clone()
+                } else {
+                    p.cmd.join(" ")
+                };
+                out.push(devservers::Listening {
+                    pid,
+                    start_time: p.start_time,
+                    ports,
+                    workspace: ws.clone(),
+                    command: timings::clean_command(&cmd),
+                });
+            }
+            out.sort_by_key(|l| l.pid);
+            out
+        });
+        lock(&self.perf.dev).observe_watch(now, interval_secs, &seen, listening.as_deref());
+    }
+
+    /// A sample: feed the dev server tracker the processes' memory and CPU.
+    pub(super) fn observe_dev_sample(&self, now: u64, members: &crate::consumers::Members) {
+        if lock(&self.perf.dev).is_idle() {
+            return;
+        }
+        let procs: Vec<devservers::SampleProc> = members
+            .values()
+            .flatten()
+            .map(|p| devservers::SampleProc {
+                pid: p.pid,
+                ppid: p.ppid,
+                start_time: p.start_time,
+                mem_bytes: p.mem_bytes,
+                cpu_pct: p.cpu_pct,
+            })
+            .collect();
+        lock(&self.perf.dev).observe_sample(now, &procs);
+    }
+
+    /// Give the runs not yet attributed their branch, `HEAD` and session,
+    /// and write the records that are due. Returns whether any was written.
+    fn record_dev_servers(&self, now: u64) -> bool {
+        let pending = lock(&self.perf.dev).unattributed();
+        for (ws, pid, start) in pending {
+            let session = self
+                .session_of_pid(pid)
+                .or_else(|| self.session_in(&ws, now));
+            let head = self.check_head(&ws, session.clone(), "devserver", now);
+            lock(&self.perf.dev).attribute(
+                pid,
+                start,
+                head.as_ref().and_then(|h| h.branch.clone()),
+                head.map(|h| h.sha),
+                session,
+            );
+        }
+        let due = lock(&self.perf.dev).due(now);
+        if due.is_empty() {
+            return false;
+        }
+        for r in &due {
+            if self.keeps_perf() {
+                let _ = devservers::file(&self.paths).append(r);
+            }
+        }
+        self.with_perf(|p| {
+            let v = p.devservers.get_or_insert_with(Vec::new);
+            v.extend(due);
+            if v.len() > devservers::KEPT {
+                let n = v.len() - devservers::KEPT;
+                v.drain(..n);
+            }
+        });
+        true
+    }
+
     /// The label of the lease or waiter `ticket` and the session of its
     /// process, before it is released.
     pub(crate) fn lease_holder(&self, ticket: u64) -> Option<(String, Option<SessionRef>)> {
@@ -435,6 +574,9 @@ impl Engine {
                 self.check_head(&ws, None, "poll", now);
             }
         }
+        if self.record_dev_servers(now) {
+            self.with_perf(|p| p.dirty = true);
+        }
         let rebuild = self.with_perf(|p| {
             let r = p.dirty || p.published.as_ref() != Some(&cfg);
             p.dirty = false;
@@ -442,7 +584,11 @@ impl Engine {
             r
         });
         if rebuild {
-            let found = self.with_perf(|p| timings::findings(p.timings(), p.commits(), &cfg, now));
+            let found = self.with_perf(|p| {
+                let mut f = timings::findings(p.timings(), p.commits(), &cfg, now);
+                f.extend(devservers::findings(p.devservers(), p.commits(), &cfg, now));
+                f
+            });
             self.with_perf(|p| p.build_findings = found);
         }
         let had_endpoints = !self.otel_findings().is_empty();
@@ -567,6 +713,34 @@ impl Engine {
                 timings: m.into_iter().take(limit).cloned().collect(),
             }
         })
+    }
+
+    /// Dev server runs, newest run first: in `workspace` when given, at
+    /// most `limit`. The runs alive now come as they stand; the others as
+    /// their newest record says.
+    pub fn dev_servers(&self, workspace: Option<&Path>, limit: usize) -> DevServerList {
+        let workspace = workspace.map(real);
+        let workspace = workspace.as_deref();
+        let now = now_unix();
+        let live = lock(&self.perf.dev).live(now);
+        let mut all: Vec<DevServer> = self.with_perf(|p| {
+            devservers::runs(p.devservers())
+                .into_iter()
+                .filter(|r| {
+                    !live
+                        .iter()
+                        .any(|l| l.pid == r.pid && l.start_unix == r.start_unix)
+                })
+                .cloned()
+                .collect()
+        });
+        all.extend(live);
+        all.retain(|r| workspace.is_none_or(|w| r.workspace == w));
+        all.sort_by_key(|r| std::cmp::Reverse((r.start_unix, r.pid)));
+        DevServerList {
+            total: all.len(),
+            dev_servers: all.into_iter().take(limit).collect(),
+        }
     }
 }
 

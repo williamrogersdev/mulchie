@@ -59,7 +59,7 @@ mod otel_glue;
 #[path = "engine_perf.rs"]
 mod perf_glue;
 pub use otel_glue::{OperationReport, OtelBrief, OtelReport, ServiceReport};
-pub use perf_glue::{CommitList, TimingList};
+pub use perf_glue::{CommitList, DevServerList, TimingList};
 #[path = "engine_integrations.rs"]
 mod integrations_glue;
 pub use integrations_glue::{DeployList, DeployView, IntegrationsStatus, ProviderStatus};
@@ -1546,6 +1546,7 @@ impl Engine {
             lock(&self.watch)
                 .tracker
                 .observe(now, snap.members.values().flatten());
+            self.observe_dev_sample(now, &snap.members);
         }
 
         let pressured =
@@ -2078,6 +2079,14 @@ impl Engine {
             let pairs: Vec<(u32, u16)> = ls.iter().map(|l| (l.pid, l.port)).collect();
             lock(&self.sup).tracker.set_listening(&pairs);
         }
+        self.observe_dev_listeners(
+            now,
+            cfg.watch.interval_secs.max(10),
+            uid,
+            &procs,
+            &samples,
+            listeners.as_deref().filter(|_| !listeners_unknown),
+        );
         self.journal_findings(&changes, now);
         findings
     }

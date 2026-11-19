@@ -1238,6 +1238,47 @@ paths:
                   total: { type: integer, description: How many matched before the limit }
         "400": { description: "`invalid_query`: a bad limit, workspace or command", content: { application/json: { schema: { type: object } } } }
         default: { $ref: "#/components/responses/Error" }
+  /v1/devservers:
+    get:
+      summary: Each project's dev server, run by run, newest first
+      description: |
+        A dev server is a process of the user's in a workspace that listens on a TCP port (`next
+        dev`, `vite`, `rails s`, a web app run with `cargo run`), found from the process table and
+        the listening sockets the watch already reads. Each run (a pid and its start time) is
+        recorded when it ends and every 30 minutes while it lasts, in
+        `<config dir>/devservers.jsonl`; a run seen listening for under a minute is not. The
+        runs alive now come as they stand; the others as their newest record says.
+        `listen_ms` is an upper bound: it is read from the watch run (`watch.interval_secs`, 60
+        by default) that first saw the port, and the true time lies within
+        `listen_uncertainty_ms` below it. It is absent when Mulchie first met the process already
+        listening. Latest runs that each start much slower or settle at much more memory than
+        usual raise `dev_server_slow_start` and `dev_server_heavier` findings (settings under
+        `perf`). Nothing acts on a run or a finding.
+      parameters:
+        - name: workspace
+          in: query
+          required: false
+          description: Only this workspace (absolute path, percent-encoded)
+          schema: { type: string }
+        - name: limit
+          in: query
+          required: false
+          description: "How many to return (1 to 1000, default 50)"
+          schema: { type: integer, minimum: 1, maximum: 1000 }
+      responses:
+        "200":
+          description: The runs
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  dev_servers:
+                    type: array
+                    items: { $ref: "#/components/schemas/DevServer" }
+                  total: { type: integer, description: How many matched before the limit }
+        "400": { description: "`invalid_query`: a bad limit or workspace", content: { application/json: { schema: { type: object } } } }
+        default: { $ref: "#/components/responses/Error" }
   /v1/otel:
     get:
       summary: The trace receiver and the endpoints of the apps sending traces
@@ -1612,6 +1653,8 @@ components:
         - endpoint_slower
         - endpoint_errors
         - otel_unavailable
+        - dev_server_slow_start
+        - dev_server_heavier
         - production_slower
     TraceResource:
       type: object
@@ -1681,7 +1724,7 @@ components:
         previous_head: { type: string, description: "Where it pointed at the check before; absent for a workspace's first entry" }
         session_id: { type: string }
         agent: { type: string }
-        via: { type: string, enum: [poll, hook, timing], description: What noticed the move }
+        via: { type: string, enum: [poll, hook, timing, otel, devserver], description: What noticed the move }
     Timing:
       type: object
       required: [at_unix, duration_ms, command, key, label]
@@ -1698,6 +1741,31 @@ components:
         head: { type: string }
         session_id: { type: string }
         agent: { type: string }
+    DevServer:
+      type: object
+      required: [at_unix, pid, start_unix, workspace, command, key, end]
+      properties:
+        at_unix: { type: integer, description: When the record was written }
+        pid: { type: integer }
+        start_unix: { type: integer, description: "The process's start; with pid it identifies the run" }
+        workspace: { type: string }
+        branch: { type: string }
+        head: { type: string, description: "The workspace's HEAD when Mulchie first saw the run listening" }
+        session_id: { type: string }
+        agent: { type: string }
+        command: { type: string, description: "Redacted, at most 1024 characters" }
+        key: { type: string, description: "The command as runs are grouped" }
+        ports: { type: array, items: { type: integer }, description: "The ports it listened on (the first 8)" }
+        listen_ms: { type: integer, description: "Process start to the first watch run that saw it listening: an upper bound. Absent when Mulchie first met it already listening" }
+        listen_uncertainty_ms: { type: integer, description: "The true time to listen is within this much below listen_ms" }
+        watch_interval_secs: { type: integer, description: "watch.interval_secs when it was measured" }
+        settled_mem_bytes: { type: integer, description: "Median memory of the process and its descendants over minutes 2 to 5 of the run (at least 3 samples)" }
+        mem_slope_mb_per_hour: { type: number, description: "Least-squares slope of that memory from minute 2 on; absent before 10 minutes were watched" }
+        peak_cpu_pct: { type: number, description: "Percent of one core, the process tree summed, at sample resolution" }
+        peak_mem_bytes: { type: integer }
+        processes: { type: integer, description: Processes in the tree at the last sample }
+        run_secs: { type: integer, description: "From the start to the last sample that saw it" }
+        end: { type: string, enum: [running, exited] }
     FindingCounts:
       type: object
       properties:
@@ -1826,6 +1894,24 @@ components:
                 attribution: { $ref: "#/components/schemas/EndpointAttribution" }
                 from_revision: { type: string, description: The commit at the end of the baseline }
                 to_revision: { type: string, description: The commit running now }
+                commits:
+                  type: array
+                  description: "The recorded moves of HEAD between them, oldest first (at most 20, the newest)"
+                  items: { $ref: "#/components/schemas/CommitEntry" }
+                commits_truncated: { type: boolean }
+            devserver:
+              type: object
+              description: "`dev_server_slow_start` and `dev_server_heavier` only: the baseline, the recent runs and what changed in between."
+              properties:
+                command: { type: string }
+                measure: { type: string, enum: [time_to_listen, settled_memory] }
+                baseline: { type: integer, description: "Milliseconds for time_to_listen, bytes for settled_memory; the median of the runs before the slow ones" }
+                baseline_runs: { type: integer }
+                recent: { type: array, items: { type: integer }, description: "The latest runs, oldest first, in the same unit" }
+                ratio: { type: number }
+                uncertainty_ms: { type: integer, description: "time_to_listen only: the largest uncertainty of the runs compared" }
+                from_head: { type: string }
+                to_head: { type: string }
                 commits:
                   type: array
                   description: "The recorded moves of HEAD between them, oldest first (at most 20, the newest)"

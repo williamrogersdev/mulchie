@@ -156,6 +156,22 @@ them. Works without an engine, from the saved file.",
     )]
     Timings(TimingsArgs),
 
+    /// Each project's dev server, run by run: time to listen, memory, CPU, newest first
+    #[command(
+        long_about = "A dev server is a long-running process in a workspace that listens on a TCP \
+port (next dev, vite, rails s, a web app run with cargo run). Mulchie finds them from the process \
+table and the listening sockets it already reads, and records each run: the command, the \
+workspace, branch, commit and agent session, the time from the process's start to the watch run \
+that first saw it listening (an upper bound, only as exact as `watch.interval_secs`, 60 seconds \
+by default), the memory it settled at over minutes 2 to 5, the memory slope in MB per hour, the \
+peak CPU and whether it is still running. When a dev server's latest runs each start much slower \
+or settle at much more memory than usual, Mulchie raises a `dev_server_slow_start` or \
+`dev_server_heavier` finding (settings under `perf`). A record; Mulchie never acts on it. Works \
+without an engine, from the saved file.",
+        after_help = "Examples:\n  mulchie devservers\n  mulchie devservers --workspace ~/code/repo-x --json"
+    )]
+    Devservers(DevserversArgs),
+
     /// Read-only links to Vercel, Sentry and PostHog: deploys, their numbers and commits
     #[command(
         subcommand,
@@ -652,6 +668,18 @@ pub struct TimingsArgs {
     /// Only commands that contain this, e.g. 'cargo test'
     #[arg(long)]
     pub command: Option<String>,
+    /// At most this many runs (1 to 1000)
+    #[arg(long, default_value_t = 50, value_parser = clap::value_parser!(u64).range(1..=1000))]
+    pub limit: u64,
+    #[command(flatten)]
+    pub out: JsonArg,
+}
+
+#[derive(Args, Debug)]
+pub struct DevserversArgs {
+    /// Only runs in this workspace (the checkout's top directory)
+    #[arg(long)]
+    pub workspace: Option<std::path::PathBuf>,
     /// At most this many runs (1 to 1000)
     #[arg(long, default_value_t = 50, value_parser = clap::value_parser!(u64).range(1..=1000))]
     pub limit: u64,
@@ -1200,6 +1228,28 @@ mod tests {
         assert!(parse(&["issues", "show", "0123456789abcdef", "--json"]).is_ok());
         assert!(parse(&["issues", "--status", "closed"]).is_err());
         assert!(parse(&["issues", "resolve"]).is_err());
+    }
+
+    #[test]
+    fn devservers_parse() {
+        let Some(Command::Devservers(d)) = parse(&[
+            "devservers",
+            "--workspace",
+            "/w/r",
+            "--limit",
+            "5",
+            "--json",
+        ])
+        .unwrap()
+        .command
+        else {
+            panic!("devservers");
+        };
+        assert_eq!(d.workspace.as_deref(), Some(std::path::Path::new("/w/r")));
+        assert_eq!(d.limit, 5);
+        assert!(d.out.json);
+        assert!(parse(&["devservers", "--limit", "0"]).is_err());
+        assert!(parse(&["devservers"]).is_ok());
     }
 
     #[test]

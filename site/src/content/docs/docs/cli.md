@@ -371,6 +371,24 @@ mulchie timings --command 'cargo test'
 mulchie timings --workspace ~/code/repo-x --json
 ```
 
+### devservers
+
+```sh
+mulchie devservers [--workspace DIR] [--limit N] [--json]
+```
+
+Each project's dev server, run by run, newest first: whether it is running or exited, its time to listen, the memory it settled at, its memory slope in MB per hour, how long it ran, its peak CPU, the workspace, command, ports, the commit and the agent session. A dev server is a process in a workspace that listens on a TCP port. See [Dev servers](/docs/watch/#dev-servers).
+
+- The time to listen is an upper bound, read from the watch run that first saw the port; the `+` figure is how much below it the true time may lie. `listen ?` means Mulchie first met the process already listening.
+- `--workspace` keeps runs in one checkout (its top directory). `--limit` is 1 to 1000, default 50.
+- When a dev server's latest runs each start much slower or settle at much more memory than usual, the engine raises a `dev_server_slow_start` or `dev_server_heavier` finding.
+- Without an engine it reads `devservers.jsonl` as the last engine left it.
+
+```sh
+mulchie devservers
+mulchie devservers --workspace ~/code/repo-x --json
+```
+
 ### integrations
 
 ```sh
