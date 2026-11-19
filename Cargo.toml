@@ -24,7 +24,7 @@ mulchie-core = { version = "0.3.0-rc.6", path = "crates/mulchie-core", default-f
 serde = { version = "1.0.229", features = ["derive", "rc"] }
 serde_json = "1.0.154"
 libc = "0.2.191"
-sysinfo = "0.40.1"
+sysinfo = { version = "0.40.4", default-features = false, features = ["system"] }
 tempfile = "3.27.0"
 semver = "1.0.28"
 toml = { version = "1.2.1", default-features = false, features = ["std", "serde", "parse"] }

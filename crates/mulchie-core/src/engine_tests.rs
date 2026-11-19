@@ -1906,3 +1906,38 @@ fn the_queue_holds_new_jobs_under_extreme_load_for_a_while() {
             .granted
     );
 }
+
+/// A config change rescans only when it changes what the scan reads, and
+/// then incrementally; dismissing a finding never rescans. A full scan
+/// someone asks for covers a waiting refresh.
+#[test]
+fn config_changes_rescan_only_what_the_scan_reads() {
+    let (_t, e) = engine();
+    e.set_config(Config::default()).unwrap();
+    while e.jobs.pop_wait(Duration::ZERO).is_some() {}
+
+    // A setting the scan does not read.
+    let mut cfg = e.config();
+    cfg.watch.interval_secs += 30;
+    cfg.throttle_cpu_pct = 50.0;
+    e.set_config(cfg).unwrap();
+    assert!(e.pending_jobs().is_empty(), "{:?}", e.pending_jobs());
+    e.dismiss_finding("stale_process:1:2", Some(1)).unwrap();
+    assert!(e.pending_jobs().is_empty(), "dismissing does not rescan");
+
+    // One it does: an incremental scan, queued once.
+    let mut cfg = e.config();
+    cfg.worktree_idle_days += 1;
+    e.set_config(cfg.clone()).unwrap();
+    cfg.stale_hours += 1;
+    e.set_config(cfg).unwrap();
+    assert_eq!(e.pending_jobs(), vec![Job::Refresh]);
+
+    // A full scan replaces the refresh; a refresh after it is covered.
+    assert!(e.request_scan());
+    assert_eq!(e.pending_jobs(), vec![Job::Scan]);
+    let mut cfg = e.config();
+    cfg.include_node_modules = !cfg.include_node_modules;
+    e.set_config(cfg).unwrap();
+    assert_eq!(e.pending_jobs(), vec![Job::Scan]);
+}

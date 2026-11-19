@@ -45,25 +45,40 @@ pub struct WorktreeMemo {
 }
 
 impl WorktreeMemo {
-    /// Whether the periodic scan may reuse this: measured within
-    /// [`REMEASURE_SECS`], read without error, nothing running in it then or
-    /// now, the same commit, folder and index untouched, and idle for
-    /// [`ACTIVE_SECS`] when measured. The safety gate reads a worktree again
-    /// itself before removing it, so a reused figure is never acted on.
+    /// Whether the periodic scan may reuse this. A worktree that shows no
+    /// sign of change (not in use then or now, the same commit, folder and
+    /// index untouched, idle for [`ACTIVE_SECS`] when measured) is reused for
+    /// [`REMEASURE_SECS`]. Any other one, where agents and builds work, is
+    /// reused for [`BUSY_REMEASURE_SECS`]: it cannot be swept while busy,
+    /// so its figures are only shown, and walking every busy worktree on
+    /// every scan cost minutes of CPU on a machine full of agents. A
+    /// measurement that failed is never reused. The safety gate reads a
+    /// worktree again itself before removing it, so a reused figure is never
+    /// acted on.
     fn fresh(&self, now: u64, head: &Option<String>, mark: (u64, u64), in_use: bool) -> bool {
-        !in_use
+        let age = now.saturating_sub(self.at_unix);
+        let unchanged_and_idle = !in_use
             && !self.in_use
             && self.head == *head
             && self.mark == mark
-            && self.status_error.is_none()
             && !self.activity_unknown
-            && now.saturating_sub(self.at_unix) < REMEASURE_SECS
             && self
                 .at_unix
                 .saturating_sub(self.newest.max(self.last_commit_unix))
-                >= ACTIVE_SECS
+                >= ACTIVE_SECS;
+        self.status_error.is_none()
+            && age
+                < if unchanged_and_idle {
+                    REMEASURE_SECS
+                } else {
+                    BUSY_REMEASURE_SECS
+                }
     }
 }
+
+/// How long the periodic scan reuses the figures of a busy worktree (in
+/// use, changed, or active within [`ACTIVE_SECS`]).
+pub const BUSY_REMEASURE_SECS: u64 = 2 * 3600;
 
 /// What the last scans measured. The engine keeps one between periodic
 /// scans; a scan someone asked for starts from an empty one.
@@ -1110,12 +1125,21 @@ mod tests {
         let now = crate::monitor::now_unix();
         let later = now + 30 * DAY;
 
-        // Changed within a day of the scan: measured every time.
+        // Changed within a day of the scan: reused for a while only.
         let mut memo = ScanMemo::default();
         let first = scan_with(&cfg, &paths, &[], now, &mut memo, true);
         grow(200_000);
         let second = scan_with(&cfg, &paths, &[], now + 60, &mut memo, true);
-        assert!(bytes(&second) > bytes(&first) + 150_000);
+        assert_eq!(bytes(&second), bytes(&first));
+        let third = scan_with(
+            &cfg,
+            &paths,
+            &[],
+            now + BUSY_REMEASURE_SECS,
+            &mut memo,
+            true,
+        );
+        assert!(bytes(&third) > bytes(&first) + 150_000);
 
         // Idle for a month: a change deep inside moves no mark, so the
         // figures are reused, and they keep the time they were measured.
@@ -1135,7 +1159,8 @@ mod tests {
         // A scan someone asked for measures it.
         assert!(bytes(&scan(&cfg, &paths, &[], later + 60)) > bytes(&base) + 300_000);
 
-        // Something running in it: measured, and not reused next time either.
+        // Something running in it: its figures from the last scan are kept
+        // for a while (a busy worktree is never swept), then measured.
         let kept = memo.clone();
         let busy = scan_with(
             &cfg,
@@ -1145,10 +1170,41 @@ mod tests {
             &mut memo,
             true,
         );
+        assert_eq!(bytes(&busy), bytes(&base));
+        let w = busy.worktrees.iter().find(|w| w.name == "agent-x").unwrap();
+        assert!(w.in_use && !w.sweepable);
+        let busy = scan_with(
+            &cfg,
+            &paths,
+            std::slice::from_ref(&wt),
+            later + BUSY_REMEASURE_SECS,
+            &mut memo,
+            true,
+        );
         assert!(bytes(&busy) > bytes(&base) + 300_000);
         assert!(memo.worktrees[&wt].in_use);
         grow(900_000);
-        let after = scan_with(&cfg, &paths, &[], later + 120, &mut memo, true);
+        let after = scan_with(
+            &cfg,
+            &paths,
+            &[],
+            later + BUSY_REMEASURE_SECS + 60,
+            &mut memo,
+            true,
+        );
+        assert_eq!(
+            bytes(&after),
+            bytes(&busy),
+            "measured while busy: reused for a while"
+        );
+        let after = scan_with(
+            &cfg,
+            &paths,
+            &[],
+            later + 2 * BUSY_REMEASURE_SECS,
+            &mut memo,
+            true,
+        );
         assert!(bytes(&after) > bytes(&busy) + 200_000);
 
         // Too old.
@@ -1156,10 +1212,18 @@ mod tests {
         let old = scan_with(&cfg, &paths, &[], later + REMEASURE_SECS, &mut memo, true);
         assert!(bytes(&old) > bytes(&base) + 300_000);
 
-        // A new commit, or a file added at the top: measured.
+        // A new commit, or a file added at the top: no longer idle, so
+        // measured once the shorter window has passed.
         let mut memo = kept.clone();
         commit(&paths, &wt, "more");
-        let moved = scan_with(&cfg, &paths, &[], later + 60, &mut memo, true);
+        let moved = scan_with(
+            &cfg,
+            &paths,
+            &[],
+            later + BUSY_REMEASURE_SECS,
+            &mut memo,
+            true,
+        );
         assert!(bytes(&moved) > bytes(&base) + 300_000);
         let mut memo = ScanMemo::default();
         let base = scan_with(&cfg, &paths, &[], later, &mut memo, true);
@@ -1167,6 +1231,15 @@ mod tests {
         std::thread::sleep(std::time::Duration::from_millis(1100));
         std::fs::write(wt.join("top.txt"), "new").unwrap();
         let top = scan_with(&cfg, &paths, &[], later + 60, &mut memo, true);
+        assert_eq!(bytes(&top), bytes(&base));
+        let top = scan_with(
+            &cfg,
+            &paths,
+            &[],
+            later + BUSY_REMEASURE_SECS,
+            &mut memo,
+            true,
+        );
         assert!(bytes(&top) > bytes(&base) + 300_000);
     }
 
