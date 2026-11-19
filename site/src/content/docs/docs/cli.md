@@ -1,6 +1,6 @@
 ---
 title: CLI reference
-description: "Every mulchie command and flag: status, diagnose, top, findings, issues, sessions, limits, updates, guard, hooks, clean, sweep, signal, group, run, mcp and config."
+description: "Every mulchie command and flag: status, diagnose, top, findings, issues, sessions, limits, updates, guard, hooks, clean, sweep, signal, group, run, mcp, config."
 ---
 
 Use this page to look up a `mulchie` command. Every command also has `--help` with examples.
