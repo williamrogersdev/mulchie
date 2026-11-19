@@ -86,6 +86,8 @@ Agents should start with `diagnose`.
 | `disk_breakdown` | No | Toolchain and package caches, model stores, and every git worktree with its size, idle days, uncommitted files and verdict. |
 | `reclaim_candidates` | No | Build caches with size, last use, and in-use and stale flags, from the engine's last scan. |
 | `list_findings` | No | What the watch noticed. Arguments: `severity`, `kind`, `include_dismissed`. See [Findings](/docs/watch/). |
+| `list_issues` | No | Findings grouped into issues that keep coming back, with how often each appeared and its status. Arguments: `status` (`open`, `resolved`, `regressed`, `ignored`, `all`), `kind`. See [Issues](/docs/watch/#issues). |
+| `get_issue` | No | One issue. Argument: `id`. |
 | `list_sessions` | No | Agent sessions, running first, with CPU, memory, processes, build slots, runtime and whether their limits are enforced here. See [Sessions and limits](/docs/sessions/). |
 | `get_session` | No | One session: its processes, budget breaches and what Mulchie paused. Argument `id`; with `events=true` also its activity record (`since`, `limit`, or `tail` and `before` to read backwards). |
 | `limits_status` | No | Whether budgets only report or act, the budgets, sessions over a cap and what was done, sessions hogging the machine, and processes Mulchie paused. |
@@ -101,6 +103,7 @@ Agents should start with `diagnose`.
 | `execute_plan` | Yes, destructive | Carry out approved items of a stored plan. |
 | `prune_cache` | Yes, destructive | Preview or run a package manager's own prune command. Arguments: `key`, `execute`. |
 | `check_updates` | Contacts the network | Ask the engine to check for updates now (GitHub, npm and, if you turned advisories on, OSV.dev). Refused when `updates.check` is off. It installs nothing. |
+| `resolve_issue` | Changes a record | Mark an issue `resolve`d, `ignore`d or `reopen`ed (argument `action`, with `id`). It changes nothing on the machine. Left out of a read-only server. |
 | `dismiss_finding` | Changes a setting | Hide a finding for `days` (default 30), or show it again with `undo=true`. It is saved in Mulchie's config and changes nothing else on the machine. |
 | `acquire_build_slot` | Takes a slot | Join the build queue, poll with the ticket, renew. |
 | `release_build_slot` | Gives up a slot | Release a slot or leave the queue. |

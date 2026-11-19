@@ -19,6 +19,7 @@ Full documentation is at [mulchie.com/docs](https://mulchie.com/docs/).
 
 **Watch**
 - Reports observations about processes: left over after their parent exited, runaway CPU, steadily growing memory, paused for hours, listening beyond this machine, running from a temporary folder, and similar. These are findings. They come from simple heuristics. They are not malware detection, and Mulchie is not an antivirus. See [findings](https://mulchie.com/docs/watch/).
+- Groups the performance findings that are about the same problem into issues, across processes and restarts: how often the same runaway command, leaking process or low-memory spell came back, and since when. Resolve an issue you fixed and Mulchie tells you if it returns. `mulchie issues` lists them. See [issues](https://mulchie.com/docs/watch/#issues).
 
 **Supervise agents**
 - A session is an agent and everything it started, found in the process table by name (Claude Code, Codex, Gemini CLI, Copilot CLI, Cursor's `cursor-agent`, aider, opencode and others; add more with `agents.extra`). `mulchie sessions` shows what each uses. See [sessions and limits](https://mulchie.com/docs/sessions/).

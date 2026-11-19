@@ -173,7 +173,7 @@ fn sweep_locally_dry_run_then_execute() {
     for w in &wts {
         age(w);
     }
-    let backend = Backend::Local(env.engine());
+    let backend = Backend::Local(Box::new(env.engine()));
 
     let c = go(
         &backend,
@@ -328,7 +328,7 @@ fn clean_paths_through_the_engine_and_locally() {
     drop(lk);
 
     // The same flow with a local engine.
-    let local = Backend::Local(env.engine());
+    let local = Backend::Local(Box::new(env.engine()));
     let c = go(
         &local,
         &Job::CleanPaths(vec![b.clone()]),
@@ -347,7 +347,7 @@ fn clean_paths_through_the_engine_and_locally() {
 #[test]
 fn empty_plans_do_nothing() {
     let env = Env::new();
-    let local = Backend::Local(env.engine());
+    let local = Backend::Local(Box::new(env.engine()));
     let c = go(
         &local,
         &Job::Sweep,
@@ -376,7 +376,7 @@ fn local_execute_holds_the_engine_lock() {
     let env = Env::new();
     let a = env.cache("a");
     let job = Job::CleanPaths(vec![a.clone()]);
-    let local = Backend::Local(env.engine());
+    let local = Backend::Local(Box::new(env.engine()));
     let plan = local.plan(&job).unwrap();
     // An engine that started after the plan was made holds the lock.
     let other = env.engine();

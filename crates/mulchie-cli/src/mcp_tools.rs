@@ -172,6 +172,27 @@ pub fn tool_list() -> Vec<Tool> {
             }),
         ),
         read(
+            "list_issues",
+            "Recurring performance issues",
+            "Performance and hygiene findings grouped into issues across processes and engine restarts: the same runaway command, memory leak, leftover process, low-memory spell or session over its budget, counted each time it appears (occurrences), with first_seen_unix and last_seen_unix and the user's decision (status). Unresolved ones (open and regressed) unless status is given; status=all lists every one. Active ones first. Use it to answer what keeps going wrong on this machine, not only what is wrong now. An issue is a record from heuristics, never a verdict.",
+            json!({
+                "status": { "type": "string", "enum": ["open", "resolved", "regressed", "ignored", "all"] },
+                "kind": { "type": "string", "description": "Only this finding kind, e.g. runaway_cpu" }
+            }),
+        ),
+        Tool {
+            name: "get_issue",
+            title: "One issue",
+            description: "One issue from list_issues by id, with its latest finding id (look the finding up with list_findings while active is true).",
+            props: json!({
+                "id": { "type": "string", "description": "The 16-hex-digit issue id from list_issues" }
+            }),
+            required: &["id"],
+            read_only: true,
+            destructive: false,
+            idempotent: true,
+        },
+        read(
             "list_sessions",
             "Agent sessions",
             "Agent sessions: each agent process and everything it started, running first, with CPU cores, memory, process count, build slots and runtime, the workspace, and whether its limits are enforced here (limits, in words). Changes nothing. get_session shows one in detail.",
@@ -297,6 +318,19 @@ pub fn tool_list() -> Vec<Tool> {
             idempotent: true,
         },
         Tool {
+            name: "resolve_issue",
+            title: "Resolve, ignore or reopen an issue",
+            description: "Mark an issue resolved (the user says it is fixed; if it appears again it becomes regressed and the user is told), ignored (still counted, never reported again) or open again. Ask the user first; it changes nothing on the machine.",
+            props: json!({
+                "id": { "type": "string", "description": "The issue id from list_issues" },
+                "action": { "type": "string", "enum": ["resolve", "ignore", "reopen"] }
+            }),
+            required: &["id", "action"],
+            read_only: false,
+            destructive: false,
+            idempotent: true,
+        },
+        Tool {
             name: "check_updates",
             title: "Check for updates now",
             description: "Ask the engine to check for updates now. It runs in the background on the engine; call list_updates after a minute for the result. Refused when update checks are off (updates.check), which only the user should change. Contacts GitHub, npm and, when advisories are on, OSV.dev from the engine.",
@@ -342,6 +376,15 @@ const FEEDBACK_TOOL: &str = "report_feedback";
 
 /// Tools offered in read-only mode: those that change nothing, build slots
 /// and feedback.
+/// An issue id: 16 hex digits.
+pub fn check_issue_id(id: &str) -> Result<(), String> {
+    if id.len() == 16 && id.chars().all(|c| c.is_ascii_hexdigit()) {
+        Ok(())
+    } else {
+        Err("id is a 16-hex-digit issue id from list_issues".into())
+    }
+}
+
 pub fn allowed(tool: &Tool, read_only: bool) -> bool {
     !read_only || tool.read_only || SLOT_TOOLS.contains(&tool.name) || tool.name == FEEDBACK_TOOL
 }
@@ -1272,6 +1315,43 @@ pub fn call_tool(cx: &mut Ctx, name: &str, a: &Map<String, Value>) -> ToolResult
                 }
                 post("/v1/findings/dismiss", b)
             }
+        }
+        "list_issues" => {
+            let mut q = Vec::new();
+            if let Some(st) = a.get("status").and_then(Value::as_str) {
+                if !matches!(st, "open" | "resolved" | "regressed" | "ignored" | "all") {
+                    return Err("status is open, resolved, regressed, ignored or all".into());
+                }
+                q.push(format!("status={st}"));
+            }
+            if let Some(k) = a.get("kind").and_then(Value::as_str) {
+                if !k.chars().all(|c| c.is_ascii_lowercase() || c == '_') {
+                    return Err("kind is a snake_case finding kind, e.g. runaway_cpu".into());
+                }
+                q.push(format!("kind={k}"));
+            }
+            let path = if q.is_empty() {
+                "/v1/issues".to_string()
+            } else {
+                format!("/v1/issues?{}", q.join("&"))
+            };
+            get(&path)
+        }
+        "get_issue" => {
+            let id = a.get("id").and_then(Value::as_str).unwrap_or("");
+            check_issue_id(id)?;
+            get(&format!("/v1/issues/{id}"))
+        }
+        "resolve_issue" => {
+            let id = a.get("id").and_then(Value::as_str).unwrap_or("");
+            check_issue_id(id)?;
+            let path = match a.get("action").and_then(Value::as_str) {
+                Some("resolve") => "/v1/issues/resolve",
+                Some("ignore") => "/v1/issues/ignore",
+                Some("reopen") => "/v1/issues/reopen",
+                _ => return Err("action is resolve, ignore or reopen".into()),
+            };
+            post(path, json!({ "id": id }))
         }
         "inspect_process" => {
             let pid = a.get("pid").and_then(Value::as_u64).unwrap_or(0);

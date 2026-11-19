@@ -88,7 +88,8 @@ paths:
         a row and is still there: `kind` (`reclaim` or `worktree`), `target`, `count`, the
         last `reason` and `detail`, `first_unix`, `last_unix`, `advice` and, from the third skip,
         `retry_after_unix` (the engine's automatic sweep and reclaim leave the target alone
-        until then). A success clears the record.
+        until then). A success clears the record. `issue_counts` counts the unresolved issues
+        and `top_issues` holds up to five of them that came back most often (as `GET /v1/issues`).
 
         Swap: each process in `snapshot.top` and each consumer group carries `swap_bytes`, its memory
         compressed or swapped out (on macOS its physical footprint minus what is resident; 0 for
@@ -489,6 +490,123 @@ paths:
                   ok: { type: boolean }
                   id: { type: string }
                   was_dismissed: { type: boolean }
+        default: { $ref: "#/components/responses/Error" }
+  /v1/issues:
+    get:
+      summary: Findings about the same problem, grouped across processes and restarts
+      description: |
+        An issue groups the performance and hygiene findings (the `hygiene` and `limit`
+        categories) that share a fingerprint: the kind, the workspace and the command with
+        paths, numbers and ids stripped (for session findings, the agent and the cap; for low
+        memory, the consumer). It counts each separate finding once (`occurrences`) and keeps
+        when it was first and last seen. Kept in `issues.json` in the config directory for 90
+        days after it was last seen, at most 500. Unresolved issues (`open` and `regressed`)
+        unless `status` is given; `status=all` lists every one. Active ones first, then the most
+        recently seen. An issue is a record, never a reason for Mulchie to act.
+      parameters:
+        - { name: status, in: query, required: false, schema: { type: string, enum: [open, resolved, regressed, ignored, all] } }
+        - { name: kind, in: query, required: false, schema: { $ref: "#/components/schemas/FindingKind" } }
+      responses:
+        "200":
+          description: The issues
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  issues: { type: array, items: { $ref: "#/components/schemas/Issue" } }
+                  counts: { $ref: "#/components/schemas/IssueCounts" }
+        default: { $ref: "#/components/responses/Error" }
+  /v1/issues/{id}:
+    get:
+      summary: One issue
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: string, pattern: "^[0-9a-f]{16}$" } }
+      responses:
+        "200":
+          description: The issue
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Issue" }
+        "404": { $ref: "#/components/responses/Error" }
+        default: { $ref: "#/components/responses/Error" }
+  /v1/issues/resolve:
+    post:
+      summary: Mark an issue resolved
+      description: When a new finding for it appears later, the issue becomes `regressed`, the journal says so and, with notifications on, so does a notification. Refused with `not_lock_holder` (409) by an engine that does not hold the lock.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [id]
+              properties:
+                id: { type: string, description: The issue id from GET /v1/issues }
+      responses:
+        "200":
+          description: The issue as it is now
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  ok: { type: boolean }
+                  issue: { $ref: "#/components/schemas/Issue" }
+        "404": { $ref: "#/components/responses/Error" }
+        "409": { $ref: "#/components/responses/Error" }
+        default: { $ref: "#/components/responses/Error" }
+  /v1/issues/ignore:
+    post:
+      summary: Ignore an issue
+      description: It is still counted, but listed only with `status=ignored` or `status=all` and never reported as regressed.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [id]
+              properties:
+                id: { type: string, description: The issue id from GET /v1/issues }
+      responses:
+        "200":
+          description: The issue as it is now
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  ok: { type: boolean }
+                  issue: { $ref: "#/components/schemas/Issue" }
+        "404": { $ref: "#/components/responses/Error" }
+        "409": { $ref: "#/components/responses/Error" }
+        default: { $ref: "#/components/responses/Error" }
+  /v1/issues/reopen:
+    post:
+      summary: Mark an issue open again
+      description: Undoes resolve or ignore.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [id]
+              properties:
+                id: { type: string, description: The issue id from GET /v1/issues }
+      responses:
+        "200":
+          description: The issue as it is now
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  ok: { type: boolean }
+                  issue: { $ref: "#/components/schemas/Issue" }
+        "404": { $ref: "#/components/responses/Error" }
+        "409": { $ref: "#/components/responses/Error" }
         default: { $ref: "#/components/responses/Error" }
   /v1/config:
     get:
@@ -1223,6 +1341,31 @@ components:
         medium: { type: integer }
         high: { type: integer }
         dismissed: { type: integer }
+    IssueCounts:
+      type: object
+      properties:
+        open: { type: integer }
+        regressed: { type: integer }
+        active: { type: integer, description: Unresolved and current now }
+    Issue:
+      type: object
+      required: [id, kind, category, severity, title, culprit, first_seen_unix, last_seen_unix, occurrences, status, regressions, active, finding_id]
+      properties:
+        id: { type: string, description: "16 hex digits of the fingerprint; stable across restarts" }
+        kind: { $ref: "#/components/schemas/FindingKind" }
+        category: { type: string, enum: [hygiene, limit] }
+        severity: { type: string, enum: [info, low, medium, high], description: The highest any of its findings had }
+        title: { type: string, description: The latest finding's title }
+        culprit: { type: string, description: "What it is about, without pids: the normalized command, the agent and cap, or the memory consumer" }
+        workspace: { type: string }
+        first_seen_unix: { type: integer }
+        last_seen_unix: { type: integer }
+        occurrences: { type: integer, description: "Separate findings it was; one that lasts counts once" }
+        status: { type: string, enum: [open, resolved, regressed, ignored] }
+        status_unix: { type: integer, description: When the status last changed }
+        regressions: { type: integer, description: Times it came back after being resolved }
+        active: { type: boolean, description: A finding for it is current now }
+        finding_id: { type: string, description: The latest finding's id }
     Finding:
       type: object
       required: [id, kind, severity, title, why, evidence, suggested, first_seen_unix, last_seen_unix, dismissed]

@@ -282,7 +282,7 @@ impl Default for Options {
 
 #[derive(Clone)]
 enum Conn {
-    Local(Engine),
+    Local(Box<Engine>),
     Remote(Client),
     Down,
 }
@@ -439,7 +439,7 @@ impl Backend {
             detail,
             since_unix: now_unix(),
         };
-        inner.conn = Conn::Local(engine);
+        inner.conn = Conn::Local(Box::new(engine));
         guard(&self.plans).clear();
         inner.lock = Some(lk);
         inner.server = server;
@@ -844,7 +844,7 @@ impl Backend {
     #[cfg(test)]
     pub fn local_engine(&self) -> Option<Engine> {
         match self.conn() {
-            Conn::Local(e) => Some(e),
+            Conn::Local(e) => Some(*e),
             _ => None,
         }
     }

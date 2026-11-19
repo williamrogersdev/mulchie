@@ -181,6 +181,14 @@ A build script that calls itself adds a level about every second, and every leve
 - A chain's self-nesting commands are remembered with their directory for `runaway.remember_secs` (in memory only, so not across an engine restart). The `runaway_repeat` guard rule matches them, and a session whose chain was stopped gets one sentence about it in its next hook reply.
 - `state.runaway` and `runaway` in `GET /v1/limits/status` report the action, whether this engine enforces it, the chains running now, the last 50 stoppings and what is remembered.
 
+### Issues (`issues.rs`)
+
+Findings of the `hygiene` and `limit` categories (without `paused_list_unreadable`) are grouped into issues by a fingerprint that leaves the pid out: the kind, the workspace and a subject (the command line normalized by `issues::normalize_command`; the agent and cap for session findings; the consumer for low memory; the program for an orphan swarm). The id is 16 hex digits of a 64-bit FNV-1a hash of that, the same in every build.
+
+The engine feeds every stored finding to the book whenever the watch or the limit findings change (`observe_issues`). A finding id not current at the previous call is a new occurrence; a resolved issue with a new occurrence becomes `regressed`, which is journaled (kind `issue`) and notified. Resolving, ignoring and reopening go through `POST /v1/issues/{resolve,ignore,reopen}` and are journaled too.
+
+The book is kept in `<config dir>/issues.json`, mode 0600, replaced whole with `write_atomic`: when something changed, and every 5 minutes while an issue is active, so `last_seen_unix` survives a crash. It also stores which current finding belongs to which issue, so a restart does not count a finding that is still there again. Only the engine that holds the lock writes it (a one-off engine of the CLI keeps what it sees in memory, and refuses changes with `not_lock_holder`). A file that is not a plain file, is over 8 MB, has another format number or cannot be parsed is ignored. Issues not seen for 90 days are dropped from it, and beyond 500 the ones seen longest ago; no file is deleted. Nothing acts on an issue.
+
 ### Feedback (`feedback.rs`)
 
 Agents and people report problems with Mulchie or the machine: the MCP tool `report_feedback`, `mulchie feedback report`, or `POST /v1/feedback` (the read-only token is accepted, since a report only adds a line to Mulchie's own file). Each report is one JSON line in `<config dir>/feedback.jsonl`, mode 0600, opened with `O_NOFOLLOW`. The engine adds the machine's state from its last sample and a `feedback` entry in the action journal. Free text is cut to a fixed length and passed through the command-line redaction. At 4 MB the file is renamed to `feedback.jsonl.1`, replacing the earlier one, as the action journal does. With no engine, the CLI and the MCP server append to the file themselves, without the machine's state. Mulchie never sends the file anywhere.

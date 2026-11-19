@@ -1,6 +1,6 @@
 ---
 title: CLI reference
-description: "Every mulchie command and flag: status, diagnose, top, findings, sessions, limits, updates, guard, hooks, clean, sweep, signal, group, run, mcp and config."
+description: "Every mulchie command and flag: status, diagnose, top, findings, issues, sessions, limits, updates, guard, hooks, clean, sweep, signal, group, run, mcp, config."
 ---
 
 Use this page to look up a `mulchie` command. Every command also has `--help` with examples.
@@ -104,6 +104,24 @@ What Mulchie's watch noticed about processes and about its own setup. Findings a
 - `dismiss` hides a finding you know is expected, for `--days` days (default 30). `undismiss` shows it again.
 
 A finding's id is printed with it, for example `runaway_cpu:4242:1700000000`.
+
+### issues
+
+```sh
+mulchie issues [--status open|resolved|regressed|ignored|all] [--kind KIND] [--json]
+mulchie issues show <id> [--json]
+mulchie issues resolve <id> [--json]
+mulchie issues ignore <id> [--json]
+mulchie issues reopen <id> [--json]
+```
+
+Problems that keep coming back. An issue groups the performance and hygiene findings that are about the same thing, across processes and engine restarts: the same runaway `npm run dev` started again tomorrow is the same issue, counted again. See [Issues](/docs/watch/#issues).
+
+- Without `--status`, open and regressed issues are listed; `--status all` lists every one.
+- `resolve` marks an issue fixed. If it appears again it becomes `regressed`, and the journal (and a notification, when they are on) says so.
+- `ignore` stops reporting an issue; it is still counted. `reopen` undoes either.
+
+Listing works without an engine and reads the saved file. Changing an issue needs the running engine.
 
 ### worktrees
 

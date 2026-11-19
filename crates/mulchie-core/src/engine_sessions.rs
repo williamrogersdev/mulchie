@@ -635,6 +635,7 @@ impl Engine {
             st.finding_counts = FindingCounts::of(&st.findings);
             changes
         };
+        self.observe_issues(now);
         if !changes.appeared.is_empty() || !changes.gone.is_empty() {
             self.journal_findings(&changes, now);
         }

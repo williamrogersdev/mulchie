@@ -130,6 +130,20 @@ raised and what to look at next. Dismiss one you know is expected.",
     )]
     Findings(FindingsArgs),
 
+    /// Problems that keep coming back: findings grouped across processes and restarts
+    #[command(
+        long_about = "Issues group Mulchie's performance and hygiene findings (runaway CPU, \
+growing memory, leftover and stuck processes, runaway chains, low memory, sessions over their \
+budget) by what they are about rather than by process: the same runaway `npm run dev` started \
+again tomorrow is the same issue, counted again. Each issue keeps how often it appeared, when \
+it was first and last seen, and your decision: resolve one you fixed (if it comes back it is \
+marked regressed and you are told), ignore one you accept. Issues are a record, never a reason \
+for Mulchie to act. Changing an issue needs the running engine.",
+        args_conflicts_with_subcommands = true,
+        after_help = "Examples:\n  mulchie issues\n  mulchie issues --status all\n  mulchie issues --kind growing_memory --json\n  mulchie issues show 0123456789abcdef\n  mulchie issues resolve 0123456789abcdef\n  mulchie issues ignore 0123456789abcdef"
+    )]
+    Issues(IssuesArgs),
+
     /// Agent sessions: what each agent and everything it started is using (needs the engine)
     #[command(
         long_about = "A session is an agent process and everything it started, found from the \
@@ -577,6 +591,70 @@ pub struct FindingsArgs {
     pub action: Option<FindingsCommand>,
 }
 
+#[derive(Args, Debug)]
+pub struct IssuesArgs {
+    /// Only issues with this status (default: open and regressed)
+    #[arg(long, value_enum)]
+    pub status: Option<IssueStatusArg>,
+    /// Only this kind, e.g. runaway_cpu
+    #[arg(long)]
+    pub kind: Option<String>,
+    #[command(flatten)]
+    pub out: JsonArg,
+    #[command(subcommand)]
+    pub action: Option<IssuesCommand>,
+}
+
+#[derive(ValueEnum, Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IssueStatusArg {
+    Open,
+    Resolved,
+    Regressed,
+    Ignored,
+    All,
+}
+
+impl IssueStatusArg {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Open => "open",
+            Self::Resolved => "resolved",
+            Self::Regressed => "regressed",
+            Self::Ignored => "ignored",
+            Self::All => "all",
+        }
+    }
+}
+
+#[derive(Subcommand, Debug, Clone)]
+pub enum IssuesCommand {
+    /// Show one issue
+    Show {
+        /// The issue id (16 hex digits)
+        id: String,
+        #[command(flatten)]
+        out: JsonArg,
+    },
+    /// Mark an issue fixed; you are told if it comes back
+    Resolve {
+        id: String,
+        #[command(flatten)]
+        out: JsonArg,
+    },
+    /// Stop reporting an issue (it is still counted)
+    Ignore {
+        id: String,
+        #[command(flatten)]
+        out: JsonArg,
+    },
+    /// Mark a resolved or ignored issue open again
+    Reopen {
+        id: String,
+        #[command(flatten)]
+        out: JsonArg,
+    },
+}
+
 #[derive(ValueEnum, Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Severity {
     Info,
@@ -954,6 +1032,22 @@ mod tests {
 
     fn parse(args: &[&str]) -> Result<Cli, clap::Error> {
         Cli::try_parse_from(std::iter::once("mulchie").chain(args.iter().copied()))
+    }
+
+    #[test]
+    fn issues_parse() {
+        let Some(Command::Issues(i)) = parse(&["issues", "--status", "all", "--json"])
+            .unwrap()
+            .command
+        else {
+            panic!("issues");
+        };
+        assert_eq!(i.status, Some(IssueStatusArg::All));
+        assert!(i.out.json);
+        assert!(parse(&["issues", "resolve", "0123456789abcdef"]).is_ok());
+        assert!(parse(&["issues", "show", "0123456789abcdef", "--json"]).is_ok());
+        assert!(parse(&["issues", "--status", "closed"]).is_err());
+        assert!(parse(&["issues", "resolve"]).is_err());
     }
 
     #[test]

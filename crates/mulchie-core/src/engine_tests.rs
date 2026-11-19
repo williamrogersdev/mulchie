@@ -2000,3 +2000,98 @@ fn a_restart_reuses_the_saved_scan_memo() {
     second.run_scan();
     assert!(bytes(&second) > measured, "a requested scan measures again");
 }
+
+/// A process whose working directory (under home) is gone.
+fn in_gone_dir(pid: u32, uid: u32, home: &Path) -> crate::process::ProcFacts {
+    let mut p = fact(pid, 5, uid, "node", None);
+    p.cmd = vec![
+        "node".into(),
+        "server.js".into(),
+        format!("--port={}", 3000 + pid),
+    ];
+    p.cwd = Some(home.join("gone-worktree"));
+    p
+}
+
+fn engine_at(paths: &Paths, procs: FakeProcesses) -> Engine {
+    Engine::with_processes(
+        paths.clone(),
+        LoadedConfig {
+            config: Config::default(),
+            error: None,
+        },
+        Arc::new(procs),
+    )
+    .with_watch_probe(Arc::new(crate::watch::NoProbe))
+}
+
+#[test]
+fn issues_group_findings_survive_a_restart_and_regress() {
+    use crate::issues::IssueStatus;
+    let t = tempfile::tempdir().unwrap();
+    let paths = Paths::under(t.path());
+    std::fs::create_dir_all(&paths.home).unwrap();
+    let mut procs = FakeProcesses::empty();
+    let uid = procs.uid;
+    procs.procs.push(in_gone_dir(10, uid, &paths.home));
+    let e = engine_at(&paths, procs);
+
+    // Without the engine lock the book is kept in memory only, and
+    // changes are refused.
+    e.run_watch();
+    let list = e.issues(None, false, None);
+    assert_eq!(list.issues.len(), 1, "{list:#?}");
+    let id = list.issues[0].id.clone();
+    assert!(!crate::issues::IssueBook::file(&paths).exists());
+    assert_eq!(
+        e.set_issue_status(&id, IssueStatus::Resolved)
+            .unwrap_err()
+            .0,
+        "not_lock_holder"
+    );
+
+    let lock = e.acquire_lock().unwrap();
+    e.run_watch();
+    let i = e.issue(&id).unwrap();
+    assert_eq!(i.occurrences, 1, "a finding that lasts counts once");
+    assert!(i.active);
+    assert_eq!(i.culprit, "node server.js --port=#");
+    assert_eq!(e.snapshot_state().issue_counts.active, 1);
+    let r = e.set_issue_status(&id, IssueStatus::Resolved).unwrap();
+    assert_eq!(r.status, IssueStatus::Resolved);
+    assert_eq!(
+        e.set_issue_status(&id, IssueStatus::Regressed)
+            .unwrap_err()
+            .0,
+        "invalid_body"
+    );
+    assert_eq!(
+        e.set_issue_status("0000000000000000", IssueStatus::Ignored)
+            .unwrap_err()
+            .0,
+        "not_found"
+    );
+    drop(lock);
+    drop(e);
+
+    // A new engine, and the same command in a new process: the same issue,
+    // which regresses.
+    let mut procs = FakeProcesses::empty();
+    procs.procs.push(in_gone_dir(11, uid, &paths.home));
+    let e = engine_at(&paths, procs);
+    let _lock = e.acquire_lock().unwrap();
+    e.run_watch();
+    let i = e.issue(&id).unwrap();
+    assert_eq!(i.status, IssueStatus::Regressed);
+    assert_eq!(i.occurrences, 2);
+    assert_eq!(i.regressions, 1);
+    let st = e.snapshot_state();
+    assert_eq!(st.top_issues[0].id, id);
+    assert!(st
+        .actions
+        .iter()
+        .any(|a| a.kind == "issue" && a.detail.contains("Came back")));
+    // Saved again with the regression.
+    let saved = crate::issues::IssueBook::load(&paths);
+    assert_eq!(saved.get(&id).unwrap().status, IssueStatus::Regressed);
+}

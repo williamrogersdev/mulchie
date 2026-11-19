@@ -50,6 +50,10 @@ pub use feedback_glue::FeedbackList;
 
 #[path = "engine_updates.rs"]
 mod updates_glue;
+
+#[path = "engine_issues.rs"]
+mod issues_glue;
+pub use issues_glue::IssueList;
 pub use sessions::{
     LimitsStatus, PausedProc, SessionBrief, SessionDetail, SessionMember, SessionsState,
     PAUSED_FILE, STATE_SESSIONS_KEPT,
@@ -421,6 +425,13 @@ pub struct State {
     /// and until when automatic passes leave the target alone
     /// ([`crate::failures`]).
     pub failures: Vec<crate::failures::Failure>,
+    /// Unresolved issues, counted (see `GET /v1/issues`).
+    #[serde(default)]
+    pub issue_counts: crate::issues::IssueCounts,
+    /// Up to five unresolved issues that came back most often (regressed
+    /// ones first).
+    #[serde(default)]
+    pub top_issues: Vec<crate::issues::Issue>,
 }
 
 impl State {
@@ -816,6 +827,9 @@ pub struct Engine {
     /// What the last disk scan measured, for the periodic scan to reuse;
     /// `None` until a scan has run or read the one saved on disk.
     scan_memo: Arc<Mutex<Option<diskmap::ScanMemo>>>,
+    /// Findings grouped into issues ([`crate::issues`]); `None` until first
+    /// used, then read from `issues.json`.
+    issues: Arc<Mutex<Option<crate::issues::IssueBook>>>,
 }
 
 impl Engine {
@@ -875,12 +889,15 @@ impl Engine {
             runaway: RunawayStatus::default(),
             updates: UpdatesStatus::default(),
             failures: Vec::new(),
+            issue_counts: Default::default(),
+            top_issues: Vec::new(),
         };
         Self {
             state: Arc::new(Mutex::new(state)),
             history: Arc::new(Mutex::new(VecDeque::with_capacity(HISTORY_LEN))),
             jobs: Arc::new(Jobs::default()),
             scan_memo: Arc::new(Mutex::new(None)),
+            issues: Arc::new(Mutex::new(None)),
             next_id: Arc::new(AtomicU64::new(1)),
             paths: Arc::new(paths),
             journal: Arc::new(journal),
@@ -949,6 +966,7 @@ impl Engine {
         st.memory_guard = self.memory_guard_status();
         st.runaway = self.runaway_status();
         st.updates = self.updates_status(false);
+        (st.issue_counts, st.top_issues) = self.issue_summary();
         // A target that is gone (removed by hand since) is no longer a
         // problem to report; cache keys of prunes are not paths and stay.
         st.failures = lock(&self.failures)
@@ -1805,6 +1823,8 @@ impl Engine {
             st.findings.retain(|f| !watch_owned(f));
             st.finding_counts = FindingCounts::of(&st.findings);
             st.findings_unix = None;
+            drop(st);
+            self.observe_issues(now);
             return Vec::new();
         }
         let procs = self.procs.list();
@@ -2002,6 +2022,7 @@ impl Engine {
             st.finding_counts = FindingCounts::of(&st.findings);
             st.findings_unix = Some(now);
         }
+        self.observe_issues(now);
         if let Some(ls) = &listeners {
             let pairs: Vec<(u32, u16)> = ls.iter().map(|l| (l.pid, l.port)).collect();
             lock(&self.sup).tracker.set_listening(&pairs);

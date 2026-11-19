@@ -66,7 +66,7 @@ pub fn execute_error(e: &mulchie_core::api::ApiError) -> String {
 /// Where plans come from and go to.
 pub enum Backend {
     Engine(Client),
-    Local(Engine),
+    Local(Box<Engine>),
 }
 
 impl Backend {
@@ -152,7 +152,10 @@ pub fn command(paths: &Paths, job: Job, confirm: Confirm, json_out: bool) -> i32
         Conn::NotRunning => {
             Conn::NotRunning
                 .note_local("planning locally; each item is still re-checked before it is touched");
-            Backend::Local(Engine::new(paths.clone(), Config::load_from(paths)))
+            Backend::Local(Box::new(Engine::new(
+                paths.clone(),
+                Config::load_from(paths),
+            )))
         }
         other => {
             // An engine exists but cannot be used: acting beside it would

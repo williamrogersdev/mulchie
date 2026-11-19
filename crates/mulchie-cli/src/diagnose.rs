@@ -684,9 +684,11 @@ pub fn build(state: &Value, advice: &Value, origin: Origin) -> Value {
         "builds": snap["build_count"],
     });
     let repeated_failures = failures_brief(&state["failures"], &mut recs);
+    let recurring_issues = issues_brief(&state["top_issues"], &state["issue_counts"], &mut recs);
     let health = json!({ "status": state["health"], "why": why });
     let rest = json!({
         "repeated_failures": repeated_failures,
+        "recurring_issues": recurring_issues,
         "consumers": consumers,
         "findings": findings,
         "sessions": sessions,
@@ -698,6 +700,58 @@ pub fn build(state: &Value, advice: &Value, origin: Origin) -> Value {
         "reclaimable": reclaimable,
     });
     finish(source, state, health, problems, recs, Some(rest))
+}
+
+/// An issue counts as recurring once it appeared this often.
+const RECURRING_AFTER: u64 = 3;
+
+/// Unresolved issues that keep coming back (`state.top_issues`), with one
+/// recommendation when one regressed or appeared [`RECURRING_AFTER`] times.
+fn issues_brief(top: &Value, counts: &Value, recs: &mut Vec<Rec>) -> Value {
+    let list: Vec<&Value> = top
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter(|i| {
+            i["status"] == "regressed" || i["occurrences"].as_u64().unwrap_or(0) >= RECURRING_AFTER
+        })
+        .collect();
+    if let Some(first) = list.first() {
+        let back = if first["status"] == "regressed" {
+            " It came back after it was resolved."
+        } else {
+            ""
+        };
+        recs.push(Rec {
+            priority: 3,
+            id: "recurring_issues",
+            title: format!("Look at {} problem(s) that keep coming back", list.len()),
+            reason: format!(
+                "{} appeared {} times ({}).{back} Fixing the cause (often a dev server, watcher or build script) stops it for good; resolve it afterwards and Mulchie says if it returns.",
+                first["title"].as_str().unwrap_or(""),
+                first["occurrences"],
+                first["culprit"].as_str().unwrap_or("")
+            ),
+            gain_bytes: None,
+            gain: "fewer slowdowns from the same cause".into(),
+            risk: "none",
+            next_call: call("list_issues", json!({})),
+            command: Some("mulchie issues".into()),
+        });
+    }
+    json!({
+        "counts": counts,
+        "top": list.iter().map(|i| json!({
+            "id": i["id"],
+            "kind": i["kind"],
+            "title": i["title"],
+            "culprit": i["culprit"],
+            "workspace": i["workspace"],
+            "occurrences": i["occurrences"],
+            "status": i["status"],
+            "active": i["active"],
+        })).collect::<Vec<_>>(),
+    })
 }
 
 /// Targets that keep being skipped (`state.failures`), with one
@@ -1019,6 +1073,21 @@ pub fn render(d: &Value) -> String {
                 f["times_in_a_row"],
                 f["reason"].as_str().unwrap_or("unknown"),
                 f["what_to_do"].as_str().unwrap_or("")
+            ));
+        }
+    }
+    let recurring = d["recurring_issues"]["top"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default();
+    if !recurring.is_empty() {
+        s.push_str("\nKeeps coming back (`mulchie issues`):\n");
+        for i in &recurring {
+            s.push_str(&format!(
+                "  {}× [{}] {}\n",
+                i["occurrences"],
+                i["status"].as_str().unwrap_or(""),
+                i["title"].as_str().unwrap_or("")
             ));
         }
     }
