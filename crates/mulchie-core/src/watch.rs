@@ -90,6 +90,9 @@ pub enum FindingKind {
     /// A build or test command's latest successful runs each took much
     /// longer than its usual time (`perf`, [`crate::perf`]).
     BuildSlower,
+    /// A production metric from a connected provider (Vercel, Sentry,
+    /// PostHog) got worse after a deploy (`integrations`).
+    ProductionSlower,
 }
 
 impl FindingKind {
@@ -125,7 +128,7 @@ impl FindingKind {
                 FindingCategory::Limit
             }
             MulchieUpdate | AgentUpdate | HomebrewOutdated | Advisory => FindingCategory::Update,
-            BuildSlower => FindingCategory::Performance,
+            BuildSlower | ProductionSlower => FindingCategory::Performance,
         }
     }
 }
@@ -256,6 +259,10 @@ pub struct Evidence {
     /// what changed in between.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub perf: Option<Box<crate::timings::PerfEvidence>>,
+    /// `production_slower`: the provider, the deploy, the metric before and
+    /// after, and the commits in the deploy with the sessions behind them.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub deploy: Option<Box<crate::integrations::DeployEvidence>>,
 }
 
 /// One thing behind a machine-wide finding.

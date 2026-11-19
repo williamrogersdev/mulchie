@@ -54,7 +54,7 @@ mulchie mcp install --client claude-code --read-only
 
 This registers `mulchie mcp --read-only`. You can also start the server with `MULCHIE_MCP_READ_ONLY=1`. In read-only mode:
 
-- The server offers only tools that change nothing, plus the build-slot tools. `check_updates`, `execute_plan`, `prune_cache` and `dismiss_finding` are left out.
+- The server offers only tools that change nothing, plus the build-slot tools. `check_updates`, `check_integrations`, `execute_plan`, `prune_cache` and `dismiss_finding` are left out.
 - It connects to the engine with the [read-only token](/docs/http-api/#tokens), so the engine itself refuses anything else.
 - Plan tools still work and show what would happen, but they return no `plan_id`. You carry the plan out yourself with `mulchie clean`, `mulchie sweep`, `mulchie signal` or `mulchie group`.
 
@@ -92,6 +92,7 @@ Agents should start with `diagnose`.
 | `list_sessions` | No | Agent sessions, running first, with CPU, memory, processes, build slots, runtime and whether their limits are enforced here. See [Sessions and limits](/docs/sessions/). |
 | `get_session` | No | One session: its processes, budget breaches and what Mulchie paused. Argument `id`; with `events=true` also its activity record (`since`, `limit`, or `tail` and `before` to read backwards). |
 | `limits_status` | No | Whether budgets only report or act, the budgets, sessions over a cap and what was done, sessions hogging the machine, and processes Mulchie paused. |
+| `list_deploys` | No | Recent production deploys from the providers the user connected, with their numbers (Vercel build duration, Sentry transaction p95, PostHog LCP and INP) and the commits in each with the agent session behind it, or `made_elsewhere`. Argument: `provider`. See [Production integrations](/docs/integrations/). |
 | `list_updates` | No | The last update check and the update findings, with the command that would update each. See [Update checks](/docs/updates/). |
 | `check_command` | No | Ask the [guard rules](/docs/hooks/#guard-rules) about a shell command before running it: allow, warn or block, with the reason. Records and runs nothing. Arguments: `command`, `cwd`. |
 | `report_feedback` | No | Report a problem the agent hit: a Mulchie tool that failed, wrong advice, a finding that was noise, a problem Mulchie missed, work it got in the way of, or a slow or broken environment. Saved in a private file on this machine with the machine's state; nothing is sent anywhere. Offered by a read-only server too, and kept even when no engine runs. Arguments: `summary`, and optionally `category`, `severity`, `details`, `tool`, `cwd`. |
@@ -103,13 +104,14 @@ Agents should start with `diagnose`.
 | `plan_process_action` | No | Plan an action on one process (`pid`, `signal`, `tree`), on a group (`group`, `action`), or on a session (`session`, `include_agent`, `action`). |
 | `execute_plan` | Yes, destructive | Carry out approved items of a stored plan. |
 | `prune_cache` | Yes, destructive | Preview or run a package manager's own prune command. Arguments: `key`, `execute`. |
+| `check_integrations` | Contacts the network | Ask the engine to poll the connected providers now. Refused when none is on, in a build without network support, or within a minute of the last poll. |
 | `check_updates` | Contacts the network | Ask the engine to check for updates now (GitHub, npm and, if you turned advisories on, OSV.dev). Refused when `updates.check` is off. It installs nothing. |
 | `resolve_issue` | Changes a record | Mark an issue `resolve`d, `ignore`d or `reopen`ed (argument `action`, with `id`). It changes nothing on the machine. Left out of a read-only server. |
 | `dismiss_finding` | Changes a setting | Hide a finding for `days` (default 30), or show it again with `undo=true`. It is saved in Mulchie's config and changes nothing else on the machine. |
 | `acquire_build_slot` | Takes a slot | Join the build queue, poll with the ticket, renew. |
 | `release_build_slot` | Gives up a slot | Release a slot or leave the queue. Optionally say how the work went: `duration_ms`, `exit_code`, `command`, `cwd`. |
 
-Each tool carries MCP annotations: `readOnlyHint` for the tools marked "No", `destructiveHint` for `execute_plan` and `prune_cache`, and `openWorldHint` for `check_updates`. In read-only mode, only the tools marked "No" and the two build-slot tools are offered.
+Each tool carries MCP annotations: `readOnlyHint` for the tools marked "No", `destructiveHint` for `execute_plan` and `prune_cache`, and `openWorldHint` for `check_updates` and `check_integrations`. In read-only mode, only the tools marked "No" and the two build-slot tools are offered.
 
 `plan_process_action` acts on processes you own. For a session it covers what the agent started, and the agent's own process only with `include_agent`. Protected processes are never acted on: operating-system programs, Mulchie itself, and the app and terminal the agent runs in.
 

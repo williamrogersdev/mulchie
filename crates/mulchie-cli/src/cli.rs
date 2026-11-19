@@ -156,6 +156,21 @@ them. Works without an engine, from the saved file.",
     )]
     Timings(TimingsArgs),
 
+    /// Read-only links to Vercel, Sentry and PostHog: deploys, their numbers and commits
+    #[command(
+        subcommand,
+        long_about = "Connect the hosting and monitoring tools you already use, read-only. The \
+engine lists each provider's recent deploys with their commit, reads one performance number per \
+deploy (Vercel: build duration; Sentry: transaction p95; PostHog: LCP and INP p75), matches each \
+commit to the moves of HEAD it recorded, and raises a production_slower finding naming the \
+commits and the agent sessions behind them when a deploy made a number worse. Every provider is \
+off until you add it. Mulchie then sends only authenticated read requests to that provider's own \
+API host over HTTPS, and nothing about this machine. The token is read from standard input \
+(without echo on a terminal) and kept in a private file; it is never an argument, in the config \
+or in any output."
+    )]
+    Integrations(IntegrationsCommand),
+
     /// Agent sessions: what each agent and everything it started is using (needs the engine)
     #[command(
         long_about = "A session is an agent process and everything it started, found from the \
@@ -630,6 +645,92 @@ pub struct TimingsArgs {
     pub limit: u64,
     #[command(flatten)]
     pub out: JsonArg,
+}
+
+#[derive(ValueEnum, Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProviderArg {
+    Vercel,
+    Sentry,
+    Posthog,
+}
+
+impl ProviderArg {
+    pub fn core(self) -> mulchie_core::integrations::Provider {
+        use mulchie_core::integrations::Provider;
+        match self {
+            ProviderArg::Vercel => Provider::Vercel,
+            ProviderArg::Sentry => Provider::Sentry,
+            ProviderArg::Posthog => Provider::Posthog,
+        }
+    }
+}
+
+#[derive(Subcommand, Debug, Clone)]
+pub enum IntegrationsCommand {
+    /// Turn a provider on: read its token from standard input and save its project
+    #[command(
+        after_help = "The token is read from standard input, never from an argument. On a \
+terminal it is not echoed.\n\nVercel: an access token (vercel.com/account/tokens). Sentry: an \
+auth token with org:read and project:read. PostHog: a personal API key with Query Read.\n\n\
+Examples:\n  mulchie integrations add vercel --project prj_123 --team team_456\n  mulchie integrations add sentry --org acme --project web\n  mulchie integrations add posthog --project 12345 --host eu.posthog.com --release-property commit_sha\n  op read op://dev/sentry/token | mulchie integrations add sentry --org acme --project web"
+    )]
+    Add {
+        provider: ProviderArg,
+        /// Vercel project id or name; Sentry project slug; PostHog project number
+        #[arg(long)]
+        project: String,
+        /// Sentry organization slug
+        #[arg(long)]
+        org: Option<String>,
+        /// Vercel team id
+        #[arg(long)]
+        team: Option<String>,
+        /// Sentry: sentry.io or <region>.sentry.io; PostHog: us.posthog.com or eu.posthog.com
+        #[arg(long)]
+        host: Option<String>,
+        /// Sentry environment (default production; '' for all)
+        #[arg(long)]
+        environment: Option<String>,
+        /// PostHog event property holding the release (default $app_version)
+        #[arg(long)]
+        release_property: Option<String>,
+        /// A checkout of the project on this machine, for commit attribution
+        #[arg(long)]
+        workspace: Option<std::path::PathBuf>,
+        #[command(flatten)]
+        out: JsonArg,
+    },
+    /// Each provider: on or off, its project, whether a token is saved, the last poll
+    #[command(
+        after_help = "Examples:\n  mulchie integrations list\n  mulchie integrations list --json"
+    )]
+    List {
+        #[command(flatten)]
+        out: JsonArg,
+    },
+    /// Turn a provider off and delete its saved token
+    #[command(after_help = "Examples:\n  mulchie integrations remove sentry")]
+    Remove {
+        provider: ProviderArg,
+        #[command(flatten)]
+        out: JsonArg,
+    },
+    /// Recent deploys with their numbers and the commits in them (needs the engine)
+    #[command(
+        after_help = "Examples:\n  mulchie integrations deploys\n  mulchie integrations deploys --provider sentry --json"
+    )]
+    Deploys {
+        #[arg(long)]
+        provider: Option<ProviderArg>,
+        #[command(flatten)]
+        out: JsonArg,
+    },
+    /// Ask the engine to poll every enabled provider now (needs the engine)
+    #[command(after_help = "Examples:\n  mulchie integrations check")]
+    Check {
+        #[command(flatten)]
+        out: JsonArg,
+    },
 }
 
 #[derive(ValueEnum, Debug, Clone, Copy, PartialEq, Eq)]

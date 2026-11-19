@@ -371,6 +371,29 @@ mulchie timings --command 'cargo test'
 mulchie timings --workspace ~/code/repo-x --json
 ```
 
+### integrations
+
+```sh
+mulchie integrations add <vercel|sentry|posthog> --project ID [--org SLUG] [--team ID] [--host HOST] [--environment ENV] [--release-property NAME] [--workspace DIR] [--json]
+mulchie integrations list [--json]
+mulchie integrations remove <provider> [--json]
+mulchie integrations deploys [--provider P] [--json]
+mulchie integrations check [--json]
+```
+
+Read-only links to Vercel, Sentry and PostHog. See [Production integrations](/docs/integrations/).
+
+- `add` reads the token from standard input (without echo on a terminal), saves it in `integrations/<provider>.token` in the config directory (mode `0600`), and turns the provider on in the config, through the engine when one runs. There is no option for the token, so it never appears in a command line. `--org` is Sentry's organization (required for Sentry), `--team` Vercel's team, `--host` the Sentry or PostHog host, `--environment` the Sentry environment, `--release-property` the PostHog property holding the release.
+- `list` shows each provider: on or off, whether a token is saved, the host and project, how many deploys the last poll returned and why it failed. Without an engine it shows the last saved state.
+- `remove` turns the provider off and deletes its token file.
+- `deploys` and `check` need the engine: the recent deploys with their numbers and the commits in them, and a poll now.
+
+```sh
+mulchie integrations add sentry --org acme --project web
+op read op://dev/vercel/token | mulchie integrations add vercel --project prj_123
+mulchie integrations deploys --provider sentry
+```
+
 ## Agents
 
 ### mcp

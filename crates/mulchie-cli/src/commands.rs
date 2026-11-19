@@ -57,6 +57,9 @@ pub fn safe_test_config(paths: &Paths) -> mulchie_core::LoadedConfig {
     cfg.memory_guard.action = mulchie_core::config::MemoryAction::Off;
     cfg.runaway.action = mulchie_core::config::MemoryAction::Off;
     cfg.updates.check = mulchie_core::config::UpdateCheck::Off;
+    cfg.integrations.vercel.enabled = false;
+    cfg.integrations.sentry.enabled = false;
+    cfg.integrations.posthog.enabled = false;
     cfg.save_to(paths, 0).expect("write the test config");
     let loaded = Config::load_from(paths);
     assert!(loaded.error.is_none(), "{:?}", loaded.error);
