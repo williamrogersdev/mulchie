@@ -25,8 +25,8 @@ It ships three ways:
 
 | Path | What it is |
 | --- | --- |
-| `crates/mulchie-core` | Engine, monitor, scanners, safety gate (`safety.rs`), sessions (`session.rs`), limits (`limits.rs`), memory guard (`memguard.rs`), runaway chains (`runaway.rs`), activity record (`record.rs`), guard rules (`guard.rs`), issues (`issues.rs`), build timings and slower builds (`perf.rs`, `timings.rs`, `commits.rs`, `engine_perf.rs`, `jsonl.rs`), update checks (`updates.rs`), feedback reports (`feedback.rs`), local HTTP API (`api.rs`). No UI. |
-| `crates/mulchie-cli` | The `mulchie` binary: commands, `serve`, `run`, the MCP server (`mcp.rs`, `mcp_tools.rs`), `mcp install` (`mcp_install.rs`), `hook` and `hooks install` (`hook.rs`, `hooks_install.rs`), `sessions.rs`, `diagnose.rs`, `timings.rs`. |
+| `crates/mulchie-core` | Engine, monitor, scanners, safety gate (`safety.rs`), sessions (`session.rs`), limits (`limits.rs`), memory guard (`memguard.rs`), runaway chains (`runaway.rs`), activity record (`record.rs`), guard rules (`guard.rs`), issues (`issues.rs`), build timings and slower builds (`perf.rs`, `timings.rs`, `commits.rs`, `engine_perf.rs`, `jsonl.rs`), the trace receiver and endpoint findings (`otel.rs`, `otel_server.rs`, `endpoints.rs`, `engine_otel.rs`), update checks (`updates.rs`), feedback reports (`feedback.rs`), local HTTP API (`api.rs`). No UI. |
+| `crates/mulchie-cli` | The `mulchie` binary: commands, `serve`, `run`, the MCP server (`mcp.rs`, `mcp_tools.rs`), `mcp install` (`mcp_install.rs`), `hook` and `hooks install` (`hook.rs`, `hooks_install.rs`), `sessions.rs`, `diagnose.rs`, `timings.rs`, `traces.rs`. |
 | `crates/mulchie-app` | Tauri desktop app. macOS only. Not a default workspace member. |
 | `docs/ARCHITECTURE.md` | How the pieces fit, and the rules the code keeps. Read it before touching deletion or signals. |
 | `docs/openapi.yaml` | The HTTP API. A test keeps it in step with `ROUTES` in `api.rs`. |
@@ -114,6 +114,8 @@ Other clients are `claude-desktop`, `cursor` and `codex`. Add `--read-only` to l
 5. Wrap heavy builds in `acquire_build_slot` and `release_build_slot`. A slot lasts at most an hour per renewal, and the server releases the slots it still holds when it exits. `mulchie slots` lists slots; `mulchie slots release <ticket>` ends one whose holder is gone. The release secret stays inside the MCP server. Pass `duration_ms`, `exit_code`, `command` and `cwd` to `release_build_slot` so the timing is recorded; `list_timings` lists timings, and a `build_slower` finding names the commits and sessions between a normal and a slow run. Nothing acts on them.
 
 Findings (`list_findings`, `mulchie://findings`) are observations from heuristics, not verdicts; never call them malware. `inspect_process` shows one process with secrets in its command line redacted. `dismiss_finding` hides one the user says is expected.
+
+- `list_endpoints` shows the endpoints of local apps that send OpenTelemetry traces to Mulchie (only with `otel.enabled` on; apps export to `OTEL_EXPORTER_OTLP_ENDPOINT=http://127.0.0.1:4318`): per service, each operation's p50/p95/p99, count and errors, its usual p95 and where the service runs. After changing an app, use it to see whether an endpoint got slower. An `endpoint_slower` or `endpoint_errors` finding names the commits since the endpoint was last normal and the sessions that made them. Nothing acts on them.
 
 Issues (`list_issues`, `get_issue`) group the performance and hygiene findings about the same problem across processes and restarts, with how often it came back. Use them to answer what keeps going wrong. `resolve_issue` marks one resolved, ignored or open again; ask the user first. A resolved issue that appears again is `regressed`.
 

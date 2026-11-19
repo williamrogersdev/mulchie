@@ -38,7 +38,7 @@ export default defineConfig({
         { label: 'Start', items: [{ slug: 'docs' }, { slug: 'docs/getting-started' }, { label: 'Install', link: '/install/' }] },
         {
           label: 'Supervise agents',
-          items: [{ slug: 'docs/sessions' }, { slug: 'docs/hooks' }, { slug: 'docs/updates' }],
+          items: [{ slug: 'docs/sessions' }, { slug: 'docs/hooks' }, { slug: 'docs/updates' }, { slug: 'docs/traces' }],
         },
         {
           label: 'Reference',
