@@ -31,7 +31,8 @@ const jsonLd = {
       <p class="lede">Mulchie shows what uses CPU, memory and disk per repo, worktree and agent, queues heavy builds, holds agents to budgets you set, and cleans up what they leave behind, with a plan you approve first.</p>
       <p class="who">For developers who run Claude Code, Codex, Cursor agents and similar tools side by side on one Mac or Linux box.</p>
       <div class="cta">
-        <a class="btn primary" href="/install/">Install Mulchie</a>
+        <a class="btn primary" href="/download/">Download for Mac</a>
+        <a class="btn ghost" href="/install/">Linux and CLI</a>
         <a class="btn ghost" href={REPO}>View on GitHub</a>
       </div>
     </div>
@@ -176,12 +177,10 @@ Not ready (1):
 
   <section class="sec wrap" aria-labelledby="install">
     <h2 id="install">Install</h2>
-    <p class="muted">The CLI, engine and API run on macOS and Linux. The menu bar app is for macOS and includes the CLI.</p>
+    <p class="muted">On a Mac, download the app: it includes the <code>mulchie</code> command, so you need nothing else. It is signed and notarized, and needs macOS 12 or later.</p>
+    <p class="cta"><a class="btn primary" href="/download/">Download for Mac</a></p>
+    <p class="muted">Prefer Homebrew? <code>brew install --cask williamrogersdev/tap/mulchie</code> installs the same app. On Linux or a server, install only the CLI:</p>
     <ul class="cmds">
-      <li>
-        <div class="label">Menu bar app on macOS<span>Homebrew cask</span></div>
-        <pre tabindex="0"><code>brew install --cask williamrogersdev/tap/mulchie</code></pre>
-      </li>
       <li>
         <div class="label">CLI on macOS or Linux<span>Homebrew</span></div>
         <pre tabindex="0"><code>brew install williamrogersdev/tap/mulchie-cli</code></pre>

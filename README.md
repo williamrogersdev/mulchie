@@ -46,19 +46,19 @@ Full documentation is at [mulchie.com/docs](https://mulchie.com/docs/).
 
 ## Install
 
-The menu bar app for macOS, which includes the `mulchie` command:
+**On a Mac, [download the app](https://mulchie.com/download/)** (a signed, notarized DMG), drag it to Applications and open it. That is the whole install: the app includes the `mulchie` command. To put that command on your `PATH`, choose **Agent API › Link mulchie into ~/.local/bin** in the dashboard. Or let Homebrew do both steps:
 
 ```sh
 brew install --cask williamrogersdev/tap/mulchie
 ```
 
-The CLI only, on macOS or Linux:
+**On Linux or a server, or for the CLI alone**, use the Homebrew formula. Do not install it next to the app: both provide `mulchie`.
 
 ```sh
 brew install williamrogersdev/tap/mulchie-cli
 ```
 
-Install one or the other: both provide the `mulchie` command. `brew upgrade --cask mulchie` or `brew upgrade mulchie-cli` updates it. The app is also a download: `Mulchie_<version>_universal.dmg` on the [releases page](https://github.com/williamrogersdev/mulchie/releases). Without Homebrew, the install script installs the CLI:
+`brew upgrade --cask mulchie` or `brew upgrade mulchie-cli` updates it. Without Homebrew, the install script installs the CLI:
 
 ```sh
 curl -fsSL https://mulchie.com/install.sh | sh

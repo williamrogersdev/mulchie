@@ -2,9 +2,14 @@
   "$schema": "node_modules/wrangler/config-schema.json",
   "name": "mulchie-site",
   "compatibility_date": "2026-11-01",
+  // worker.js handles /download/ (a redirect to the newest DMG); everything
+  // else is a static asset.
+  "main": "worker.js",
   "assets": {
     "directory": "./dist",
-    "not_found_handling": "404-page"
+    "binding": "ASSETS",
+    "not_found_handling": "404-page",
+    "run_worker_first": ["/download", "/download/"]
   },
   // Cloudflare creates the DNS record and certificate for a custom domain. The zone
   // must be in the account the Worker is deployed to.

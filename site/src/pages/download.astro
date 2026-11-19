@@ -1,0 +1,17 @@
+---
+import Base from '../layouts/Base.astro';
+import { REPO } from '../lib/meta';
+
+// mulchie.com/download/ normally never shows this page: worker.js redirects it
+// to the newest DMG. This is what is served when GitHub cannot be reached.
+const title = 'Download Mulchie for Mac';
+const description = 'Download the Mulchie menu bar app for macOS: a signed, notarized universal DMG that includes the mulchie command.';
+---
+<Base title={title} description={description} ogImage="default" current="install">
+  <div class="wrap prose">
+    <h1>Download Mulchie for Mac</h1>
+    <p class="lede">The download could not start by itself. Get <code>Mulchie_&lt;version&gt;_universal.dmg</code> from the newest release on GitHub.</p>
+    <p class="cta"><a class="btn primary" href={`${REPO}/releases`}>Open the releases page</a></p>
+    <p>Open the DMG and drag Mulchie to Applications. It needs macOS 12 or later and runs on Apple silicon and Intel. For other ways to install, see <a href="/install/">Install</a>.</p>
+  </div>
+</Base>

@@ -4,42 +4,48 @@ import { REPO } from '../lib/meta';
 
 const title = 'Install Mulchie on macOS or Linux';
 const description =
-  'Install Mulchie with Homebrew: the signed macOS menu bar app, or the CLI for macOS and Linux. Also the install script, Cargo, checksums and uninstall.';
+  'Download the signed Mulchie menu bar app for Mac, or install the CLI on Linux with Homebrew or one script. Also Cargo, checksums and uninstall.';
 ---
 <Base title={title} description={description} ogImage="default" current="install">
   <div class="wrap prose">
     <h1>Install Mulchie</h1>
-    <p class="lede">Mulchie is a macOS menu bar app and a <code>mulchie</code> command for macOS and Linux. Install either with one command.</p>
+    <p class="lede">On a Mac, download the app. That is the whole install: it includes the <code>mulchie</code> command. On Linux or a server, install the CLI with one command.</p>
+    <p class="cta"><a class="btn primary" href="/download/">Download for Mac</a></p>
 
     <h2 id="requirements">Requirements</h2>
     <ul>
-      <li>CLI, engine, local API and MCP server: macOS or Linux (x86_64 or aarch64). Windows is not supported.</li>
       <li>Menu bar app: macOS 12 or later, Apple silicon or Intel.</li>
+      <li>CLI, engine, local API and MCP server: macOS or Linux (x86_64 or aarch64). Windows is not supported.</li>
     </ul>
 
-    <h2 id="paths">Choose an install path</h2>
-    <p>The menu bar app includes the <code>mulchie</code> command, so install the app or the CLI, not both.</p>
+    <h2 id="app">Mac: the menu bar app</h2>
+    <ol>
+      <li><a href="/download/">Download the DMG</a> (the newest <code>Mulchie_&lt;version&gt;_universal.dmg</code> from the <a href={`${REPO}/releases`}>releases page</a>).</li>
+      <li>Open it and drag Mulchie to Applications.</li>
+      <li>Open Mulchie. An icon appears in the menu bar and the engine starts.</li>
+      <li>To use <code>mulchie</code> in a terminal, open the dashboard, choose <strong>Agent API</strong>, then <strong>Link mulchie into ~/.local/bin</strong>.</li>
+    </ol>
+    <p>The app is a universal build, signed with a Developer ID and notarized by Apple, so it opens without a warning.</p>
+    <p>With Homebrew, this one command does all of the above, including putting <code>mulchie</code> on your <code>PATH</code>:</p>
+    <pre><code>brew install --cask williamrogersdev/tap/mulchie</code></pre>
+    <p>Update with <code>brew upgrade --cask mulchie</code> and remove with <code>brew uninstall --cask mulchie</code>. To build the app from source instead, see <a href={`${REPO}/blob/main/CONTRIBUTING.md`}>CONTRIBUTING</a>.</p>
+
+    <h2 id="paths">Linux, servers, or the CLI only</h2>
+    <p>Skip this section if you installed the app: it already includes the CLI, and installing both gives you two <code>mulchie</code> commands. Pick one of these:</p>
     <table>
-      <thead><tr><th scope="col">You want</th><th scope="col">Use</th></tr></thead>
+      <thead><tr><th scope="col">You have</th><th scope="col">Use</th></tr></thead>
       <tbody>
-        <tr><td>The menu bar app and dashboard on a Mac</td><td><a href="#app">Homebrew cask or the DMG</a></td></tr>
-        <tr><td>The CLI on a Mac or on Linux with Homebrew</td><td><a href="#homebrew">Homebrew</a></td></tr>
-        <tr><td>The CLI on a server, or without Homebrew</td><td><a href="#script">Install script</a></td></tr>
-        <tr><td>The CLI built from source</td><td><a href="#cargo">Cargo</a> or <a href="#source">build from source</a></td></tr>
+        <tr><td>Homebrew (macOS or Linux)</td><td><a href="#homebrew">Homebrew formula</a></td></tr>
+        <tr><td>No Homebrew, or a server</td><td><a href="#script">Install script</a></td></tr>
+        <tr><td>A Rust toolchain and want to build it</td><td><a href="#cargo">Cargo</a> or <a href="#source">build from source</a></td></tr>
       </tbody>
     </table>
 
-    <h2 id="app">The menu bar app</h2>
-    <pre><code>brew install --cask williamrogersdev/tap/mulchie</code></pre>
-    <p>This installs <code>Mulchie.app</code> in <code>/Applications</code> and links the <code>mulchie</code> command that ships inside it. The app is a universal build, signed with a Developer ID and notarized by Apple. Update with <code>brew upgrade --cask mulchie</code> and remove with <code>brew uninstall --cask mulchie</code>.</p>
-    <p>Without Homebrew, download <code>Mulchie_&lt;version&gt;_universal.dmg</code> from the <a href={`${REPO}/releases`}>releases page</a>, open it and drag Mulchie to Applications. To put the command on your <code>PATH</code>, open the dashboard, choose <strong>Agent API</strong>, then <strong>Link mulchie into ~/.local/bin</strong>. This build does not update itself: download the newer DMG to update.</p>
-    <p>To build the app from source instead, see <a href={`${REPO}/blob/main/CONTRIBUTING.md`}>CONTRIBUTING</a>.</p>
-
-    <h2 id="homebrew">Homebrew (CLI)</h2>
+    <h2 id="homebrew">Homebrew (CLI only)</h2>
     <pre><code>brew install williamrogersdev/tap/mulchie-cli</code></pre>
     <p>This installs the <code>mulchie</code> command from the release tarball for your OS and CPU, after Homebrew checks its SHA-256. It works on macOS and on Linux with Homebrew. Update with <code>brew upgrade mulchie-cli</code> and remove with <code>brew uninstall mulchie-cli</code>.</p>
 
-    <h2 id="script">Install script (CLI)</h2>
+    <h2 id="script">Install script (CLI only)</h2>
     <pre><code>curl -fsSL https://mulchie.com/install.sh | sh</code></pre>
     <p>The script picks the release tarball for your OS and CPU, downloads it with its <code>.sha256</code> file, and installs nothing if the checksum does not match. Because it fetches the file itself, macOS does not quarantine it (see <a href="#gatekeeper">macOS and Gatekeeper</a>). It installs to <code>~/.local/bin/mulchie</code> and needs no <code>sudo</code>. To read it first, run <code>curl -fsSL https://mulchie.com/install.sh | less</code>, or open <a href="/install.sh">/install.sh</a>. The same script is in the repository, so you can also run it from GitHub:</p>
     <pre><code>curl -fsSL https://raw.githubusercontent.com/williamrogersdev/mulchie/main/scripts/install.sh | sh</code></pre>
