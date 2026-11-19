@@ -448,7 +448,10 @@ mod tests {
         let cmd = vec!["cargo".to_string(), "build".to_string()];
         let t = timing_body(&cmd, started, 3);
         assert!(t["duration_ms"].as_u64().unwrap() >= 1500);
-        assert_eq!((t["exit_code"].as_i64(), t["command"].as_str()), (Some(3), Some("cargo build")));
+        assert_eq!(
+            (t["exit_code"].as_i64(), t["command"].as_str()),
+            (Some(3), Some("cargo build"))
+        );
         assert!(t["cwd"].as_str().is_some_and(|c| c.starts_with('/')));
         lease.timing = Some(t);
         drop(lease);

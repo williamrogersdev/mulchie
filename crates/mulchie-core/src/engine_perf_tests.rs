@@ -117,7 +117,10 @@ fn a_git_commit_reported_by_a_hook_is_attributed_to_its_session() {
     );
     assert_eq!(m.session_id.as_deref(), Some(sid.as_str()));
     assert_eq!(m.agent.as_deref(), Some("claude"));
-    assert_eq!((m.via.as_str(), m.branch.as_deref()), ("hook", Some("main")));
+    assert_eq!(
+        (m.via.as_str(), m.branch.as_deref()),
+        ("hook", Some("main"))
+    );
 
     // The public attribution API.
     let a = e.attribute(&repo.dir, &second[..12]).unwrap();

@@ -87,6 +87,7 @@ Agents should start with `diagnose`.
 | `reclaim_candidates` | No | Build caches with size, last use, and in-use and stale flags, from the engine's last scan. |
 | `list_findings` | No | What the watch noticed. Arguments: `severity`, `kind`, `include_dismissed`. See [Findings](/docs/watch/). |
 | `list_issues` | No | Findings grouped into issues that keep coming back, with how often each appeared and its status. Arguments: `status` (`open`, `resolved`, `regressed`, `ignored`, `all`), `kind`. See [Issues](/docs/watch/#issues). |
+| `list_timings` | No | How long builds and tests took, newest first, with exit code, workspace, branch, commit and agent session. Arguments: `workspace`, `command`, `limit`. See [Slower builds](/docs/watch/#slower-builds). |
 | `get_issue` | No | One issue. Argument: `id`. |
 | `list_sessions` | No | Agent sessions, running first, with CPU, memory, processes, build slots, runtime and whether their limits are enforced here. See [Sessions and limits](/docs/sessions/). |
 | `get_session` | No | One session: its processes, budget breaches and what Mulchie paused. Argument `id`; with `events=true` also its activity record (`since`, `limit`, or `tail` and `before` to read backwards). |
@@ -106,7 +107,7 @@ Agents should start with `diagnose`.
 | `resolve_issue` | Changes a record | Mark an issue `resolve`d, `ignore`d or `reopen`ed (argument `action`, with `id`). It changes nothing on the machine. Left out of a read-only server. |
 | `dismiss_finding` | Changes a setting | Hide a finding for `days` (default 30), or show it again with `undo=true`. It is saved in Mulchie's config and changes nothing else on the machine. |
 | `acquire_build_slot` | Takes a slot | Join the build queue, poll with the ticket, renew. |
-| `release_build_slot` | Gives up a slot | Release a slot or leave the queue. |
+| `release_build_slot` | Gives up a slot | Release a slot or leave the queue. Optionally say how the work went: `duration_ms`, `exit_code`, `command`, `cwd`. |
 
 Each tool carries MCP annotations: `readOnlyHint` for the tools marked "No", `destructiveHint` for `execute_plan` and `prune_cache`, and `openWorldHint` for `check_updates`. In read-only mode, only the tools marked "No" and the two build-slot tools are offered.
 
@@ -120,7 +121,7 @@ Agents wrap heavy work in a build slot so that several agents do not start large
 
 1. Call `acquire_build_slot` with a `label`. Keep calling it with the returned `ticket`, every few seconds, until `granted` is true. Then run with the returned job count.
 2. A granted slot lasts `ttl_secs` (default 900, at most 3600). During long work, call it again with the same ticket before that time passes to renew it. If it is not renewed, the slot expires and goes to someone else, so a crashed agent cannot block the queue.
-3. Call `release_build_slot` as soon as the work ends.
+3. Call `release_build_slot` as soon as the work ends. Pass `duration_ms` (how long the command ran, not the wait), `exit_code`, `command` and `cwd`, and Mulchie records the timing: it is how a `build_slower` finding notices that a build got slower. The command is redacted before it is stored.
 
 Build slots work in read-only mode. The server holds the secret that releases or renews a ticket, and never shows it to the agent.
 

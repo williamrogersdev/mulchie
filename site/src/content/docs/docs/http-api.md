@@ -82,7 +82,9 @@ Requests are capped at 8 KB per line, 64 KB of headers and a 1 MB body. The serv
 | GET | `/v1/feedback` | Feedback reports, newest first (`limit`, default 50). |
 | POST | `/v1/feedback` | Save a report about Mulchie or the machine (`summary`, and optionally `category`, `severity`, `details`, `tool`, `client`, `cwd`). It goes to `feedback.jsonl` in the config directory with the machine's state. Nothing is sent anywhere. |
 | POST | `/v1/lease` | Join the build queue, poll a ticket, or renew a slot. |
-| POST | `/v1/release` | Release a slot or leave the queue. |
+| POST | `/v1/release` | Release a slot or leave the queue. Optionally with a timing: `duration_ms`, `exit_code`, `command`, `cwd`. |
+| GET | `/v1/timings` | Build and test timings, newest first. Query: `workspace`, `command`, `limit` (default 50). |
+| GET | `/v1/commits` | Recorded moves of workspaces' `HEAD`, each with the agent session working there, newest first. Query: `workspace`, `since`, `limit` (default 100). |
 
 Errors are JSON: `{"error": "...", "code": "..."}`, with status 400 for a bad body, 401 for a bad token, 403 for a refused origin, host or read-only token, and 404, 405, 413 or 500 otherwise.
 
@@ -110,3 +112,7 @@ The response has one result per item, in order: `done`, with any backups and the
 The reply that creates a ticket also carries a `release_secret`. Only that caller sees it. Send it as `secret` when you poll, renew or call `POST /v1/release`; without it the reply is 403 `release_secret_required`.
 
 `mulchie run` leases against its own pid. A lease for a pid is freed when that process ends.
+
+`POST /v1/release` may also say how the work went: `duration_ms` (required for the rest to count, at most 7 days), `exit_code`, `command` and `cwd` (an absolute path). When the release frees a ticket, the engine records a timing with the workspace holding `cwd`, its branch and `HEAD`, and the agent session, and redacts the command. The reply's `timing_recorded` says whether it was taken, and `timing_error` why not; a refused timing never stops the release. `mulchie run` sends one for every command. See [Slower builds](/docs/watch/#slower-builds).
+
+Query values for `workspace` and `command` are percent-encoded (`/v1/timings?command=cargo%20test`).

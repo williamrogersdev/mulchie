@@ -95,7 +95,10 @@ pub fn render(v: &Value) -> String {
             .and_then(|w| Path::new(w).file_name())
             .map(|n| n.to_string_lossy().to_string())
             .unwrap_or_else(|| "-".into());
-        let head = t["head"].as_str().map(|h| h.get(..10).unwrap_or(h)).unwrap_or("");
+        let head = t["head"]
+            .as_str()
+            .map(|h| h.get(..10).unwrap_or(h))
+            .unwrap_or("");
         let by = t["agent"]
             .as_str()
             .map(|a| format!(" · {a}"))
@@ -134,7 +137,10 @@ mod tests {
             { "duration_ms": 1200, "exit_code": 2, "command": "make" },
         ]});
         let r = render(&v);
-        assert!(r.contains("4m10s") && r.contains("repo-x") && r.contains("0123456789 · claude"), "{r}");
+        assert!(
+            r.contains("4m10s") && r.contains("repo-x") && r.contains("0123456789 · claude"),
+            "{r}"
+        );
         assert!(r.contains("exit 2"), "{r}");
         assert!(r.contains("2 of 3 shown"), "{r}");
     }

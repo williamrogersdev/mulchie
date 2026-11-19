@@ -540,7 +540,10 @@ mod tests {
             assert!(ok, "{args:?}");
         };
         g(&["init", "-q", "-b", "main"]);
-        assert!(head(&paths, &repo, DEFAULT_TIMEOUT).is_err(), "no commit yet");
+        assert!(
+            head(&paths, &repo, DEFAULT_TIMEOUT).is_err(),
+            "no commit yet"
+        );
         g(&["commit", "-q", "--allow-empty", "-m", "one"]);
         let h = head(&paths, &repo, DEFAULT_TIMEOUT).unwrap();
         assert_eq!(h.sha.len(), 40);

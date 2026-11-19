@@ -86,7 +86,10 @@ pub fn moves_head(cmd: &str) -> bool {
         }
         let mut j = i + 1;
         while let Some(a) = words.get(j) {
-            if matches!(*a, "-C" | "-c" | "--git-dir" | "--work-tree" | "--namespace") {
+            if matches!(
+                *a,
+                "-C" | "-c" | "--git-dir" | "--work-tree" | "--namespace"
+            ) {
                 j += 2;
             } else if a.starts_with('-') {
                 j += 1;
@@ -127,11 +130,19 @@ pub fn attribute<'a>(
 /// up to the one that left `from` (or, when `from` was never recorded, up to
 /// the first entry of the workspace, at most [`KEPT`]). Empty when `from`
 /// and `to` are the same commit or `to` was never recorded.
-pub fn between(entries: &[CommitEntry], workspace: &Path, from: &str, to: &str) -> Vec<CommitEntry> {
+pub fn between(
+    entries: &[CommitEntry],
+    workspace: &Path,
+    from: &str,
+    to: &str,
+) -> Vec<CommitEntry> {
     if same_commit(from, to) {
         return Vec::new();
     }
-    let ws: Vec<&CommitEntry> = entries.iter().filter(|e| e.workspace == workspace).collect();
+    let ws: Vec<&CommitEntry> = entries
+        .iter()
+        .filter(|e| e.workspace == workspace)
+        .collect();
     let Some(end) = ws.iter().rposition(|e| same_commit(&e.head, to)) else {
         return Vec::new();
     };
@@ -141,7 +152,10 @@ pub fn between(entries: &[CommitEntry], workspace: &Path, from: &str, to: &str) 
             break;
         }
         out.push((*e).clone());
-        let left_from = e.previous_head.as_deref().is_some_and(|p| same_commit(p, from));
+        let left_from = e
+            .previous_head
+            .as_deref()
+            .is_some_and(|p| same_commit(p, from));
         if left_from || e.previous_head.is_none() || out.len() >= KEPT {
             break;
         }
@@ -231,10 +245,7 @@ mod tests {
             e(5, "/r", Some(&c), &d, Some("s-3-3")),
         ];
         let r = between(&v, Path::new("/r"), &a, &c);
-        assert_eq!(
-            r.iter().map(|e| e.at_unix).collect::<Vec<_>>(),
-            vec![2, 4]
-        );
+        assert_eq!(r.iter().map(|e| e.at_unix).collect::<Vec<_>>(), vec![2, 4]);
         assert!(between(&v, Path::new("/r"), &c, &c).is_empty());
         assert!(between(&v, Path::new("/r"), &a, &sha('e')).is_empty());
         // `from` never recorded: back to the first entry of the workspace.

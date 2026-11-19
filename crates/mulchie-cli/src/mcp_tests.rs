@@ -1965,7 +1965,10 @@ fn read_only_mode_keeps_issue_reads_and_drops_resolve() {
 #[test]
 fn release_build_slot_sends_the_timing_and_list_timings_reads_it() {
     let f = Fake::default()
-        .with("POST /v1/release", json!({ "released": true, "timing_recorded": true }))
+        .with(
+            "POST /v1/release",
+            json!({ "released": true, "timing_recorded": true }),
+        )
         .with(
             "GET /v1/timings?limit=5&workspace=/w/repo%20x&command=cargo%20test",
             json!({ "timings": [{ "duration_ms": 1 }], "total": 1 }),
@@ -1994,7 +1997,10 @@ fn release_build_slot_sends_the_timing_and_list_timings_reads_it() {
         ),
     ));
     assert_eq!(v["total"], 1);
-    assert_eq!(result(&one(&f, call(3, "list_timings", json!({}))))["total"], 0);
+    assert_eq!(
+        result(&one(&f, call(3, "list_timings", json!({}))))["total"],
+        0
+    );
     for (tool, args) in [
         ("list_timings", json!({ "workspace": "relative" })),
         ("list_timings", json!({ "limit": 0 })),

@@ -292,7 +292,9 @@ impl Engine {
 
     fn record_timing(&self, t: PendingTiming, now: u64) {
         let cwd = t.report.cwd.clone();
-        let ws = cwd.as_deref().map(|c| checkout_root(c).unwrap_or_else(|| real(c)));
+        let ws = cwd
+            .as_deref()
+            .map(|c| checkout_root(c).unwrap_or_else(|| real(c)));
         let session = t
             .session
             .or_else(|| ws.as_deref().and_then(|w| self.session_in(w, now)));
@@ -465,7 +467,12 @@ impl Engine {
 
     /// Recorded moves of `HEAD`, newest first: in `workspace` when given,
     /// at or after `since`, at most `limit`.
-    pub fn commits(&self, workspace: Option<&Path>, since: Option<u64>, limit: usize) -> CommitList {
+    pub fn commits(
+        &self,
+        workspace: Option<&Path>,
+        since: Option<u64>,
+        limit: usize,
+    ) -> CommitList {
         let workspace = workspace.map(real);
         let workspace = workspace.as_deref();
         self.with_perf(|p| {
@@ -485,7 +492,12 @@ impl Engine {
 
     /// The recorded moves of `HEAD` in `workspace` from `from_sha` to
     /// `to_sha`, oldest first ([`commits::between`]).
-    pub fn commits_between(&self, workspace: &Path, from_sha: &str, to_sha: &str) -> Vec<CommitEntry> {
+    pub fn commits_between(
+        &self,
+        workspace: &Path,
+        from_sha: &str,
+        to_sha: &str,
+    ) -> Vec<CommitEntry> {
         let ws = real(workspace);
         self.with_perf(|p| commits::between(p.commits(), &ws, from_sha, to_sha))
     }
@@ -500,7 +512,12 @@ impl Engine {
     /// Recorded timings, newest first: in `workspace` when given, of
     /// commands whose grouping key contains `command` normalized, at most
     /// `limit`.
-    pub fn timings(&self, workspace: Option<&Path>, command: Option<&str>, limit: usize) -> TimingList {
+    pub fn timings(
+        &self,
+        workspace: Option<&Path>,
+        command: Option<&str>,
+        limit: usize,
+    ) -> TimingList {
         let want = command.map(crate::issues::normalize_command);
         let workspace = workspace.map(real);
         let workspace = workspace.as_deref();

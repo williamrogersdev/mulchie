@@ -1217,7 +1217,11 @@ fn query_path(req: &Req, key: &str) -> Result<Option<PathBuf>, Resp> {
             if p.is_absolute() {
                 Ok(Some(p))
             } else {
-                Err(fail(400, "invalid_query", format!("{key} must be an absolute path")))
+                Err(fail(
+                    400,
+                    "invalid_query",
+                    format!("{key} must be an absolute path"),
+                ))
             }
         }
     }

@@ -27,6 +27,10 @@ All notable changes to Mulchie are listed here. The format follows
 
 ### Added
 
+- Build and test timings: `mulchie run` tells the engine how long each command took, its exit status, the command (redacted) and its directory, and agents can send the same with `release_build_slot` or `POST /v1/release`. The engine adds the workspace, branch, commit and agent session and keeps them in `timings.jsonl`. `mulchie timings`, `GET /v1/timings` and the MCP tool `list_timings` list them.
+- Commit attribution: the engine records when a workspace's `HEAD` moves (checked every minute for workspaces with agent activity, and right after a hook reports `git commit`, `merge`, `rebase`, `cherry-pick`, `pull` or `am`) with the agent session working there, in `commits.jsonl`. `GET /v1/commits` lists the moves.
+- A `build_slower` finding, in the new `performance` category, when a command's latest successful runs each take much longer than its usual time, with the commits in between and the sessions that made them. Thresholds are under `perf` (`mulchie config set perf.slower_ratio 2`). These findings become issues too. They only report.
+
 - App: Settings has a **Runaway chains** section next to the memory guard (action, nesting depth, how long agents are warned) and shows chains running now, what was stopped and which commands agents are warned about.
 - `GET /v1/history?since=<unix seconds>` returns only the samples taken after that time.
 
