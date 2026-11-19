@@ -330,7 +330,12 @@ fn closed_without_a_request_is_not_answered() {
 
 #[test]
 fn hostile_bodies_never_take_the_server_down() {
-    let (srv, _agg) = start(test_limits());
+    // A roomy deadline: on a loaded machine 300 ms per request is not
+    // always enough, and this test is about bodies, not slow clients.
+    let (srv, _agg) = start(Limits {
+        deadline: Duration::from_secs(5),
+        ..test_limits()
+    });
     let mut st = 0x1234_5678_9abc_def0u64;
     for i in 0..60u64 {
         st ^= st << 13;
