@@ -104,7 +104,7 @@ pub struct Timing {
     pub label: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cwd: Option<PathBuf>,
-    /// The checkout holding `cwd`.
+    /// The checkout holding `cwd`, or `cwd` itself outside git.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub workspace: Option<PathBuf>,
     #[serde(default, skip_serializing_if = "Option::is_none")]

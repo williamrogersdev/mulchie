@@ -292,7 +292,7 @@ impl Engine {
 
     fn record_timing(&self, t: PendingTiming, now: u64) {
         let cwd = t.report.cwd.clone();
-        let ws = cwd.as_deref().and_then(checkout_root);
+        let ws = cwd.as_deref().map(|c| checkout_root(c).unwrap_or_else(|| real(c)));
         let session = t
             .session
             .or_else(|| ws.as_deref().and_then(|w| self.session_in(w, now)));

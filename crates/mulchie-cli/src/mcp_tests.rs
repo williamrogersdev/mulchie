@@ -156,7 +156,7 @@ fn tools_have_titles_and_annotations() {
     let f = Fake::default();
     let r = one(&f, req(1, "tools/list", json!({})));
     let tools = r["result"]["tools"].as_array().unwrap();
-    assert_eq!(tools.len(), 30);
+    assert_eq!(tools.len(), 31);
     assert_eq!(tools[0]["name"], "diagnose", "diagnose comes first");
     for t in tools {
         let name = t["name"].as_str().unwrap();
@@ -258,7 +258,7 @@ fn read_only_mode_hides_and_refuses_destructive_tools() {
     let mut s = Session::read_only(&f);
     let r = s.handle(req(1, "tools/list", json!({}))).unwrap();
     let names = tool_names(&r);
-    assert_eq!(names.len(), 25, "{names:?}");
+    assert_eq!(names.len(), 26, "{names:?}");
     for n in [
         "execute_plan",
         "prune_cache",
@@ -1960,4 +1960,55 @@ fn read_only_mode_keeps_issue_reads_and_drops_resolve() {
     assert!(names.contains(&"list_issues".to_string()));
     assert!(names.contains(&"get_issue".to_string()));
     assert!(!names.contains(&"resolve_issue".to_string()));
+}
+
+#[test]
+fn release_build_slot_sends_the_timing_and_list_timings_reads_it() {
+    let f = Fake::default()
+        .with("POST /v1/release", json!({ "released": true, "timing_recorded": true }))
+        .with(
+            "GET /v1/timings?limit=5&workspace=/w/repo%20x&command=cargo%20test",
+            json!({ "timings": [{ "duration_ms": 1 }], "total": 1 }),
+        )
+        .with("GET /v1/timings", json!({ "timings": [], "total": 0 }));
+    result(&one(
+        &f,
+        call(
+            1,
+            "release_build_slot",
+            json!({ "ticket": 4, "duration_ms": 61000, "exit_code": 0,
+                    "command": "cargo test", "cwd": "/w/repo x" }),
+        ),
+    ));
+    assert_eq!(
+        f.posted("/v1/release"),
+        vec![json!({ "ticket": 4, "duration_ms": 61000, "exit_code": 0,
+                     "command": "cargo test", "cwd": "/w/repo x" })]
+    );
+    let v = result(&one(
+        &f,
+        call(
+            2,
+            "list_timings",
+            json!({ "limit": 5, "workspace": "/w/repo x", "command": "cargo test" }),
+        ),
+    ));
+    assert_eq!(v["total"], 1);
+    assert_eq!(result(&one(&f, call(3, "list_timings", json!({}))))["total"], 0);
+    for (tool, args) in [
+        ("list_timings", json!({ "workspace": "relative" })),
+        ("list_timings", json!({ "limit": 0 })),
+        (
+            "release_build_slot",
+            json!({ "ticket": 4, "duration_ms": -1 }),
+        ),
+        ("release_build_slot", json!({ "ticket": 4, "cwd": "x" })),
+    ] {
+        let r = one(&f, call(9, tool, args.clone()));
+        assert!(
+            r["result"]["isError"] == true || r["error"].is_object(),
+            "{tool} {args}: {r}"
+        );
+    }
+    assert_eq!(f.posted("/v1/release").len(), 1);
 }
