@@ -60,6 +60,9 @@ mod otel_glue;
 mod perf_glue;
 pub use otel_glue::{OperationReport, OtelBrief, OtelReport, ServiceReport};
 pub use perf_glue::{CommitList, TimingList};
+#[path = "engine_integrations.rs"]
+mod integrations_glue;
+pub use integrations_glue::{DeployList, DeployView, IntegrationsStatus, ProviderStatus};
 pub use sessions::{
     LimitsStatus, PausedProc, SessionBrief, SessionDetail, SessionMember, SessionsState,
     PAUSED_FILE, STATE_SESSIONS_KEPT,
@@ -588,6 +591,16 @@ fn update_sources(home: PathBuf) -> Updates {
     }
 }
 
+/// The real HTTPS client for integrations; in this crate's tests none (a
+/// test that polls passes a fake).
+fn integration_http() -> Arc<dyn crate::integrations::AuthHttp> {
+    if cfg!(test) {
+        Arc::new(crate::integrations::NoNetwork)
+    } else {
+        crate::integrations::default_http()
+    }
+}
+
 /// RFC 7396 JSON merge patch.
 pub fn merge_patch(target: &mut Value, patch: &Value) {
     let Some(p) = patch.as_object() else {
@@ -845,6 +858,9 @@ pub struct Engine {
     /// Commit attribution, build timings and their findings
     /// ([`crate::commits`], [`crate::timings`]).
     perf: Arc<perf_glue::Perf>,
+    /// Deploys and performance numbers from Vercel, Sentry and PostHog
+    /// ([`crate::integrations`]).
+    integrations: Arc<integrations_glue::Integrations>,
     /// The trace receiver, its aggregates and endpoint findings
     /// ([`crate::otel_server`], [`crate::endpoints`]).
     otel: Arc<otel_glue::Otel>,
@@ -918,6 +934,7 @@ impl Engine {
             scan_memo: Arc::new(Mutex::new(None)),
             issues: Arc::new(Mutex::new(None)),
             perf: Arc::new(perf_glue::Perf::default()),
+            integrations: Arc::new(integrations_glue::Integrations::new(integration_http())),
             otel: Arc::new(otel_glue::Otel::default()),
             next_id: Arc::new(AtomicU64::new(1)),
             paths: Arc::new(paths),
@@ -1352,6 +1369,7 @@ impl Engine {
         self.start_limits_worker(&mut threads);
         self.start_updates(&mut threads);
         self.start_perf(&mut threads);
+        self.start_integrations(&mut threads);
     }
 
     pub fn is_shut_down(&self) -> bool {
@@ -1372,6 +1390,7 @@ impl Engine {
         self.limit_wake.notify_all();
         self.updates.wake.notify_all();
         self.perf.wake_all();
+        self.integrations.wake.notify_all();
         self.otel_stop();
         let handles: Vec<JoinHandle<()>> = lock(&self.threads).drain(..).collect();
         let deadline = Instant::now() + wait;

@@ -79,6 +79,9 @@ Requests are capped at 8 KB per line, 64 KB of headers and a 1 MB body. The serv
 | POST | `/v1/guard/check` | Check a command against the guard rules. Records nothing. |
 | GET | `/v1/updates` | The last update check and its result. |
 | POST | `/v1/updates/check` | Ask for an update check now. Full token only. 409 `updates_off` when checks are off. |
+| GET | `/v1/integrations` | Each [connected provider](/docs/integrations/): on or off, host, project, whether a token file is in place (never the token), the last poll and its error in words. |
+| POST | `/v1/integrations/check` | Poll every enabled provider now. Full token only. 409 `integrations_off` when none is on, `no_network` in a build without network support, `too_soon` within a minute of the last poll. |
+| GET | `/v1/deploys` | Recent deploys of the enabled providers, newest first, with their numbers and the commits in each with the agent session behind it. Query: `provider`. |
 | GET | `/v1/feedback` | Feedback reports, newest first (`limit`, default 50). |
 | POST | `/v1/feedback` | Save a report about Mulchie or the machine (`summary`, and optionally `category`, `severity`, `details`, `tool`, `client`, `cwd`). It goes to `feedback.jsonl` in the config directory with the machine's state. Nothing is sent anywhere. |
 | POST | `/v1/lease` | Join the build queue, poll a ticket, or renew a slot. |

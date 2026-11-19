@@ -51,9 +51,10 @@ impl Tool {
                 "readOnlyHint": self.read_only,
                 "destructiveHint": self.destructive,
                 "idempotentHint": self.idempotent,
-                // Only an update check reaches outside this machine (from
-                // the engine, to GitHub, npm and OSV.dev).
-                "openWorldHint": self.name == "check_updates",
+                // Only an update check (from the engine, to GitHub, npm and
+                // OSV.dev) and an integrations poll (to the providers the
+                // user turned on) reach outside this machine.
+                "openWorldHint": matches!(self.name, "check_updates" | "check_integrations"),
             },
         })
     }
@@ -245,6 +246,14 @@ pub fn tool_list() -> Vec<Tool> {
             "The engine's last update check (Mulchie itself, agent tools, Homebrew, and advisories for lockfile packages when turned on) and the update findings it raised. packages lists each package (package, installed, latest, source, command: what the user may run; Mulchie runs nothing); unknown_versions says where an unknown installed version was looked for; homebrew says why Homebrew was not checked, when it was not. Changes nothing; check_updates asks for a new check.",
             json!({}),
         ),
+        read(
+            "list_deploys",
+            "Production deploys",
+            "Recent production deploys from the providers the user connected (Vercel, Sentry, PostHog), newest first: id, commit sha, time, metrics (Vercel build_duration, Sentry p95 of transactions, PostHog lcp_p75 and inp_p75, in ms) and commits: the moves of HEAD this machine recorded between the previous deploy and this one, each with session_id and agent, or made: made_elsewhere when this machine never saw it. A production_slower finding (list_findings) says when a deploy made a number worse. status says whether each provider is on and how its last poll went. Changes nothing and contacts nothing.",
+            json!({
+                "provider": { "type": "string", "enum": ["vercel", "sentry", "posthog"], "description": "Only this provider" }
+            }),
+        ),
         Tool {
             required: &["command"],
             ..read(
@@ -353,6 +362,16 @@ pub fn tool_list() -> Vec<Tool> {
             name: "check_updates",
             title: "Check for updates now",
             description: "Ask the engine to check for updates now. It runs in the background on the engine; call list_updates after a minute for the result. Refused when update checks are off (updates.check), which only the user should change. Contacts GitHub, npm and, when advisories are on, OSV.dev from the engine.",
+            props: json!({}),
+            required: &[],
+            read_only: false,
+            destructive: false,
+            idempotent: true,
+        },
+        Tool {
+            name: "check_integrations",
+            title: "Poll connected providers now",
+            description: "Ask the engine to poll every provider the user connected (Vercel, Sentry, PostHog) now instead of at its next interval. It runs in the background; call list_deploys after a minute. Refused when no provider is on, in a build without network support, or within a minute of the last poll. Sends authenticated read requests from the engine to those providers' own API hosts only.",
             props: json!({}),
             required: &[],
             read_only: false,
@@ -1471,6 +1490,20 @@ pub fn call_tool(cx: &mut Ctx, name: &str, a: &Map<String, Value>) -> ToolResult
         "check_updates" => match api.call("POST", "/v1/updates/check", None) {
             Ok(v) => Ok(json!({ "queued": v["queued"], "next": "The check runs on the engine; call list_updates in a minute for its result." })),
             Err(e) if e.code == "updates_off" => Err("Update checks are off (updates.check in Mulchie's config), so nothing was checked. Only the user should turn them on.".into()),
+            Err(e) => Err(api_err(e)),
+        },
+        "list_deploys" => {
+            let path = match a.get("provider").and_then(Value::as_str) {
+                Some(p) => format!("/v1/deploys?provider={}", mulchie_core::api::query_escape(p)),
+                None => "/v1/deploys".to_string(),
+            };
+            let deploys = get(&path)?;
+            let status = get("/v1/integrations")?;
+            Ok(json!({ "deploys": deploys["deploys"], "status": status }))
+        }
+        "check_integrations" => match api.call("POST", "/v1/integrations/check", None) {
+            Ok(v) => Ok(json!({ "queued": v["queued"], "next": "The engine is polling; call list_deploys in a minute for the result." })),
+            Err(e) if e.code == "integrations_off" => Err("No provider is connected (integrations in Mulchie's config), so nothing was polled. Only the user should connect one, with `mulchie integrations add`.".into()),
             Err(e) => Err(api_err(e)),
         },
         "report_feedback" => {

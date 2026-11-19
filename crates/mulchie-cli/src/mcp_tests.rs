@@ -156,7 +156,7 @@ fn tools_have_titles_and_annotations() {
     let f = Fake::default();
     let r = one(&f, req(1, "tools/list", json!({})));
     let tools = r["result"]["tools"].as_array().unwrap();
-    assert_eq!(tools.len(), 32);
+    assert_eq!(tools.len(), 34);
     assert_eq!(tools[0]["name"], "diagnose", "diagnose comes first");
     for t in tools {
         let name = t["name"].as_str().unwrap();
@@ -215,6 +215,10 @@ fn tools_have_titles_and_annotations() {
     assert_eq!(ann("check_updates")["readOnlyHint"], false);
     assert_eq!(ann("check_updates")["destructiveHint"], false);
     assert_eq!(ann("check_updates")["openWorldHint"], true);
+    assert_eq!(ann("check_integrations")["readOnlyHint"], false);
+    assert_eq!(ann("check_integrations")["openWorldHint"], true);
+    assert_eq!(ann("list_deploys")["readOnlyHint"], true);
+    assert_eq!(ann("list_deploys")["openWorldHint"], false);
     // No one-step deletion or signal is offered.
     let names = tool_names(&r);
     for gone in [
@@ -258,7 +262,7 @@ fn read_only_mode_hides_and_refuses_destructive_tools() {
     let mut s = Session::read_only(&f);
     let r = s.handle(req(1, "tools/list", json!({}))).unwrap();
     let names = tool_names(&r);
-    assert_eq!(names.len(), 27, "{names:?}");
+    assert_eq!(names.len(), 28, "{names:?}");
     for n in [
         "execute_plan",
         "prune_cache",
@@ -1686,6 +1690,45 @@ fn sessions_limits_updates_and_guard_tools() {
     let r = one(&f, call(1, "check_updates", json!({})));
     assert_eq!(r["result"]["isError"], true);
     assert!(text(&r).contains("Only the user"), "{r}");
+}
+
+#[test]
+fn deploys_and_integration_checks() {
+    let f = Fake::default()
+        .with(
+            "GET /v1/deploys?provider=sentry",
+            json!({ "deploys": [{ "provider": "sentry", "id": "r1", "commits": [{ "sha": "abc1234", "made": "made_elsewhere" }] }] }),
+        )
+        .with(
+            "GET /v1/integrations",
+            json!({ "network": true, "providers": [] }),
+        )
+        .with(
+            "POST /v1/integrations/check",
+            json!({ "ok": true, "queued": true }),
+        );
+    let v = result(&one(
+        &f,
+        call(1, "list_deploys", json!({ "provider": "sentry" })),
+    ));
+    assert_eq!(v["deploys"][0]["id"], "r1", "{v}");
+    assert_eq!(v["status"]["network"], true);
+    assert_eq!(
+        result(&one(&f, call(2, "check_integrations", json!({}))))["queued"],
+        true
+    );
+    let r = one(&f, call(3, "list_deploys", json!({ "provider": "heroku" })));
+    assert_eq!(r["result"]["isError"], true, "{r}");
+    let f = Fake::default().failing(
+        "POST /v1/integrations/check",
+        ApiError::new(409, "integrations_off", "no integration is turned on"),
+    );
+    let r = one(&f, call(1, "check_integrations", json!({})));
+    assert_eq!(r["result"]["isError"], true);
+    assert!(text(&r).contains("Only the user"), "{r}");
+    // A read-only server lists deploys but does not poll.
+    assert!(crate::mcp_tools::offered_read_only("list_deploys"));
+    assert!(!crate::mcp_tools::offered_read_only("check_integrations"));
 }
 
 #[test]

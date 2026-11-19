@@ -110,6 +110,9 @@ pub const ROUTES: &[(&str, &str)] = &[
     ("POST", "/v1/feedback"),
     ("GET", "/v1/commits"),
     ("GET", "/v1/timings"),
+    ("GET", "/v1/integrations"),
+    ("POST", "/v1/integrations/check"),
+    ("GET", "/v1/deploys"),
     ("GET", "/v1/otel"),
 ];
 
@@ -1515,6 +1518,27 @@ fn route(req: &Req, engine: &Engine, read_only: bool) -> Resp {
                 let cmd = query_text(req, "command")?;
                 ok(&engine.timings(ws.as_deref(), cmd.as_deref(), limit))
             }
+            ("GET", "/v1/integrations") => ok(&engine.integrations_status()),
+            ("POST", "/v1/integrations/check") => match engine.request_integrations_check() {
+                Ok(()) => ok(&serde_json::json!({ "ok": true, "queued": true })),
+                Err((code, m)) => fail(409, code, m),
+            },
+            ("GET", "/v1/deploys") => {
+                let only = match query_text(req, "provider")? {
+                    None => None,
+                    Some(p) => match crate::integrations::Provider::parse(&p) {
+                        Some(p) => Some(p),
+                        None => {
+                            return Ok(fail(
+                                400,
+                                "bad_provider",
+                                "provider must be vercel, sentry or posthog",
+                            ))
+                        }
+                    },
+                };
+                ok(&engine.deploys(only))
+            }
             ("GET", "/v1/otel") => {
                 let minutes = query_u64(req, "minutes")?.unwrap_or(15);
                 if !(1..=1440).contains(&minutes) {
@@ -1843,3 +1867,7 @@ fn http(
 #[cfg(test)]
 #[path = "api_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "api_integrations_tests.rs"]
+mod integrations_tests;

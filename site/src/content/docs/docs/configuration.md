@@ -199,6 +199,32 @@ The `updates` settings control [update checks](/docs/updates/). Nothing here ins
 | `updates.advisories` | `false` | Send package names and versions from workspace lockfiles to OSV.dev. Off because it tells a third party what your projects depend on. |
 | `updates.interval_hours` | 24 | How long a result is reused, 6 to 720. |
 
+## Integrations
+
+The `integrations` settings control the read-only [production integrations](/docs/integrations/) with Vercel, Sentry and PostHog. Every provider is off by default. `mulchie integrations add` sets these and saves the token in its own file; no token is ever in the config.
+
+| Setting | Default | Meaning |
+| --- | --- | --- |
+| `integrations.interval_mins` | 30 | Minutes between polls of each enabled provider. 15 to 1440. |
+| `integrations.baseline_deploys` | 5 | A deploy is compared with the median of up to this many deploys before it. 3 to 50. |
+| `integrations.slower_ratio` | 1.5 | A deploy is slower when its number is more than this many times that median... 1.05 to 100. |
+| `integrations.min_increase_ms` | 100 | ...and more than this many milliseconds higher. 0 to 3600000. |
+| `integrations.vercel.enabled` | `false` | Poll Vercel. |
+| `integrations.vercel.project` | `""` | Project id or name. Needed when enabled. |
+| `integrations.vercel.team` | `""` | Team id; empty for a personal account. |
+| `integrations.sentry.enabled` | `false` | Poll Sentry. |
+| `integrations.sentry.org` | `""` | Organization slug. Needed when enabled. |
+| `integrations.sentry.project` | `""` | Project slug. Needed when enabled. |
+| `integrations.sentry.environment` | `production` | Only this environment; empty for all. |
+| `integrations.sentry.host` | `sentry.io` | `sentry.io` or a region such as `us.sentry.io` or `de.sentry.io`. |
+| `integrations.posthog.enabled` | `false` | Poll PostHog. |
+| `integrations.posthog.project` | `""` | Project id (a number). Needed when enabled. |
+| `integrations.posthog.host` | `us.posthog.com` | `us.posthog.com` or `eu.posthog.com`. |
+| `integrations.posthog.release_property` | `$app_version` | The event property that holds the release. Letters, digits and `_`, with an optional leading `$`. |
+| `integrations.<provider>.workspace` | none | A checkout of the project on this machine (absolute path), for commit attribution. |
+
+Identifiers are letters, digits, `-`, `_` and `.`, at most 128 characters.
+
 ## Files Mulchie writes
 
 All of these are in the config directory.
@@ -213,6 +239,8 @@ All of these are in the config directory.
 | `engine.lock` | Makes sure one engine runs per user. |
 | `sessions/` | One `<id>.jsonl` [activity record](/docs/sessions/#the-activity-record) per session (mode `0600`, in a `0700` folder), and `paused.json`, the processes Mulchie paused for a limit and has not resumed. |
 | `updates.json` | The last [update check](/docs/updates/), so a restart shows it. |
+| `integrations/` | One `<provider>.token` per [connected provider](/docs/integrations/), mode `0600` in a `0700` folder. `mulchie integrations remove` deletes it. |
+| `integrations.json` | The last poll of each connected provider (deploys, numbers, status; never a token), mode `0600`. |
 | `timings.jsonl` | [Build and test timings](/docs/watch/#slower-builds), mode `0600`. Renamed to `timings.jsonl.1` at 4 MB. |
 | `commits.jsonl` | Moves of workspaces' `HEAD` with the agent session working there, mode `0600`. Renamed to `commits.jsonl.1` at 2 MB. |
 | `scan-memo.json` | What the last disk scan measured (sizes per worktree and cache), mode `0600`, so the first scan after a restart re-measures only what changed. Safe to delete: the next scan measures everything. |

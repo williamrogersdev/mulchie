@@ -158,6 +158,16 @@ impl Engine {
         f(&mut g)
     }
 
+    /// Run `f` on the recorded moves of `HEAD`, oldest first.
+    pub(crate) fn with_commit_log<R>(&self, f: impl FnOnce(&[CommitEntry]) -> R) -> R {
+        self.with_perf(|p| f(p.commits()))
+    }
+
+    /// A workspace path as the commit log stores it.
+    pub(crate) fn real_workspace(p: &Path) -> PathBuf {
+        real(p)
+    }
+
     fn queue_perf(&self, job: PerfJob) {
         let mut g = lock(&self.perf.state);
         if g.jobs.len() >= MAX_JOBS {
@@ -442,7 +452,16 @@ impl Engine {
         if rebuild || assessed || cleared {
             let mut all = self.with_perf(|p| p.build_findings.clone());
             all.extend(self.otel_findings());
-            self.replace_findings(watch::FindingCategory::Performance, all, now);
+            self.replace_findings_of(
+                watch::FindingCategory::Performance,
+                &[
+                    watch::FindingKind::BuildSlower,
+                    watch::FindingKind::EndpointSlower,
+                    watch::FindingKind::EndpointErrors,
+                ],
+                all,
+                now,
+            );
         }
     }
 

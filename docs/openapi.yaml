@@ -1331,6 +1331,92 @@ paths:
                               resource: { $ref: "#/components/schemas/TraceResource" }
         "400": { description: "`invalid_query`: a bad service or minutes", content: { application/json: { schema: { type: object } } } }
         default: { $ref: "#/components/responses/Error" }
+  /v1/integrations:
+    get:
+      summary: Connected providers (Vercel, Sentry, PostHog) and how their last poll went
+      description: |
+        Every provider is off until the user turns it on (`integrations.<provider>.enabled`, set by
+        `mulchie integrations add`). Only the engine holding the lock polls, each enabled provider no
+        sooner than a minute after start and then every `integrations.interval_mins` (at least 15),
+        doubling after each failed poll up to a day. A poll is authenticated read requests over HTTPS
+        to that provider's own API host, with no redirects followed; nothing about this machine is
+        sent. Tokens are never in this response: `token` only says whether a token file is in place.
+      responses:
+        "200":
+          description: The status
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  network: { type: boolean, description: "This build has network support (the `network` feature)" }
+                  interval_mins: { type: integer }
+                  checking: { type: boolean }
+                  slower: { type: integer, description: "Open `production_slower` findings" }
+                  sends: { type: string, description: "What goes over the network, in words" }
+                  providers:
+                    type: array
+                    items:
+                      type: object
+                      properties:
+                        provider: { type: string, enum: [vercel, sentry, posthog] }
+                        enabled: { type: boolean }
+                        host: { type: string, description: The one API host requests go to }
+                        project: { type: string, description: The project identifiers from the config }
+                        token: { type: boolean, description: A token file is in place }
+                        last_attempt_unix: { type: integer }
+                        last_success_unix: { type: integer }
+                        last_error: { type: string, description: "Why the last poll failed, in words" }
+                        failures: { type: integer }
+                        next_poll_unix: { type: integer }
+                        deploys: { type: integer }
+        default: { $ref: "#/components/responses/Error" }
+  /v1/integrations/check:
+    post:
+      summary: Ask for a poll of every enabled provider now
+      description: The poll runs on the engine's integrations worker; read `GET /v1/deploys` after it. Full token only.
+      responses:
+        "200":
+          description: Queued
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  ok: { type: boolean }
+                  queued: { type: boolean }
+        "409": { description: "`integrations_off`: no provider is on; `no_network`: this build has no network support; `too_soon`: the last poll was less than a minute ago", content: { application/json: { schema: { type: object } } } }
+        default: { $ref: "#/components/responses/Error" }
+  /v1/deploys:
+    get:
+      summary: Recent deploys of the enabled providers, newest first, with their numbers and commits
+      description: |
+        The deploys of the last successful poll of each enabled provider. Vercel: production
+        deployments in state READY and their build duration (Vercel's API offers no per-deployment
+        latency). Sentry: releases and the p95 of transaction durations per release over the last
+        30 days. PostHog: values of the release property on `$web_vitals` events and their LCP and
+        INP at the 75th percentile. Each deploy lists the moves of HEAD this machine recorded from the
+        previous deploy's commit to its own, with the agent session that was working then, or
+        `made_elsewhere`. A deploy that made a number worse raises a `production_slower` finding.
+      parameters:
+        - name: provider
+          in: query
+          required: false
+          description: Only this provider
+          schema: { type: string, enum: [vercel, sentry, posthog] }
+      responses:
+        "200":
+          description: The deploys
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  deploys:
+                    type: array
+                    items: { $ref: "#/components/schemas/Deploy" }
+        "400": { description: "`bad_provider`", content: { application/json: { schema: { type: object } } } }
+        default: { $ref: "#/components/responses/Error" }
 components:
   securitySchemes:
     bearer:
@@ -1526,6 +1612,7 @@ components:
         - endpoint_slower
         - endpoint_errors
         - otel_unavailable
+        - production_slower
     TraceResource:
       type: object
       description: The resource attributes kept from a service's spans
@@ -1546,6 +1633,43 @@ components:
         session_id: { type: string, description: The agent session working there when HEAD moved to it }
         agent: { type: string }
         via: { type: string, enum: [pid, revision] }
+    DeployCommit:
+      type: object
+      required: [sha, made]
+      properties:
+        sha: { type: string, description: The commit HEAD moved to }
+        at_unix: { type: integer }
+        branch: { type: string }
+        session_id: { type: string }
+        agent: { type: string }
+        made:
+          type: string
+          enum: [session, no_session, made_elsewhere]
+          description: "`made_elsewhere`: this machine never recorded the commit"
+    Deploy:
+      type: object
+      required: [provider, id, at_unix, metrics, commits]
+      properties:
+        provider: { type: string, enum: [vercel, sentry, posthog] }
+        id: { type: string, description: "A Vercel deployment id, or a Sentry or PostHog release" }
+        sha: { type: string, description: "The commit it was built from, when the provider says" }
+        at_unix: { type: integer, description: "Created or released (PostHog: first seen)" }
+        metrics:
+          type: array
+          items:
+            type: object
+            required: [metric, value_ms]
+            properties:
+              metric: { type: string, enum: [build_duration, p95, lcp_p75, inp_p75] }
+              value_ms: { type: number }
+              samples: { type: integer }
+        previous_deploy_id: { type: string }
+        workspace: { type: string, description: Where the commits were recorded }
+        commits:
+          type: array
+          description: "The recorded moves of HEAD from the previous deploy's commit to this one's (at most 20, the newest)"
+          items: { $ref: "#/components/schemas/DeployCommit" }
+        commits_truncated: { type: boolean }
     CommitEntry:
       type: object
       required: [at_unix, workspace, head, via]
@@ -1706,6 +1830,27 @@ components:
                   type: array
                   description: "The recorded moves of HEAD between them, oldest first (at most 20, the newest)"
                   items: { $ref: "#/components/schemas/CommitEntry" }
+                commits_truncated: { type: boolean }
+            deploy:
+              type: object
+              description: "`production_slower` only: the provider, the deploy, the metric before and after, and the commits in the deploy."
+              properties:
+                provider: { type: string, enum: [vercel, sentry, posthog] }
+                metric: { type: string }
+                metric_label: { type: string }
+                deploy_id: { type: string }
+                sha: { type: string }
+                deploy_unix: { type: integer }
+                previous_deploy_id: { type: string }
+                previous_sha: { type: string }
+                before_ms: { type: number, description: "The median over the deploys before" }
+                baseline_deploys: { type: integer }
+                after_ms: { type: number }
+                ratio: { type: number }
+                workspace: { type: string }
+                commits:
+                  type: array
+                  items: { $ref: "#/components/schemas/DeployCommit" }
                 commits_truncated: { type: boolean }
         suggested:
           type: array

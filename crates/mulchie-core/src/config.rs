@@ -57,6 +57,9 @@ pub struct Config {
     pub updates: UpdatesConfig,
     /// Build timings, commit attribution and `build_slower` findings.
     pub perf: PerfConfig,
+    /// Read-only links to hosting and monitoring tools (Vercel, Sentry,
+    /// PostHog) and `production_slower` findings. Off by default.
+    pub integrations: IntegrationsConfig,
     /// The local OpenTelemetry trace receiver and its `endpoint_slower` and
     /// `endpoint_errors` findings. Off by default.
     pub otel: OtelConfig,
@@ -199,6 +202,7 @@ impl Default for Config {
             guard: GuardConfig::default(),
             updates: UpdatesConfig::default(),
             perf: PerfConfig::default(),
+            integrations: IntegrationsConfig::default(),
             otel: OtelConfig::default(),
         }
     }
@@ -856,6 +860,223 @@ impl UpdatesConfig {
     }
 }
 
+// ------------------------------------------------------- integrations
+
+/// `integrations`: which providers Mulchie reads deploys and performance
+/// numbers from, and when a deploy counts as slower. Every provider is off
+/// until turned on; tokens are never here (see [`crate::integrations`]).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(default)]
+pub struct IntegrationsConfig {
+    /// Minutes between polls of each enabled provider (at least 15).
+    pub interval_mins: u64,
+    /// The baseline is the median of the metric over up to this many
+    /// deploys before the slower one.
+    pub baseline_deploys: usize,
+    /// A deploy is slower when its metric is more than this many times the
+    /// baseline...
+    pub slower_ratio: f64,
+    /// ...and more than this many milliseconds above it.
+    pub min_increase_ms: u64,
+    pub vercel: VercelIntegration,
+    pub sentry: SentryIntegration,
+    pub posthog: PostHogIntegration,
+}
+
+impl Default for IntegrationsConfig {
+    fn default() -> Self {
+        Self {
+            interval_mins: 30,
+            baseline_deploys: 5,
+            slower_ratio: 1.5,
+            min_increase_ms: 100,
+            vercel: VercelIntegration::default(),
+            sentry: SentryIntegration::default(),
+            posthog: PostHogIntegration::default(),
+        }
+    }
+}
+
+/// Vercel: production deployments of one project.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
+#[serde(default)]
+pub struct VercelIntegration {
+    pub enabled: bool,
+    /// Project id or name (`projectId`).
+    pub project: String,
+    /// Team id (`teamId`); empty for a personal account.
+    pub team: String,
+    /// A checkout of the project on this machine, for commit attribution.
+    /// `None`: any workspace whose recorded commits include the deploy's.
+    pub workspace: Option<PathBuf>,
+}
+
+/// Sentry: releases of one project and their transaction p95.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(default)]
+pub struct SentryIntegration {
+    pub enabled: bool,
+    /// Organization slug.
+    pub org: String,
+    /// Project slug.
+    pub project: String,
+    /// Only this environment; empty for all.
+    pub environment: String,
+    /// `sentry.io`, or a region of it such as `us.sentry.io` or `de.sentry.io`.
+    pub host: String,
+    pub workspace: Option<PathBuf>,
+}
+
+impl Default for SentryIntegration {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            org: String::new(),
+            project: String::new(),
+            environment: "production".into(),
+            host: "sentry.io".into(),
+            workspace: None,
+        }
+    }
+}
+
+/// PostHog: web vitals per release of one project.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(default)]
+pub struct PostHogIntegration {
+    pub enabled: bool,
+    /// Project id (a number).
+    pub project: String,
+    /// `us.posthog.com` or `eu.posthog.com`.
+    pub host: String,
+    /// The event property that holds the release (a commit SHA works
+    /// best). Web SDKs do not set `$app_version` on their own.
+    pub release_property: String,
+    pub workspace: Option<PathBuf>,
+}
+
+impl Default for PostHogIntegration {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            project: String::new(),
+            host: "us.posthog.com".into(),
+            release_property: "$app_version".into(),
+            workspace: None,
+        }
+    }
+}
+
+/// An identifier that goes into a URL path or query: letters, digits and
+/// `-_.`, at most 128 characters.
+pub fn safe_ident(s: &str) -> bool {
+    !s.is_empty()
+        && s.len() <= 128
+        && s.chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
+}
+
+/// A Sentry host: `sentry.io` or `<region>.sentry.io`.
+pub fn sentry_host_ok(h: &str) -> bool {
+    h == "sentry.io"
+        || h.strip_suffix(".sentry.io").is_some_and(|r| {
+            !r.is_empty()
+                && r.len() <= 32
+                && r.chars()
+                    .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit())
+        })
+}
+
+/// A PostHog host Mulchie reads from.
+pub fn posthog_host_ok(h: &str) -> bool {
+    matches!(h, "us.posthog.com" | "eu.posthog.com")
+}
+
+/// A PostHog property name that can go into HogQL as it is.
+pub fn posthog_property_ok(p: &str) -> bool {
+    let rest = p.strip_prefix('$').unwrap_or(p);
+    !rest.is_empty()
+        && rest.len() <= 64
+        && rest.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+}
+
+impl IntegrationsConfig {
+    pub fn validate(&self, e: &mut Vec<String>) {
+        if !(15..=1440).contains(&self.interval_mins) {
+            e.push("integrations.interval_mins must be between 15 and 1440".into());
+        }
+        if !(3..=50).contains(&self.baseline_deploys) {
+            e.push("integrations.baseline_deploys must be between 3 and 50".into());
+        }
+        if !(self.slower_ratio.is_finite() && (1.05..=100.0).contains(&self.slower_ratio)) {
+            e.push("integrations.slower_ratio must be between 1.05 and 100".into());
+        }
+        if self.min_increase_ms > 3_600_000 {
+            e.push("integrations.min_increase_ms must be between 0 and 3600000".into());
+        }
+        let ident = |v: &str, key: &str, need: bool, e: &mut Vec<String>| {
+            if (need || !v.is_empty()) && !safe_ident(v) {
+                e.push(format!(
+                    "integrations.{key} must be letters, digits, '-', '_' or '.' (at most 128)"
+                ));
+            }
+        };
+        let v = &self.vercel;
+        ident(&v.project, "vercel.project", v.enabled, e);
+        ident(&v.team, "vercel.team", false, e);
+        let s = &self.sentry;
+        ident(&s.org, "sentry.org", s.enabled, e);
+        ident(&s.project, "sentry.project", s.enabled, e);
+        ident(&s.environment, "sentry.environment", false, e);
+        if !sentry_host_ok(&s.host) {
+            e.push("integrations.sentry.host must be sentry.io or <region>.sentry.io".into());
+        }
+        let p = &self.posthog;
+        let number = !p.project.is_empty()
+            && p.project.len() <= 20
+            && p.project.chars().all(|c| c.is_ascii_digit());
+        if (p.enabled || !p.project.is_empty()) && !number {
+            e.push("integrations.posthog.project must be the project's number".into());
+        }
+        if !posthog_host_ok(&p.host) {
+            e.push("integrations.posthog.host must be us.posthog.com or eu.posthog.com".into());
+        }
+        if !posthog_property_ok(&p.release_property) {
+            e.push(
+                "integrations.posthog.release_property must be letters, digits and '_', with an optional leading '$'"
+                    .into(),
+            );
+        }
+        for (k, w) in [
+            ("vercel", &v.workspace),
+            ("sentry", &s.workspace),
+            ("posthog", &p.workspace),
+        ] {
+            if w.as_ref().is_some_and(|w| !w.is_absolute()) {
+                e.push(format!(
+                    "integrations.{k}.workspace must be an absolute path"
+                ));
+            }
+        }
+    }
+
+    /// The thresholds for deploy metrics, in milliseconds: one slower deploy
+    /// against the median of the ones before it.
+    pub fn thresholds(&self) -> crate::perf::Thresholds {
+        crate::perf::Thresholds {
+            baseline_runs: self.baseline_deploys,
+            slow_runs: 1,
+            ratio: self.slower_ratio,
+            min_increase: self.min_increase_ms as f64,
+        }
+    }
+
+    /// Whether any provider is on.
+    pub fn any_enabled(&self) -> bool {
+        self.vercel.enabled || self.sentry.enabled || self.posthog.enabled
+    }
+}
+
 /// Scan roots used when the config names none.
 pub fn default_scan_roots(home: &Path) -> Vec<PathBuf> {
     let mut roots: Vec<PathBuf> = [
@@ -1018,6 +1239,7 @@ impl Config {
         self.guard.validate(&mut e);
         self.updates.validate(&mut e);
         self.perf.validate(&mut e);
+        self.integrations.validate(&mut e);
         self.otel.validate(&mut e);
         if self.otel.port != 0 && self.otel.port == self.api_port {
             e.push("otel.port must differ from api_port".into());

@@ -107,6 +107,7 @@ An update finding never installs anything. It names the command you can run.
 | Kind | What was seen | Severity |
 | --- | --- | --- |
 | `build_slower` | A build or test command's latest successful runs each took much longer than its usual time. The title says the command, the workspace and both times; the evidence names the commits in between and the agent sessions that made them. See [Slower builds](#slower-builds). | low; medium at twice the usual time or more |
+| `production_slower` | A deploy made a production number from a connected provider worse (Vercel build duration, Sentry transaction p95, PostHog LCP or INP). The evidence names the deploy, the number before and after, and the commits in the deploy with the agent sessions behind them, or `made_elsewhere`. Only when an integration is on. See [Production integrations](/docs/integrations/). | low; medium at twice the baseline or more |
 | `endpoint_slower` | An endpoint of a local app that sends traces to Mulchie was much slower at p95 over the last 15 minutes than usual. The title says the operation, the service and both p95s; the evidence names the workspace, the commits since it was last normal and the sessions that made them. See [Traces](/docs/traces/#slower-endpoints). | low; medium at twice the usual p95 or more |
 | `endpoint_errors` | An endpoint of a local app failed much more often over the last 15 minutes than usual. Same evidence as `endpoint_slower`. | low; medium at 25% of requests failing or more |
 
@@ -135,7 +136,7 @@ The engine that holds the lock reads `HEAD` of each workspace an agent session w
 
 A finding lasts as long as its cause: a finding about a process ends when the process does. An issue groups the findings that are about the same problem, so you can see what keeps going wrong:
 
-- Findings of the `hygiene`, `limit` and `performance` kinds become issues (leftover, stale, stopped and runaway processes, growing memory, runaway chains, low memory, sessions over a budget or hogging the machine, slower builds, slower or failing endpoints). Security, setup and update findings do not.
+- Findings of the `hygiene`, `limit` and `performance` kinds become issues (leftover, stale, stopped and runaway processes, growing memory, runaway chains, low memory, sessions over a budget or hogging the machine, slower builds, slower production deploys, slower or failing endpoints). Security, setup and update findings do not.
 - Two findings are the same issue when they have the same kind, the same workspace and the same subject. For a process the subject is its command line with paths cut to their last part and numbers, ports and long ids replaced by `#`: `/usr/bin/node /code/site/node_modules/.bin/next dev --port=3001` becomes `node next dev --port=#`. For a session it is the agent and the cap; for low memory, the consumer; for an endpoint, the service and the operation.
 - Each separate finding counts once (`occurrences`): a process that runs away for a day is one occurrence; the same command running away again tomorrow is a second.
 - An issue is `open` until you decide. `resolved` means you fixed it: if it appears again it becomes `regressed`, and the journal and, with notifications on, a notification say so. `ignored` keeps counting it but never reports it.

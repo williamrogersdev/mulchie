@@ -12,7 +12,9 @@ them only through a safety gate that backs things up first. It groups each
 agent with what it started into a session, holds sessions to limits the user
 sets (by default it only reports), keeps a per-session activity record, takes
 calls from agent hooks and applies guard rules to shell commands, and reports
-newer versions without installing anything. It is a supervisor, not a sandbox
+newer versions without installing anything. When the user connects Vercel,
+Sentry or PostHog (off by default, read-only), it links production slowdowns
+to the deploys, commits and agent sessions behind them. It is a supervisor, not a sandbox
 and not an antivirus: say so wherever these features are described.
 
 It ships three ways:
@@ -25,7 +27,7 @@ It ships three ways:
 
 | Path | What it is |
 | --- | --- |
-| `crates/mulchie-core` | Engine, monitor, scanners, safety gate (`safety.rs`), sessions (`session.rs`), limits (`limits.rs`), memory guard (`memguard.rs`), runaway chains (`runaway.rs`), activity record (`record.rs`), guard rules (`guard.rs`), issues (`issues.rs`), build timings and slower builds (`perf.rs`, `timings.rs`, `commits.rs`, `engine_perf.rs`, `jsonl.rs`), the trace receiver and endpoint findings (`otel.rs`, `otel_server.rs`, `endpoints.rs`, `engine_otel.rs`), update checks (`updates.rs`), feedback reports (`feedback.rs`), local HTTP API (`api.rs`). No UI. |
+| `crates/mulchie-core` | Engine, monitor, scanners, safety gate (`safety.rs`), sessions (`session.rs`), limits (`limits.rs`), memory guard (`memguard.rs`), runaway chains (`runaway.rs`), activity record (`record.rs`), guard rules (`guard.rs`), issues (`issues.rs`), build timings and slower builds (`perf.rs`, `timings.rs`, `commits.rs`, `engine_perf.rs`, `jsonl.rs`), the trace receiver and endpoint findings (`otel.rs`, `otel_server.rs`, `endpoints.rs`, `engine_otel.rs`), update checks (`updates.rs`), production integrations (`integrations.rs` and `integrations_*.rs`), feedback reports (`feedback.rs`), local HTTP API (`api.rs`). No UI. |
 | `crates/mulchie-cli` | The `mulchie` binary: commands, `serve`, `run`, the MCP server (`mcp.rs`, `mcp_tools.rs`), `mcp install` (`mcp_install.rs`), `hook` and `hooks install` (`hook.rs`, `hooks_install.rs`), `sessions.rs`, `diagnose.rs`, `timings.rs`, `traces.rs`. |
 | `crates/mulchie-app` | Tauri desktop app. macOS only. Not a default workspace member. |
 | `docs/ARCHITECTURE.md` | How the pieces fit, and the rules the code keeps. Read it before touching deletion or signals. |
@@ -75,7 +77,7 @@ gh pr merge --auto --squash         # merges by itself when the "CI passed" chec
   - set `MULCHIE_PORT` to a free port.
 
   The same applies to manual checks. Do not run `sweep`, `clean`, `service install`, `mcp install` or `hooks install` against your real home; use `--dry-run` with a temp HOME.
-- **A test that starts an engine writes a safe config first**: build throttling off, no limit budgets, the memory guard and runaway chains off (`memory_guard.action` and `runaway.action` set to `off`, and never `stop` against the real process table) and update checks off (`updates.check` set to `off`). Otherwise the engine, which holds the lock in its temp home and samples the real process table, could renice your real builds, signal real processes or reach the network. Use the existing `safe_config` and `safe_test_config` helpers.
+- **A test that starts an engine writes a safe config first**: build throttling off, no limit budgets, the memory guard and runaway chains off (`memory_guard.action` and `runaway.action` set to `off`, and never `stop` against the real process table) update checks off (`updates.check` set to `off`) and every integration off (`integrations.<provider>.enabled` false). Otherwise the engine, which holds the lock in its temp home and samples the real process table, could renice your real builds, signal real processes or reach the network. Use the existing `safe_config` and `safe_test_config` helpers.
 - **Only the safety gate deletes or signals.** Every cache deletion, worktree removal and signal to another process goes through `crates/mulchie-core/src/safety.rs`. Nothing else may delete user files or signal other processes. These are the only other places that delete, signal, renice or probe a process (`docs/ARCHITECTURE.md` has the detail):
   - `git.rs` kills the process group of a child it started that timed out (git, and every helper run through `run_with_timeout` or `run_capped`);
   - `mulchie run` forwards signals to its own child;
@@ -84,6 +86,7 @@ gh pr merge --auto --squash         # merges by itself when the "CI passed" chec
   - the build throttle in `engine.rs` calls `lower_priority`, after re-reading the pid's start time;
   - `engine.rs` (`own_pid_alive`) and `safety.rs` (`pid_alive`) probe liveness with `kill(pid, 0)`, which sends nothing;
   - `diskmap.rs` (`prune_cache`) runs a package manager's own prune command, which deletes inside that tool's cache.
+  - `integrations.rs` (`remove_token`) deletes a provider token file, `<config dir>/integrations/<provider>.token`, on `mulchie integrations remove` (and when `add` saved a new token but the config change was refused): only a regular file of that name; a symbolic link is refused and left alone.
   - `safety.rs` (`discard_backup_set`) removes a backup set the gate wrote a moment ago for a removal that then did not happen: a real directory directly inside the backups directory, and only before `git worktree remove` has started.
 
   A change to a deletion or signal rule needs a test for that rule. Do not add another exception without adding it here and to `docs/ARCHITECTURE.md`.
@@ -100,7 +103,7 @@ Connect the MCP server:
 mulchie mcp install --client claude-code
 ```
 
-Other clients are `claude-desktop`, `cursor` and `codex`. Add `--read-only` to leave out every tool that deletes, signals, prunes or dismisses, and `check_updates`. A read-only server also connects with the engine's read-only token, so the engine itself refuses changes; build slots still work.
+Other clients are `claude-desktop`, `cursor` and `codex`. Add `--read-only` to leave out every tool that deletes, signals, prunes or dismisses, `check_updates` and `check_integrations`. A read-only server also connects with the engine's read-only token, so the engine itself refuses changes; build slots still work.
 
 1. Call `diagnose` first. It returns CPU and memory in words with the top apps and workspaces, health, findings, reclaimable space and recommendations. Each recommendation and finding names the exact next tool call.
 2. To reclaim space or act on processes, call a plan tool:
@@ -127,6 +130,7 @@ Sessions, limits, guard rules and updates:
 - `limits_status` says whether budgets only report or act, which sessions are over a cap, what Mulchie paused and why it may not enforce. Limits notify by default. Its `memory_guard` field is the machine-wide memory guard: whether it closes things when memory runs low (`action: stop`) or only reports, what it would close next and what it closed. Its `runaway` field is about commands that keep starting themselves (a build script that calls itself): the chains running now, what Mulchie froze and killed, and the commands `check_command` warns about for now.
 - `check_command` asks the guard rules whether a shell command is `allow`, `warn` or `block` before you run it, with the reason. It records nothing. It is a tripwire on command text, not a sandbox: do not treat `allow` as safe. If it says `block`, do not run the command; if `warn`, tell the user first. Rule `runaway_repeat` means this command, in this directory, was just seen starting itself over and over: read its build script and fix what calls it before running it again.
 - `list_updates` shows the last update check. `check_updates` asks the engine to check now (it contacts GitHub and npm from the engine, and OSV.dev only if the user turned advisories on) and is refused when `updates.check` is off. Mulchie never installs updates; the commands in the findings are for the user to run.
+- `list_deploys` shows recent production deploys from the providers the user connected (Vercel, Sentry, PostHog), each with its numbers and the commits in it with the agent session behind each, or `made_elsewhere`. A `production_slower` finding says a deploy made a number worse. `check_integrations` asks for a poll now. Only the user connects a provider (`mulchie integrations add`); never ask for or handle a provider token.
 
 Agent apps can also report to Mulchie through their own hooks: `mulchie hooks install --client <claude-code|codex|cursor|gemini|copilot>` (with `--dry-run` to see the exact diff) adds `mulchie hook <client> <event>` for session start, prompts, before and after shell commands, stop and session end. The hook fails open: with no engine, a slow one (300 ms) or any error it allows the action and exits 0. `mulchie hooks uninstall` removes exactly those entries; `mulchie hooks status` lists them.
 

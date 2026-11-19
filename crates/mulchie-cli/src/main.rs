@@ -7,6 +7,7 @@ mod feedback;
 mod hook;
 mod hook_wire;
 mod hooks_install;
+mod integrations;
 mod issues;
 mod json_faithful;
 mod mcp;
@@ -175,6 +176,7 @@ fn dispatch(paths: &Paths, cmd: Command) -> i32 {
                 i.out.json,
             ),
         },
+        Command::Integrations(c) => integrations::command(paths, c),
         Command::Timings(t) => timings::list(
             paths,
             t.workspace.as_deref(),

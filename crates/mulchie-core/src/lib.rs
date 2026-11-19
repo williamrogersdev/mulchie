@@ -9,6 +9,7 @@ pub mod failures;
 pub mod feedback;
 pub mod git;
 pub mod guard;
+pub mod integrations;
 pub mod issues;
 pub mod journal;
 pub mod jsonl;
