@@ -1383,6 +1383,8 @@ impl Engine {
                 let _ = h.join();
             }
         }
+        // A perf tick that was running may have started it again.
+        self.otel_stop();
         self.restore_priorities("shutdown");
         {
             // A pause still running finishes first; none starts after.

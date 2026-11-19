@@ -174,13 +174,22 @@ impl Engine {
     /// Start, restart or stop the receiver to match the config. Only the
     /// engine that holds the lock runs it.
     pub(crate) fn otel_reconcile(&self, now: u64) {
+        // Logged after the receiver's lock is let go: `log` takes `state`.
+        if let Some((kind, msg)) = self.otel_reconcile_quiet(now) {
+            self.log(kind, msg, 0, None, "otel");
+        }
+    }
+
+    /// [`Engine::otel_reconcile`], returning what to log.
+    fn otel_reconcile_quiet(&self, now: u64) -> Option<(&'static str, String)> {
         let cfg = self.config().otel;
-        let want = cfg.enabled && self.keeps_perf();
+        let want = cfg.enabled && self.keeps_perf() && !self.is_shut_down();
         let mut g = lock(&self.otel.inner);
+        let mut note = None;
         if !want {
             if let Some(s) = g.server.take() {
                 s.stop();
-                self.log("otel", "trace receiver stopped".into(), 0, None, "otel");
+                note = Some(("otel", "trace receiver stopped".to_string()));
             }
             g.started_for = None;
             g.error = None;
@@ -191,30 +200,27 @@ impl Engine {
                 g.used = false;
                 *lock(&self.otel.agg) = Aggregator::default();
             }
-            return;
+            return note;
         }
         if g.server.is_some() && g.started_for == Some(cfg.port) {
-            return;
+            return None;
         }
         if let Some(s) = g.server.take() {
             s.stop();
         }
         if let Some((p, _)) = &g.error {
             if *p == cfg.port && now >= g.error_at && now < g.error_at + RETRY_SECS {
-                return;
+                return None;
             }
         }
         let addr = SocketAddr::from(([127, 0, 0, 1], cfg.port));
         let sink: Arc<dyn Sink> = self.otel.agg.clone();
         match otel_server::serve(addr, sink, otel_server::Limits::default()) {
             Ok(s) => {
-                self.log(
+                note = Some((
                     "otel",
                     format!("trace receiver listening on {}", s.local_addr()),
-                    0,
-                    None,
-                    "otel",
-                );
+                ));
                 g.server = Some(s);
                 g.started_for = Some(cfg.port);
                 g.error = None;
@@ -222,18 +228,16 @@ impl Engine {
             }
             Err(e) => {
                 if g.error.as_ref().map(|x| x.0) != Some(cfg.port) {
-                    self.log(
+                    note = Some((
                         "error",
                         format!("trace receiver could not listen on {addr}: {e}"),
-                        0,
-                        None,
-                        "otel",
-                    );
+                    ));
                 }
                 g.error = Some((cfg.port, e.to_string()));
                 g.error_at = now;
             }
         }
+        note
     }
 
     /// Stop the receiver (shutdown).
