@@ -14,6 +14,8 @@ pub mod measure;
 pub mod memguard;
 pub mod monitor;
 pub mod notify;
+pub mod otel;
+pub mod otel_server;
 pub mod paths;
 pub mod process;
 pub mod procplan;
