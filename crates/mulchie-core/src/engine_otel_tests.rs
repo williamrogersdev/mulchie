@@ -231,9 +231,13 @@ fn a_slower_endpoint_names_its_workspace_commits_and_session() {
     );
 
     // Twelve busy windows at ~100 ms, two to three hours ago.
+    // Each burst sits inside one window (windows start on a multiple of
+    // five minutes), so none splits into two windows too small to count.
     let w = 5 * 60 * 1000;
+    let base = now_ms - 3 * 3600 * 1000;
+    let base = base - base % w;
     for i in 0..12u64 {
-        let end = now_ms - 3 * 3600 * 1000 + i * w + 1000;
+        let end = base + i * w + 1000;
         let ends: Vec<u64> = (0..30).map(|k| end + k * 1000).collect();
         e.otel_ingest(
             &batch("shop-web", 4242, "GET /api/orders", &ends, 100),
