@@ -14,7 +14,10 @@ cask "mulchie" do
     strategy :github_latest
   end
 
-  auto_updates true
+  # No `auto_updates true`, although the app can update itself: with it, a plain
+  # `brew upgrade` skips this cask, and an app whose updater never ran (or could
+  # not find a release) stays out of date. After the app updates itself, Homebrew
+  # may install the same version again on the next `brew upgrade`; that is harmless.
   # Homebrew casks cannot declare a conflict with a formula; mulchie-cli declares it.
   depends_on macos: :monterey
 
