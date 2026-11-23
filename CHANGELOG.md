@@ -4,6 +4,12 @@ All notable changes to Mulchie are listed here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the project uses
 [Semantic Versioning](https://semver.org/).
 
+## [0.3.1] - 2026-11-23
+
+### Changed
+
+- The Homebrew cask no longer declares `auto_updates`, so a plain `brew upgrade` upgrades Mulchie. Before, Homebrew skipped it unless you passed `--greedy` or named the cask, and an install whose own updater could not find a release (0.3.0-rc.5 and older, while every release was a pre-release) stayed out of date with no sign from either. After the app updates itself, the next `brew upgrade` may install the same version again; that is harmless.
+
 ## [0.3.0] - 2026-11-23
 
 ### Fixed
