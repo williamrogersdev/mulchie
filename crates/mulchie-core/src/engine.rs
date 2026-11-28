@@ -152,6 +152,13 @@ pub struct Forecast {
     pub bytes_per_hour: f64,
     pub hours_to_low: Option<f64>,
     pub hours_to_full: Option<f64>,
+    /// Swap in use at the last sample.
+    pub swap_bytes: u64,
+    /// How fast swap grew over the same window (negative: shrank).
+    pub swap_bytes_per_hour: f64,
+    /// Swap is written to the disk the forecast watches (macOS keeps it in
+    /// `/System/Volumes/VM` on the data volume), so its growth is disk use.
+    pub swap_on_disk: bool,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -3653,20 +3660,35 @@ fn throttle_notes(snap: &Snapshot, newly: &[u32], now: u64) -> Vec<Action> {
     notes
 }
 
-fn forecast(h: &VecDeque<Sample>, cfg: &Config) -> Forecast {
-    let pts: Vec<(f64, f64)> = h.iter().map(|s| (s.t as f64, s.disk_free as f64)).collect();
-    if pts.len() < 20 {
-        return Forecast::default();
-    }
+/// Least-squares slope of `pts` per hour, or `None` with no spread in time.
+fn slope_per_hour(pts: &[(f64, f64)]) -> Option<f64> {
     let n = pts.len() as f64;
     let mx = pts.iter().map(|p| p.0).sum::<f64>() / n;
     let my = pts.iter().map(|p| p.1).sum::<f64>() / n;
     let num: f64 = pts.iter().map(|p| (p.0 - mx) * (p.1 - my)).sum();
     let den: f64 = pts.iter().map(|p| (p.0 - mx).powi(2)).sum();
-    if den == 0.0 {
-        return Forecast::default();
+    (den != 0.0).then(|| num / den * 3600.0)
+}
+
+fn forecast(h: &VecDeque<Sample>, cfg: &Config) -> Forecast {
+    let swap = Forecast {
+        swap_bytes: h.back().map_or(0, |s| s.swap),
+        swap_on_disk: cfg!(target_os = "macos"),
+        ..Forecast::default()
+    };
+    let pts: Vec<(f64, f64)> = h.iter().map(|s| (s.t as f64, s.disk_free as f64)).collect();
+    if pts.len() < 20 {
+        return swap;
     }
-    let per_hour = -(num / den) * 3600.0;
+    let Some(slope) = slope_per_hour(&pts) else {
+        return swap;
+    };
+    let swap_pts: Vec<(f64, f64)> = h.iter().map(|s| (s.t as f64, s.swap as f64)).collect();
+    let swap = Forecast {
+        swap_bytes_per_hour: slope_per_hour(&swap_pts).unwrap_or(0.0),
+        ..swap
+    };
+    let per_hour = -slope;
     let free = pts.last().map(|p| p.1).unwrap_or(0.0);
     let low = cfg.low_disk_gb as f64 * 1e9;
     if per_hour > 1e8 {
@@ -3674,12 +3696,14 @@ fn forecast(h: &VecDeque<Sample>, cfg: &Config) -> Forecast {
             bytes_per_hour: per_hour,
             hours_to_low: Some(((free - low) / per_hour).max(0.0)),
             hours_to_full: Some(free / per_hour),
+            ..swap
         }
     } else {
         Forecast {
             bytes_per_hour: per_hour,
             hours_to_low: None,
             hours_to_full: None,
+            ..swap
         }
     }
 }

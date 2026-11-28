@@ -629,6 +629,101 @@ fn sweeps_take_only_idle_agent_worktrees() {
     assert!(wt.exists() && human.exists());
 }
 
+/// 2026-11-27: repackify merges through a squash merge queue, so a merged
+/// branch is never an ancestor of `main`; its clean worktrees were never
+/// offered. A clean worktree whose branch is merged is now swept before the
+/// idle window, by the scan and by the gate; an unmerged or dirty one waits.
+#[test]
+fn merged_clean_worktrees_are_swept_before_the_idle_window() {
+    let mut env = Env::new();
+    // 30 days pass in the test; the window is longer than that.
+    env.cfg.worktree_idle_days = 60;
+    let repo = env.repo("repo");
+    let squashed = env.worktree(&repo, "agent-squashed", false);
+    std::fs::write(squashed.join("feature.rs"), "fn f() {}\n").unwrap();
+    env.git(&squashed, &["add", "-A"]);
+    env.git(&squashed, &["commit", "-q", "-m", "feature"]);
+    std::fs::write(squashed.join("lib.rs"), "fn main() { f() }\n").unwrap();
+    env.git(&squashed, &["commit", "-q", "-am", "use it"]);
+    let open = env.worktree(&repo, "agent-open", false);
+    std::fs::write(open.join("open.rs"), "fn o() {}\n").unwrap();
+    env.git(&open, &["add", "-A"]);
+    env.git(&open, &["commit", "-q", "-m", "open work"]);
+    let dirty = env.worktree(&repo, "agent-dirty", false);
+    std::fs::write(dirty.join("lib.rs"), "fn main() { f() }\n").unwrap();
+    // main gets other work, then the squash merge of agent-squashed, and the
+    // dirty worktree's one change.
+    std::fs::write(repo.join("other.rs"), "\n").unwrap();
+    env.git(&repo, &["add", "-A"]);
+    env.git(&repo, &["commit", "-q", "-m", "other"]);
+    env.git(&repo, &["merge", "-q", "--squash", "agent-squashed"]);
+    env.git(&repo, &["commit", "-q", "-m", "feature (#1)"]);
+
+    let map = diskmap::scan(&env.cfg, &env.paths, &[], env.now);
+    let wt = |p: &Path| {
+        let p = p.canonicalize().unwrap();
+        map.worktrees
+            .iter()
+            .find(|w| w.path.canonicalize().unwrap() == p)
+            .unwrap()
+            .clone()
+    };
+    let s = wt(&squashed);
+    assert!(s.merged && s.sweepable, "{s:?}");
+    assert_eq!(s.merged_by, Some(crate::merged::MergedBy::Squash));
+    assert!(s.verdict.contains("squash"), "{}", s.verdict);
+    let o = wt(&open);
+    assert!(!o.merged && !o.sweepable, "{o:?}");
+    let d = wt(&dirty);
+    assert!(!d.sweepable, "{d:?}");
+
+    let plan = env.gate().plan_sweep(&map.worktrees);
+    assert_eq!(plan.items.len(), 1, "{plan:?}");
+    assert!(plan.items[0].ready, "{plan:?}");
+    assert!(plan.items[0].verdict.contains("squash"), "{plan:?}");
+    let r = env.gate().execute(&plan.approved(), "t");
+    assert!(done(&r[0]), "{r:?}");
+    assert!(!squashed.exists() && open.exists() && dirty.exists());
+
+    // The gate decides for itself: neither of the others goes.
+    let req = |p: &Path| Request::RemoveWorktree {
+        path: p.to_path_buf(),
+        expected_head: env.head(p),
+        allow_dirty: true,
+        require_idle: true,
+    };
+    let r = env.gate().execute_one(&req(&open), "t");
+    assert_eq!(reason(&r), Some(SkipReason::NotIdle), "{r:?}");
+    let r = env.gate().execute_one(&req(&dirty), "t");
+    assert_eq!(reason(&r), Some(SkipReason::NotIdle), "{r:?}");
+    assert!(open.exists() && dirty.exists());
+}
+
+/// A worktree just made from `main` is an ancestor of it ("merged") but is
+/// not swept before the grace period: its agent may not have started yet.
+#[test]
+fn a_fresh_worktree_is_not_swept_as_merged() {
+    let mut env = Env::new();
+    env.cfg.worktree_idle_days = 60;
+    env.now = crate::monitor::now_unix();
+    let repo = env.repo("repo");
+    let wt = env.worktree(&repo, "agent-new", false);
+    let map = diskmap::scan(&env.cfg, &env.paths, &[], env.now);
+    let w = &map.worktrees[0];
+    assert!(w.merged && !w.sweepable, "{w:?}");
+    let r = env.gate().execute_one(
+        &Request::RemoveWorktree {
+            path: wt.clone(),
+            expected_head: env.head(&wt),
+            allow_dirty: true,
+            require_idle: true,
+        },
+        "t",
+    );
+    assert_eq!(reason(&r), Some(SkipReason::NotIdle));
+    assert!(wt.exists());
+}
+
 #[test]
 fn locked_and_main_worktrees_are_refused() {
     let env = Env::new();

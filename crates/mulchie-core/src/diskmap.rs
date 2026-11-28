@@ -189,6 +189,9 @@ pub struct Worktree {
     pub idle_days: u64,
     pub dirty_files: usize,
     pub merged: bool,
+    /// How `merged` was decided: `ancestor`, `upstream_gone` or `squash`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub merged_by: Option<crate::merged::MergedBy>,
     /// HEAD commit at scan time. Removal requests carry it as the expected HEAD.
     pub head: Option<String>,
     /// git marks the entry prunable (its directory is gone).
@@ -663,21 +666,7 @@ fn repo_worktrees(
     let Ok(entries) = git::worktree_list(paths, repo) else {
         return Vec::new();
     };
-    let main_branch = git(paths, repo, &["symbolic-ref", "--short", "HEAD"])
-        .ok()
-        .map(|s| s.trim().to_string());
-    let merged: Vec<String> = main_branch
-        .as_ref()
-        .and_then(|b| {
-            git(
-                paths,
-                repo,
-                &["branch", "--merged", b, "--format=%(refname:short)"],
-            )
-            .ok()
-        })
-        .map(|s| s.lines().map(|l| l.trim().to_string()).collect())
-        .unwrap_or_default();
+    let merge = crate::merged::RepoMerge::read(paths, repo);
 
     let repo_name = repo
         .file_name()
@@ -748,19 +737,29 @@ fn repo_worktrees(
             let activity_unknown = m.is_some_and(|m| m.activity_unknown);
             let last_activity_unix = m.map_or(0, |m| m.newest.max(m.last_commit_unix));
             let idle_days = now.saturating_sub(last_activity_unix) / 86_400;
-            let is_merged = e.branch.as_ref().map(|b| merged.contains(b)).unwrap_or(false);
+            let merged_by = e
+                .branch
+                .as_deref()
+                .and_then(|b| merge.check(paths, b, e.head.as_deref()));
+            let is_merged = merged_by.is_some();
             let locked = e.locked;
             let known = status_error.is_none();
             let removable = (missing && agent)
                 || (exists && known && !in_use && !locked && dirty_files == 0);
+            // A clean worktree whose branch is merged has nothing left to
+            // lose: offered at once, however recently it was used.
+            let merged_clean = is_merged
+                && dirty_files == 0
+                && !activity_unknown
+                && now.saturating_sub(last_activity_unix) >= crate::merged::MERGED_GRACE_SECS;
             let sweepable = agent
                 && !locked
                 && (missing
                     || (exists
                         && known
-                        && !activity_unknown
                         && !in_use
-                        && idle_days >= cfg.worktree_idle_days));
+                        && !activity_unknown
+                        && (merged_clean || idle_days >= cfg.worktree_idle_days)));
             let verdict = if let (true, Some(err)) = (exists, status_error.as_deref()) {
                 format!("could not read git status ({err}); left alone")
             } else if missing && !agent {
@@ -777,8 +776,13 @@ fn repo_worktrees(
                 format!("idle {idle_days}d with {dirty_files} uncommitted file(s); removal saves a patch first")
             } else if dirty_files > 0 {
                 format!("{dirty_files} uncommitted file(s); review before removing")
-            } else if is_merged {
-                "clean and merged; safe to remove".to_string()
+            } else if let Some(by) = merged_by {
+                match by {
+                    crate::merged::MergedBy::Ancestor => {
+                        "clean and merged; safe to remove".to_string()
+                    }
+                    by => format!("clean; {}; safe to remove", by.describe()),
+                }
             } else if sweepable {
                 format!("idle {idle_days}d; branch is kept on removal")
             } else if activity_unknown && agent {
@@ -800,6 +804,7 @@ fn repo_worktrees(
                 idle_days,
                 dirty_files,
                 merged: is_merged,
+                merged_by,
                 head: e.head.clone(),
                 missing,
                 locked,

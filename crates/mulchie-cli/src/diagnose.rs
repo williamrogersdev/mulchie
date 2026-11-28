@@ -415,6 +415,12 @@ pub fn build(state: &Value, advice: &Value, origin: Origin) -> Value {
             sz(low_disk)
         ));
     }
+    if disk_low && state["forecast"]["swap_on_disk"] == true && u(snap, "swap_used") >= SWAP_LARGE {
+        why.push(format!(
+            "{} of the disk is swap (memory pressure, not files)",
+            sz(u(snap, "swap_used"))
+        ));
+    }
     if mem_total > 0 && mem_free_pct < mem_floor {
         why.push(format!(
             "memory pressure: {mem_free_pct:.0}% free (floor {mem_floor:.0}%)"
@@ -621,6 +627,10 @@ pub fn build(state: &Value, advice: &Value, origin: Origin) -> Value {
         },
     });
     let reclaim_priority = if disk_low { 1 } else { 3 };
+    // Before the cleanups: when swap fills the disk, they do not stop it.
+    if let Some(rec) = swap_rec(state, snap, &ws, disk_low) {
+        recs.push(rec);
+    }
     if !stale_items.is_empty() {
         recs.push(Rec {
             priority: reclaim_priority,
@@ -641,7 +651,7 @@ pub fn build(state: &Value, advice: &Value, origin: Origin) -> Value {
             id: "sweep_idle_worktrees",
             title: format!("Remove {} idle agent worktree(s)", idle.len()),
             reason: format!(
-                "Agent worktrees idle past the configured window. Branches are kept{}; nothing is lost.",
+                "Agent worktrees idle past the configured window, or clean with their branch merged. Branches are kept{}; nothing is lost.",
                 if dirty > 0 { format!(", and {dirty} uncommitted file(s) are saved as a patch first") } else { String::new() }
             ),
             gain_bytes: Some(idle_bytes),
@@ -754,6 +764,96 @@ pub fn build(state: &Value, advice: &Value, origin: Origin) -> Value {
         "reclaimable": reclaimable,
     });
     finish(source, state, health, problems, recs, Some(rest))
+}
+
+/// Swap at least this large counts as a large share of disk use.
+const SWAP_LARGE: u64 = 8_000_000_000;
+
+/// When swap is a large or fast-growing part of disk use (macOS writes it to
+/// the data volume), name it: cleaning caches does not stop it, fewer
+/// concurrent agents and builds do.
+fn swap_rec(state: &Value, snap: &Value, ws: &[Value], disk_low: bool) -> Option<Rec> {
+    let fc = &state["forecast"];
+    if fc["swap_on_disk"] != true {
+        return None;
+    }
+    let swap = u(snap, "swap_used").max(u(fc, "swap_bytes"));
+    let swap_rate = f(fc, "swap_bytes_per_hour");
+    let disk_rate = f(fc, "bytes_per_hour");
+    let filling = disk_low || !fc["hours_to_full"].is_null();
+    // Swap growth is a large part of how fast the disk fills.
+    let fast = disk_rate > 1e9 && swap_rate >= disk_rate * 0.3;
+    let large = swap >= SWAP_LARGE.max(u(snap, "mem_total") / 4);
+    if !(fast || (large && filling)) {
+        return None;
+    }
+    let cores = u(snap, "cpu_count");
+    let load1 = snap["load"][0].as_f64().unwrap_or(0.0);
+    let mut reason = format!(
+        "macOS writes swap to the data volume (/System/Volumes/VM), and {} of it is in use",
+        sz(swap)
+    );
+    if swap_rate > 1e8 {
+        reason.push_str(&format!(", growing {}/hour", sz(swap_rate as u64)));
+        if disk_rate > 1e8 {
+            reason.push_str(&format!(
+                " ({:.0}% of the disk's {}/hour)",
+                (swap_rate / disk_rate * 100.0).min(100.0),
+                sz(disk_rate as u64)
+            ));
+        }
+    }
+    reason.push_str(&format!(
+        ". It comes from memory pressure: {} agent(s) and {} build process(es)",
+        u(snap, "agent_count"),
+        u(snap, "build_count")
+    ));
+    if cores > 0 {
+        reason.push_str(&format!(" at load {load1:.0} on {cores} cores"));
+    }
+    reason.push_str(". Deleting caches and worktrees will not stop it; running fewer agents and builds at once will, and the space comes back as swap shrinks.");
+    // The workspace holding the most memory, as the place to start.
+    let heavy = ws
+        .iter()
+        .filter(|w| w["paused"] != true && (u(w, "agents") > 0 || u(w, "builds") > 0))
+        .max_by_key(|w| u(w, "mem_bytes"));
+    let (next_call, command) = match heavy {
+        Some(w) => {
+            let action = if u(w, "builds") > 0 {
+                "stop_builds"
+            } else {
+                "pause"
+            };
+            reason.push_str(&format!(
+                " {} uses the most memory ({}).",
+                w["label"].as_str().unwrap_or("?"),
+                sz(u(w, "mem_bytes"))
+            ));
+            (
+                call(
+                    "plan_process_action",
+                    json!({ "group": ws_key(w), "action": action }),
+                ),
+                Some(format!(
+                    "mulchie group {} {}",
+                    q(&ws_key(w)),
+                    action.replace('_', "-")
+                )),
+            )
+        }
+        None => (call("get_status", json!({})), Some("mulchie top".into())),
+    };
+    Some(Rec {
+        priority: if disk_low { 1 } else { 2 },
+        id: "reduce_swap",
+        title: format!("Swap is using {} of disk: reduce memory pressure", sz(swap)),
+        reason,
+        gain_bytes: Some(swap),
+        gain: format!("up to {} of disk, and a faster machine", sz(swap)),
+        risk: "medium",
+        next_call,
+        command,
+    })
 }
 
 /// An issue counts as recurring once it appeared this often.
@@ -1482,6 +1582,55 @@ mod tests {
             "forecast": { "hours_to_full": 12.0 },
             "loops": { "sample": { "restarts": 0 }, "scan": { "restarts": 0 } },
         })
+    }
+
+    #[test]
+    fn swap_filling_the_disk_is_named() {
+        // 2026-11-27: 49 GB of swap in /System/Volumes/VM, the disk filling
+        // at ~35 GB/hour, 32 agents at load 171 on 16 cores.
+        let mut st = state();
+        st["snapshot"]["swap_used"] = json!(49_000_000_000u64);
+        st["snapshot"]["load"] = json!([171.0, 160.0, 150.0]);
+        st["snapshot"]["cpu_count"] = json!(16);
+        st["snapshot"]["agent_count"] = json!(32);
+        st["snapshot"]["workspaces"][7]["mem_bytes"] = json!(20_000_000_000u64);
+        st["snapshot"]["workspaces"][7]["builds"] = json!(3);
+        st["forecast"] = json!({
+            "bytes_per_hour": 35e9, "hours_to_full": 0.3,
+            "swap_bytes": 49_000_000_000u64, "swap_bytes_per_hour": 30e9, "swap_on_disk": true,
+        });
+        let d = build(&st, &json!({}), Origin::Engine);
+        let recs = d["recommendations"].as_array().unwrap();
+        let r = recs
+            .iter()
+            .find(|r| r["id"] == "reduce_swap")
+            .expect("a swap recommendation");
+        let reason = r["reason"].as_str().unwrap();
+        assert!(
+            reason.contains("/System/Volumes/VM") && reason.contains("49.0 GB"),
+            "{reason}"
+        );
+        assert!(reason.contains("86%"), "{reason}");
+        assert!(reason.contains("load 171 on 16 cores"), "{reason}");
+        assert_eq!(r["next_call"]["name"], "plan_process_action");
+        assert_eq!(r["next_call"]["arguments"]["group"], "workspace:/r/w7");
+        assert_eq!(r["next_call"]["arguments"]["action"], "stop_builds");
+        // First: cleaning caches would not stop the disk filling.
+        assert_eq!(recs[0]["id"], "reduce_swap");
+        let why = d["health"]["why"].to_string();
+        assert!(why.contains("is swap"), "{why}");
+
+        // Swap that is small and steady says nothing.
+        let mut calm = state();
+        calm["snapshot"]["swap_used"] = json!(1_000_000_000u64);
+        calm["forecast"] = json!({ "bytes_per_hour": 2e9, "hours_to_full": 5.0,
+            "swap_bytes": 1_000_000_000u64, "swap_bytes_per_hour": 0.0, "swap_on_disk": true });
+        let d = build(&calm, &json!({}), Origin::Engine);
+        assert!(!d["recommendations"].to_string().contains("reduce_swap"));
+        // Nor does swap that is not on the watched disk (Linux).
+        st["forecast"]["swap_on_disk"] = json!(false);
+        let d = build(&st, &json!({}), Origin::Engine);
+        assert!(!d["recommendations"].to_string().contains("reduce_swap"));
     }
 
     #[test]
