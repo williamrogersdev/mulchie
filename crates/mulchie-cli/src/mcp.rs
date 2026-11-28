@@ -198,8 +198,8 @@ pub struct Session<'a> {
     pub negotiated: Option<String>,
     /// Only tools that change nothing (plus build slots).
     pub read_only: bool,
-    /// Plans shown by this server process (in memory, lost on restart);
-    /// execute_plan needs one.
+    /// Plans shown by this server; execute_plan needs one. `mulchie mcp`
+    /// also saves them, so a restarted server still has them.
     pub plans: Plans,
     /// Build-slot release secrets by ticket; never shown to the client.
     /// Shared with the signal thread, which releases them on SIGTERM.
@@ -639,11 +639,12 @@ pub fn command(paths: &Paths, read_only: bool) -> i32 {
     } else {
         EngineApi::new(paths.clone())
     };
-    let session = if read_only {
+    let mut session = if read_only {
         Session::read_only(&api)
     } else {
         Session::new(&api)
     };
+    session.plans = Plans::persistent(paths);
     release_on_signals(paths.clone(), read_only, session.secrets.clone());
     let stdin = std::io::stdin();
     match serve_session(stdin.lock(), std::io::stdout().lock(), session) {

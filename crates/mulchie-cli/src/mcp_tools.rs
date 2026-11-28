@@ -18,6 +18,10 @@ use std::time::{Duration, Instant};
 pub const PLAN_TTL: Duration = Duration::from_secs(30 * 60);
 /// Plans kept per session; the oldest goes first.
 const MAX_PLANS: usize = 32;
+/// One `execute_plan` call starts no new item after this long: it returns
+/// what is done so far and keeps the rest of the plan under the same id, so
+/// a long removal never outlasts the client's or the engine's timeout.
+pub const EXECUTE_BUDGET: Duration = Duration::from_secs(240);
 
 pub struct Tool {
     pub name: &'static str,
@@ -310,13 +314,13 @@ pub fn tool_list() -> Vec<Tool> {
         read(
             "plan_worktree_sweep",
             "Plan sweeping idle agent worktrees",
-            "Plan removing every agent worktree idle past the configured window. Changes nothing. Uncommitted work would be saved as a patch, ignored non-cache files archived, a detached HEAD kept on a backup/<name> branch, and branches are never deleted. Returns a plan_id; show the plan to the user, then call execute_plan with the approved targets.",
+            "Plan removing every agent worktree idle past the configured window, and every clean agent worktree whose branch is merged (also by squash merge, or with its remote branch deleted) and unchanged for 6 hours, however recently it was used before that. Changes nothing. Uncommitted work would be saved as a patch, ignored non-cache files archived, a detached HEAD kept on a backup/<name> branch, and branches are never deleted. Returns a plan_id; show the plan to the user, then call execute_plan with the approved targets.",
             json!({}),
         ),
         Tool {
             name: "execute_plan",
             title: "Execute approved plan items",
-            description: "Carry out items from a plan made by plan_cache_cleanup, plan_worktree_removal, plan_worktree_sweep or plan_process_action on this server. Plans are kept in this server process's memory, so they are lost if the server restarts. items must be targets of ready items in that plan; anything else is refused. Only call this after the user has seen the plan and approved these items. Each item is re-checked just before it runs and skipped if anything changed. The result lists what was done, what was skipped and why, every backup with its path, and how to restore. A plan can be executed once and expires after 30 minutes.",
+            description: "Carry out items from a plan made by plan_cache_cleanup, plan_worktree_removal, plan_worktree_sweep or plan_process_action on this server. Plans are saved, so a restarted server still has them. items must be targets of ready items in that plan; anything else is refused. Only call this after the user has seen the plan and approved these items. Each item is re-checked just before it runs and skipped if anything changed. The result lists what was done, what was skipped and why, every backup with its path, and how to restore. A long run stops starting items after about 4 minutes and returns partial=true with the remaining targets, still under the same plan_id: call execute_plan again with them to continue. A plan can be executed once and expires after 30 minutes.",
             props: json!({
                 "plan_id": { "type": "string", "description": "From the plan tool's result" },
                 "items": { "type": "array", "items": { "type": "string" }, "minItems": 1, "description": "Targets of the approved ready items" }
@@ -557,6 +561,25 @@ impl PlanKind {
         }
     }
 
+    fn key(self) -> &'static str {
+        match self {
+            PlanKind::Caches => "caches",
+            PlanKind::Worktrees => "worktrees",
+            PlanKind::Sweep => "sweep",
+            PlanKind::Process => "process",
+        }
+    }
+
+    fn from_key(k: &str) -> Option<Self> {
+        Some(match k {
+            "caches" => PlanKind::Caches,
+            "worktrees" => PlanKind::Worktrees,
+            "sweep" => PlanKind::Sweep,
+            "process" => PlanKind::Process,
+            _ => return None,
+        })
+    }
+
     fn name(self) -> &'static str {
         match self {
             PlanKind::Caches => "delete build caches",
@@ -567,27 +590,134 @@ impl PlanKind {
     }
 }
 
+#[derive(Clone)]
 struct StoredPlan {
     kind: PlanKind,
-    created: Instant,
+    /// Unix seconds when the plan was shown (or when a partial execution
+    /// put the rest of it back).
+    created_unix: u64,
     items: Vec<Value>,
     /// Carried out whole or not at all: a group or tree action, whose
     /// parts (a restart's quit, a parent's children) belong together.
     whole: bool,
 }
 
-/// Plans shown by this server process, by id (in memory only). Execution needs one of these.
+impl StoredPlan {
+    fn to_json(&self) -> Value {
+        json!({ "kind": self.kind.key(), "created_unix": self.created_unix,
+                "items": self.items, "whole": self.whole })
+    }
+
+    fn from_json(v: &Value) -> Option<Self> {
+        Some(StoredPlan {
+            kind: PlanKind::from_key(v["kind"].as_str()?)?,
+            created_unix: v["created_unix"].as_u64()?,
+            items: v["items"].as_array()?.clone(),
+            whole: v["whole"].as_bool().unwrap_or(false),
+        })
+    }
+
+    fn expired(&self, now: u64) -> bool {
+        now.saturating_sub(self.created_unix) > PLAN_TTL.as_secs()
+    }
+}
+
+/// Plans shown by this server, by id. Execution needs one of these. Kept in
+/// memory and, for a server started by `mulchie mcp`, in
+/// `<config dir>/mcp-plans.json` (mode 0600, under an `flock`), so a plan
+/// survives a restart of the server between planning and executing. Each
+/// plan expires [`PLAN_TTL`] after it was made and runs once.
 #[derive(Default)]
 pub struct Plans {
     map: HashMap<String, StoredPlan>,
     order: Vec<String>,
+    /// The saved plans file, when plans persist.
+    file: Option<std::path::PathBuf>,
     /// Package caches whose prune preview this server showed, and when.
     /// `prune_cache` with `execute=true` needs one, like `execute_plan`
     /// needs a plan.
     previews: HashMap<String, Instant>,
+    /// How long one `execute_plan` call starts new items before it returns
+    /// what is done and keeps the rest of the plan ([`EXECUTE_BUDGET`]).
+    budget: Option<Duration>,
+    /// Tests: seconds added to the clock.
+    #[cfg(test)]
+    skew: u64,
 }
 
+/// Saved plans kept in the file across all servers; the oldest go first.
+const MAX_SAVED_PLANS: usize = 256;
+
 impl Plans {
+    /// Plans saved under `paths`' config directory.
+    pub fn persistent(paths: &Paths) -> Self {
+        Plans {
+            file: Some(paths.config_dir.join("mcp-plans.json")),
+            ..Default::default()
+        }
+    }
+
+    fn now(&self) -> u64 {
+        #[cfg(test)]
+        let skew = self.skew;
+        #[cfg(not(test))]
+        let skew = 0;
+        mulchie_core::monitor::now_unix() + skew
+    }
+
+    fn budget(&self) -> Duration {
+        self.budget.unwrap_or(EXECUTE_BUDGET)
+    }
+
+    #[cfg(test)]
+    pub fn set_budget(&mut self, d: Duration) {
+        self.budget = Some(d);
+    }
+
+    /// Read-modify-write the saved plans under an exclusive lock. Errors
+    /// leave the file alone; the in-memory copy still works.
+    fn with_file<T>(&self, f: impl FnOnce(&mut Map<String, Value>) -> T) -> Option<T> {
+        use std::os::unix::fs::OpenOptionsExt;
+        use std::os::unix::io::AsRawFd;
+        let file = self.file.as_ref()?;
+        let dir = file.parent()?;
+        mulchie_core::config::create_private_dir(dir).ok()?;
+        let lock = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .mode(0o600)
+            .custom_flags(libc::O_NOFOLLOW)
+            .open(dir.join("mcp-plans.lock"))
+            .ok()?;
+        // SAFETY: flock on a file descriptor we own; released when `lock` drops.
+        if unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX) } != 0 {
+            return None;
+        }
+        let mut saved: Map<String, Value> = std::fs::read(file)
+            .ok()
+            .and_then(|b| serde_json::from_slice::<Value>(&b).ok())
+            .and_then(|v| v.as_object().cloned())
+            .unwrap_or_default();
+        let now = self.now();
+        saved.retain(|_, v| StoredPlan::from_json(v).is_some_and(|p| !p.expired(now)));
+        let out = f(&mut saved);
+        while saved.len() > MAX_SAVED_PLANS {
+            let oldest = saved
+                .iter()
+                .min_by_key(|(_, v)| v["created_unix"].as_u64().unwrap_or(0))
+                .map(|(k, _)| k.clone());
+            match oldest {
+                Some(k) => saved.remove(&k),
+                None => break,
+            };
+        }
+        let data = serde_json::to_vec(&Value::Object(saved)).ok()?;
+        mulchie_core::config::write_atomic(file, &data, 0o600).ok()?;
+        Some(out)
+    }
+
     fn insert(&mut self, kind: PlanKind, items: Vec<Value>) -> String {
         self.insert_as(kind, items, false)
     }
@@ -599,26 +729,41 @@ impl Plans {
                 Instant::now().elapsed().as_nanos() ^ self.order.len() as u128
             )
         });
-        self.map.insert(
-            id.clone(),
-            StoredPlan {
-                kind,
-                created: Instant::now(),
-                items,
-                whole,
-            },
-        );
-        self.order.push(id.clone());
+        let plan = StoredPlan {
+            kind,
+            created_unix: self.now(),
+            items,
+            whole,
+        };
+        self.put(&id, plan);
+        id
+    }
+
+    fn put(&mut self, id: &str, plan: StoredPlan) {
+        let saved = plan.to_json();
+        self.with_file(|m| {
+            m.insert(id.to_string(), saved);
+        });
+        self.map.insert(id.to_string(), plan);
+        self.order.retain(|x| x != id);
+        self.order.push(id.to_string());
         while self.order.len() > MAX_PLANS {
             let old = self.order.remove(0);
             self.map.remove(&old);
         }
-        id
     }
 
+    /// Take a plan out to execute it: from memory, or from the saved file
+    /// (a plan another run of this server showed). Either way it is gone
+    /// from both, so it runs once.
     fn take(&mut self, id: &str) -> Option<StoredPlan> {
         self.order.retain(|x| x != id);
-        self.map.remove(id)
+        let mem = self.map.remove(id);
+        let saved = self
+            .with_file(|m| m.remove(id))
+            .flatten()
+            .and_then(|v| StoredPlan::from_json(&v));
+        mem.or(saved)
     }
 
     fn previewed(&mut self, key: &str) {
@@ -638,9 +783,7 @@ impl Plans {
 
     #[cfg(test)]
     pub fn age_all(&mut self, by: Duration) {
-        for p in self.map.values_mut() {
-            p.created -= by;
-        }
+        self.skew += by.as_secs();
         for at in self.previews.values_mut() {
             *at -= by;
         }
@@ -857,10 +1000,10 @@ fn execute(api: &dyn Api, plans: &mut Plans, a: &Map<String, Value>) -> ToolResu
     let id = a.get("plan_id").and_then(Value::as_str).unwrap_or("");
     let Some(plan) = plans.take(id) else {
         return Err(format!(
-            "no plan {id:?} on this server: plans live in this server process's memory, are lost when it restarts, and can be executed once; make a new plan with plan_cache_cleanup, plan_worktree_removal, plan_worktree_sweep or plan_process_action"
+            "no plan {id:?}: a plan can be executed once, within 30 minutes of being made; make a new plan with plan_cache_cleanup, plan_worktree_removal, plan_worktree_sweep or plan_process_action"
         ));
     };
-    if plan.created.elapsed() > PLAN_TTL {
+    if plan.expired(plans.now()) {
         return Err(
             "that plan is more than 30 minutes old; make a new one so it reflects the machine now"
                 .into(),
@@ -873,63 +1016,107 @@ fn execute(api: &dyn Api, plans: &mut Plans, a: &Map<String, Value>) -> ToolResu
         .flatten()
         .filter_map(Value::as_str)
         .collect();
-    let mut requests = Vec::new();
-    let mut chosen = Vec::new();
+    let mut chosen: Vec<Value> = Vec::new();
     for t in &wanted {
         let Some(item) = plan.items.iter().find(|i| i["target"] == *t) else {
-            plans_restore(plans, id, plan);
+            plans.put(id, plan);
             return Err(format!(
                 "{t} is not in plan {id}; only targets listed in its ready items can be executed"
             ));
         };
         if item["ready"] != true {
             let why = item["verdict"].as_str().unwrap_or("").to_string();
-            plans_restore(plans, id, plan);
+            plans.put(id, plan);
             return Err(format!(
                 "{t} was not ready in the plan ({why}), so it cannot be executed"
             ));
         }
-        if !chosen.iter().any(|c: &&Value| c["target"] == *t) {
-            chosen.push(item);
-            requests.push(item["request"].clone());
+        if !chosen.iter().any(|c| c["target"] == *t) {
+            chosen.push(item.clone());
         }
     }
     if plan.whole {
         let ready = plan.items.iter().filter(|i| i["ready"] == true).count();
         if chosen.len() != ready {
-            plans_restore(plans, id, plan);
+            plans.put(id, plan);
             return Err(format!(
                 "plan {id} is a group or tree action and is carried out whole: pass all {ready} ready targets, or none. Part of it (a restart without its quit, a parent without its children) is not what the user reviewed; make a new plan for a smaller action."
             ));
         }
     }
-    // From here the plan is used: whatever happens, a retry needs a new one.
+    // From here the plan is used: whatever happens, a retry needs a new one
+    // (except for the items a partial run hands back below).
     let check = "It may have acted on some items: check get_status or the mulchie://actions resource before anything else. This plan has been used; make a new plan if more is needed.";
-    let results = api
-        .call(
+    // A group or tree goes in one call; anything else one item per call, so
+    // the run can stop between items before a timeout.
+    let batches: Vec<Vec<Value>> = if plan.whole || plan.kind == PlanKind::Process {
+        vec![chosen.clone()]
+    } else {
+        chosen.iter().map(|c| vec![c.clone()]).collect()
+    };
+    let started = Instant::now();
+    let budget = plans.budget();
+    let mut results: Vec<Value> = Vec::new();
+    let mut sent = 0usize;
+    let mut failure: Option<String> = None;
+    for batch in &batches {
+        if sent > 0 && started.elapsed() >= budget {
+            break;
+        }
+        let requests: Vec<Value> = batch.iter().map(|i| i["request"].clone()).collect();
+        sent += 1;
+        match api.call(
             "POST",
             plan.kind.route(),
             Some(&json!({ "items": requests })),
-        )
-        .map_err(|e| {
-            if e.status == 0 {
-                format!("The engine did not answer ({}). {check}", api_err(e))
-            } else {
-                format!(
+        ) {
+            Ok(Value::Array(rs)) => results.extend(rs),
+            Ok(_) => {
+                failure = Some(format!(
+                    "Unexpected reply from the engine; this server and the engine may be different versions. {check}"
+                ));
+                break;
+            }
+            Err(e) if e.status == 0 => {
+                failure = Some(format!(
+                    "The engine did not answer ({}). {check}",
+                    api_err(e)
+                ));
+                break;
+            }
+            Err(e) => {
+                failure = Some(format!(
                     "{}. This plan has been used; make a new plan if more is needed.",
                     api_err(e)
-                )
+                ));
+                break;
             }
-        })?;
-    if !results.is_array() {
+        }
+    }
+    let remaining: Vec<Value> = batches[sent..].iter().flatten().cloned().collect();
+    if let Some(f) = failure {
+        if results.is_empty() {
+            return Err(f);
+        }
+        let done = results.iter().filter(|r| r["status"] == "done").count();
         return Err(format!(
-            "Unexpected reply from the engine; this server and the engine may be different versions. {check}"
+            "{f} Before that, {done} of {} item(s) finished: {}",
+            chosen.len(),
+            results
+                .iter()
+                .map(|r| format!(
+                    "{} {}",
+                    r["target"].as_str().unwrap_or("?"),
+                    r["status"].as_str().unwrap_or("?")
+                ))
+                .collect::<Vec<_>>()
+                .join(", ")
         ));
     }
     let mut freed = 0u64;
     let mut done = 0;
     let mut out = Vec::new();
-    for r in results.as_array().into_iter().flatten() {
+    for r in &results {
         let item = plan.items.iter().find(|i| i["target"] == r["target"]);
         if r["status"] == "done" {
             done += 1;
@@ -946,20 +1133,35 @@ fn execute(api: &dyn Api, plans: &mut Plans, a: &Map<String, Value>) -> ToolResu
         }));
     }
     let total = out.len();
-    Ok(json!({
+    let mut reply = json!({
         "done": done,
         "skipped": total - done,
         "freed": human_bytes(freed),
         "freed_bytes": freed,
         "results": out,
         "note": "Skipped items changed after the plan was made (or failed a safety check) and were left alone. Backups are kept in Mulchie's backups directory until the user deletes them.",
-    }))
-}
-
-/// Put a plan back after a refused execute, so the model can retry.
-fn plans_restore(plans: &mut Plans, id: &str, plan: StoredPlan) {
-    plans.map.insert(id.to_string(), plan);
-    plans.order.push(id.to_string());
+    });
+    if !remaining.is_empty() {
+        // Hand the approved items not yet started back under the same id,
+        // with a fresh expiry: the user already approved them.
+        let targets: Vec<Value> = remaining.iter().map(|i| i["target"].clone()).collect();
+        let rest = StoredPlan {
+            kind: plan.kind,
+            created_unix: plans.now(),
+            items: remaining,
+            whole: false,
+        };
+        plans.put(id, rest);
+        reply["partial"] = json!(true);
+        reply["plan_id"] = json!(id);
+        reply["remaining"] = json!(targets);
+        reply["next"] = json!(format!(
+            "Stopped after {}s so this call returns before a timeout; {} approved item(s) have not started. Call execute_plan again with this plan_id and items set to remaining to continue.",
+            started.elapsed().as_secs(),
+            targets.len()
+        ));
+    }
+    Ok(reply)
 }
 
 // ------------------------------------------------------------------- calls

@@ -16,6 +16,51 @@ struct Fixture {
     // the whole real process table (heavy enough to upset the timing of
     // the lock and takeover tests).
     _turn: Box<dyn std::any::Any>,
+    _watchdog: Watchdog,
+}
+
+/// A test that holds its turn longer than this is stuck.
+const TEST_LIMIT: Duration = Duration::from_secs(180);
+
+/// Aborts the test binary, naming the test, when a fixture outlives
+/// [`TEST_LIMIT`]: a hang fails in minutes with the culprit's name instead of
+/// holding [`HEAVY`] and every later test until CI cancels the job. Started
+/// once the turn is held, so time spent waiting for it does not count.
+struct Watchdog(Arc<std::sync::atomic::AtomicBool>);
+
+impl Watchdog {
+    fn start() -> Self {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let done = Arc::new(AtomicBool::new(false));
+        let flag = done.clone();
+        let name = std::thread::current()
+            .name()
+            .unwrap_or("unnamed test")
+            .to_string();
+        std::thread::spawn(move || {
+            let start = std::time::Instant::now();
+            while start.elapsed() < TEST_LIMIT {
+                if flag.load(Ordering::Relaxed) {
+                    return;
+                }
+                std::thread::sleep(Duration::from_millis(200));
+            }
+            if !flag.load(Ordering::Relaxed) {
+                eprintln!(
+                    "{name} still running after {}s: aborting the test binary",
+                    TEST_LIMIT.as_secs()
+                );
+                std::process::abort();
+            }
+        });
+        Watchdog(done)
+    }
+}
+
+impl Drop for Watchdog {
+    fn drop(&mut self) {
+        self.0.store(true, std::sync::atomic::Ordering::Relaxed);
+    }
 }
 
 static HEAVY: std::sync::RwLock<()> = std::sync::RwLock::new(());
@@ -41,6 +86,7 @@ fn fixture_with(turn: Box<dyn std::any::Any>) -> Fixture {
         paths,
         root,
         _turn: turn,
+        _watchdog: Watchdog::start(),
     }
 }
 

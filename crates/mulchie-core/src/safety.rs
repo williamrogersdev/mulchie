@@ -511,6 +511,8 @@ struct WorktreeFacts {
     branch: Option<String>,
     detached: bool,
     idle_days: Option<u64>,
+    /// The idle window was waived: the branch is merged and the tree clean.
+    merged_waiver: Option<crate::merged::MergedBy>,
     dirty_files: usize,
     status: String,
     ignored: Vec<String>,
@@ -815,9 +817,13 @@ impl<'a> Gate<'a> {
                         item.ignored_files = f.ignored.len();
                         item.ignored_bytes = f.ignored_bytes;
                         item.would_backup = self.would_backup(&f);
-                        match f.idle_days {
-                            Some(d) => format!("idle {d}d; removable"),
-                            None => "removable".to_string(),
+                        match (f.merged_waiver, f.idle_days) {
+                            (Some(by), Some(d)) => {
+                                format!("clean, active {d}d ago; {}; removable", by.describe())
+                            }
+                            (Some(by), None) => format!("clean; {}; removable", by.describe()),
+                            (None, Some(d)) => format!("idle {d}d; removable"),
+                            (None, None) => "removable".to_string(),
                         }
                     })
             }
@@ -1320,37 +1326,64 @@ impl<'a> Gate<'a> {
         let name = file_name(&canon);
         let agent = is_agent_worktree(&canon);
         let mut idle_days = None;
+        // Set when the idle window is waived because the branch is merged;
+        // the worktree must then also be clean.
+        let mut merged_waiver: Option<crate::merged::MergedBy> = None;
         if require_idle {
             if !agent {
                 return skip(SkipReason::NotAgent, "sweeps only remove agent worktrees");
             }
+            let merged = || {
+                entry.branch.as_deref().and_then(|b| {
+                    crate::merged::RepoMerge::read(self.paths, &repo).check(
+                        self.paths,
+                        b,
+                        Some(&head),
+                    )
+                })
+            };
             let last_commit: u64 =
                 git::git(self.paths, &canon, &["log", "-1", "--format=%ct", "HEAD"])
                     .map_err(Self::git_skip)?
                     .trim()
                     .parse()
                     .unwrap_or(0);
-            let Some(walked) = last_activity_checked(&canon) else {
-                return skip(
-                    SkipReason::NotIdle,
-                    format!(
-                        "more than {} files; cannot tell when it was last used",
-                        diskmap::ACTIVITY_BUDGET
-                    ),
-                );
-            };
-            let last = walked.max(last_commit);
-            let days = self.now.saturating_sub(last) / 86_400;
-            if days < self.config.worktree_idle_days {
-                return skip(
-                    SkipReason::NotIdle,
-                    format!(
-                        "active {days}d ago; the idle window is {}d",
-                        self.config.worktree_idle_days
-                    ),
-                );
+            match last_activity_checked(&canon) {
+                None => {
+                    return skip(
+                        SkipReason::NotIdle,
+                        format!(
+                            "more than {} files; cannot tell when it was last used",
+                            diskmap::ACTIVITY_BUDGET
+                        ),
+                    )
+                }
+                Some(walked) => {
+                    let last = walked.max(last_commit);
+                    let quiet = self.now.saturating_sub(last);
+                    let days = quiet / 86_400;
+                    if days < self.config.worktree_idle_days {
+                        let merged = if quiet >= crate::merged::MERGED_GRACE_SECS {
+                            merged()
+                        } else {
+                            None
+                        };
+                        match merged {
+                            Some(by) => merged_waiver = Some(by),
+                            None => {
+                                return skip(
+                                    SkipReason::NotIdle,
+                                    format!(
+                                        "active {days}d ago; the idle window is {}d",
+                                        self.config.worktree_idle_days
+                                    ),
+                                )
+                            }
+                        }
+                    }
+                    idle_days = Some(days);
+                }
             }
-            idle_days = Some(days);
         }
         if let Some(sub) = initialized_submodule(self.paths, &canon)? {
             return skip(
@@ -1387,6 +1420,15 @@ impl<'a> Gate<'a> {
         )
         .map_err(Self::git_skip)?;
         let dirty_files = status.lines().filter(|l| !l.is_empty()).count();
+        if dirty_files > 0 && merged_waiver.is_some() {
+            return skip(
+                SkipReason::NotIdle,
+                format!(
+                    "merged, but {dirty_files} uncommitted file(s); the {}d idle window applies",
+                    self.config.worktree_idle_days
+                ),
+            );
+        }
         if dirty_files > 0 && !allow_dirty {
             return skip(
                 SkipReason::Dirty,
@@ -1420,6 +1462,7 @@ impl<'a> Gate<'a> {
             branch: entry.branch.clone(),
             detached: entry.detached,
             idle_days,
+            merged_waiver,
             dirty_files,
             status,
             ignored,

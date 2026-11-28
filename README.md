@@ -43,7 +43,7 @@ Full documentation is at [mulchie.com/docs](https://mulchie.com/docs/).
 
 **Reclaim**
 - Build caches: Rust `target/`, `.next`, optionally `node_modules`, and Xcode DerivedData on macOS. A cache is stale when it has not been used within the stale window and no process runs in its project.
-- Git worktrees: size, idle days, uncommitted files and a verdict for each. Idle time comes from the last file change and the last commit, not from folder timestamps. A sweep removes idle agent worktrees.
+- Git worktrees: size, idle days, uncommitted files and a verdict for each. Idle time comes from the last file change and the last commit, not from folder timestamps. A sweep removes idle agent worktrees, and clean ones whose branch is merged (including squash merges and branches deleted on the remote).
 - Package and toolchain stores: `mulchie prune` runs the tool's own prune command for npm, bun, pnpm, yarn, uv, pip, Homebrew, Go and iOS simulators. The disk breakdown also lists Docker and model stores, which Mulchie does not prune.
 - Every deletion is a plan you see first. Mulchie then deletes exactly that plan, re-checking each item at the moment it acts.
 

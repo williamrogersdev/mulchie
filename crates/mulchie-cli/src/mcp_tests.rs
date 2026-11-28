@@ -2128,3 +2128,128 @@ fn list_endpoints_reads_the_receiver_and_stays_in_read_only_mode() {
     let r = s.handle(req(4, "tools/list", json!({}))).unwrap();
     assert!(tool_names(&r).contains(&"list_endpoints".to_string()));
 }
+
+/// 2026-11-27: a 19-worktree removal ran past the 600 s engine call and the
+/// MCP call failed after 17. Items now go one per engine call, and once the
+/// budget is spent the call returns what is done and keeps the rest.
+#[test]
+fn a_long_execution_returns_partial_and_keeps_the_rest() {
+    let plan = plan_with(&["/w/a", "/w/b", "/w/c"], &[]);
+    let f = Fake::default().with("GET /v1/sweep", plan.clone()).with(
+        "POST /v1/sweep",
+        json!([{ "action": "remove_worktree", "target": "/w/a", "status": "done", "freed_bytes": 1 }]),
+    );
+    let mut s = Session::new(&f);
+    s.plans.set_budget(std::time::Duration::ZERO);
+    let shown = result(&s.handle(call(1, "plan_worktree_sweep", json!({}))).unwrap());
+    let id = shown["plan_id"].as_str().unwrap().to_string();
+    let out = result(
+        &s.handle(call(
+            2,
+            "execute_plan",
+            json!({ "plan_id": id, "items": ["/w/a", "/w/b", "/w/c"] }),
+        ))
+        .unwrap(),
+    );
+    // One item per call; the first always runs.
+    let posted = f.posted("/v1/sweep");
+    assert_eq!(posted.len(), 1);
+    assert_eq!(posted[0]["items"], json!([plan["items"][0]["request"]]));
+    assert_eq!(out["partial"], true);
+    assert_eq!(out["plan_id"], json!(id));
+    assert_eq!(out["remaining"], json!(["/w/b", "/w/c"]));
+    assert!(out["next"].as_str().unwrap().contains("execute_plan"));
+    // The finished item is not in the plan any more; the rest is.
+    let r = s
+        .handle(call(
+            3,
+            "execute_plan",
+            json!({ "plan_id": id, "items": ["/w/a"] }),
+        ))
+        .unwrap();
+    assert_eq!(r["result"]["isError"], true);
+    s.plans.set_budget(crate::mcp_tools::EXECUTE_BUDGET);
+    let out = result(
+        &s.handle(call(
+            4,
+            "execute_plan",
+            json!({ "plan_id": id, "items": ["/w/b", "/w/c"] }),
+        ))
+        .unwrap(),
+    );
+    assert!(out.get("partial").is_none(), "{out}");
+    let posted = f.posted("/v1/sweep");
+    assert_eq!(posted.len(), 3);
+    assert_eq!(posted[1]["items"], json!([plan["items"][1]["request"]]));
+    assert_eq!(posted[2]["items"], json!([plan["items"][2]["request"]]));
+}
+
+/// 2026-11-27: the MCP server restarted between planning and executing, and
+/// the plan was gone ("no plan ... on this server"). Plans are saved now.
+#[test]
+fn a_plan_survives_a_server_restart_and_still_runs_once() {
+    let tmp = tempfile::tempdir().unwrap();
+    let paths = mulchie_core::Paths::under(tmp.path());
+    let plan = plan_with(&["/w/a"], &[]);
+    let f = Fake::default().with("GET /v1/sweep", plan).with(
+        "POST /v1/sweep",
+        json!([{ "target": "/w/a", "status": "done" }]),
+    );
+    let id = {
+        let mut s = Session::new(&f);
+        s.plans = Plans::persistent(&paths);
+        let shown = result(&s.handle(call(1, "plan_worktree_sweep", json!({}))).unwrap());
+        shown["plan_id"].as_str().unwrap().to_string()
+    };
+    let saved = paths.config_dir.join("mcp-plans.json");
+    use std::os::unix::fs::PermissionsExt;
+    assert_eq!(
+        std::fs::metadata(&saved).unwrap().permissions().mode() & 0o777,
+        0o600
+    );
+    // A new server process: nothing in memory.
+    let mut s = Session::new(&f);
+    s.plans = Plans::persistent(&paths);
+    let out = result(
+        &s.handle(call(
+            2,
+            "execute_plan",
+            json!({ "plan_id": id, "items": ["/w/a"] }),
+        ))
+        .unwrap(),
+    );
+    assert_eq!(out["done"], 1);
+    // Once only, in this server or another.
+    let mut other = Session::new(&f);
+    other.plans = Plans::persistent(&paths);
+    let r = other
+        .handle(call(
+            3,
+            "execute_plan",
+            json!({ "plan_id": id, "items": ["/w/a"] }),
+        ))
+        .unwrap();
+    assert_eq!(r["result"]["isError"], true);
+    assert_eq!(f.posted("/v1/sweep").len(), 1);
+
+    // A saved plan still expires.
+    let id = {
+        let mut s = Session::new(&f);
+        s.plans = Plans::persistent(&paths);
+        let shown = result(&s.handle(call(4, "plan_worktree_sweep", json!({}))).unwrap());
+        shown["plan_id"].as_str().unwrap().to_string()
+    };
+    let mut s = Session::new(&f);
+    s.plans = Plans::persistent(&paths);
+    s.plans
+        .age_all(crate::mcp_tools::PLAN_TTL + std::time::Duration::from_secs(1));
+    let r = s
+        .handle(call(
+            5,
+            "execute_plan",
+            json!({ "plan_id": id, "items": ["/w/a"] }),
+        ))
+        .unwrap();
+    assert_eq!(r["result"]["isError"], true);
+    assert_eq!(f.posted("/v1/sweep").len(), 1);
+}

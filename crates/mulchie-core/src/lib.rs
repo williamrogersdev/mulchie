@@ -18,6 +18,7 @@ pub mod limits;
 pub mod lock;
 pub mod measure;
 pub mod memguard;
+pub mod merged;
 pub mod monitor;
 pub mod notify;
 pub mod otel;
