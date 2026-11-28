@@ -61,7 +61,10 @@ jobs:
         if: runner.os == 'Linux'
         run: cargo clippy --locked -p mulchie-core -p mulchie --all-targets --no-default-features -- -D warnings
 
+      # A hung test fails this step in minutes; a whole-job timeout is a
+      # cancel, which reports no failure to act on.
       - name: Test
+        timeout-minutes: 15
         run: cargo test --locked ${{ matrix.packages }}
 
       # Already part of the run above; repeated by name so a failure is easy to spot.
